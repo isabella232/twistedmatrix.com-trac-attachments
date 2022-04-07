@@ -1,0 +1,139 @@
+Index: twisted/internet/win32eventreactor.py
+===================================================================
+--- twisted/internet/win32eventreactor.py	(revision 30568)
++++ twisted/internet/win32eventreactor.py	(working copy)
+@@ -169,6 +169,8 @@
+         else:
+             timeout = int(timeout * 1000)
+ 
++        timeout = min(timeout, 100)
++
+         if not (self._events or self._writes):
+             # sleep so we don't suck up CPU time
+             time.sleep(timeout / 1000.0)
+@@ -200,8 +202,7 @@
+         try:
+             closed = fd.doWrite()
+         except:
+-            closed = sys.exc_info()[1]
+-            log.deferr()
++            closed = True
+ 
+         if closed:
+             self.removeReader(fd)
+Index: twisted/internet/test/test_serialport.py
+===================================================================
+--- twisted/internet/test/test_serialport.py	(revision 30568)
++++ twisted/internet/test/test_serialport.py	(working copy)
+@@ -11,7 +11,7 @@
+ except ImportError, e:
+     skip = "serial support unavailable (%s)" % (e,)
+ else:
+-    from twisted.internet.serialport import SerialPort
++    from twisted.internet.serialport import SerialPort, getDefaultPort
+ 
+ from twisted.internet.interfaces import IReactorFDSet, IReactorWin32Events
+ from twisted.internet.error import ConnectionDone
+@@ -19,13 +19,13 @@
+ from twisted.internet.test.reactormixins import ReactorBuilder
+ from twisted.trial.unittest import SkipTest
+ from twisted.test.test_tcp import ConnectionLostNotifyingProtocol
++from twisted.python.runtime import platformType
+ 
+-
+ class SerialPortTestsBuilder(ReactorBuilder):
+     """
+     Builder defining tests for L{twisted.internet.serialport}.
+     """
+-    portName = 0
++    portName = getDefaultPort()
+ 
+     def test_loseConnection(self):
+         """
+@@ -36,9 +36,11 @@
+         """
+         reactor = self.buildReactor()
+ 
+-        interfaces = [IReactorFDSet, IReactorWin32Events]
+-        support = [True for iface in interfaces if iface.providedBy(reactor)]
+-        if not support:
++        if platformType == "win32" and IReactorWin32Events.providedBy(reactor):
++            pass
++        elif platformType != "win32" and IReactorFDSet.providedBy(reactor):
++            pass
++        else:
+             raise SkipTest(
+                 "Cannot use SerialPort without IReactorFDSet or "
+                 "IReactorWin32Events")
+@@ -59,7 +61,5 @@
+ 
+         self.runReactor(reactor)
+ 
+-        protocol.lostConnectionReason.trap(ConnectionDone)
+ 
+-
+ globals().update(SerialPortTestsBuilder.makeTestCaseClasses())
+Index: twisted/internet/_posixserialport.py
+===================================================================
+--- twisted/internet/_posixserialport.py	(revision 30568)
++++ twisted/internet/_posixserialport.py	(working copy)
+@@ -55,3 +55,19 @@
+         abstract.FileDescriptor.connectionLost(self, reason)
+         self.protocol.connectionLost(reason)
+         self._serial.close()
++
++
++def getDefaultPort():
++    """
++    Returns the name of the first serial port that can be opened.
++    """
++    MAX_SERIAL_PORTS = 20
++    for prefix in ['/dev/ttyS',  '/dev/ttyUSB']:
++        for i in range(MAX_SERIAL_PORTS):
++            try:
++                s = serial.Serial(prefix + '%d' % i)
++                portName = s.portstr
++                s.close()
++                return portName
++            except serial.SerialException:
++                pass
+Index: twisted/internet/_win32serialport.py
+===================================================================
+--- twisted/internet/_win32serialport.py	(revision 30568)
++++ twisted/internet/_win32serialport.py	(working copy)
+@@ -16,6 +16,8 @@
+ from serial import STOPBITS_ONE, STOPBITS_TWO
+ from serial import FIVEBITS, SIXBITS, SEVENBITS, EIGHTBITS
+ import win32file, win32event
++import _winreg as winreg
++import itertools
+ 
+ # twisted imports
+ from twisted.protocols import basic
+@@ -109,4 +111,13 @@
+         self.reactor.removeEvent(self._overlappedRead.hEvent)
+         self.reactor.removeEvent(self._overlappedWrite.hEvent)
+         abstract.FileDescriptor.connectionLost(self, reason)
++        self.protocol.connectionLost(reason)
+         self._serial.close()
++
++def getDefaultPort():
++    """
++    Returns the name of the first serial port that is found in the registry.
++    """
++    path = 'HARDWARE\\DEVICEMAP\\SERIALCOMM'
++    key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, path)
++    return str(winreg.EnumValue(key, 0)[1])
+Index: twisted/internet/serialport.py
+===================================================================
+--- twisted/internet/serialport.py	(revision 30568)
++++ twisted/internet/serialport.py	(working copy)
+@@ -67,6 +67,6 @@
+ 
+ # replace SerialPort with appropriate serial port
+ if os.name == 'posix':
+-    from twisted.internet._posixserialport import SerialPort
++    from twisted.internet._posixserialport import SerialPort, getDefaultPort
+ elif sys.platform == 'win32':
+-    from twisted.internet._win32serialport import SerialPort
++    from twisted.internet._win32serialport import SerialPort, getDefaultPort

@@ -1,0 +1,94 @@
+Index: twisted/web/test/test_webclient.py
+===================================================================
+--- twisted/web/test/test_webclient.py	(revision 24566)
++++ twisted/web/test/test_webclient.py	(working copy)
+@@ -10,7 +10,7 @@
+ from urlparse import urlparse
+ 
+ from twisted.trial import unittest
+-from twisted.web import server, static, client, error, util, resource
++from twisted.web import server, static, client, error, util, resource, http
+ from twisted.internet import reactor, defer, interfaces
+ from twisted.python.filepath import FilePath
+ from twisted.protocols.policies import WrappingFactory
+@@ -100,7 +100,22 @@
+         return util.Redirect.render(self, request)
+ 
+ 
++class BrokenRedirect(resource.Resource):
++    """
++    Send an arbitrary response without any error checking. Used to send a
++    relative redirect (which violates standards) to test_RelativeRedirect
++    
++    @param path The redirect path to send via the Location header
++    """
++    def __init__(self, path, *a, **kw):
++        resource.Resource.__init__(self, *a, **kw)
++        self.path = path
++    def render(self, request):
++        request.setResponseCode(301)
++        request.setHeader("location", self.path)
++        request.finish()
+ 
++
+ class ParseUrlTestCase(unittest.TestCase):
+     """
+     Test URL parsing facility and defaults values.
+@@ -138,7 +153,6 @@
+         self.assertTrue(isinstance(host, str))
+         self.assertTrue(isinstance(path, str))
+ 
+-
+ class WebClientTestCase(unittest.TestCase):
+     def _listen(self, site):
+         return reactor.listenTCP(0, site, interface="127.0.0.1")
+@@ -149,6 +163,9 @@
+         FilePath(name).child("file").setContent("0123456789")
+         r = static.File(name)
+         r.putChild("redirect", util.Redirect("/file"))
++        r.putChild("rel_redirect_startslash", BrokenRedirect("/rel_redirect_target"))
++        r.putChild("rel_redirect_nostartslash", BrokenRedirect("rel_redirect_target"))
++        r.putChild("rel_redirect_target", static.Data("success", "text/plain"))
+         self.infiniteRedirectResource = CountingRedirect("/infiniteRedirect")
+         r.putChild("infiniteRedirect", self.infiniteRedirectResource)
+         r.putChild("wait", ForeverTakingResource())
+@@ -344,6 +361,15 @@
+         self.assertEquals(exc.location, "/file")
+ 
+ 
++    def test_noStartingSlashRelativeRedirect(self):
++        return client.getPage(self.getURL("rel_redirect_nostartslash")
++            ).addCallback(self.assertEqual, "success")
++
++    def test_startingSlashRelativeRedirect(self):
++        return client.getPage(self.getURL("rel_redirect_startslash")
++            ).addCallback(self.assertEqual, "success")
++
++
+     def test_infiniteRedirection(self):
+         """
+         When more than C{redirectLimit} HTTP redirects are encountered, the
+Index: twisted/web/client.py
+===================================================================
+--- twisted/web/client.py	(revision 24566)
++++ twisted/web/client.py	(working copy)
+@@ -97,6 +97,19 @@
+                 self.transport.loseConnection()
+                 return
+ 
++            if not host:
++                parsed = list(http.urlparse(self.factory.url))
++                redirectPath = path.split('/')
++                if redirectPath[0] == "":
++                    parsed[2] = path
++                else:
++                    basePath = parsed[2].split('/')
++                    if basePath[-1] != '':
++                        del basePath[-1]
++                    basePath.extend(redirectPath)
++                    parsed[2] = '/'.join(basePath)
++                url = urlunparse(parsed)
++
+             self.factory.setURL(url)
+ 
+             if self.factory.scheme == 'https':

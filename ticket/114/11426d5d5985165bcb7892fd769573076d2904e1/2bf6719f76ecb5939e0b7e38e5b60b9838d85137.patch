@@ -1,0 +1,161 @@
+diff -u /Users/habnabit/Desktop/download/2007-12-06/Twisted-2.5.0/TwistedWeb-0.7.0/twisted/web/http.py /Library/Frameworks/Python.framework/Versions/2.5/lib/python2.5/site-packages/twisted/web/http.py
+--- /Users/habnabit/Desktop/download/2007-12-06/Twisted-2.5.0/TwistedWeb-0.7.0/twisted/web/http.py	2006-10-04 02:07:22.000000000 -0700
++++ /Library/Frameworks/Python.framework/Versions/2.5/lib/python2.5/site-packages/twisted/web/http.py	2007-12-12 10:30:47.000000000 -0800
+@@ -349,7 +349,7 @@
+ 
+ 
+ class HTTPClient(basic.LineReceiver):
+-    """A client for HTTP 1.0
++    """A client for HTTP 1.1
+ 
+     Notes:
+     You probably want to send a 'Host' header with the name of
+@@ -357,11 +357,12 @@
+     based virtual hosting.
+     """
+     length = None
++    chunked = 0
+     firstLine = 1
+     __buffer = None
+ 
+     def sendCommand(self, command, path):
+-        self.transport.write('%s %s HTTP/1.0\r\n' % (command, path))
++        self.transport.write('%s %s HTTP/1.1\r\n' % (command, path))
+ 
+     def sendHeader(self, name, value):
+         self.transport.write('%s: %s\r\n' % (name, value))
+@@ -370,6 +371,18 @@
+         self.transport.write('\r\n')
+ 
+     def lineReceived(self, line):
++        if self.chunked == 2:
++            if not self.length:
++                self.length = int(line, 16)
++                if self.length == 0:
++                    self.handleResponseEnd()
++            else:
++                line += '\r\n'
++                if len(line) > self.length:
++                    line = line[:self.length]
++                self.handleResponsePart(line)
++                self.length -= len(line)
++            return
+         if self.firstLine:
+             self.firstLine = 0
+             l = line.split(None, 2)
+@@ -388,10 +401,17 @@
+             self.handleHeader(key, val)
+             if key.lower() == 'content-length':
+                 self.length = int(val)
++            elif key.lower() == 'transfer-encoding' and val.lower() == 'chunked':
++                self.chunked = 1
+         else:
+             self.__buffer = StringIO()
+             self.handleEndHeaders()
+-            self.setRawMode()
++            if self.chunked:
++                self.chunked = 2
++            elif self.length == 0:
++                self.handleResponseEnd()
++            else:
++                self.setRawMode()
+ 
+     def connectionLost(self, reason):
+         self.handleResponseEnd()
+diff -u /Users/habnabit/Desktop/download/2007-12-06/Twisted-2.5.0/TwistedWeb-0.7.0/twisted/web/test/test_http.py /Library/Frameworks/Python.framework/Versions/2.5/lib/python2.5/site-packages/twisted/web/test/test_http.py
+--- /Users/habnabit/Desktop/download/2007-12-06/Twisted-2.5.0/TwistedWeb-0.7.0/twisted/web/test/test_http.py	2006-10-04 02:07:22.000000000 -0700
++++ /Library/Frameworks/Python.framework/Versions/2.5/lib/python2.5/site-packages/twisted/web/test/test_http.py	2007-12-12 10:39:40.000000000 -0800
+@@ -71,6 +71,7 @@
+     def connectionMade(self):
+         self.sendCommand("GET", "/foo/bar")
+         self.sendHeader("Content-Length", 10)
++        self.sendHeader("Connection", "close")
+         self.endHeaders()
+         self.transport.write("0123456789")
+ 
+@@ -161,8 +162,9 @@
+ 
+     expectedHeaders = {'request' : '/foo/bar',
+                        'command' : 'GET',
+-                       'version' : 'HTTP/1.0',
+-                       'content-length' : '21'}
++                       'version' : 'HTTP/1.1',
++                       'content-length' : '21',
++                       'connection' : 'close'}
+     numHeaders = 0
+     gotStatus = 0
+     gotResponse = 0
+@@ -170,7 +172,7 @@
+ 
+     def _handleStatus(self, version, status, message):
+         self.gotStatus = 1
+-        self.assertEquals(version, "HTTP/1.0")
++        self.assertEquals(version, "HTTP/1.1")
+         self.assertEquals(status, "200")
+ 
+     def _handleResponse(self, data):
+@@ -183,7 +185,7 @@
+ 
+     def _handleEndHeaders(self):
+         self.gotEndHeaders = 1
+-        self.assertEquals(self.numHeaders, 4)
++        self.assertEquals(self.numHeaders, 5)
+ 
+     def testLoopback(self):
+         server = http.HTTPChannel()
+@@ -241,6 +243,9 @@
+             for header in resultHeaders.keys():
+                 self.assertEquals(req.headers.get(header, None), resultHeaders[header])
+ 
++class ResponseStorer(http.HTTPClient):
++    def handleResponse(self, resp):
++        self.response = resp
+ 
+ class ChunkingTestCase(unittest.TestCase):
+ 
+@@ -264,7 +269,23 @@
+             except ValueError:
+                 pass
+         self.assertEquals(result, self.strings)
+-
++    
++    def testClientChunks(self):
++        request = [
++            'HTTP/1.1 200 OK',
++            'Transfer-Encoding: chunked',
++            '',
++            'a',
++            '0123456789',
++            'c',
++            'line1',
++            'line2',
++            '0'
++        ]
++        client = ResponseStorer()
++        for line in request:
++            client.lineReceived(line)
++        self.assertEquals(client.response, '0123456789line1\r\nline2')
+ 
+ 
+ class ParsingTestCase(unittest.TestCase):
+diff -u /Users/habnabit/Desktop/download/2007-12-06/Twisted-2.5.0/TwistedWeb-0.7.0/twisted/web/test/test_webclient.py /Library/Frameworks/Python.framework/Versions/2.5/lib/python2.5/site-packages/twisted/web/test/test_webclient.py
+--- /Users/habnabit/Desktop/download/2007-12-06/Twisted-2.5.0/TwistedWeb-0.7.0/twisted/web/test/test_webclient.py	2006-09-22 20:46:03.000000000 -0700
++++ /Library/Frameworks/Python.framework/Versions/2.5/lib/python2.5/site-packages/twisted/web/test/test_webclient.py	2007-12-12 10:48:39.000000000 -0800
+@@ -130,7 +130,7 @@
+ 
+     def testBrokenDownload(self):
+         # test what happens when download gets disconnected in the middle
+-        d = client.getPage(self.getURL("broken"))
++        d = client.getPage(self.getURL("broken"), headers={'Connection': 'close'})
+         d = self.assertFailure(d, client.PartialDownloadError)
+         d.addCallback(lambda exc: self.assertEquals(exc.response, "abc"))
+         return d
+@@ -410,7 +410,7 @@
+             ]:
+             proto.dataReceived(line + '\r\n')
+         self.assertEquals(proto.transport.data,
+-                          ['GET / HTTP/1.0\r\n',
++                          ['GET / HTTP/1.1\r\n',
+                            'Host: foo.example.com\r\n',
+                            'User-Agent: Twisted PageGetter\r\n',
+                            '\r\n'])

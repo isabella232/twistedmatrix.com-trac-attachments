@@ -1,0 +1,139 @@
+Index: client.py
+===================================================================
+--- client.py	(revision 27226)
++++ client.py	(working copy)
+@@ -123,7 +123,11 @@
+         self.quietLoss = True
+         self.transport.loseConnection()
+ 
+-    handleStatus_302 = lambda self: self.handleStatus_301()
++    def handleStatus_302(self):
++        if self.enableUnsafeRedirects:
++            self.handleStatus_303()
++        self.handleStatus_301()
++
+ 
+     def handleStatus_303(self):
+         self.factory.method = 'GET'
+@@ -226,6 +230,12 @@
+     @ivar redirectLimit: The maximum number of HTTP redirects that can occur
+           before it is assumed that the redirection is endless.
+ 
++    @type enableUnsafeRedirects: C{bool}
++    @ivar enableUnsafeRedirects: This flag enables unsafe beahavoir for redirects
++          as implemented by most browsers. If request method is POST and a 302
++          redirect is received, it follows the request automatically with a GET
++
++
+     @type _redirectCount: int
+     @ivar _redirectCount: The current number of HTTP redirects encountered.
+     """
+@@ -240,13 +250,14 @@
+ 
+     def __init__(self, url, method='GET', postdata=None, headers=None,
+                  agent="Twisted PageGetter", timeout=0, cookies=None,
+-                 followRedirect=True, redirectLimit=20):
++                 followRedirect=True, redirectLimit=20,
++                 enableUnsafeRedirects=False):
+         self.followRedirect = followRedirect
+         self.redirectLimit = redirectLimit
+         self._redirectCount = 0
+         self.timeout = timeout
+         self.agent = agent
+-
++        self.enableUnsafeRedirects=enableUnsafeRedirects
+         if cookies is None:
+             cookies = {}
+         self.cookies = cookies
+@@ -282,6 +293,7 @@
+     def buildProtocol(self, addr):
+         p = protocol.ClientFactory.buildProtocol(self, addr)
+         p.followRedirect = self.followRedirect
++        p.enableUnsafeRedirects=self.enableUnsafeRedirects
+         if self.timeout:
+             timeoutCall = reactor.callLater(self.timeout, p.timeout)
+             self.deferred.addBoth(self._cancelTimeout, timeoutCall)
+Index: test/test_webclient.py
+===================================================================
+--- test/test_webclient.py	(revision 27226)
++++ test/test_webclient.py	(working copy)
+@@ -23,6 +23,36 @@
+ except:
+     ssl = None
+ 
++class ExtendedRedirect(resource.Resource):
++    """
++    L{ExtendedRedirect} is a redirection resource. It uses HTTP parameter 'code' for redirection.
++    It also records the method of last request in C{lastMethod}
++    @ivar lastMethod: Last HTTP request method that L{ExtendedRedirect} handled.
++    @type lastMethod: C{str}
++    """
++    isLeaf = 1
++    lastMethod = None
++    def __init__(self, url):
++        resource.Resource.__init__(self)
++        self.url = url
++
++    def render(self, request):
++        if self.lastMethod:
++            self.lastMethod = request.method
++            return "OK Thnx!"
++        else:
++            self.lastMethod = request.method
++            code = int(request.args['code'][0])
++            return self.redirectTo(self.url, request, code)
++
++    def getChild(self, name, request):
++        return self
++    
++    def redirectTo(self, URL, request, code):
++        request.setResponseCode(code)
++        request.setHeader("location", URL)
++        return "OK Bye!"
++
+ 
+ class ForeverTakingResource(resource.Resource):
+     """
+@@ -231,6 +261,8 @@
+         r.putChild("payload", PayloadResource())
+         r.putChild("broken", BrokenDownloadResource())
+         r.putChild("cookiemirror", CookieMirrorResource())
++        self.extendedRedirect=ExtendedRedirect('/extendedRedirect')
++        r.putChild("extendedRedirect",self.extendedRedirect)
+         self.site = server.Site(r, timeout=None)
+         self.wrapper = WrappingFactory(self.site)
+         self.port = self._listen(self.wrapper)
+@@ -493,7 +525,33 @@
+             ).addCallback(lambda dummy: d1)
+         return d
+ 
++    def test_nonRFC2616CompliantRedirects(self):
++        """
++        Here we test the behavior of nonRFC2616CompliantRedirects. For discussion, see here:
++        U{Ticket #3624<http://twistedmatrix.com/trac/ticket/3624>}
++        """
++        
++        
++        d1 = client.getPage(self.getURL('extendedRedirect?code=302'),
++                         followRedirect=True,
++                         enableUnsafeRedirects=True,
++                         method="POST")
++        d1.addCallback(lambda _: self.assertEquals(self.extendedRedirect.lastMethod, "GET"))
++        # Test default behavior
++        d2 = client.getPage(self.getURL('extendedRedirect?code=302'),
++                         followRedirect=True,
++                         method="POST")
++        d2.addCallback(lambda _: self.assertEquals(self.extendedRedirect.lastMethod, "POST"))
++        
++        d3 = client.getPage(self.getURL('extendedRedirect?code=302'),
++                         followRedirect=True,
++                         enableUnsafeRedirects=False,
++                         method="POST")
++        d3.addCallback(lambda _: self.assertEquals(self.extendedRedirect.lastMethod, "POST"))
++        
++        return defer.DeferredList([d1, d2, d3])
+ 
++    
+     def testPartial(self):
+         name = self.mktemp()
+         f = open(name, "wb")

@@ -1,0 +1,131 @@
+diff --git a/twisted/python/_reflectpy3.py b/twisted/python/_reflectpy3.py
+index f3e98d4..356a6ab 100644
+--- a/twisted/python/_reflectpy3.py
++++ b/twisted/python/_reflectpy3.py
+@@ -385,3 +385,21 @@ def safe_str(o):
+     @rtype: C{str}
+     """
+     return _safeFormat(str, o)
++
++
++
++def safe_bytes(o):
++    """
++    Returns a C{bytes} representation of an object.  If the object is
++    C{unicode} (or C{str} on Python 3) and can be ASCII encoded, return the
++    ASCII encoded C{bytes}.  If it cannot be ASCII encoded, return the repr()
++    of the Unicode instead.
++
++    @param o: Any object.
++
++    @rtype: C{bytes}
++    """
++    try:
++        return bytes(o)
++    except Exception:
++        return _safeFormat(repr, o)
+diff --git a/twisted/python/log.py b/twisted/python/log.py
+index 9299651..29298ef 100644
+--- a/twisted/python/log.py
++++ b/twisted/python/log.py
+@@ -292,9 +292,14 @@ def textFromEventDict(eventDict):
+     handle the dict, it returns None.
+ 
+     The possible keys of eventDict are:
+-     - C{message}: by default, it holds the final text. It's required, but can
+-       be empty if either C{isError} or C{format} is provided (the first
+-       having the priority).
++     - C{message}: by default, it holds the final text as a C{list} of
++       C{bytes}.  It's required, but can be empty if either C{isError} or
++       C{format} is provided (the first having the priority).  For each object
++       in the list, if it is a C{unicode}, this function will attempt to encode
++       them using the 'ascii' codec (implicit in the call to safe_str), and if
++       that fails, it resorts to representing them as the C{byte} string
++       returned by C{repr} of the C{unicode} objects.  See
++       L{_reflectpy3.safe_str}.
+      - C{isError}: boolean indicating the nature of the event.
+      - C{failure}: L{failure.Failure} instance, required if the event is an
+        error.
+@@ -315,7 +320,7 @@ def textFromEventDict(eventDict):
+             # we don't know how to log this
+             return
+     else:
+-        text = ' '.join(map(reflect.safe_str, edm))
++        text = ' '.join(map(reflect.safe_bytes, edm))
+     return text
+ 
+ 
+diff --git a/twisted/test/test_log.py b/twisted/test/test_log.py
+index d07ca6a..bb13fff 100644
+--- a/twisted/test/test_log.py
++++ b/twisted/test/test_log.py
+@@ -350,8 +350,7 @@ class LogPublisherTestCase(LogPublisherTestCaseMixin, unittest.SynchronousTestCa
+         if _PY3:
+             self.assertIn(message, self.out[0])
+         else:
+-            self.assertIn('with str error', self.out[0])
+-            self.assertIn('UnicodeEncodeError', self.out[0])
++            self.assertIn("Hello, \\xbd world.", self.out[0])
+ 
+ 
+ 
+diff --git a/twisted/trial/_dist/test/test_workertrial.py b/twisted/trial/_dist/test/test_workertrial.py
+index 953b68e..d20487a 100644
+--- a/twisted/trial/_dist/test/test_workertrial.py
++++ b/twisted/trial/_dist/test/test_workertrial.py
+@@ -35,6 +35,7 @@ class WorkerLogObserverTestCase(TestCase):
+     def test_emit(self):
+         """
+         L{WorkerLogObserver} forwards data to L{managercommands.TestWrite}.
++        The data always come out as C{bytes}.
+         """
+         calls = []
+ 
+@@ -47,6 +48,47 @@ class WorkerLogObserverTestCase(TestCase):
+         observer.emit({'message': ['Some log']})
+         self.assertEqual(
+             calls, [(managercommands.TestWrite, {'out': 'Some log'})])
++        self.assertEqual(bytes, type(calls[0][1]['out']))
++
++
++    def test_emitUnicodeASCIIUnicode(self):
++        """
++        L{WorkerLogObserver} forwards ASCII-encodeable C{unicode} to
++        L{managercommands.TestWrite}.  The data comes out as ASCII-encoded
++        C{bytes}.
++        """
++        calls = []
++
++        class FakeClient(object):
++
++            def callRemote(self, method, **kwargs):
++                calls.append((method, kwargs))
++
++        observer = WorkerLogObserver(FakeClient())
++        observer.emit({'message': [u"hello"]})
++        self.assertEqual(
++            calls, [(managercommands.TestWrite, {'out': b"hello"})])
++        self.assertEqual(bytes, type(calls[0][1]['out']))
++
++
++    def test_emitUnicodeNotASCIIEncodable(self):
++        """
++        L{WorkerLogObserver} forwards non-ASCII-encodeable C{unicode} to
++        L{managercommands.TestWrite}.  The data comes out as repr() of the
++        Unicode C{bytes}.
++        """
++        calls = []
++
++        class FakeClient(object):
++
++            def callRemote(self, method, **kwargs):
++                calls.append((method, kwargs))
++
++        observer = WorkerLogObserver(FakeClient())
++        observer.emit({'message': [u"\u2603"]})
++        self.assertEqual(
++            calls, [(managercommands.TestWrite, {'out': b"u'\\u2603'"})])
++        self.assertEqual(bytes, type(calls[0][1]['out']))
+ 
+ 
+ 

@@ -1,0 +1,99 @@
+Index: twisted/topfiles/6768.feature
+===================================================================
+--- twisted/topfiles/6768.feature	(revision 41805)
++++ twisted/topfiles/6768.feature	(working copy)
+@@ -1 +1 @@
+-twisted.web.proxy.ProxyClient (and all of its users in twisted.web.proxy) will now close HTTP connections that they initiate if the incoming connection to the proxy dies before receiving a response.
++twisted.web.proxy.ProxyClient (and all of its users in twisted.web.proxy) now closes HTTP connections that it initiates if the incoming connection to the proxy dies before receiving a response.
+Index: twisted/web/proxy.py
+===================================================================
+--- twisted/web/proxy.py	(revision 41805)
++++ twisted/web/proxy.py	(working copy)
+@@ -95,10 +95,17 @@
+         This is called when the proxy's client disconnects or otherwise aborts.
+         We want to abort, too, so that we don't tie up resources on the
+         server we're connecting to.
++
++        @param failure: the failure object
++        @type failure: L{twisted.python.failure.Failure}
+         """
+         self._finished = True
+-        self.transport.loseConnection()
+ 
++        abort = getattr(self.transport, 'abortConnection', None)
++        if abort is not None:
++            abort(self.transport)
++        else:
++            self.transport.loseConnection()
+ 
+ 
+ class ProxyClientFactory(ClientFactory):
+Index: twisted/web/test/test_proxy.py
+===================================================================
+--- twisted/web/test/test_proxy.py	(revision 41805)
++++ twisted/web/test/test_proxy.py	(working copy)
+@@ -5,6 +5,8 @@
+ Test for L{twisted.web.proxy}.
+ """
+ 
++import types
++
+ from twisted.trial.unittest import TestCase
+ from twisted.test.proto_helpers import StringTransportWithDisconnection
+ from twisted.test.proto_helpers import MemoryReactor
+@@ -378,7 +380,7 @@
+ 
+     def test_parentDisconnected(self):
+         """
+-        The client should disconnect if the parent request is dropped.
++        The client disconnects if the parent request is dropped.
+         """
+         request = self.makeRequest('foo')
+         client = self.makeProxyClient(request, headers={"accept": "text/html"})
+@@ -392,15 +394,43 @@
+         self.assertFalse(client.transport.connected)
+ 
+ 
+-    def test_parentDisconnectedEarly(self):
++    def test_parentDisconnectedAbort(self):
+         """
+-        The proxy should survive a parent disconnection before the client
+-        connects.
++        The client aborts if the parent request is dropped and the client's
++        transport supports abortConnection.
+         """
+         request = self.makeRequest('foo')
+         client = self.makeProxyClient(request, headers={"accept": "text/html"})
++
++        self.assertForwardsHeaders(
++            client, 'GET /foo HTTP/1.0',
++            {'connection': 'close', 'accept': 'text/html'})
++
++        # Monkey patch the transport object to add an abortConnection
++        # function.  (This is too specialized to be worth adding to the
++        # core testing code.)
++        self.assertFalse(hasattr(client.transport, 'abortConnection'))
++        aborted = [False]
++        def abortConnection(self):
++            self.loseConnection()
++            aborted[0] = True
++        client.transport.abortConnection = (
++            types.MethodType(abortConnection, None, type(client.transport)))
++
++        self.assertTrue(client.transport.connected)
+         request.processingFailed(main.CONNECTION_LOST)
++        self.assertFalse(client.transport.connected)
++        self.assertTrue(aborted[0])
+ 
++
++    def test_parentDisconnectedEarly(self):
++        """
++        The proxy survives a parent disconnection before the client connects.
++        """
++        request = self.makeRequest('foo')
++        self.makeProxyClient(request, headers={"accept": "text/html"})
++        request.processingFailed(main.CONNECTION_LOST)
++
+         # Note: this test is a little bit odd.  We're testing that the
+         # processingFailed call doesn't raise an exception.
+ 

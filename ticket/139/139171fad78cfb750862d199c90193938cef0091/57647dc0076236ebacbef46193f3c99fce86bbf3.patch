@@ -1,0 +1,226 @@
+Index: twisted/words/protocols/irc.py
+===================================================================
+--- twisted/words/protocols/irc.py	(revision 39738)
++++ twisted/words/protocols/irc.py	(working copy)
+@@ -41,7 +41,7 @@
+ import textwrap
+ from os import path
+ 
+-from twisted.internet import reactor, protocol, task
++from twisted.internet import reactor, protocol, task, defer
+ from twisted.persisted import styles
+ from twisted.protocols import basic
+ from twisted.python import log, reflect, text, _textattributes
+@@ -57,6 +57,8 @@
+ 
+ CHANNEL_PREFIXES = '&#!+'
+ 
++NICK_PREFIXES = '~&@%+'
++
+ class IRCBadMessage(Exception):
+     pass
+ 
+@@ -1263,6 +1265,17 @@
+         intact.
+         """
+ 
++        
++    def channelNames(self, channel, names):
++        """Called when a list of users in the channel has been requested.
++
++        Also called when first joining a channel.
++
++        @param channel: the name of the channel where the users are in.
++        @param names: a list of users that are in the specified channel.
++        """
++
++
+     def left(self, channel):
+         """
+         Called when I have left a channel.
+@@ -1420,6 +1433,24 @@
+         else:
+             self.sendLine("JOIN %s" % (channel,))
+ 
++    def names(self, *channels):
++        """
++        Tells the server to give a list of users in the specified channels.
++
++        Multiple channels can be specified at one time, `channelNames` will be 
++        called multiple times, once for each channel.
++        """
++        # dump all names of all visible channels
++        if not channels:
++            self.sendLine("NAMES")
++        elif len(channels) == 1:
++            channel = channels[0]
++            self.sendLine("NAMES %s" % channel)
++        else:
++            # some servers do not support multiple channel names at once
++            for channel in channels:
++                self.sendLine("NAMES %s" % channel)
++
+     def leave(self, channel, reason=None):
+         """
+         Leave a channel.
+@@ -1835,8 +1866,40 @@
+         Called when the login was incorrect.
+         """
+         raise IRCPasswordMismatch("Password Incorrect.")
++ 
+ 
++    def irc_RPL_NAMREPLY(self, prefix, params):
++        """
++        Handles the raw NAMREPLY that is returned as answer to
++        the NAMES command. Accumulates users until ENDOFNAMES.
++        """
++        channel = params[2]
++        prefixed_users = params[3].split()
++        users = []
++        for prefixed_user in prefixed_users:
++            users.append(prefixed_user.lstrip(NICK_PREFIXES))
++        self._namreply.setdefault(channel, [])
++        self._namreply[channel].extend(users)
+ 
++
++    def irc_RPL_ENDOFNAMES(self, prefix, params):
++        """
++        Handles the end of the NAMREPLY. This is called when all
++        NAMREPLYs have finished. It gathers one, or all depending
++        on the NAMES request, channel names lists gathered from
++        RPL_NAMREPLY responses.
++        """
++        channel = params[1]
++        # channel
++        if not channel in self._namreply:
++            for channel, users in self._namreply.iteritems():
++                self.channelNames(channel, users)
++            self._namreply = {}
++        else:
++            users = self._namreply.pop(channel, [])
++            self.channelNames(channel, users)
++
++
+     def irc_RPL_WELCOME(self, prefix, params):
+         """
+         Called when we have received the welcome from the server.
+@@ -2404,10 +2467,12 @@
+         """
+         log.msg(s + '\n')
+ 
+-    ### Protocool methods
++    ### Protocol methods
+ 
+     def connectionMade(self):
+         self.supported = ServerSupportedFeatures()
++        # container for NAME replies
++        self._namreply = {}
+         self._queue = []
+         if self.performLogin:
+             self.register(self.nickname)
+Index: twisted/words/test/test_irc.py
+===================================================================
+--- twisted/words/test/test_irc.py	(revision 39738)
++++ twisted/words/test/test_irc.py	(working copy)
+@@ -1682,7 +1682,6 @@
+         self.check(expected)
+ 
+ 
+-
+ class DummyClient(irc.IRCClient):
+     """
+     A L{twisted.words.protocols.irc.IRCClient} that stores sent lines in a
+@@ -1971,7 +1970,27 @@
+             self.client.lines, ["PRIVMSG #thechannel :the message"])
+ 
+ 
++class SemiImplClient(IRCClient):
++    """
++    A L{twisted.words.protocols.irc.IRCClient} that implements some of the
++    callback stubs for testing.
++    """
++    def __init__(self):
++        self.userNamesByChannel = {}
+ 
++    def clear(self):
++        self.userNamesByChannel = {}
++
++    def hasChannel(self, channel):
++        return channel in self.userNamesByChannel
++
++    def getUsersByChannel(self, channel):
++        return self.userNamesByChannel[channel]
++
++    def channelNames(self, channel, names):
++        self.userNamesByChannel[channel] = names
++
++
+ class ClientTests(TestCase):
+     """
+     Tests for the protocol-level behavior of IRCClient methods intended to
+@@ -1982,7 +2001,7 @@
+         Create and connect a new L{IRCClient} to a new L{StringTransport}.
+         """
+         self.transport = StringTransport()
+-        self.protocol = IRCClient()
++        self.protocol = SemiImplClient()
+         self.protocol.performLogin = False
+         self.protocol.makeConnection(self.transport)
+ 
+@@ -2198,7 +2217,56 @@
+             'spam', ['#greasyspooncafe', "I don't want any spam!"])
+ 
+ 
++    def test_names(self):
++        """
++        L{IRCClient.names} sends one or more NAMES requests to the destination
++        server.
++        """
++        users_reply = 'someguy someotherguy'
+ 
++        # check names() without arguments
++        one_channel = 'justachannel'
++        self.protocol.names()
++        self.assertEqual(self.transport.value().rstrip(), 'NAMES')
++        self.protocol.irc_RPL_NAMREPLY(None, [None, None, one_channel, users_reply])
++        self.protocol.irc_RPL_ENDOFNAMES(None, [None, one_channel])
++        self.assertTrue(self.protocol.hasChannel(one_channel))
++        self.assertEqual(self.protocol.getUsersByChannel(one_channel), users_reply.split(' '))
++        self.transport.clear()
++        self.protocol.clear()
++
++        # check names() with one channel
++        one_channel = 'justachannel'
++        self.protocol.names(one_channel)
++        self.assertEqual(self.transport.value().rstrip(), 'NAMES ' + one_channel)
++        self.protocol.irc_RPL_NAMREPLY(None, [None, None, one_channel, users_reply])
++        self.protocol.irc_RPL_ENDOFNAMES(None, [None, one_channel])
++        self.assertTrue(self.protocol.hasChannel(one_channel))
++        self.assertEqual(self.protocol.getUsersByChannel(one_channel), users_reply.split(' '))
++        self.transport.clear()
++        self.protocol.clear()
++
++        # check names with many channels
++        many_channels = ['justachannel', 'justanotherchannel', 'yetanotherchannel']
++        users_reply_by_channel = {
++            many_channels[0]: users_reply,
++            many_channels[1]: 'pinky thebrain',
++            many_channels[2]: 'justme'
++        }
++        self.protocol.names(many_channels[0], many_channels[1], many_channels[2])
++        expected = []
++        for channel in many_channels:
++            expected.append('NAMES ' + channel)
++        self.assertEqual(self.transport.value().rstrip().split('\r\n'), expected)
++        self.protocol.irc_RPL_NAMREPLY(None, [None, None, many_channels[0], users_reply_by_channel[many_channels[0]]])
++        self.protocol.irc_RPL_NAMREPLY(None, [None, None, many_channels[1], users_reply_by_channel[many_channels[1]]])
++        self.protocol.irc_RPL_NAMREPLY(None, [None, None, many_channels[2], users_reply_by_channel[many_channels[2]]])
++        self.protocol.irc_RPL_ENDOFNAMES(None, [None, None])
++        for channel in many_channels:
++            self.assertTrue(self.protocol.hasChannel(channel))
++            self.assertEqual(self.protocol.getUsersByChannel(channel), users_reply_by_channel[channel].split(' '))
++
++
+ class DccChatFactoryTests(unittest.TestCase):
+     """
+     Tests for L{DccChatFactory}

@@ -1,0 +1,195 @@
+diff --git twisted/topfiles/5339.feature twisted/topfiles/5339.feature
+new file mode 100644
+index 0000000..cc0c2d8
+--- /dev/null
++++ twisted/topfiles/5339.feature
+@@ -0,0 +1 @@
++twisted.trial.unittest.SynchronousTestCase.assertRaises now can act as a context manager.
+\ No newline at end of file
+diff --git twisted/trial/_synctest.py twisted/trial/_synctest.py
+index 0461130..05c3e80 100644
+--- twisted/trial/_synctest.py
++++ twisted/trial/_synctest.py
+@@ -310,7 +310,7 @@ class _Assertions(pyunit.TestCase, object):
+     assert_ = failUnlessTrue = failUnless = assertTrue
+ 
+ 
+-    def assertRaises(self, exception, f, *args, **kwargs):
++    def assertRaises(self, exception, f=None, *args, **kwargs):
+         """
+         Fail the test unless calling the function C{f} with the given
+         C{args} and C{kwargs} raises C{exception}. The failure will report
+@@ -320,25 +320,88 @@ class _Assertions(pyunit.TestCase, object):
+         @param f: the function to call
+ 
+         @return: The raised exception instance, if it is of the given type.
++            When C{f} is C{None} it returns a context manager. The exception
++            raised inside the context is stored in context's C{exception}
++            member.
+         @raise self.failureException: Raised if the function call does
+             not raise an exception or if it raises an exception of a
+             different type.
+         """
+-        try:
+-            result = f(*args, **kwargs)
+-        except exception as inst:
+-            return inst
+-        except:
+-            raise self.failureException('%s raised instead of %s:\n %s'
+-                                        % (sys.exc_info()[0],
+-                                           exception.__name__,
+-                                           failure.Failure().getTraceback()))
+-        else:
+-            raise self.failureException('%s not raised (%r returned)'
+-                                        % (exception.__name__, result))
++        context = self._AssertRaisesContext(self, exception)
++        return context.handle(f, *args, **kwargs)
+     failUnlessRaises = assertRaises
+ 
+ 
++    class _AssertRaisesContext(object):
++        """
++        Wrapper for turning assertRaises into context manager, while keeping
++        the old non-context call.
++        """
++
++        def __init__(self, testCase, expected):
++            self.expected = expected
++            self.testCase = testCase
++            self._returnValue = None
++            try:
++                self._expectedName = self.expected.__name__
++            except AttributeError:
++                self._expectedName = str(self.expected)
++
++
++        def handle(self, callable, *args, **kwargs):
++            """
++            If callable is None, assertRaises is being used as a
++            context manager.
++
++            If callable is not None, it is used a normal assert
++            method.
++            To keep compatibility with trial, it returns the exception or
++            the callable's return value (if exception was not raised).
++
++            @param callable: Callable which is checked.
++
++            @return: The raised exception instance or context manager.
++            """
++            # Called as context.
++            if callable is None:
++                return self
++
++            # Called as method.
++            with self as context:
++                self._returnValue = callable(*args, **kwargs)
++            return context.exception
++
++
++        def __enter__(self):
++            return self
++
++
++        def __exit__(self, exceptionType, exceptionValue, traceback):
++            """
++            Check exit exception against expected exception.
++            """
++            # Store exception so that it can be access from context.
++            self.exception = exceptionValue
++
++            # No exception raised.
++            if exceptionType is None:
++                raise self.testCase.failureException(
++                    "{} not raised ({} returned)".format(
++                        self._expectedName, self._returnValue))
++
++            # Wrong exception raised.
++            if not issubclass(exceptionType, self.expected):
++                raise self.testCase.failureException(
++                    "{} raised instead of {}:\n {}".format(
++                        sys.exc_info()[0],
++                        self._expectedName,
++                        failure.Failure().getTraceback()),
++                        )
++
++            # All good.
++            return True
++
++
+     def assertEqual(self, first, second, msg=''):
+         """
+         Fail the test if C{first} and C{second} are not equal.
+diff --git twisted/trial/test/test_assertions.py twisted/trial/test/test_assertions.py
+index 356e89a..79ae2a6 100644
+--- twisted/trial/test/test_assertions.py
++++ twisted/trial/test/test_assertions.py
+@@ -362,11 +362,12 @@ class TestSynchronousAssertions(unittest.SynchronousTestCase):
+ 
+ 
+     def test_failUnlessRaises_noException(self):
++        returnValue = 3
+         try:
+-            self.failUnlessRaises(ValueError, lambda : None)
++            self.failUnlessRaises(ValueError, lambda : returnValue)
+         except self.failureException as e:
+             self.assertEqual(str(e),
+-                                 'ValueError not raised (None returned)')
++                                 'ValueError not raised (3 returned)')
+         else:
+             self.fail("Exception not raised. Should have failed")
+ 
+@@ -387,6 +388,53 @@ class TestSynchronousAssertions(unittest.SynchronousTestCase):
+             self.fail("Should have raised exception")
+ 
+ 
++    def test_assertRaises_contextExpected(self):
++        """
++        Test succeeds when called with context for expected exception. Raised
++        exceptions is stored in context's `exception` member.
++        """
++        exception = ValueError('marker')
++
++        with self.assertRaises(ValueError) as context:
++            raise exception
++
++        self.assertIs(exception, context.exception)
++
++
++    def test_assertRaises_contextUnexpected(self):
++        """
++        Raises failureException when expected exception raised by the code
++        withing the context does not match.
++        """
++        with self.assertRaises(self.failureException) as context:
++
++            with self.assertRaises(ValueError):
++                raise TypeError('marker')
++
++        message = context.exception.message
++        self.assertTrue(message.startswith(
++                '<type \'exceptions.TypeError\'> raised instead of '
++                'ValueError:\n Traceback'
++                ))
++
++
++    def test_assertRaises_contextNoException(self):
++        """
++        Raises failureException when no exception is raised by the code
++        from withing the context.
++        """
++        with self.assertRaises(self.failureException) as context:
++
++            with self.assertRaises(ValueError):
++                # No exception is raised.
++                pass
++
++        message = context.exception.message
++        # `(None returned)` text is here for backward compatibility and should
++        # be ignored for context manager use case.
++        self.assertEqual(message, 'ValueError not raised (None returned)')
++
++
+     def test_failIfEqual_basic(self):
+         x, y, z = [1], [2], [1]
+         ret = self.failIfEqual(x, y)

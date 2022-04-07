@@ -1,0 +1,119 @@
+Index: twisted/words/test/test_jabberclient.py
+===================================================================
+--- twisted/words/test/test_jabberclient.py	(revision 19913)
++++ twisted/words/test/test_jabberclient.py	(working copy)
+@@ -32,7 +32,18 @@
+         self.assertEquals('unsupported-version', exc.condition)
+ 
+ 
++class CheckAuthInitializerTest(unittest.TestCase):
++    def setUp(self):
++        a = xmlstream.Authenticator()
++        xs = xmlstream.XmlStream(a)
++        self.init = client.CheckAuthInitializer(xs)
+ 
++    def test_SASLOffered(self):
++        self.init.xmlstream.features = {(sasl.NS_XMPP_SASL, 'mechanisms'):
++                                         None)
++        self.init.initialize()
++
++
+ class InitiatingInitializerHarness(object):
+     def setUp(self):
+         self.output = []
+@@ -272,14 +283,9 @@
+         self.assertEqual('secret', xs.authenticator.password)
+ 
+         # test list of initializers
+-        version, tls, sasl, bind, session = xs.initializers
++        version, tls, auth = xs.initializers
+ 
+         self.assert_(isinstance(tls, xmlstream.TLSInitiatingInitializer))
+-        self.assert_(isinstance(sasl, SASLInitiatingInitializer))
+-        self.assert_(isinstance(bind, client.BindInitializer))
+-        self.assert_(isinstance(session, client.SessionInitializer))
++        self.assert_(isinstance(auth, client.CheckAuthInitializer))
+ 
+         self.assertFalse(tls.required)
+-        self.assertTrue(sasl.required)
+-        self.assertFalse(bind.required)
+-        self.assertFalse(session.required)
+Index: twisted/words/protocols/jabber/xmlstream.py
+===================================================================
+--- twisted/words/protocols/jabber/xmlstream.py	(revision 19914)
++++ twisted/words/protocols/jabber/xmlstream.py	(working copy)
+@@ -205,10 +205,10 @@
+     implements(ijabber.IInitiatingInitializer)
+ 
+     feature = None
+-    required = False
+ 
+-    def __init__(self, xs):
++    def __init__(self, xs, required=False):
+         self.xmlstream = xs
++        self.required = required
+ 
+     def initialize(self):
+         """
+@@ -536,7 +536,7 @@
+ 
+         # Extract stream identifier
+         if self.initiating:
+-            self.sid = rootelem.getAttribute("id") or None
++            self.sid = rootelem.getAttribute("id")
+             self.otherHost = rootelem.getAttribute("from") or None
+         else:
+             self.namespace = rootelem.defaultUri
+Index: twisted/words/protocols/jabber/client.py
+===================================================================
+--- twisted/words/protocols/jabber/client.py	(revision 19913)
++++ twisted/words/protocols/jabber/client.py	(working copy)
+@@ -237,6 +237,26 @@
+ 
+ 
+ 
++class CheckAuthInitializer(object):
++    """
++    Check what authentication methods are available.
++    """
++
++    def __init__(self, xs):
++        self.xmlstream = xs
++
++    def initialize(self):
++        if (sasl.NS_XMPP_SASL, 'mechanisms') in self.xmlstream.features:
++            inits = self.xmlstream.initializers
++            inits.append(sasl.SASLInitiatingInitializer(self.xmlstream, True))
++            inits.append(BindInitializer(self.xmlstream, True))
++            inits.append(SessionInitializer(self.xmlstream, False))
++        elif (NS_IQ_AUTH_FEATURE, 'auth') in self.xmlstream.features:
++            inits = self.xmlstream.initializers
++            inits.append(IQAuthInitializer(self.xmlstream))
++        else:
++            raise Exception("No available authentication method found")
++
+ class BindInitializer(xmlstream.BaseFeatureInitiatingInitializer):
+     """
+     Initializer that implements Resource Binding for the initiating entity.
+@@ -357,18 +377,10 @@
+         """
+         xmlstream.ConnectAuthenticator.associateWithStream(self, xs)
+ 
+-        xs.initializers = [CheckVersionInitializer(xs)]
+-        inits = [ (xmlstream.TLSInitiatingInitializer, False),
+-                  (sasl.SASLInitiatingInitializer, True),
+-                  (BindInitializer, False),
+-                  (SessionInitializer, False),
+-                ]
++        xs.initializers = [CheckVersionInitializer(xs),
++                           xmlstream.TLSInitiatingInitializer(xs, False),
++                           CheckAuthInitializer(xs)]
+ 
+-        for initClass, required in inits:
+-            init = initClass(xs)
+-            init.required = required
+-            xs.initializers.append(init)
+-
+ class XMPPClientConnector(SRVConnector):
+     def __init__(self, reactor, domain, factory):
+         SRVConnector.__init__(self, reactor, 'xmpp-client', domain, factory)

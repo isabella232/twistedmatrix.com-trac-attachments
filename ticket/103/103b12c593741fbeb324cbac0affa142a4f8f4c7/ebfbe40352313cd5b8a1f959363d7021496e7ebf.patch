@@ -1,0 +1,290 @@
+Index: twisted/conch/test/test_transport.py
+===================================================================
+--- twisted/conch/test/test_transport.py	(revision 43486)
++++ twisted/conch/test/test_transport.py	(working copy)
+@@ -1298,21 +1298,22 @@
+         self.assertEqual(self.packets, [])
+ 
+ 
+-    def test_KEXDH_INIT(self):
++    def test_KEXDH_INIT(self, kexAlgorithm = 'diffie-hellman-group1-sha1',
++                dhPrime = transport.DH_PRIME, dhGenerator = transport.DH_GENERATOR):
+         """
+         Test that the KEXDH_INIT packet causes the server to send a
+         KEXDH_REPLY with the server's public key and a signature.
+         """
+-        self.proto.supportedKeyExchanges = ['diffie-hellman-group1-sha1']
++        self.proto.supportedKeyExchanges = [kexAlgorithm]
+         self.proto.supportedPublicKeys = ['ssh-rsa']
+         self.proto.dataReceived(self.transport.value())
+-        e = pow(transport.DH_GENERATOR, 5000,
+-                transport.DH_PRIME)
++        e = pow(self.proto.dhGenerator, 5000,
++                self.proto.dhPrime)
+ 
+         self.proto.ssh_KEX_DH_GEX_REQUEST_OLD(common.MP(e))
+         y = common.getMP('\x00\x00\x00\x40' + '\x99' * 64)[0]
+-        f = common._MPpow(transport.DH_GENERATOR, y, transport.DH_PRIME)
+-        sharedSecret = common._MPpow(e, y, transport.DH_PRIME)
++        f = common._MPpow(self.proto.dhGenerator, y, self.proto.dhPrime)
++        sharedSecret = common._MPpow(e, y, self.proto.dhPrime)
+ 
+         h = sha1()
+         h.update(common.NS(self.proto.ourVersionString) * 2)
+@@ -1333,7 +1334,19 @@
+               + f + common.NS(signature)),
+              (transport.MSG_NEWKEYS, '')])
+ 
++        self.assertEqual(self.proto.dhPrime, dhPrime)
++        self.assertEqual(self.proto.dhGenerator, dhGenerator)
+ 
++
++    def test_KEXDH_INIT_GROUP14(self):
++        """
++        Test that the KEXDH_INIT packet causes the server to send a
++        KEXDH_REPLY with the server's public key and a signature.
++        """
++        self.test_KEXDH_INIT('diffie-hellman-group14-sha1', transport.DH_PRIME_14,
++                transport.DH_GENERATOR_14)
++
++
+     def test_KEX_DH_GEX_REQUEST_OLD(self):
+         """
+         Test that the KEX_DH_GEX_REQUEST_OLD message causes the server
+@@ -1604,21 +1617,33 @@
+                                           '\x00\x00\x08\x00')])
+ 
+ 
+-    def test_KEXINIT_group1(self):
++    def test_KEXINIT_group14(self):
+         """
+-        Like test_KEXINIT_groupexchange, but for the group-1 key exchange.
++        Like test_KEXINIT_groupexchange, but for the group14 key exchange.
+         """
+-        self.proto.supportedKeyExchanges = ['diffie-hellman-group1-sha1']
++        self.test_KEXINIT('diffie-hellman-group14-sha1', transport.DH_PRIME_14,
++                transport.DH_GENERATOR_14)
++
++
++    def test_KEXINIT(self, kexAlgorithm = 'diffie-hellman-group1-sha1',
++                dhPrime = transport.DH_PRIME, dhGenerator = transport.DH_GENERATOR):
++        """
++        Like test_KEXINIT_groupexchange, but for a group1 or group14 key exchange.
++        """
++        self.proto.supportedKeyExchanges = [kexAlgorithm]
+         self.proto.dataReceived(self.transport.value())
++
+         self.assertEqual(common.MP(self.proto.x)[5:], '\x99' * 64)
+         self.assertEqual(self.packets,
+                           [(transport.MSG_KEXDH_INIT, self.proto.e)])
++        self.assertEqual(self.proto.dhPrime, dhPrime)
++        self.assertEqual(self.proto.dhGenerator, dhGenerator)
+ 
+ 
+     def test_KEXINIT_badKexAlg(self):
+         """
+         Test that the client raises a ConchError if it receives a
+-        KEXINIT message bug doesn't have a key exchange algorithm that we
++        KEXINIT message but doesn't have a key exchange algorithm that we
+         understand.
+         """
+         self.proto.supportedKeyExchanges = ['diffie-hellman-group2-sha1']
+@@ -1630,10 +1655,10 @@
+         """
+         Test that the KEXDH_REPLY message verifies the server.
+         """
+-        self.test_KEXINIT_group1()
++        self.test_KEXINIT()
+ 
+-        sharedSecret = common._MPpow(transport.DH_GENERATOR,
+-                                     self.proto.x, transport.DH_PRIME)
++        sharedSecret = common._MPpow(self.proto.dhGenerator,
++                                     self.proto.x, self.proto.dhPrime)
+         h = sha1()
+         h.update(common.NS(self.proto.ourVersionString) * 2)
+         h.update(common.NS(self.proto.ourKexInitPayload) * 2)
+Index: twisted/conch/topfiles/7717.feature
+===================================================================
+--- twisted/conch/topfiles/7717.feature	(revision 0)
++++ twisted/conch/topfiles/7717.feature	(revision 0)
+@@ -0,0 +1 @@
++twisted.conch.ssh now supports the diffie-hellman-group14-sha1 key exchange algorithm.
+Index: twisted/conch/ssh/transport.py
+===================================================================
+--- twisted/conch/ssh/transport.py	(revision 43486)
++++ twisted/conch/ssh/transport.py	(working copy)
+@@ -115,6 +115,11 @@
+     @ivar supportedKeyExchanges: A list of strings representing the
+         key exchanges supported, in order from most-preferred to least.
+ 
++    @ivar dhPrime: Long prime used in Diffie-Hellman key exchange algorithm. Set
++        based on the key exchange algorithm negotiated between server and client.
++
++    @ivar dhGenerator: Long generator used in Diffie-Hellman key exchange algorithm.
++
+     @ivar supportedPublicKeys:  A list of strings representing the
+         public key types supported, in order from most-preferred to least.
+ 
+@@ -219,7 +224,10 @@
+     # default.  to enable them, subclass this class and add it, or do:
+     #   SSHTransportBase.supportedCiphers.append('none')
+     supportedKeyExchanges = ['diffie-hellman-group-exchange-sha1',
+-                             'diffie-hellman-group1-sha1']
++                             'diffie-hellman-group1-sha1',
++                             'diffie-hellman-group14-sha1']
++    dhPrime = ''
++    dhGenerator = ''
+     supportedPublicKeys = ['ssh-rsa', 'ssh-dss']
+     supportedCompressions = ['none', 'zlib']
+     supportedLanguages = ()
+@@ -594,6 +602,13 @@
+         else:
+             self.sendKexInit()
+ 
++        if self.kexAlg == 'diffie-hellman-group1-sha1':
++            self.dhPrime = DH_PRIME
++            self.dhGenerator = DH_GENERATOR
++        elif self.kexAlg == 'diffie-hellman-group14-sha1':
++            self.dhPrime = DH_PRIME_14
++            self.dhGenerator = DH_GENERATOR_14
++
+         return kexAlgs, keyAlgs, rest # for SSHServerTransport to use
+ 
+ 
+@@ -904,15 +919,16 @@
+ 
+     def _ssh_KEXDH_INIT(self, packet):
+         """
+-        Called to handle the beginning of a diffie-hellman-group1-sha1 key
+-        exchange.
++        Called to handle the beginning of a diffie-hellman-group1-sha1 or
++	diffie-hellman-group14-sha1 key exchange.
+ 
+         Unlike other message types, this is not dispatched automatically.  It
+         is called from C{ssh_KEX_DH_GEX_REQUEST_OLD} because an extra check is
+         required to determine if this is really a KEXDH_INIT message or if it
+         is a KEX_DH_GEX_REQUEST_OLD message.
+ 
+-        The KEXDH_INIT (for diffie-hellman-group1-sha1 exchanges) payload::
++        The KEXDH_INIT (for diffie-hellman-group1-sha1 and
++	diffie-hellman-group14-sha1 exchanges) payload::
+ 
+                 integer e (the client's Diffie-Hellman public key)
+ 
+@@ -920,8 +936,8 @@
+         """
+         clientDHpublicKey, foo = getMP(packet)
+         y = _getRandomNumber(randbytes.secureRandom, 512)
+-        serverDHpublicKey = _MPpow(DH_GENERATOR, y, DH_PRIME)
+-        sharedSecret = _MPpow(clientDHpublicKey, y, DH_PRIME)
++        serverDHpublicKey = _MPpow(self.dhGenerator, y, self.dhPrime)
++        sharedSecret = _MPpow(clientDHpublicKey, y, self.dhPrime)
+         h = sha1()
+         h.update(NS(self.otherVersionString))
+         h.update(NS(self.ourVersionString))
+@@ -945,7 +961,7 @@
+         This represents two different key exchange methods that share the same
+         integer value.  If the message is determined to be a KEXDH_INIT,
+         C{_ssh_KEXDH_INIT} is called to handle it.  Otherwise, for
+-        KEX_DH_GEX_REQUEST_OLD (for diffie-hellman-group-exchange-sha1)
++        KEX_DH_GEX_REQUEST_OLD (for diffie-hellman-group-exchange-sha)
+         payload::
+ 
+                 integer ideal (ideal size for the Diffie-Hellman prime)
+@@ -962,7 +978,7 @@
+ 
+         # KEXDH_INIT and KEX_DH_GEX_REQUEST_OLD have the same value, so use
+         # another cue to decide what kind of message the peer sent us.
+-        if self.kexAlg == 'diffie-hellman-group1-sha1':
++        if self.kexAlg in ['diffie-hellman-group1-sha1', 'diffie-hellman-group14-sha1']:
+             return self._ssh_KEXDH_INIT(packet)
+         elif self.kexAlg == 'diffie-hellman-group-exchange-sha1':
+             self.dhGexRequest = packet
+@@ -1108,16 +1124,16 @@
+         Called when we receive a MSG_KEXINIT message.  For a description
+         of the packet, see SSHTransportBase.ssh_KEXINIT().  Additionally,
+         this method sends the first key exchange packet.  If the agreed-upon
+-        exchange is diffie-hellman-group1-sha1, generate a public key
+-        and send it in a MSG_KEXDH_INIT message.  If the exchange is
+-        diffie-hellman-group-exchange-sha1, ask for a 2048 bit group with a
+-        MSG_KEX_DH_GEX_REQUEST_OLD message.
++        exchange is diffie-hellman-group1-sha1 or diffie-hellman-group14-sha1,
++        generate a public key and send it in a MSG_KEXDH_INIT message.  If the
++        exchange is diffie-hellman-group-exchange-sha1, ask for a 2048 bit group
++        with a MSG_KEX_DH_GEX_REQUEST_OLD message.
+         """
+         if SSHTransportBase.ssh_KEXINIT(self, packet) is None:
+             return # we disconnected
+-        if self.kexAlg == 'diffie-hellman-group1-sha1':
++        if self.kexAlg in ['diffie-hellman-group1-sha1','diffie-hellman-group14-sha1']:
+             self.x = _generateX(randbytes.secureRandom, 512)
+-            self.e = _MPpow(DH_GENERATOR, self.x, DH_PRIME)
++            self.e = _MPpow(self.dhGenerator, self.x, self.dhPrime)
+             self.sendPacket(MSG_KEXDH_INIT, self.e)
+         elif self.kexAlg == 'diffie-hellman-group-exchange-sha1':
+             self.sendPacket(MSG_KEX_DH_GEX_REQUEST_OLD, '\x00\x00\x08\x00')
+@@ -1128,13 +1144,13 @@
+ 
+     def _ssh_KEXDH_REPLY(self, packet):
+         """
+-        Called to handle a reply to a diffie-hellman-group1-sha1 key exchange
+-        message (KEXDH_INIT).
++        Called to handle a reply to a diffie-hellman-group1-sha1 or
++        diffie-hellman-group14-sha1 key exchange message (KEXDH_INIT).
+         
+         Like the handler for I{KEXDH_INIT}, this message type has an
+         overlapping value.  This method is called from C{ssh_KEX_DH_GEX_GROUP}
+-        if that method detects a diffie-hellman-group1-sha1 key exchange is in
+-        progress.
++        if that method detects a diffie-hellman-group1-sha1 or 
++        diffie-hellman-group14-sha1 key exchange is in progress.
+ 
+         Payload::
+ 
+@@ -1162,15 +1178,16 @@
+         """
+         This handles two different message which share an integer value.
+ 
+-        If the key exchange is diffie-hellman-group-exchange-sha1, this is
+-        MSG_KEX_DH_GEX_GROUP.  Payload::
++        If the key exchange is diffie-hellman-group1-sha1 or
++        diffie-hellman-group14-sha1, this is MSG_KEX_DH_GEX_GROUP.
++        Payload::
+             string g (group generator)
+             string p (group prime)
+ 
+         We generate a Diffie-Hellman public key and send it in a
+         MSG_KEX_DH_GEX_INIT message.
+         """
+-        if self.kexAlg == 'diffie-hellman-group1-sha1':
++        if self.kexAlg in ['diffie-hellman-group1-sha1', 'diffie-hellman-group14-sha1']:
+             return self._ssh_KEXDH_REPLY(packet)
+         else:
+             self.p, rest = getMP(packet)
+@@ -1193,7 +1210,7 @@
+         @type signature: C{str}
+         """
+         serverKey = keys.Key.fromString(pubKey)
+-        sharedSecret = _MPpow(f, self.x, DH_PRIME)
++        sharedSecret = _MPpow(f, self.x, self.dhPrime)
+         h = sha1()
+         h.update(NS(self.ourVersionString))
+         h.update(NS(self.otherVersionString))
+@@ -1590,6 +1607,17 @@
+ '7692932019128194467627007L')
+ DH_GENERATOR = 2L
+ 
++# Diffie-Hellman primes from Oakley Group 14 [RFC 3526]
++DH_PRIME_14 = long('32317006071311007300338913926423828248817941241140239112'
++'842009751400741706634354222619689417363569347117901737909704191754605873209'
++'195028853758986185622153212175412514901774520270235796078236248884246189477'
++'587641105928646099411723245426622522193230540919037680524235519125679715870'
++'117001058055877651038861847280257976054903569732561526167081339361799541336'
++'476559160368317896729073178384589680639671900977202194168647225871031411336'
++'429319536193471636533209717077448227988588565369208645296636077250268955505'
++'928362751121174096972998068410554359584866583291642136218231078990999448652'
++'468262416972035911852507045361090559L')
++DH_GENERATOR_14 = 2L
+ 
+ 
+ MSG_DISCONNECT = 1

@@ -1,0 +1,127 @@
+diff --git twisted/internet/tcp.py twisted/internet/tcp.py
+index 222ae9b..9fefe6b 100644
+--- twisted/internet/tcp.py
++++ twisted/internet/tcp.py
+@@ -17,6 +17,7 @@ import types
+ import socket
+ import sys
+ import operator
++import warnings
+ 
+ from zope.interface import implements, classImplements
+ 
+@@ -26,7 +27,7 @@ except ImportError:
+     SSL = None
+ 
+ from twisted.python.runtime import platformType
+-
++from twisted.python import versions, deprecate
+ 
+ if platformType == 'win32':
+     # no such thing as WSAEPERM or error code 10001 according to winsock.h or MSDN
+@@ -457,8 +458,14 @@ class Connection(abstract.FileDescriptor, _SocketCloser):
+                 return main.CONNECTION_LOST
+         if not data:
+             return main.CONNECTION_DONE
+-        return self.protocol.dataReceived(data)
+-
++        rval = self.protocol.dataReceived(data)
++        if rval:
++            warningFormat = 'Returning a value other than None from %(fqpn)s was deprecated in %(version)s'
++            warningString = deprecate.getDeprecationWarningString(self.protocol.dataReceived, 
++                                                                  versions.Version('twisted', 11, 0, 0),
++                                                                  format = warningFormat)
++            warnings.warn(warningString, category=DeprecationWarning, stacklevel=2)
++        return rval
+ 
+     def writeSomeData(self, data):
+         """
+diff --git twisted/internet/test/test_tcp.py twisted/internet/test/test_tcp.py
+index 19f861d..1d162aa 100644
+--- twisted/internet/test/test_tcp.py
++++ twisted/internet/test/test_tcp.py
+@@ -22,7 +22,8 @@ from twisted.internet.protocol import ServerFactory, ClientFactory, Protocol
+ from twisted.python.runtime import platform
+ from twisted.python.failure import Failure
+ from twisted.python import log
+-from twisted.trial.unittest import SkipTest
++from twisted.trial.unittest import SkipTest, TestCase
++from twisted.internet.tcp import Connection
+ 
+ from twisted.test.test_tcp import ClosingProtocol
+ from twisted.internet.test.test_core import ObjectModelIntegrationMixin
+@@ -102,6 +103,67 @@ def serverFactoryFor(protocol):
+     return factory
+ 
+ 
++class FakeSocket(object):
++    """
++    A Fake Socket object
++    """
++    fileno = 1
++    
++    def __init__(self, data):
++        self.data = data
++
++    def setblocking(self, blocking):
++        self.blocking = blocking
++
++    def recv(self, size):
++        return self.data
++
++
++
++class TestFakeSocket(TestCase):
++    """
++    Test that the FakeSocket can be used by the doRead method of L{Connection}
++    """
++
++    def test_blocking(self):
++        skt = FakeSocket("someData")
++        skt.setblocking(0)
++        self.assertEquals(skt.blocking, 0)
++
++
++    def test_recv(self):
++        skt = FakeSocket("someData")
++        self.assertEquals(skt.recv(10), "someData")
++
++
++
++class FakeProtocol(Protocol):
++    """
++    An L{IProtocol} that returns a value from its dataReceived method.
++    """
++    def dataReceived(self, data):
++        return "Returning something I shouldn't"
++
++
++
++class TestTCPConnection(TestCase):
++    """
++    Test that an L{IProtocol} that returns a value from its dataReceived method raises a deprecated warning
++    """
++    def test_doReadWarningIsRaised(self):
++        skt = FakeSocket("someData")
++        protocol = FakeProtocol()
++        conn = Connection(skt, protocol)
++        conn.doRead()
++        warnings = self.flushWarnings([self.test_doReadWarningIsRaised])
++        self.assertEquals(warnings[0]['category'], DeprecationWarning)
++        self.assertEquals(
++            warnings[0]["message"],
++            "Returning a value other than None from twisted.internet.test.test_tcp.FakeProtocol.dataReceived was deprecated in twisted 11.0.0")
++        self.assertEquals(len(warnings), 1)
++
++
++
+ 
+ class TCPClientTestsBuilder(ReactorBuilder):
+     """
+diff --git twisted/topfiles/2491.removal twisted/topfiles/2491.removal
+new file mode 100644
+index 0000000..cee4baf
+--- /dev/null
++++ twisted/topfiles/2491.removal
+@@ -0,0 +1 @@
++returning a value other than None from IProtocol.dataReceived was deprecated

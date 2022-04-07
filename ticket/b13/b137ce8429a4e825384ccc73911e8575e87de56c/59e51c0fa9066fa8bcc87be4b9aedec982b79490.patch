@@ -1,0 +1,184 @@
+=== modified file 'twisted/conch/ls.py'
+--- twisted/conch/ls.py	2011-02-14 04:45:15 +0000
++++ twisted/conch/ls.py	2011-03-15 13:04:19 +0000
+@@ -7,8 +7,16 @@
+ 
+ from time import time, strftime, localtime
+ 
++# locale-independent month names to use instead of strftime's
++_MONTH_NAMES = dict(zip(range(1, 13),
++                    "Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec".split()))
++
+ 
+ def lsLine(name, s):
++    """
++    Build an 'ls' line for a file ('file' in its generic sense, it
++    can be of any type).
++    """
+     mode = s.st_mode
+     perms = array.array('c', '-'*10)
+     ft = stat.S_IFMT(mode)
+@@ -39,22 +47,28 @@
+     if mode&stat.S_ISGID:
+         if perms[6] == 'x': perms[6] = 's'
+         else: perms[6] = 'S'
+-    l = perms.tostring()
+-    l += str(s.st_nlink).rjust(5) + ' '
+-    un = str(s.st_uid)
+-    l += un.ljust(9)
+-    gr = str(s.st_gid)
+-    l += gr.ljust(9)
+-    sz = str(s.st_size)
+-    l += sz.rjust(8)
+-    l += ' '
+-    sixmo = 60 * 60 * 24 * 7 * 26
+-    if s.st_mtime + sixmo < time(): # last edited more than 6mo ago
+-        l += strftime("%b %d  %Y ", localtime(s.st_mtime))
++
++    lsresult = [
++        perms.tostring(),
++        str(s.st_nlink).rjust(5),
++        ' ',
++        str(s.st_uid).ljust(9),
++        str(s.st_gid).ljust(9),
++        str(s.st_size).rjust(8),
++        ' ',
++    ]
++
++    # need to specify the month manually, as strftime depends on locale
++    ttup = localtime(s.st_mtime)
++    sixmonths = 60 * 60 * 24 * 7 * 26
++    if s.st_mtime + sixmonths < time(): # last edited more than 6mo ago
++        strtime = strftime("%%s %d  %Y ", ttup)
+     else:
+-        l += strftime("%b %d %H:%M ", localtime(s.st_mtime))
+-    l += name
+-    return l
++        strtime = strftime("%%s %d %H:%M ", ttup)
++    lsresult.append(strtime % (_MONTH_NAMES[ttup[1]],))
++
++    lsresult.append(name)
++    return ''.join(lsresult)
+ 
+ 
+ __all__ = ['lsLine']
+
+=== modified file 'twisted/conch/test/test_cftp.py'
+--- twisted/conch/test/test_cftp.py	2010-05-30 16:10:42 +0000
++++ twisted/conch/test/test_cftp.py	2011-03-15 13:07:49 +0000
+@@ -6,6 +6,7 @@
+ Tests for L{twisted.conch.scripts.cftp}.
+ """
+ 
++import locale
+ import time, sys, os, operator, getpass, struct
+ from StringIO import StringIO
+ 
+@@ -142,6 +143,37 @@
+             '!---------    0 0        0               0 Aug 29 09:33 foo')
+ 
+ 
++    def test_localeIndependent(self):
++        """
++        The month name in the date is locale independent.
++        """
++        # A point about three months in the past.
++        then = self.now - (60 * 60 * 24 * 31 * 3)
++        stat = os.stat_result((0, 0, 0, 0, 0, 0, 0, 0, then, 0))
++
++        # Fake that we're in a language where August is not Aug (e.g.: Spanish)
++        currentLocale = locale.getlocale()
++        locale.setlocale(locale.LC_ALL, "es_AR.UTF8")
++        self.addCleanup(locale.setlocale, locale.LC_ALL, currentLocale)
++
++        self.assertEqual(
++            self._lsInTimezone('America/New_York', stat),
++            '!---------    0 0        0               0 Aug 28 17:33 foo')
++        self.assertEqual(
++            self._lsInTimezone('Pacific/Auckland', stat),
++            '!---------    0 0        0               0 Aug 29 09:33 foo')
++
++    # if alternate locale is not available, the previous test will be
++    # skipped, please install this locale for it to run
++    currentLocale = locale.getlocale()
++    try:
++        locale.setlocale(locale.LC_ALL, "es_AR.UTF8")
++    except locale.Error:
++        test_localeIndependent.skip = "The es_AR.UTF8 locale is not installed."
++    finally:
++        locale.setlocale(locale.LC_ALL, currentLocale)
++
++
+     def test_newSingleDigitDayOfMonth(self):
+         """
+         A file with a high-resolution timestamp which falls on a day of the
+
+=== modified file 'twisted/mail/imap4.py'
+--- twisted/mail/imap4.py	2011-02-14 04:45:15 +0000
++++ twisted/mail/imap4.py	2011-03-15 12:54:20 +0000
+@@ -49,6 +49,9 @@
+ import twisted.cred.credentials
+ 
+ 
++# locale-independent month names to use instead of strftime's
++_MONTH_NAMES = dict(zip(range(1, 13),
++                    "Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec".split()))
+ 
+ class MessageSet(object):
+     """
+@@ -1904,7 +1907,9 @@
+             log.msg("%d:%r: unpareseable internaldate: %r" % (id, msg, idate))
+             raise IMAP4Exception("Internal failure generating INTERNALDATE")
+ 
+-        odate = time.strftime("%d-%b-%Y %H:%M:%S ", ttup[:9])
++        # need to specify the month manually, as strftime depends on locale
++        strdate = time.strftime("%d-%%s-%Y %H:%M:%S ", ttup[:9])
++        odate = strdate % (_MONTH_NAMES[ttup[1]],)
+         if ttup[9] is None:
+             odate = odate + "+0000"
+         else:
+
+=== modified file 'twisted/mail/test/test_imap.py'
+--- twisted/mail/test/test_imap.py	2011-02-14 04:45:15 +0000
++++ twisted/mail/test/test_imap.py	2011-03-15 12:45:41 +0000
+@@ -12,9 +12,10 @@
+ except ImportError:
+     from StringIO import StringIO
+ 
++import codecs
++import locale
+ import os
+ import types
+-import codecs
+ 
+ from zope.interface import implements
+ 
+@@ -3461,6 +3462,27 @@
+     def testFetchInternalDateUID(self):
+         return self.testFetchInternalDate(1)
+ 
++    def test_FetchInternalDateLocaleIndependent(self):
++        """
++        The month name in the date is locale independent.
++        """
++        # Fake that we're in a language where December is not Dec
++        currentLocale = locale.getlocale()
++        locale.setlocale(locale.LC_ALL, "es_AR.UTF8")
++        self.addCleanup(locale.setlocale, locale.LC_ALL, currentLocale)
++        return self.testFetchInternalDate(1)
++
++    # if alternate locale is not available, the previous test will be
++    # skipped, please install this locale for it to run
++    currentLocale = locale.getlocale()
++    try:
++        locale.setlocale(locale.LC_ALL, "es_AR.UTF8")
++    except locale.Error:
++        test_FetchInternalDateLocaleIndependent.skip = ("The es_AR.UTF8 locale"
++                                                       " is not installed.")
++    finally:
++        locale.setlocale(locale.LC_ALL, currentLocale)
++
+     def testFetchEnvelope(self, uid=0):
+         self.function = self.client.fetchEnvelope
+         self.messages = '15'
+

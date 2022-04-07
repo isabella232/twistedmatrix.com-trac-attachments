@@ -1,0 +1,216 @@
+Index: twisted/scripts/tap2deb.py
+===================================================================
+--- twisted/scripts/tap2deb.py	(revision 34869)
++++ twisted/scripts/tap2deb.py	(working copy)
+@@ -1,12 +1,15 @@
++# -*- test-case-name: twisted.scripts.test.test_tap2deb -*-
+ # Copyright (c) Twisted Matrix Laboratories.
+ # See LICENSE for details.
+ 
+-
+-
+-import sys, os, string, shutil
++import os
++import sys
++import shutil
++import subprocess
+ 
+ from twisted.python import usage
+ 
++
+ class MyOptions(usage.Options):
+     optFlags = [["unsigned", "u"]]
+     optParameters = [["tapfile", "t", "twistd.tap"],
+@@ -27,47 +30,47 @@
+ 
+     def postOptions(self):
+         if not self["maintainer"]:
+-            raise usage.UsageError, "maintainer must be specified."
++            raise usage.UsageError("maintainer must be specified.")
+ 
+ 
+ type_dict = {
+-'tap': 'file',
+-'python': 'python',
+-'source': 'source',
+-'xml': 'xml',
++    'tap': 'file',
++    'python': 'python',
++    'source': 'source',
++    'xml': 'xml',
+ }
+ 
+-def save_to_file(file, text):
+-    f = open(file, 'w')
+-    f.write(text)
+-    f.close()
+ 
+ 
+-def run():
++def save_to_file(file, text):
++    with open(file, 'w') as f:
++        f.write(text)
++
+ 
++def run(options=None):
+     try:
+         config = MyOptions()
+-        config.parseOptions()
+-    except usage.error, ue:
++        config.parseOptions(options)
++    except usage.error as ue:
+         sys.exit("%s: %s" % (sys.argv[0], ue))
+ 
+     tap_file = config['tapfile']
+     base_tap_file = os.path.basename(config['tapfile'])
+     protocol = (config['protocol'] or os.path.splitext(base_tap_file)[0])
+-    deb_file = config['debfile'] or 'twisted-'+protocol
++    deb_file = config['debfile'] or 'twisted-' + protocol
+     version = config['set-version']
+     maintainer = config['maintainer']
+     description = config['description'] or ('A Twisted-based server for %(protocol)s' %
+                                             vars())
+     long_description = config['long_description'] or 'Automatically created by tap2deb'
+     twistd_option = type_dict[config['type']]
+-    date = string.strip(os.popen('822-date').read())
++    date = os.popen('date -R').read().strip()
+     directory = deb_file + '-' + version
+     python_version = '%s.%s' % sys.version_info[:2]
+ 
+     if os.path.exists(os.path.join('.build', directory)):
+         os.system('rm -rf %s' % os.path.join('.build', directory))
+-    os.makedirs(os.path.join('.build', directory, 'debian'))
++    os.makedirs(os.path.join('.build', directory, 'debian', 'source'))
+ 
+     shutil.copy(tap_file, os.path.join('.build', directory))
+ 
+@@ -192,6 +195,11 @@
+  %(long_description)s
+ ''' % vars())
+ 
++    save_to_file(os.path.join('.build', directory, 'debian', 'compat'),
++    '''\
++7
++''' % vars())
++
+     save_to_file(os.path.join('.build', directory, 'debian', 'copyright'),
+     '''\
+ This package was auto-debianized by %(maintainer)s on
+@@ -216,6 +224,12 @@
+ usr/share/%(deb_file)s
+ ''' % vars())
+ 
++    save_to_file(os.path.join('.build', directory, 'debian', 'source',
++                 'format'),
++    '''\
++3.0 (native)
++''' % vars())
++
+     save_to_file(os.path.join('.build', directory, 'debian', 'rules'),
+     '''\
+ #!/usr/bin/make -f
+@@ -274,8 +288,13 @@
+     os.chmod(os.path.join('.build', directory, 'debian', 'rules'), 0755)
+ 
+     os.chdir('.build/%(directory)s' % vars())
+-    os.system('dpkg-buildpackage -rfakeroot'+ ['', ' -uc -us'][config['unsigned']])
+ 
+-if __name__ == '__main__':
+-    run()
++    args = ["dpkg-buildpackage", "-rfakeroot"]
++    if config['unsigned']:
++        args = args + ['-uc', '-us']
++
++    #  build deb
++    job = subprocess.Popen(args, stdout=subprocess.PIPE,
++                           stderr=subprocess.STDOUT)
++    stdout, _ = job.communicate()
+ 
+Index: twisted/scripts/test/test_tap2deb.py
+===================================================================
+--- twisted/scripts/test/test_tap2deb.py	(revision 0)
++++ twisted/scripts/test/test_tap2deb.py	(revision 0)
+@@ -0,0 +1,83 @@
++# Copyright (c) Twisted Matrix Laboratories.
++# See LICENSE for details.
++
++"""
++Tests for L{twisted.scripts.tap2deb}.
++"""
++
++import os
++
++from twisted.scripts import tap2deb
++from twisted.python import usage
++from twisted.python import procutils
++from twisted.python.filepath import FilePath
++
++from twisted.trial.unittest import TestCase, SkipTest
++
++
++
++class TestTap2DEB(TestCase):
++
++    def setUp(self):
++        self._checkForDebBuild()
++
++        self.maintainer = "Jane Doe <janedoe@example.com>"
++        self.basedir = FilePath(self.mktemp())
++        self.basedir.makedirs()
++        self.addCleanup(os.chdir, os.getcwd())
++        os.chdir(self.basedir.path)
++
++
++    def _checkForDebBuild(self):
++        """
++        tap2deb requires dpkg-buildpackage; skip tests if dpkg-buildpackage
++        is not present.
++        """
++        if not procutils.which("dpkg-buildpackage"):
++            raise SkipTest("dpkg-buildpackage must be present to test tap2deb")
++
++
++    def test_maintainerOption(self):
++        """
++        The C{--maintainer} option must be specified on the commandline or
++        passed to L{tap2deb.run}.
++        """
++        config = tap2deb.MyOptions()
++        self.assertRaises(usage.UsageError, config.parseOptions, [])
++        self.assertRaises(SystemExit, tap2deb.run, [])
++
++
++    def test_optionDefaults(self):
++        """
++        Commandline options should default to sensible values.
++        """
++        config = tap2deb.MyOptions()
++        config.parseOptions(['--maintainer', self.maintainer])
++
++        self.assertEqual(config['tapfile'], 'twistd.tap')
++        self.assertEqual(config['maintainer'], self.maintainer)
++        self.assertEqual(config['protocol'], '')
++        self.assertEqual(config['description'], '')
++        self.assertEqual(config['long_description'], '')
++        self.assertEqual(config['set-version'], '1.0')
++        self.assertEqual(config['debfile'], None)
++        self.assertEqual(config['type'], 'tap')
++
++
++    def test_basicOperation(self):
++        """
++        Calling tap2deb should produce a DEB and DSC file.
++        """
++        # make a temporary .tap file
++        tap = self.basedir.child("lemon.tap")
++        tap.setContent("# Dummy .tap file")
++
++        # run
++        args = ["--tapfile", tap.path, "--maintainer", self.maintainer]
++        tap2deb.run(args)
++
++        build = tap.child('.build')
++        for name in ['twisted-twistd_1.0_all.deb',
++                     'twisted-twistd_1.0_all.dsc']:
++            self.assertTrue(build.child(name).exists)
++

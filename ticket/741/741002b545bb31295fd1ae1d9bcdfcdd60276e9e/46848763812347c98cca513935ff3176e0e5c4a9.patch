@@ -1,0 +1,87 @@
+=== modified file 'twisted/protocols/portforward.py'
+--- twisted/protocols/portforward.py	2011-02-14 04:45:15 +0000
++++ twisted/protocols/portforward.py	2011-09-13 19:05:37 +0000
+@@ -31,6 +31,14 @@
+ class ProxyClient(Proxy):
+     def connectionMade(self):
+         self.peer.setPeer(self)
++
++        # Wire this and the peer transport together to enable
++        # flow control (this stops connections from filling
++        # this proxy memory when one side produces data at a
++        # higher rate than the other can consume).
++        self.transport.registerProducer(self.peer.transport, True)
++        self.peer.transport.registerProducer(self.transport, True)
++
+         # We're connected, everybody can read to their hearts content.
+         self.peer.transport.resumeProducing()
+ 
+@@ -53,6 +61,7 @@
+ class ProxyServer(Proxy):
+ 
+     clientProtocolFactory = ProxyClientFactory
++    reactor = None
+ 
+     def connectionMade(self):
+         # Don't read anything from the connecting client until we have
+@@ -62,8 +71,10 @@
+         client = self.clientProtocolFactory()
+         client.setServer(self)
+ 
+-        from twisted.internet import reactor
+-        reactor.connectTCP(self.factory.host, self.factory.port, client)
++        if self.reactor is None:
++            from twisted.internet import reactor
++            self.reactor = reactor
++        self.reactor.connectTCP(self.factory.host, self.factory.port, client)
+ 
+ 
+ class ProxyFactory(protocol.Factory):
+
+=== modified file 'twisted/test/test_protocols.py'
+--- twisted/test/test_protocols.py	2011-07-14 18:05:14 +0000
++++ twisted/test/test_protocols.py	2011-09-13 19:41:53 +0000
+@@ -1061,6 +1061,42 @@
+         return d
+ 
+ 
++    def test_resgisterProducers(self):
++        """
++        Test proxy client registering itself as a producer of the peer
++        and vicevera.
++        """
++        # create a ProxyServer instance
++        addr = proto_helpers.IPv4Address('TCP', '127.0.0.1', 0)
++        proxy = portforward.ProxyFactory('127.0.0.1', 0).buildProtocol(addr)
++
++        # set the reactor for this test
++        test_reactor = proto_helpers.MemoryReactor()
++        proxy.reactor = test_reactor
++
++        # make the connection
++        proxyTransport = proto_helpers.StringTransport()
++        proxy.makeConnection(proxyTransport)
++
++        client = portforward.ProxyClient()
++        # call setPeer (called by buildProtocol)
++        client.setPeer(proxy)
++        clientTransport = proto_helpers.StringTransport()
++        client.makeConnection(clientTransport)
++
++        # check that the producers are registered
++        self.assertIdentical(clientTransport.producer, proxyTransport)
++        self.assertIdentical(proxyTransport.producer, clientTransport)
++        # check the streaming attribute in both transports
++        self.assertTrue(clientTransport.streaming)
++        self.assertTrue(proxyTransport.streaming)
++        # check that the ProxyClientFactory is connected to the backend
++        self.assertEqual(len(test_reactor.tcpClients), 1)
++        # get the factory instance and check it's the one we expect
++        host, port, clientFactory, timeout, _ = test_reactor.tcpClients[0]
++        self.assertIsInstance(clientFactory, portforward.ProxyClientFactory)
++
++
+ 
+ class StringTransportTestCase(unittest.TestCase):
+     """
+

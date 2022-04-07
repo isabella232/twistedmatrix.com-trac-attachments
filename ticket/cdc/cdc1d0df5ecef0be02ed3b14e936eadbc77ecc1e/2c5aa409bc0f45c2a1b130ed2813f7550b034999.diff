@@ -1,0 +1,128 @@
+Index: twisted/names/test/test_cache.py
+===================================================================
+--- twisted/names/test/test_cache.py	(revision 34216)
++++ twisted/names/test/test_cache.py	(working copy)
+@@ -48,11 +48,36 @@
+         return c.lookupAddress("example.com").addCallback(cbLookup)
+ 
+ 
+-    def test_negativeTTLLookup(self):
++    def test_cachedResultExpires(self):
+         """
++        Once the TTL has been exceeded, the result is removed from the cache
++        """
++        r = ([dns.RRHeader("example.com", dns.A, dns.IN, 60,
++                           dns.Record_A("127.0.0.1", 60))],
++             [dns.RRHeader("example.com", dns.A, dns.IN, 50,
++                           dns.Record_A("127.0.0.1", 50))],
++             [dns.RRHeader("example.com", dns.A, dns.IN, 40,
++                           dns.Record_A("127.0.0.1", 40))])
++        
++        clock = task.Clock()
++        
++        c = cache.CacheResolver(reactor=clock)
++        query = dns.Query(name="example.com", type=dns.A, cls=dns.IN)
++        c.cacheResult(query, r)
++        
++        clock.advance(40)
++        
++        self.assertNotIn(query, c.cache)
++        
++        return self.assertFailure(
++            c.lookupAddress("example.com"), dns.DomainError)
++
++    
++    def test_expiredTTLLookup(self):
++        """
+         When the cache is queried exactly as the cached entry should expire
+-        but before it has actually been cleared, the TTL will be 0, not
+-        negative.
++        but before it has actually been cleared, the cache should not return
++        the expired entry
+         """
+         r = ([dns.RRHeader("example.com", dns.A, dns.IN, 60,
+                            dns.Record_A("127.0.0.1", 60))],
+@@ -71,11 +96,5 @@
+ 
+         clock.advance(60.1)
+ 
+-        def cbLookup(result):
+-            self.assertEquals(result[0][0].ttl, 0)
+-            self.assertEquals(result[0][0].ttl, 0)
+-            self.assertEquals(result[0][0].ttl, 0)
+-            self.assertEquals(result[0][0].name.name, "example.com")
+-
+-        return c.lookupAddress("example.com").addCallback(cbLookup)
+-
++        return self.assertFailure(
++            c.lookupAddress("example.com"), dns.DomainError)
+Index: twisted/names/test/test_dns.py
+===================================================================
+--- twisted/names/test/test_dns.py	(revision 34216)
++++ twisted/names/test/test_dns.py	(working copy)
+@@ -1483,3 +1483,18 @@
+             dns.UnknownRecord('foo', ttl=10),
+             dns.UnknownRecord('foo', ttl=10),
+             dns.UnknownRecord('foo', ttl=100))
++
++
++
++class RRHeaderTests(unittest.TestCase):
++    """
++    Tests for L{twisted.names.dns.RRHeader}.
++    """
++
++    def test_negativeTTL(self):
++        """
++        L{dns.RRHeader} instances cannot be created with a negative ttl
++        so that DNS caches do not serve expired information
++        """
++        self.assertRaises(ValueError, dns.RRHeader, "example.com", dns.A,
++            dns.IN, -1, dns.Record_A("127.0.0.1"))
+Index: twisted/names/cache.py
+===================================================================
+--- twisted/names/cache.py	(revision 34216)
++++ twisted/names/cache.py	(working copy)
+@@ -66,13 +66,19 @@
+             if self.verbose:
+                 log.msg('Cache hit for ' + repr(name))
+             diff = now - when
+-            return defer.succeed((
+-                [dns.RRHeader(str(r.name), r.type, r.cls, max(0, r.ttl - diff), r.payload) for r in ans],
+-                [dns.RRHeader(str(r.name), r.type, r.cls, max(0, r.ttl - diff), r.payload) for r in auth],
+-                [dns.RRHeader(str(r.name), r.type, r.cls, max(0, r.ttl - diff), r.payload) for r in add]
+-            ))
+ 
++            try:
++                return defer.succeed((
++                    [dns.RRHeader(str(r.name), r.type, r.cls, r.ttl - diff,
++                                  r.payload) for r in ans],
++                    [dns.RRHeader(str(r.name), r.type, r.cls, r.ttl - diff,
++                                  r.payload) for r in auth],
++                    [dns.RRHeader(str(r.name), r.type, r.cls, r.ttl - diff,
++                                  r.payload) for r in add]))
++            except ValueError:
++                return defer.fail(failure.Failure(dns.DomainError(name)))
+ 
++
+     def lookupAllRecords(self, name, timeout = None):
+         return defer.fail(failure.Failure(dns.DomainError(name)))
+ 
+Index: twisted/names/dns.py
+===================================================================
+--- twisted/names/dns.py	(revision 34216)
++++ twisted/names/dns.py	(working copy)
+@@ -481,8 +481,13 @@
+ 
+         @type payload: An object implementing C{IEncodable}
+         @param payload: A Query Type specific data object.
++
++        @raises ValueError: if the ttl is negative
+         """
+         assert (payload is None) or isinstance(payload, UnknownRecord) or (payload.TYPE == type)
++        
++        if ttl < 0:
++            raise ValueError("TTL cannot be negative")
+ 
+         self.name = Name(name)
+         self.type = type

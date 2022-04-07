@@ -1,0 +1,127 @@
+commit 9b0f5bc2d3e3fb4c6de6aba5d832b4fde240e378
+Author: Chris AtLee <catlee@mozilla.com>
+Date:   Thu Mar 11 22:11:32 2010 -0500
+
+    Restore observers even when exceptions are raised
+    
+    Add a try/finally block around the error logging when an observer fails
+    to log a message.
+    
+    Previously, if logging the error about the observer also raised an
+    exception, the original observer would not be restored.
+
+diff --git a/twisted/python/log.py b/twisted/python/log.py
+index cb8d459..a72bb57 100644
+--- a/twisted/python/log.py
++++ b/twisted/python/log.py
+@@ -13,6 +13,7 @@ import time
+ import warnings
+ from datetime import datetime
+ import logging
++import traceback
+ 
+ from zope.interface import Interface
+ 
+@@ -241,6 +242,7 @@ class LogPublisher:
+ 
+     def __init__(self):
+         self.observers = []
++        self.increasedRuntimeLimit = False
+ 
+     def addObserver(self, other):
+         """
+@@ -288,11 +290,24 @@ class LogPublisher:
+             except UnicodeEncodeError:
+                 raise
+             except:
+-                observer = self.observers[i]
+-                self.observers[i] = lambda event: None
+-                err(failure.Failure(),
+-                    "Log observer %s failed." % (observer,))
+-                self.observers[i] = observer
++                exc_info = sys.exc_info()
++                if exc_info[0] == RuntimeError and not self.increasedRuntimeLimit:
++                    self.increasedRuntimeLimit = True
++                    oldlimit = sys.getrecursionlimit()
++                    sys.setrecursionlimit(oldlimit + 10)
++                    try:
++                        err("RuntimeError hit: %s" % "\n".join(traceback.format_stack(limit=50)))
++                    finally:
++                        sys.setrecursionlimit(oldlimit)
++                        self.increasedRuntimeLimit = False
++                else:
++                    observer = self.observers[i]
++                    self.observers[i] = lambda event: None
++                    try:
++                        err(failure.Failure(),
++                            "Log observer %s failed." % (observer,))
++                    finally:
++                        self.observers[i] = observer
+ 
+ 
+     def showwarning(self, message, category, filename, lineno, file=None,
+diff --git a/twisted/test/test_log.py b/twisted/test/test_log.py
+index 032eaf2..e48ea13 100644
+--- a/twisted/test/test_log.py
++++ b/twisted/test/test_log.py
+@@ -114,6 +114,60 @@ class LogTest(unittest.TestCase):
+             self.assertEquals(L1[1]['message'], ("Howdy, y'all.",))
+             self.assertEquals(L2[0]['message'], ("Howdy, y'all.",))
+ 
++    def test_runtimeError(self):
++        catcher = self.catcher
++
++        publisher = log.LogPublisher()
++        oldLogPublisher = log.theLogPublisher
++        log.theLogPublisher = publisher
++        log.msg = publisher.msg
++
++        def _cleanup():
++            log.theLogPublisher = oldLogPublisher
++            log.msg = oldLogPublisher.msg
++
++        self.addCleanup(_cleanup)
++
++        def logit(msg, n=5):
++            if n:
++                logit(msg, n-1)
++            else:
++                catcher.append(msg)
++
++        publisher.addObserver(logit)
++
++        errors = [0]
++
++        # Force a RuntimeError by recursing a lot
++        def recurse(level=0):
++            try:
++                recurse(level+1)
++            except:
++                # The bottom n calls will generate a RuntimeError when trying
++                # to log this message
++                try:
++                    publisher.msg("At the bottom of everything (%i)" % level)
++                except:
++                    errors[0] += 1
++                    raise
++
++        try:
++            recurse()
++        except:
++            pass
++
++        publisher.msg("Back on top")
++
++        self.flushLoggedErrors()
++
++        self.assertEquals(publisher.observers, [logit])
++
++        self.assert_(len(catcher) >= 2)
++        i = catcher.pop()
++        self.assertEquals(i['message'], ("Back on top",))
++
++        i = catcher.pop()
++        self.assert_("RuntimeError" in i['message'][0])
+ 
+     def test_showwarning(self):
+         """

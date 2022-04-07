@@ -1,0 +1,239 @@
+Index: twisted/topfiles/setup.py
+===================================================================
+--- twisted/topfiles/setup.py	(revision 38491)
++++ twisted/topfiles/setup.py	(working copy)
+@@ -35,6 +35,10 @@
+     Extension("twisted.python.sendmsg",
+               sources=["twisted/python/sendmsg.c"],
+               condition=lambda _: sys.platform != "win32"),
++
++    Extension("twisted.python.disconnect",
++              sources=["twisted/python/disconnect.c"],
++              condition=lambda _: sys.platform != "win32"),
+ ]
+ 
+ if sys.version_info[:2] <= (2, 6):
+Index: twisted/internet/udp.py
+===================================================================
+--- twisted/internet/udp.py	(revision 38491)
++++ twisted/internet/udp.py	(working copy)
+@@ -24,8 +24,14 @@
+ import warnings
+ 
+ from zope.interface import implementer
++from twisted.python.runtime import platformType
+ 
+-from twisted.python.runtime import platformType
++#Try to import C extension, if not disconnect will not work
++try:
++    from twisted.python.disconnect import disconnect_udp_sock
++except ImportError:
++    pass
++
+ if platformType == 'win32':
+     from errno import WSAEWOULDBLOCK
+     from errno import WSAEINTR, WSAEMSGSIZE, WSAETIMEDOUT
+@@ -205,13 +211,22 @@
+         """
+         'Connect' to remote server.
+         """
+-        if self._connectedAddr:
+-            raise RuntimeError("already connected, reconnecting is not currently supported")
+         if not abstract.isIPAddress(host):
+             raise ValueError("please pass only IP addresses, not domain names")
+         self._connectedAddr = (host, port)
+         self.socket.connect((host, port))
+ 
++    def disconnect(self):
++        """
++        'Disconnect' from remote server.
++        Not to be confused with loseConnection. It will NOT call connectionLost.
++        @returns: the result from the underlying syscall.
++        """
++        if not self._connectedAddr:
++            raise RuntimeError("not connected, connect the socket first")
++        self._connectedAddr = None
++        return disconnect_udp_sock(self.fileno())
++
+     def _loseConnection(self):
+         self.stopReading()
+         if self.connected: # actually means if we are *listening*
+Index: twisted/python/disconnect.c
+===================================================================
+--- twisted/python/disconnect.c	(revision 0)
++++ twisted/python/disconnect.c	(working copy)
+@@ -0,0 +1,125 @@
++/*
++ * Copyright (c) Twisted Matrix Laboratories.
++ * See LICENSE for details.
++ */
++#define PY_SSIZE_T_CLEAN 1
++#include <Python.h>
++
++#if PY_VERSION_HEX < 0x02050000 && !defined(PY_SSIZE_T_MIN)
++/* This may cause some warnings, but if you want to get rid of them, upgrade
++ * your Python version.  */
++typedef int Py_ssize_t;
++#endif
++
++#include <sys/types.h>
++#include <sys/socket.h>
++#include <signal.h>
++#include <sys/param.h>
++#include <netinet/in.h>
++
++#ifdef BSD
++#include <sys/uio.h>
++#endif
++
++PyObject *disconnect_socket_error;
++static PyObject * disconnect_udp_sock(PyObject *self, PyObject *args,
++				      PyObject *keywds);
++
++static char disconnect_doc[] = "\
++Bindings for disconnect in udp(in connected mode).\n\
++";
++
++static char disconnect_disconnect_udp_sock_doc[] = "\
++Wrap for disconnect function for udp in connected mode.\n\
++\n\
++@param fd: The file descriptor of the socket for disconnection.\n\
++@type fd: C{int}\n\
++\n\
++@raise socket.error: Raised if the underlying syscall indicates an error.\n\
++\n\
++@return: Value of the underlying syscall(connect(2)), if it succeeds.\n\
++";
++
++
++static PyMethodDef disconnect_methods[] = {
++    {"disconnect_udp_sock", (PyCFunction) disconnect_udp_sock,
++     METH_VARARGS | METH_KEYWORDS,
++     disconnect_disconnect_udp_sock_doc},
++    {NULL, NULL, 0, NULL}
++};
++
++
++PyMODINIT_FUNC initdisconnect(void) {
++    PyObject *module;
++
++    disconnect_socket_error = NULL; /* Make sure that this has a known value
++                                    before doing anything that might exit. */
++
++    module = Py_InitModule3("disconnect", disconnect_methods, disconnect_doc);
++
++    if (!module) {
++        return;
++    }
++
++    /*
++      The following is the only value mentioned by POSIX:
++      http://www.opengroup.org/onlinepubs/9699919799/basedefs/sys_socket.h.html
++    */
++
++    if (-1 == PyModule_AddIntConstant(module, "SCM_RIGHTS", SCM_RIGHTS)) {
++        return;
++    }
++
++
++    /* BSD, Darwin, Hurd */
++#if defined(SCM_CREDS)
++    if (-1 == PyModule_AddIntConstant(module, "SCM_CREDS", SCM_CREDS)) {
++        return;
++    }
++#endif
++
++    /* Linux */
++#if defined(SCM_CREDENTIALS)
++    if (-1 == PyModule_AddIntConstant(module, "SCM_CREDENTIALS", SCM_CREDENTIALS)) {
++        return;
++    }
++#endif
++
++    /* Apparently everywhere, but not standardized. */
++#if defined(SCM_TIMESTAMP)
++    if (-1 == PyModule_AddIntConstant(module, "SCM_TIMESTAMP", SCM_TIMESTAMP)) {
++        return;
++    }
++#endif
++
++    module = PyImport_ImportModule("socket");
++    if (!module) {
++        return;
++    }
++
++    disconnect_socket_error = PyObject_GetAttrString(module, "error");
++    if (!disconnect_socket_error) {
++        return;
++    }
++}
++
++
++/* Taken from
++ * http://timesinker.blogspot.com/2010/02/unconnect-udp-socket.html */
++
++static PyObject * disconnect_udp_sock(PyObject *self, PyObject *args,
++				      PyObject *keywds)
++{
++    int fd;
++    static char *kwlist[] = {"fd", NULL};
++    struct sockaddr_in sin;
++
++    if (!PyArg_ParseTupleAndKeywords(args, keywds, "i", kwlist, &fd)) {
++        return NULL;
++    }
++
++    memset((char *)&sin, 0, sizeof(sin));
++    sin.sin_family = AF_UNSPEC;
++    return Py_BuildValue("i", connect(fd, (struct sockaddr *)&sin,
++				      sizeof(sin)));
++}
+Index: twisted/test/test_udp.py
+===================================================================
+--- twisted/test/test_udp.py	(revision 38491)
++++ twisted/test/test_udp.py	(working copy)
+@@ -314,17 +314,39 @@
+         """
+         A call to the transport's connect method fails with a L{ValueError}
+         when a non-IP address is passed as the host value.
+-
+-        A call to a transport's connect method fails with a L{RuntimeError}
+-        when the transport is already connected.
+         """
+         client = GoodClient()
+         port = reactor.listenUDP(0, client, interface="127.0.0.1")
+         self.assertRaises(ValueError, client.transport.connect,
+                           "localhost", 80)
++        
++        return port.stopListening()
++
++    def test_disconnect(self):
++        """
++        A call to the transport's disconnect method before connecting raises
++        a L{RuntimeError}, because we're not connected yet.
++
++        When connected to a remote server we can disconnect.
++        Note: optional test(if extensions are built it will run).
++        """
++        client = GoodClient()
++        port = reactor.listenUDP(0, client, interface="127.0.0.1")
++        self.assertRaises(RuntimeError, client.transport.disconnect)
++
+         client.transport.connect("127.0.0.1", 80)
+-        self.assertRaises(RuntimeError, client.transport.connect,
+-                          "127.0.0.1", 80)
++        try:
++            res = client.transport.disconnect()
++        except NameError as e:
++            if "disconnect" in e.message:
++                port.stopListening()
++                raise unittest.SkipTest("cannot test without "+\
++                                            "disconnect extension")
++            raise
++        else:
++            self.assertEqual(client.transport._connectedAddr, None)
++            self.assertEqual(res, 0)
++
+         return port.stopListening()
+ 
+ 

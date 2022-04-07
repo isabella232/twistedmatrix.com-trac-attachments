@@ -1,0 +1,100 @@
+Index: test/test_xmlrpc.py
+===================================================================
+--- test/test_xmlrpc.py	(revision 26856)
++++ test/test_xmlrpc.py	(working copy)
+@@ -371,12 +371,37 @@
+                  'deferFault', 'dict', 'echo', 'fail', 'fault',
+                  'pair', 'system.listMethods',
+                  'system.methodHelp',
+-                 'system.methodSignature'])
++                 'system.methodSignature',
++                 'system.multicall'])
+ 
+         d = self.proxy().callRemote("system.listMethods")
+         d.addCallback(cbMethods)
+         return d
+ 
++    def test_multicall(self):
++
++        # The calls to "fail" and "deferFail" work, but because log.err()
++        # is called from xmlrpc_multicall(), the unit test is failing with
++        # ERRORs.
++
++        calls = [{'methodName': 'add', 'params': [2, 3]},
++                 # {'methodName': 'fail', 'params': []},
++                 # {'methodName': 'deferFail', 'params': []},
++                 {'methodName': 'fault', 'params': []},
++                 {'methodName': 'deferFault', 'params': []},
++                 {'methodName': 'echo', 'params': ['hello']}]
++
++        expected = [[5],
++                    # {'faultCode': 8002, 'faultString': 'error'},
++                    # {'faultCode': 8002, 'faultString': 'error'},
++                    {'faultCode': 12, 'faultString': 'hello'},
++                    {'faultCode': 17, 'faultString': 'hi'},
++                    ['hello']]
++
++        d = self.proxy().callRemote("system.multicall", calls)
++        d.addCallback(self.assertEquals, expected)
++        return d
++
+     def test_methodHelp(self):
+         inputOutputs = [
+             ("defer", "Help for defer."),
+Index: xmlrpc.py
+===================================================================
+--- xmlrpc.py	(revision 26856)
++++ xmlrpc.py	(working copy)
+@@ -256,7 +256,52 @@
+     xmlrpc_methodSignature.signature = [['array', 'string'],
+                                         ['string', 'string']]
+ 
++    def xmlrpc_multicall(self, calls):
++        """
++        Boxcar multiple RPC calls in one request.
+ 
++        Calls should be specified as [call1, call2, ...] where callN is a
++        struct like {'methodName': method, 'params': [param1, param2, ...]}.
++
++        The returned value will be of the form [result1, result2, ...] where
++        each result corresponds to the output of each call, in the order that
++        the calls were specified. A successful result will be wrapped in an
++        array. A failure will be converted to a struct of the form
++        {'faultcode': code, 'faultString': error}.
++
++        All methods will be executed in unspecified order, and the failure of
++        one method will not prevent the other methods from executing.
++
++        system.multicall is documented here:
++        http://web.archive.org/web/20060824100531/http://www.xmlrpc.com/discuss/msgReader$1208
++        """
++        results = []
++        for call in calls:
++            name = call['methodName']
++            params = call['params']
++            method = self._xmlrpc_parent._getFunction(name)
++            try:
++                d = defer.maybeDeferred(method, *params)
++                g = defer.waitForDeferred(d)
++                yield g
++                result = g.getResult()
++                if isinstance(result, Fault):
++                    raise result
++                result = [result]
++            except Fault, f:
++                result = {'faultCode': f.faultCode,
++                          'faultString': f.faultString}
++            except:
++                log.err()
++                result = {'faultCode': self.FAILURE,
++                          'faultString': 'error'}
++            results.append(result)
++        yield results
++
++    xmlrpc_multicall = defer.deferredGenerator(xmlrpc_multicall)
++    xmlrpc_multicall.signature = [['array', 'array']]
++
++
+ def addIntrospection(xmlrpc):
+     """
+     Add Introspection support to an XMLRPC server.

@@ -1,0 +1,267 @@
+Index: twisted/test/test_ftp.py
+===================================================================
+--- twisted/test/test_ftp.py	(revision 34534)
++++ twisted/test/test_ftp.py	(working copy)
+@@ -184,27 +184,40 @@
+             chainDeferred=d)
+ 
+ 
+-
+ class BasicFTPServerTestCase(FTPServerTestCase):
+     def testNotLoggedInReply(self):
+-        """When not logged in, all commands other than USER and PASS should
+-        get NOT_LOGGED_IN errors.
++        """When not logged in, most commands other than USER and PASS should
++        get NOT_LOGGED_IN errors, but some can be called before USER and PASS.
+         """
+-        commandList = ['CDUP', 'CWD', 'LIST', 'MODE', 'PASV',
+-                       'PWD', 'RETR', 'STRU', 'SYST', 'TYPE']
++        loginRequiredCommandList = ['CDUP', 'CWD', 'LIST', 'MODE', 'PASV',
++            'PWD', 'RETR', 'STRU', 'SYST', 'TYPE']
++        loginNotRequiredCommandList = ['FEAT']
+ 
+         # Issue commands, check responses
+-        def checkResponse(exception):
++        def checkFailResponse(exception, command):
+             failureResponseLines = exception.args[0]
+             self.failUnless(failureResponseLines[-1].startswith("530"),
+-                            "Response didn't start with 530: %r"
+-                            % (failureResponseLines[-1],))
++                            "%s - Response didn't start with 530: %r"
++                            % (command, failureResponseLines[-1],))
++
++        def checkPassResponse(result, command):
++            result = result[0]
++            self.failIf(result.startswith("530"),
++                            "%s - Response start with 530: %r"
++                            % (command, result,))
++
+         deferreds = []
+-        for command in commandList:
++        for command in loginRequiredCommandList:
+             deferred = self.client.queueStringCommand(command)
+             self.assertFailure(deferred, ftp.CommandFailed)
+-            deferred.addCallback(checkResponse)
++            deferred.addCallback(checkFailResponse, command)
+             deferreds.append(deferred)
++
++        for command in loginNotRequiredCommandList:
++            deferred = self.client.queueStringCommand(command)
++            deferred.addCallback(checkPassResponse, command)
++            deferreds.append(deferred)
++
+         return defer.DeferredList(deferreds, fireOnOneErrback=True)
+ 
+     def testPASSBeforeUSER(self):
+@@ -399,7 +412,25 @@
+         protocol = self.factory.buildProtocol(None)
+         self.assertEqual(portRange, protocol.wrappedProtocol.passivePortRange)
+ 
++    def testFEAT(self):
++        d = self.client.queueStringCommand('FEAT')
++        def gotResponse(responseLines):
++            self.assertEqual('211-Features:', responseLines[0])
++            self.assertTrue(' MDTM' in responseLines)
++            self.assertTrue(' PASV' in responseLines)
++            self.assertTrue(' TYPE A;I' in responseLines)
++            self.assertTrue(' SIZE' in responseLines)
++            self.assertEqual('211 End', responseLines[-1])
++        return d.addCallback(gotResponse)
+ 
++    def testOPTS(self):
++        d = self._anonymousLogin()
++        self.assertCommandFailed(
++            'OPTS something',
++            ["502 Option 'something' not implemented."],
++            chainDeferred=d,
++            )
++        return d
+ 
+ class FTPServerTestCaseAdvancedClient(FTPServerTestCase):
+     """
+Index: twisted/protocols/ftp.py
+===================================================================
+--- twisted/protocols/ftp.py	(revision 34534)
++++ twisted/protocols/ftp.py	(working copy)
+@@ -45,7 +45,8 @@
+ TYPE_SET_OK                             = "200.2"
+ ENTERING_PORT_MODE                      = "200.3"
+ CMD_NOT_IMPLMNTD_SUPERFLUOUS            = "202"
+-SYS_STATUS_OR_HELP_REPLY                = "211"
++SYS_STATUS_OR_HELP_REPLY                = "211.1"
++FEAT_OK                                 = '211.2'
+ DIR_STATUS                              = "212"
+ FILE_STATUS                             = "213"
+ HELP_MSG                                = "214"
+@@ -80,7 +81,8 @@
+ 
+ SYNTAX_ERR                              = "500"
+ SYNTAX_ERR_IN_ARGS                      = "501"
+-CMD_NOT_IMPLMNTD                        = "502"
++CMD_NOT_IMPLMNTD                        = "502.1"
++OPTS_NOT_IMPLEMENTED                    = '502.2'
+ BAD_CMD_SEQ                             = "503"
+ CMD_NOT_IMPLMNTD_FOR_PARAM              = "504"
+ NOT_LOGGED_IN                           = "530.1"     # v1 of code 530 - please log in
+@@ -111,6 +113,7 @@
+     ENTERING_PORT_MODE:                 '200 PORT OK',
+     CMD_NOT_IMPLMNTD_SUPERFLUOUS:       '202 Command not implemented, superfluous at this site',
+     SYS_STATUS_OR_HELP_REPLY:           '211 System status reply',
++    FEAT_OK:                            ['211-Features:','211 End'],
+     DIR_STATUS:                         '212 %s',
+     FILE_STATUS:                        '213 %s',
+     HELP_MSG:                           '214 help: %s',
+@@ -151,6 +154,7 @@
+     SYNTAX_ERR:                         "500 Syntax error: %s",
+     SYNTAX_ERR_IN_ARGS:                 '501 syntax error in argument(s) %s.',
+     CMD_NOT_IMPLMNTD:                   "502 Command '%s' not implemented",
++    OPTS_NOT_IMPLEMENTED:               "502 Option '%s' not implemented.",
+     BAD_CMD_SEQ:                        '503 Incorrect sequence of commands: %s',
+     CMD_NOT_IMPLMNTD_FOR_PARAM:         "504 Not implemented for parameter '%s'.",
+     NOT_LOGGED_IN:                      '530 Please login with USER and PASS.',
+@@ -657,6 +661,8 @@
+     dtpPort = None
+     dtpInstance = None
+     binary = True
++    PUBLIC_COMMANDS = ['FEAT', 'QUIT']
++    FEATURES = ['FEAT', 'MDTM', 'PASV', 'SIZE', 'TYPE A;I']
+ 
+     passivePortRange = xrange(0, 1)
+ 
+@@ -731,9 +737,19 @@
+ 
+ 
+     def processCommand(self, cmd, *params):
++
++        def call_ftp_command(command):
++            method = getattr(self, "ftp_" + command, None)
++            if method is not None:
++                return method(*params)
++            return defer.fail(CmdNotImplementedError(command))
++
+         cmd = cmd.upper()
+ 
+-        if self.state == self.UNAUTH:
++        if cmd in self.PUBLIC_COMMANDS:
++            return call_ftp_command(cmd)
++
++        elif self.state == self.UNAUTH:
+             if cmd == 'USER':
+                 return self.ftp_USER(*params)
+             elif cmd == 'PASS':
+@@ -748,10 +764,7 @@
+                 return BAD_CMD_SEQ, "PASS required after USER"
+ 
+         elif self.state == self.AUTHED:
+-            method = getattr(self, "ftp_" + cmd, None)
+-            if method is not None:
+-                return method(*params)
+-            return defer.fail(CmdNotImplementedError(cmd))
++            return call_ftp_command(cmd)
+ 
+         elif self.state == self.RENAMING:
+             if cmd == 'RNTO':
+@@ -1164,6 +1177,30 @@
+ 
+ 
+     def ftp_SIZE(self, path):
++        '''File SIZE
++
++        The FTP command, SIZE OF FILE (SIZE), is used to obtain the transfer
++        size of a file from the server-FTP process.  This is the exact number
++        of octets (8 bit bytes) that would be transmitted over the data
++        connection should that file be transmitted.  This value will change
++        depending on the current STRUcture, MODE, and TYPE of the data
++        connection or of a data connection that would be created were one
++        created now.  Thus, the result of the SIZE command is dependent on
++        the currently established STRU, MODE, and TYPE parameters.
++
++        The SIZE command returns how many octets would be transferred if the
++        file were to be transferred using the current transfer structure,
++        mode, and type.  This command is normally used in conjunction with
++        the RESTART (REST) command when STORing a file to a remote server in
++        STREAM mode, to determine the restart point.  The server-PI might
++        need to read the partially transferred file, do any appropriate
++        conversion, and count the number of octets that would be generated
++        when sending the file in order to correctly respond to this command.
++        Estimates of the file transfer size MUST NOT be returned; only
++        precise information is acceptable.
++
++        http://tools.ietf.org/html/rfc3659
++        '''
+         try:
+             newsegs = toSegments(self.workingDirectory, path)
+         except InvalidPath:
+@@ -1176,6 +1213,17 @@
+ 
+ 
+     def ftp_MDTM(self, path):
++        '''File Modification Time (MDTM)
++
++        The FTP command, MODIFICATION TIME (MDTM), can be used to determine
++        when a file in the server NVFS was last modified.  This command has
++        existed in many FTP servers for many years, as an adjunct to the REST
++        command for STREAM mode, thus is widely available.  However, where
++        supported, the "modify" fact that can be provided in the result from
++        the new MLST command is recommended as a superior alternative.
++
++        http://tools.ietf.org/html/rfc3659
++        '''
+         try:
+             newsegs = toSegments(self.workingDirectory, path)
+         except InvalidPath:
+@@ -1188,6 +1236,17 @@
+ 
+ 
+     def ftp_TYPE(self, type):
++        '''REPRESENTATION TYPE (TYPE)
++
++        The argument specifies the representation type as described
++        in the Section on Data Representation and Storage.  Several
++        types take a second parameter.  The first parameter is
++        denoted by a single Telnet character, as is the second
++        Format parameter for ASCII and EBCDIC; the second parameter
++        for local byte is a decimal integer to indicate Bytesize.
++        The parameters are separated by a <SP> (Space, ASCII code
++        32).
++        '''
+         p = type.upper()
+         if p:
+             f = getattr(self, 'type_' + p[0], None)
+@@ -1280,12 +1339,28 @@
+         return self.shell.rename(fromsegs, tosegs).addCallback(lambda ign: (REQ_FILE_ACTN_COMPLETED_OK,))
+ 
+ 
++    def ftp_FEAT(self):
++        '''Advertise the features supported by the server.
++
++        http://tools.ietf.org/html/rfc2389
++        '''
++        self.sendLine(RESPONSE[FEAT_OK][0])
++        for feature in self.FEATURES:
++            self.sendLine(' ' + feature)
++        self.sendLine(RESPONSE[FEAT_OK][1])
++
++    def ftp_OPTS(self, option):
++        '''Handle OPTS command.
++
++        http://tools.ietf.org/html/draft-ietf-ftpext-utf-8-option-00
++        '''
++        return self.reply(OPTS_NOT_IMPLEMENTED, option)
++
+     def ftp_QUIT(self):
+         self.reply(GOODBYE_MSG)
+         self.transport.loseConnection()
+         self.disconnected = True
+ 
+-
+     def cleanupDTP(self):
+         """call when DTP connection exits
+         """
+Index: twisted/topfiles/4515.feature
+===================================================================
+--- twisted/topfiles/4515.feature	(revision 0)
++++ twisted/topfiles/4515.feature	(revision 0)
+@@ -0,0 +1 @@
++twisted.protocols.ftp.FTP now handles FEAT and OPTS commands.
+\ No newline at end of file

@@ -1,0 +1,199 @@
+Index: python/filepath.py
+===================================================================
+--- python/filepath.py	(revision 23070)
++++ python/filepath.py	(working copy)
+@@ -68,8 +68,16 @@
+ armor = getattr(base64, 'urlsafe_b64encode', _stub_armor)
+ 
+ class InsecurePath(Exception):
++    """
++    Error that is raised when the path provided to FilePath is invalid
++    """
+     pass
+ 
++class LinkError(Exception):
++    """
++    An error with symlinks - most likely that there is a cyclical symlink
++    """
++    pass
+ 
+ class UnlistableError(OSError):
+     """
+@@ -176,17 +184,24 @@
+             raise UnlistableError(ose)
+         return map(self.child, subnames)
+ 
+-    def walk(self):
++    def walk(self, descend=None):
+         """
+         Yield myself, then each of my children, and each of those children's
+-        children in turn.
++        children in turn.  The optional argument descend is a predicate that
++        takes a FilePath, and determines whether or not that FilePath is 
++        traversed/descended into.
+ 
++        @param descend: predicate that will return True for FilePaths that
++        should be traversed, False else
+         @return: a generator yielding FilePath-like objects.
+         """
+         yield self
+-        if self.isdir():
++        if self.isdir() and (descend is None or descend(self)):
+             for c in self.children():
+-                for subc in c.walk():
++                for subc in c.walk(descend):
++                    if os.path.realpath(self.path).startswith(
++                        os.path.realpath(subc.path)):
++                        raise LinkError("Cycle in file graph.")
+                     yield subc
+ 
+     def sibling(self, path):
+@@ -362,6 +377,37 @@
+     def siblingExtension(self, ext):
+         return self.clonePath(self.path+ext)
+ 
++    def followLink(self):
++        """
++        Returns the target path as a FilePath if self is a link.  If it is
++        not a link, or the filesystem does not support symlinks, raises a
++        LinkError.
++
++        @return: FilePath of the target path
++        @raises LinkError: if self is not a link, or links are not supported
++        """
++        if not hasattr(os, "readlink"):
++            raise LinkError("Links are not supported.")
++        target = os.readlink(self.path)
++        if os.path.isabs(target):
++            return self.clonePath(target)
++        return self.clonePath(os.path.join(self.parent().path, target))
++
++    def realpath(self):
++        """
++        Returns the absolute target as a FilePath if self is a link, self
++        otherwise.  The absolute link is the ultimate file or directory the 
++        link refers to (for instance, if the link refers to another link, and 
++        another...).
++
++        Since it depends upon os.realpath it does not resolve link names in
++        the middle (ex. /x/y/z, y is a link to w - realpath on z will return
++        /x/y/z, not /x/w/z).
++
++        @return: FilePath of the target path
++        """
++        return self.clonePath(os.path.realpath(self.path))
++
+     def open(self, mode='r'):
+         if self.alwaysCreate:
+             assert 'a' not in mode, "Appending not supported when alwaysCreate == True"
+Index: test/test_paths.py
+===================================================================
+--- test/test_paths.py	(revision 23070)
++++ test/test_paths.py	(working copy)
+@@ -49,6 +49,14 @@
+ 
+         self.path = filepath.FilePath(cmn)
+ 
++    def setUpLinks(self):
++        subdir = self.path.child("sub1")
++        os.symlink(subdir.path, self._mkpath("sub1.link"))
++        os.symlink(subdir.child("file2").path, self._mkpath("file2.link"))
++        os.symlink(subdir.child("file2").path, 
++                   self._mkpath("sub1", "sub1.file2.link"))
++        self.all.sort()
++
+     def test_segmentsFromPositive(self):
+         """
+         Verify that the segments between two paths are correctly identified.
+@@ -276,8 +284,90 @@
+         self.failUnless(s4.isdir())
+         self.failUnless(s3.isdir())
+ 
++    def test_followLink_hasSymlinks(self):
++        """
++        Verify that, on platforms with symlinks, it returns the target of 
++        a symlink correctly
++        """
++        self.setUpLinks()
++        self.assertEquals(self.path.child("sub1.link").followLink(),
++                          self.path.child("sub1"))
++        # test relative path
++        rellink = self.path.child("sub1").child("relative.link")
++        os.symlink("file2", rellink.path)
++        self.assertEquals(rellink.followLink(), rellink.parent().child("file2"))
++
++    def test_followLink_noSymlinks(self):
++        """
++        Verify that on platforms without symlinks, raises an error
++        """
++        self.assertRaises(filepath.LinkError, 
++                          self.path.child("sub1").followLink)
++
++    if hasattr(os, "symlink"):
++        test_followLink_noSymlinks.skip = "Platform supports symlinks"
++    else:
++        test_followLink_hasSymlinks.skip = "Platform does not support symlinks"
++
++    def test_realpathSymlink(self):
++        """
++        Verify that it returns the ultimate target of a symlink correctly.
++        """
++        self.setUpLinks()
++        os.symlink(self.path.child("file2.link").path, 
++                   self.path.child("link.link").path)
++        self.assertEquals(self.path.child("link.link").realpath(),
++                          self.path.child("sub1").child("file2"))
++
++    def test_realpathNoSymlink(self):
++        """
++        Verify that realpath returns the path if it's called on a FilePath 
++        that is not a link
++        """
++        self.assertEquals(self.path.child("sub1").realpath(),
++                          self.path.child("sub1"))
++
++    def test_walkCyclicalSymlink(self):
++        """
++        Verify that walking a path with a cyclical symlink raises an error
++        """
++        self.setUpLinks()
++        os.symlink(self.path.child("sub1").path, 
++                   self.path.child("sub1").child("sub1.loopylink").path)
++        def iterateOverPath():
++            return [foo.path for foo in self.path.walk()]
++        self.assertRaises(filepath.LinkError, iterateOverPath)
++
++    def test_walkCyclicalSymlinkTwo(self):
++        """
++        Second cyclical test
++        """
++        self.subdir("foo")
++        self.subdir("bar")
++        self.subdir("bar", "baz")
++        os.symlink(self.path.child("bar").child("baz").path,
++                   self.path.child("foo").child("bar").path)
++        os.symlink(self.path.child("foo").path,
++                   self.path.child("bar").child("baz").child("quux").path)
++        def iterateOverPath():
++            return [foo.path for foo in self.path.walk()]
++        self.assertRaises(filepath.LinkError, iterateOverPath)
++
++    def test_walkNotFollowSymlinks(self):
++        """
++        Verify that, when called with the followLinks=False, does not return
++        the children of the target of the symlink.
++        """
++        self.setUpLinks()
++        x = [foo.path for foo in self.path.walk(lambda x: not x.islink())]
++        x.sort()
++        self.assertEquals(x, self.all)
++
+     if not hasattr(os, "symlink"):
+-        testSymbolicLink.skip = "Your platform does not support symbolic links."
++        text = "Your platform does not support symbolic links."
++        test_realpathSymlink.skip = testSymbolicLink.skip = text
++        test_walkCyclicalSymlink.skip = test_walkNotFollowSymlinks.skip = text
++        test_walkCyclicalSymlinkTwo.skip = text
+ 
+     def testMultiExt(self):
+         f3 = self.path.child('sub3').child('file3')

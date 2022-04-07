@@ -1,0 +1,210 @@
+Index: twisted/internet/error.py
+===================================================================
+--- twisted/internet/error.py	(revision 38822)
++++ twisted/internet/error.py	(working copy)
+@@ -68,6 +68,14 @@
+ 
+ 
+ 
++class InvalidBroadcastAddress(StandardError):
++    """For UDP sockets: An attempt was made to send data a network/broadcast address
++        as though it was a unicast address. """
++
++    pass
++
++
++
+ class DNSLookupError(IOError):
+     """DNS lookup failed"""
+ 
+Index: twisted/internet/interfaces.py
+===================================================================
+--- twisted/internet/interfaces.py	(revision 38822)
++++ twisted/internet/interfaces.py	(working copy)
+@@ -2208,6 +2208,7 @@
+ 
+         @raise twisted.internet.error.MessageLengthError: C{packet} was too
+         long.
++        @raise twisted.internet.error.InvalidBroadcastAddress: socket C{address} was invalid.
+         """
+ 
+     def connect(host, port):
+Index: twisted/internet/udp.py
+===================================================================
+--- twisted/internet/udp.py	(revision 38822)
++++ twisted/internet/udp.py	(working copy)
+@@ -27,26 +27,34 @@
+ 
+ from twisted.python.runtime import platformType
+ if platformType == 'win32':
+-    from errno import WSAEWOULDBLOCK
+-    from errno import WSAEINTR, WSAEMSGSIZE, WSAETIMEDOUT
+-    from errno import WSAECONNREFUSED, WSAECONNRESET, WSAENETRESET
+-    from errno import WSAEINPROGRESS
++    from errno import WSAEWOULDBLOCK, WSAEINTR, WSAEMSGSIZE, WSAETIMEDOUT, WSAECONNREFUSED, WSAECONNRESET, \
++        WSAENETRESET, WSAEINPROGRESS, WSAEACCES, WSAENOBUFS, WSAEHOSTUNREACH, WSAENETUNREACH, WSAESHUTDOWN, WSAECONNABORTED
+ 
+     # Classify read and write errors
+     _sockErrReadIgnore = [WSAEINTR, WSAEWOULDBLOCK, WSAEMSGSIZE, WSAEINPROGRESS]
+     _sockErrReadRefuse = [WSAECONNREFUSED, WSAECONNRESET, WSAENETRESET,
+                           WSAETIMEDOUT]
++    _sockErrWriteIgnore = [WSAENOBUFS]
++    _sockErrWriteRefuse = [WSAECONNREFUSED, WSAENETUNREACH, WSAESHUTDOWN, WSAECONNABORTED, WSAETIMEDOUT,
++                           WSAEHOSTUNREACH, WSAEWOULDBLOCK, WSAECONNRESET]
++    _sockErrWriteReattempt = [WSAEINTR]
+ 
+     # POSIX-compatible write errors
+     EMSGSIZE = WSAEMSGSIZE
++    EACCES = WSAEACCES
+     ECONNREFUSED = WSAECONNREFUSED
+     EAGAIN = WSAEWOULDBLOCK
+-    EINTR = WSAEINTR
+ else:
+-    from errno import EWOULDBLOCK, EINTR, EMSGSIZE, ECONNREFUSED, EAGAIN
++    from errno import EWOULDBLOCK, EINTR, EMSGSIZE, ECONNREFUSED, EAGAIN, ENETUNREACH, ESHUTDOWN, ECONNABORTED, \
++        ETIMEDOUT, EHOSTUNREACH, ENOBUFS, ECONNRESET, EACCES
+     _sockErrReadIgnore = [EAGAIN, EINTR, EWOULDBLOCK]
+     _sockErrReadRefuse = [ECONNREFUSED]
+ 
++    _sockErrWriteIgnore = [ENOBUFS]
++    _sockErrWriteRefuse = [ECONNREFUSED, ENETUNREACH, ESHUTDOWN, ECONNABORTED, ETIMEDOUT, EHOSTUNREACH, EWOULDBLOCK,
++                           EAGAIN, ECONNRESET]
++    _sockErrWriteReattempt = [EINTR]
++
+ # Twisted Imports
+ from twisted.internet import base, defer, address
+ from twisted.python import log, failure
+@@ -150,11 +158,17 @@
+                 except:
+                     log.err()
+ 
++    def _writeConnected(self, datagram, addr):
++        assert addr in (None, self._connectedAddr)
++        return self.socket.send(datagram)
+ 
++    def _writeConnectionLess(self, datagram, addr):
++        assert addr is not None
++        return self.socket.sendto(datagram, addr)
++
+     def write(self, datagram, addr=None):
+         """
+         Write a datagram.
+-
+         @type datagram: C{str}
+         @param datagram: The datagram to be sent.
+ 
+@@ -163,40 +177,25 @@
+         @param addr: A tuple of (I{stringified dotted-quad IP address},
+             I{integer port number}); can be C{None} in connected mode.
+         """
+-        if self._connectedAddr:
+-            assert addr in (None, self._connectedAddr)
+-            try:
+-                return self.socket.send(datagram)
+-            except socket.error as se:
+-                no = se.args[0]
+-                if no == EINTR:
+-                    return self.write(datagram)
+-                elif no == EMSGSIZE:
+-                    raise error.MessageLengthError("message too long")
+-                elif no == ECONNREFUSED:
+-                    self.protocol.connectionRefused()
+-                else:
+-                    raise
+-        else:
+-            assert addr != None
+-            if not addr[0].replace(".", "").isdigit() and addr[0] != "<broadcast>":
+-                warnings.warn("Please only pass IPs to write(), not hostnames",
+-                              DeprecationWarning, stacklevel=2)
+-            try:
+-                return self.socket.sendto(datagram, addr)
+-            except socket.error as se:
+-                no = se.args[0]
+-                if no == EINTR:
+-                    return self.write(datagram, addr)
+-                elif no == EMSGSIZE:
+-                    raise error.MessageLengthError("message too long")
+-                elif no == ECONNREFUSED:
+-                    # in non-connected UDP ECONNREFUSED is platform dependent, I
+-                    # think and the info is not necessarily useful. Nevertheless
+-                    # maybe we should call connectionRefused? XXX
+-                    return
+-                else:
+-                    raise
++        try:
++            if self._connectedAddr:
++                return self._writeConnected(datagram, addr)
++            else:
++                return self._writeConnectionLess(datagram, addr)
++        except socket.error as se:
++            no = se.args[0]
++            if no in _sockErrWriteRefuse:
++                self.protocol.connectionRefused()
++            elif no in _sockErrWriteIgnore:
++                return
++            elif no in _sockErrWriteReattempt:
++                self.write(datagram, addr)
++            elif no == EMSGSIZE:
++                raise error.MessageLengthError("message too long")
++            elif no == EACCES:
++                raise error.InvalidBroadcastAddress
++            else:
++                raise
+ 
+     def writeSequence(self, seq, addr):
+         self.write("".join(seq), addr)
+Index: twisted/test/test_udp.py
+===================================================================
+--- twisted/test/test_udp.py	(revision 38822)
++++ twisted/test/test_udp.py	(working copy)
+@@ -5,9 +5,11 @@
+ """
+ Tests for implementations of L{IReactorUDP} and L{IReactorMulticast}.
+ """
+-
+ from __future__ import division, absolute_import
+ 
++import errno
++from socket import error as se
++
+ from twisted.trial import unittest
+ 
+ from twisted.python.compat import intToBytes
+@@ -448,7 +450,37 @@
+         self.assertEqual(len(warnings), 0)
+ 
+ 
++class UDPOnWriteSocketErrorsTestCase(unittest.TestCase):
+ 
++    def _bad_sockets_factory(self, socket_error_num):
++
++        class SOCKET_ERROR(se):
++            args = (socket_error_num, )
++
++        class fakeSocket(object):
++            def send(self, *args, **kwargs):
++                raise SOCKET_ERROR
++
++            def connect(self, *args, **kwargs):
++                pass
++
++        return fakeSocket()
++
++    def test_messageToLongError(self):
++        p = udp.Port(0, Server())
++        p.socket = self._bad_sockets_factory(errno.EMSGSIZE)
++        p.connect("127.0.0.1", 0)
++        func = lambda: p.write("hello world!")
++        self.assertRaises(error.MessageLengthError, func)
++
++    def test_invalidBroadCaseError(self):
++        p = udp.Port(0, Server())
++        p.socket = self._bad_sockets_factory(errno.EACCES)
++        p.connect("127.0.0.1", 0)
++        func = lambda: p.write("hello world!")
++        self.assertRaises(error.InvalidBroadcastAddress, func)
++
++
+ class ReactorShutdownInteraction(unittest.TestCase):
+     """Test reactor shutdown interaction"""
+ 

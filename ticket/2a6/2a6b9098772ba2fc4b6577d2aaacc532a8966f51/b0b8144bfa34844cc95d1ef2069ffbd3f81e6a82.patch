@@ -1,0 +1,523 @@
+diff -r 0ec4afc24de5 twisted/python/_libevent.c
+--- a/twisted/python/_libevent.c	Fri Jan 04 23:00:19 2008 +0100
++++ b/twisted/python/_libevent.c	Sat Jan 05 02:44:14 2008 +0100
+@@ -54,6 +54,11 @@ typedef struct EventBaseObject {
+ typedef struct EventBaseObject {
+     PyObject_HEAD
+     struct event_base *ev_base;
++    /* A list of objects to be expired. We keep them here until the loop
++       returns, otherwise it may crash libevent (who knows). */
++    PyObject *expiredEvents;
++    /* A dict of EventObject => None */
++    PyObject *registeredEvents;
+ } EventBaseObject;
+ 
+ /* Forward declaration of CPython type object */
+@@ -67,6 +72,9 @@ typedef struct EventObject {
+     struct event ev;
+     EventBaseObject *eventBase;
+     PyObject *callback;
++    /* Duplicate original event flags since they seem to be modified when we
++       arrive in the callback thunk */
++    short flags;
+ } EventObject;
+ 
+ /* Forward declaration of CPython type object */
+@@ -99,6 +107,8 @@ static PyObject *EventBase_New(PyTypeObj
+             return NULL;
+         }
+     }
++    self->expiredEvents = PyList_New(0);
++    self->registeredEvents = PyDict_New();
+     return (PyObject *)self;
+ }
+ 
+@@ -127,10 +137,63 @@ static int EventBase_Init(EventBaseObjec
+     return 0;
+ }
+ 
++/* Internal helper, destroy expired events */
++static void EventBase_ExpireEvents(EventBaseObject *self) {
++    /* Destroy and recreate an empty list, so as to to decref all events
++       as well as their contents */
++    Py_CLEAR(self->expiredEvents);
++    self->expiredEvents = PyList_New(0);
++}
++
++/* Internal helper, register an event */
++static void EventBase_RegisterEvent(EventBaseObject *self, PyObject *obj) {
++    PyDict_SetItem(self->registeredEvents, obj, Py_None);
++}
++
++/* Internal helper, unregister an event */
++static void EventBase_UnregisterEvent(EventBaseObject *self, PyObject *obj) {
++    PyDict_DelItem(self->registeredEvents, obj);
++}
++
++
++
++static int
++EventBase_Traverse(EventBaseObject *self, visitproc visit, void *arg)
++{
++    int vret;
++
++    if (self->registeredEvents) {
++        vret = visit(self->registeredEvents, arg);
++        if (vret != 0)
++            return vret;
++    }
++    if (self->expiredEvents) {
++        vret = visit(self->expiredEvents, arg);
++        if (vret != 0)
++            return vret;
++    }
++
++    return 0;
++}
++
++static int
++EventBase_Clear(EventBaseObject *self)
++{
++    Py_CLEAR(self->registeredEvents);
++    Py_CLEAR(self->expiredEvents);
++    return 0;
++}
++
+ /* EventBaseObject destructor */
+ static void EventBase_Dealloc(EventBaseObject *obj) {
++    EventBase_Clear(obj);
++    /* Unfortunately the following line can make libevent crash (w/ 1.4.1-beta)
++       ("event.c:241: event_base_free: Assertion `min_heap_empty(&base->timeheap)' failed.")
++    */
++//     event_base_free(obj->ev_base);
+     obj->ob_type->tp_free((PyObject *)obj);
+ }
++
+ 
+ /* EventBaseObject methods */
+ PyDoc_STRVAR(EventBase_LoopDoc,
+@@ -152,6 +215,7 @@ static PyObject *EventBase_Loop(EventBas
+     rv = event_base_loop(self->ev_base, flags);
+     Py_END_ALLOW_THREADS
+ 
++    EventBase_ExpireEvents(self);
+     if (PyErr_Occurred()) {
+         return NULL;
+     }
+@@ -177,7 +241,15 @@ static PyObject *EventBase_LoopExit(Even
+ 
+     tv.tv_sec = (long) exitAfterSecs;
+     tv.tv_usec = (exitAfterSecs - (long) exitAfterSecs) * 1000000;
++    Py_BEGIN_ALLOW_THREADS
+     rv = event_base_loopexit(self->ev_base, &tv);
++    Py_END_ALLOW_THREADS
++
++    EventBase_ExpireEvents(self);
++    if (PyErr_Occurred()) {
++        return NULL;
++    }
++
+     return PyInt_FromLong(rv);
+ }
+ 
+@@ -189,8 +261,11 @@ explicit call to EventBase.loopExit() or
+ explicit call to EventBase.loopExit() or via a signal, or if a callback \n\
+ raises an exception.");
+ static PyObject *EventBase_Dispatch(EventBaseObject *self) {
+-
+-    int rv = event_base_dispatch(self->ev_base);
++    int rv = 0;
++    Py_BEGIN_ALLOW_THREADS
++    rv = event_base_dispatch(self->ev_base);
++    Py_END_ALLOW_THREADS
++    EventBase_ExpireEvents(self);
+     if (PyErr_Occurred()) {
+         return NULL;
+     }
+@@ -335,10 +410,10 @@ static PyTypeObject EventBase_Type = {
+     PyObject_GenericGetAttr,                   /*tp_getattro*/
+     PyObject_GenericSetAttr,                   /*tp_setattro*/
+     0,                                         /*tp_as_buffer*/
+-    Py_TPFLAGS_DEFAULT | Py_TPFLAGS_BASETYPE,  /*tp_flags*/
++    Py_TPFLAGS_DEFAULT | Py_TPFLAGS_BASETYPE | Py_TPFLAGS_HAVE_GC, /*tp_flags*/
+     0,                                         /*tp_doc*/
+-    0,                                         /*tp_traverse*/
+-    0,                                         /*tp_clear*/
++    (traverseproc)EventBase_Traverse,          /*tp_traverse*/
++    (inquiry)EventBase_Clear,                  /*tp_clear*/
+     0,                                         /*tp_richcompare*/
+     0,                                         /*tp_weaklistoffset*/
+     0,                                         /*tp_iter*/
+@@ -353,9 +428,7 @@ static PyTypeObject EventBase_Type = {
+     0,                                         /*tp_dictoffset*/
+     (initproc)EventBase_Init,                  /*tp_init*/
+     PyType_GenericAlloc,                       /*tp_alloc*/
+-    EventBase_New,                             /*tp_new*/
+-    PyObject_Del,                              /*tp_free*/
+-    0                                          /*tp_is_gc*/
++    EventBase_New                              /*tp_new*/
+ };
+ 
+ /* Typechecker */
+@@ -376,17 +449,20 @@ static void __libevent_ev_callback(int f
+ static void __libevent_ev_callback(int fd, short events, void *arg) {
+     EventObject *ev = arg;
+     PyObject *result = 0;
+-    PyObject *tupleArgs = PyTuple_New(3);
+-    Py_INCREF((PyObject *) ev);
+-    Py_INCREF((PyObject *) ev);
+-    PyTuple_SET_ITEM(tupleArgs, 0, PyInt_FromLong(fd));
+-    PyTuple_SET_ITEM(tupleArgs, 1, PyInt_FromLong(events));
+-    PyTuple_SET_ITEM(tupleArgs, 2, (PyObject *) ev);
++    PyObject *tupleArgs;
+     PyGILState_STATE gstate;
+     gstate = PyGILState_Ensure();
++    tupleArgs = Py_BuildValue("(iiO)", fd, events, ev);
++    Py_INCREF((PyObject *) ev);
+     result = PyObject_CallObject(ev->callback, tupleArgs);
+-    Py_DECREF((PyObject *) ev);
+     Py_CLEAR(tupleArgs);
++    if (!(ev->flags & EV_PERSIST)) {
++        /* Register the event for deletion but do not delete it right now.
++           The list will be destroyed and its contents deallocated when the
++           event loop returns. */
++        PyList_Append(ev->eventBase->expiredEvents, (PyObject *) ev);
++        EventBase_UnregisterEvent(ev->eventBase, (PyObject *) ev);
++    }
+     if (result) {
+         Py_CLEAR(result);
+     }
+@@ -397,6 +473,7 @@ static void __libevent_ev_callback(int f
+         /* Exit the loop, so that the error pops out to dispatch/loop. */
+         event_base_loopexit(ev->ev.ev_base, &tv);
+     }
++    Py_DECREF((PyObject *) ev);
+     Safe_PyGILState_Release(gstate);
+ }
+ 
+@@ -430,8 +507,37 @@ static int Event_Init(EventObject *self,
+ 
+     Py_INCREF(callback);
+     self->callback = callback;
++    self->flags = events;
+     return 0;
+ }
++
++static int
++Event_Traverse(EventObject *self, visitproc visit, void *arg)
++{
++    int vret;
++
++    if (self->eventBase) {
++        vret = visit((PyObject *) self->eventBase, arg);
++        if (vret != 0)
++            return vret;
++    }
++    if (self->callback) {
++        vret = visit(self->callback, arg);
++        if (vret != 0)
++            return vret;
++    }
++
++    return 0;
++}
++
++static int
++Event_Clear(EventObject *self)
++{
++    Py_CLEAR(self->callback);
++    Py_CLEAR(self->eventBase);
++    return 0;
++}
++
+ 
+ PyDoc_STRVAR(Event_SetPriorityDoc,
+ "setPriority(self, priority)\n\
+@@ -451,8 +557,7 @@ static PyObject *Event_SetPriority(Event
+                 "error setting event priority - event is either already active or priorities are not enabled");
+         return NULL;
+     }
+-    Py_INCREF(Py_None);
+-    return Py_None;
++    Py_RETURN_NONE;
+ }
+ 
+ PyDoc_STRVAR(Event_AddToLoopDoc,
+@@ -476,17 +581,16 @@ static PyObject *Event_AddToLoop(EventOb
+     if (timeout >= 0.0) {
+         tv.tv_sec = (long) timeout;
+         tv.tv_usec = (timeout - (long) timeout) * 1000000;
+-        rv = event_add(&((EventObject *) self)->ev, &tv);
++        rv = event_add(&self->ev, &tv);
+     }
+     else {
+-        rv = event_add(&((EventObject *) self)->ev, NULL);
++        rv = event_add(&self->ev, NULL);
+     }
+     if (rv != 0) {
+         return PyErr_SetFromErrno(EventErrorObject);
+     }
+-    Py_INCREF(self);
+-    Py_INCREF(Py_None);
+-    return Py_None;
++    EventBase_RegisterEvent(self->eventBase, (PyObject *) self);
++    Py_RETURN_NONE;
+ }
+ 
+ PyDoc_STRVAR(Event_RemoveFromLoopDoc,
+@@ -498,9 +602,8 @@ static PyObject *Event_RemoveFromLoop(Ev
+     if (event_del(&self->ev) < 0) {
+         return PyErr_SetFromErrno(EventErrorObject);
+     }
+-    Py_DECREF(self);
+-    Py_INCREF(Py_None);
+-    return Py_None;
++    EventBase_UnregisterEvent(self->eventBase, (PyObject *) self);
++    Py_RETURN_NONE;
+ }
+ 
+ PyDoc_STRVAR(Event_SetEventBaseDoc,
+@@ -510,7 +613,7 @@ static PyObject *Event_SetEventBase(Even
+ static PyObject *Event_SetEventBase(EventObject *self, PyObject *args,
+                     PyObject *kwargs) {
+     static char *kwlist[] = {"eventBase", NULL};
+-    PyObject *eventBase;
++    PyObject *eventBase, *old_eventBase;
+     int rv = 0;
+ 
+     if (!PyArg_ParseTupleAndKeywords(args, kwargs, "O", kwlist, &eventBase)) {
+@@ -527,10 +630,11 @@ static PyObject *Event_SetEventBase(Even
+         return NULL;
+     }
+     Py_INCREF(eventBase);
+-    Py_XDECREF(self->eventBase);
++    /* Thread-safe way of removing an attr value */
++    old_eventBase = (PyObject *) self->eventBase;
+     self->eventBase = (EventBaseObject *)eventBase;
+-    Py_INCREF(Py_None);
+-    return Py_None;
++    Py_XDECREF(old_eventBase);
++    Py_RETURN_NONE;
+ }
+ 
+ PyDoc_STRVAR(Event_PendingDoc,
+@@ -559,8 +663,7 @@ static PyObject *Event_GetTimeout(EventO
+         d = tv.tv_sec + (tv.tv_usec / 1000000.0);
+         return PyFloat_FromDouble(d);
+     }
+-    Py_INCREF(Py_None);
+-    return Py_None;
++    Py_RETURN_NONE;
+ }
+ 
+ PyDoc_STRVAR(Event_FilenoDoc,
+@@ -574,8 +677,7 @@ static PyObject *Event_Fileno(EventObjec
+ 
+ /* EventObject destructor */
+ static void Event_Dealloc(EventObject *obj) {
+-    Py_XDECREF(obj->eventBase);
+-    Py_XDECREF(obj->callback);
++    Event_Clear(obj);
+     obj->ob_type->tp_free((PyObject *)obj);
+ }
+ 
+@@ -650,10 +752,10 @@ static PyTypeObject Event_Type = {
+     PyObject_GenericGetAttr,                   /*tp_getattro*/
+     PyObject_GenericSetAttr,                   /*tp_setattro*/
+     0,                                         /*tp_as_buffer*/
+-    Py_TPFLAGS_DEFAULT | Py_TPFLAGS_BASETYPE,  /*tp_flags*/
++    Py_TPFLAGS_DEFAULT | Py_TPFLAGS_BASETYPE | Py_TPFLAGS_HAVE_GC,  /*tp_flags*/
+     0,                                         /*tp_doc*/
+-    0,                                         /*tp_traverse*/
+-    0,                                         /*tp_clear*/
++    (traverseproc)Event_Traverse,              /*tp_traverse*/
++    (inquiry)Event_Clear,                      /*tp_clear*/
+     0,                                         /*tp_richcompare*/
+     0,                                         /*tp_weaklistoffset*/
+     0,                                         /*tp_iter*/
+@@ -668,9 +770,7 @@ static PyTypeObject Event_Type = {
+     0,                                         /*tp_dictoffset*/
+     (initproc)Event_Init,                      /*tp_init*/
+     PyType_GenericAlloc,                       /*tp_alloc*/
+-    Event_New,                                 /*tp_new*/
+-    PyObject_Del,                              /*tp_free*/
+-    0,                                         /*tp_is_gc*/
++    Event_New                                  /*tp_new*/
+ };
+ 
+ static PyMethodDef EventModule_Functions[] = {
+diff -r 0ec4afc24de5 twisted/test/test_libevent.py
+--- a/twisted/test/test_libevent.py	Fri Jan 04 23:00:19 2008 +0100
++++ b/twisted/test/test_libevent.py	Sat Jan 05 02:44:14 2008 +0100
+@@ -1,11 +1,11 @@
+-# Copyright (c) 2007-2008 Twisted Matrix Laboratories.
++# Copyright (c) 2007 Twisted Matrix Laboratories.
+ # See LICENSE for details.
+ 
+ """
+-Tests for L{libevent} wrapper.
++Tests for libevent wrapper.
+ """
+ 
+-import socket, errno, sys, weakref, gc
++import socket, errno, sys, os, weakref, gc
+ 
+ from twisted.trial import unittest
+ 
+@@ -148,6 +148,8 @@ class ConnectedEventTestCase(unittest.Te
+             client.connect(('127.0.0.1', self.serverSocket.getsockname()[1]))
+         except socket.error, e:
+             self.assertEquals(e.args[0], errno.EINPROGRESS)
++        else:
++            raise unittest.FailTest("Connect should have raised EINPROGRESS")
+         server, addr = self.serverSocket.accept()
+ 
+         self.connections.extend((client, server))
+@@ -342,7 +344,6 @@ class EventBaseTestCase(unittest.TestCas
+         timer.addToLoop(0.01)
+         self.assertRaises(RuntimeError, newEventBase.loop, libevent.EVLOOP_ONCE)
+ 
+-
+     def test_dispatchError(self):
+         """
+         Check that dispatch forwards exception raised in callback.
+@@ -367,7 +368,6 @@ class EventBaseTestCase(unittest.TestCas
+         newEventBase.dispatch()
+         self.assertEquals(len(fireEvents), 1)
+ 
+-
+     def test_successfulCallbackReference(self):
+         """
+         Check that successful callbacks aren't leaked.
+@@ -375,7 +375,6 @@ class EventBaseTestCase(unittest.TestCas
+         newEventBase = libevent.EventBase()
+         def cb(fd, events, obj):
+             pass
+-        import sys
+         self._watchForLeaks(cb)
+         timer = newEventBase.createTimer(cb)
+         timer.addToLoop(0.002)
+@@ -383,7 +382,6 @@ class EventBaseTestCase(unittest.TestCas
+ 
+         del cb, timer
+         self._assertLeaks()
+-
+ 
+     def test_failedCallbackReference(self):
+         """
+@@ -400,7 +398,6 @@ class EventBaseTestCase(unittest.TestCas
+         del eb, timer
+         self._assertLeaks()
+ 
+-
+     def test_unfiredCallbackReference(self):
+         """
+         Check that unfired callbacks aren't leaked when the eventBase is
+@@ -410,12 +407,14 @@ class EventBaseTestCase(unittest.TestCas
+         def cb(fd, events, obj):
+             pass
+         self._watchForLeaks(cb)
++        #print map(sys.getrefcount, [newEventBase, cb])
+         timer = newEventBase.createTimer(cb)
++        #print map(sys.getrefcount, [newEventBase, timer, cb])
+         timer.addToLoop(1)
++        #print map(sys.getrefcount, [newEventBase, timer, cb])
+ 
+         del cb, timer, newEventBase
+         self._assertLeaks()
+-
+ 
+     def test_callbackReference(self):
+         """
+@@ -429,7 +428,6 @@ class EventBaseTestCase(unittest.TestCas
+ 
+         del cb, timer
+         self._assertLeaks()
+-
+ 
+     def test_callbackExceptionReference(self):
+         """
+@@ -449,9 +447,7 @@ class EventBaseTestCase(unittest.TestCas
+         self._watchForLeaks(exc[0])
+ 
+         del exc[0]
+-
+         self._assertLeaks()
+-
+ 
+     def test_callbackSurvival(self):
+         """
+@@ -459,9 +455,8 @@ class EventBaseTestCase(unittest.TestCas
+         dies.
+         """
+         newEventBase = libevent.EventBase()
+-        fireEvents = []
+         def cb(fd, events, obj):
+-            fireEvents.append((fd, events, obj))
++            pass
+         timer = newEventBase.createTimer(cb)
+         timer.addToLoop(1)
+         self._watchForSurvival(cb)
+@@ -469,6 +464,62 @@ class EventBaseTestCase(unittest.TestCas
+         del cb, timer
+         self._assertSurvival()
+ 
++    def test_persistentCallbackSurvival(self):
++        """
++        Check that a persistent callback survives after been fired.
++        """
++        rfd, wfd = os.pipe()
++        newEventBase = libevent.EventBase()
++        def cb(fd, events, obj):
++            newEventBase.loopExit(0)
++        timer = newEventBase.createEvent(rfd,
++            libevent.EV_READ | libevent.EV_PERSIST, cb)
++        timer.addToLoop()
++        os.write(wfd, " ")
++        newEventBase.dispatch()
++        self._watchForSurvival(cb)
++
++        del cb, timer
++        self._assertSurvival()
++
++    def test_persistentFailedCallbackSurvival(self):
++        """
++        Check that a persistent callback survives after raising an exception.
++        """
++        rfd, wfd = os.pipe()
++        newEventBase = libevent.EventBase()
++        def cb(fd, events, obj):
++            newEventBase.loopExit(0)
++            raise RuntimeError("foo")
++        timer = newEventBase.createEvent(rfd,
++            libevent.EV_READ | libevent.EV_PERSIST, cb)
++        timer.addToLoop()
++        os.write(wfd, " ")
++        self.assertRaises(RuntimeError, newEventBase.dispatch)
++        self._watchForSurvival(cb)
++
++        del cb, timer
++        self._assertSurvival()
++
++    def test_persistentCallbackReference(self):
++        """
++        Check that a persistent callback doesn't leak when the eventBase
++        is destroyed.
++        """
++        rfd, wfd = os.pipe()
++        newEventBase = libevent.EventBase()
++        def cb(fd, events, obj):
++            newEventBase.loopExit(0)
++        timer = newEventBase.createEvent(rfd,
++            libevent.EV_READ | libevent.EV_PERSIST, cb)
++        timer.addToLoop()
++        os.write(wfd, " ")
++        newEventBase.dispatch()
++        self._watchForLeaks(cb)
++
++        newEventBase = None
++        del cb, timer
++        self._assertLeaks()
+ 
+     def test_dispatchedEventRefCount(self):
+         """

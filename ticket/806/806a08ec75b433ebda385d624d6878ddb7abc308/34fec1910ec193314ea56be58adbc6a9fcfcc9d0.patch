@@ -1,0 +1,150 @@
+diff --git a/twisted/conch/test/test_ssh.py b/twisted/conch/test/test_ssh.py
+index 9ebae55..b1a2fc8 100644
+--- a/twisted/conch/test/test_ssh.py
++++ b/twisted/conch/test/test_ssh.py
+@@ -1,4 +1,4 @@
+-# -*- test-case-name: twisted.conch.test.test_ssh -*-
++#-*- test-case-name: twisted.conch.test.test_ssh -*-
+ # Copyright (c) 2001-2010 Twisted Matrix Laboratories.
+ # See LICENSE for details.
+ 
+@@ -115,7 +115,8 @@ class ConchSessionForTestAvatar:
+         self.proto = proto
+         f = cmd.split()[0]
+         if f == 'false':
+-            FalseTransport(proto)
++            t = FalseTransport(proto)
++            reactor.callLater(0, t.loseConnection)
+         elif f == 'echo':
+             t = EchoTransport(proto)
+             t.write(cmd[5:])
+@@ -163,13 +164,28 @@ class CrazySubsystem(protocol.Protocol):
+         """
+ 
+ class FalseTransport:
++    """
++    False transport should act like a /bin/false execution, i.e. just exit with
++    nonzero status, writing nothing to the terminal.
++    """
+ 
+     def __init__(self, p):
++        """
++        @type p L{twisted.conch.ssh.session.SSHSessionProcessProtocol} instance
++        """
++
++        self.proto = p
+         p.makeConnection(self)
+-        p.processEnded(failure.Failure(ProcessTerminated(255, None, None)))
++        self.closed = 0
++
+ 
+     def loseConnection(self):
+-        pass
++        if self.closed: return
++        self.closed = 1
++        self.proto.inConnectionLost()
++        self.proto.outConnectionLost()
++        self.proto.errConnectionLost()
++        self.proto.processEnded(failure.Failure(ProcessTerminated(255, None, None)))
+ 
+ class EchoTransport:
+ 
+@@ -348,6 +364,9 @@ if Crypto is not None and pyasn1 is not None:
+ 
+     class ConchTestClient(ConchTestBase, transport.SSHClientTransport):
+ 
++        def __init__(self):
++            self.completed = defer.Deferred()
++
+         def connectionLost(self, reason):
+             ConchTestBase.connectionLost(self, reason)
+             transport.SSHClientTransport.connectionLost(self, reason)
+@@ -359,7 +378,7 @@ if Crypto is not None and pyasn1 is not None:
+ 
+         def connectionSecure(self):
+             self.requestService(ConchTestClientAuth('testuser',
+-                ConchTestClientConnection()))
++                ConchTestClientConnection(self.completed)))
+ 
+     class ConchTestClientAuth(userauth.SSHUserAuthClient):
+ 
+@@ -389,6 +408,11 @@ if Crypto is not None and pyasn1 is not None:
+         results = 0
+         totalResults = 8
+ 
++        def __init__(self, completed):
++            connection.SSHConnection.__init__(self)
++            self._completed = completed
++
++
+         def serviceStarted(self):
+             self.openChannel(SSHTestFailExecChannel(conn = self))
+             self.openChannel(SSHTestFalseChannel(conn = self))
+@@ -405,6 +429,7 @@ if Crypto is not None and pyasn1 is not None:
+             if self.results == self.totalResults:
+                 self.transport.expectedLoseConnection = 1
+                 self.serviceStopped()
++                self._completed.callback(None)
+ 
+     class SSHUnknownChannel(channel.SSHChannel):
+ 
+@@ -457,17 +482,17 @@ if Crypto is not None and pyasn1 is not None:
+ 
+         def _cbRequestWorked(self, ignored):
+             """
+-            The false channel is never expected to complete successfully.  Log
+-            an error so that the running test fails.
++            The false channel request is expected to succeed. No need to check
++            for this to be actually called, since it will automatically be
++            errbacked if this channel is closed with the deferred left pending.
+             """
+-            log.err(Exception('False channel should never callback.'))
+ 
+ 
+         def _ebRequestFailed(self, reason):
+             """
+-            The false channel is always expected to fail when the connection is
+-            closed.  Do nothing here.
++            The request deferred should never errback.
+             """
++            log.err(Exception('False channel request errbacked.'))
+ 
+ 
+         def dataReceived(self, data):
+@@ -475,15 +500,19 @@ if Crypto is not None and pyasn1 is not None:
+ 
+ 
+         def request_exit_status(self, status):
+-            status, = struct.unpack('>L', status)
+-            if status == 0:
+-                unittest.fail('false exit status was 0')
++            self.status, = struct.unpack('>L', status)
++   
++
++        def closed(self):
++            if self.status == 0:
++                log.err(Exception('false exit status was 0'))
+             log.msg('finished false')
+             self.conn.addResult()
+             return 1
+ 
+ 
+ 
++
+     class SSHTestEchoChannel(channel.SSHChannel):
+ 
+         name = 'session'
+@@ -745,6 +774,13 @@ class SSHProtocolTestCase(unittest.TestCase):
+                                 self.clientTransport.clearBuffer)
+         self.assertFalse(self.server.done and self.client.done)
+ 
++        return self.client.completed.addCallback(self._verifyExpectedErrors)
++
++    def _verifyExpectedErrors(self, ignored):
++        """
++        Verify errors of the current test case are as many as we expect and the
++        ones we expect.
++        """
+         errors = self.flushLoggedErrors(error.ConchError)
+         errors.sort(key=lambda reason: reason.value.args)
+ 

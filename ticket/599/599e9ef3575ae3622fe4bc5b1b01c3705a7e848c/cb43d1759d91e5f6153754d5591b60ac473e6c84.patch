@@ -1,0 +1,165 @@
+Index: twisted/conch/test/test_conch.py
+===================================================================
+--- twisted/conch/test/test_conch.py	(revision 14694)
++++ twisted/conch/test/test_conch.py	(working copy)
+@@ -35,8 +35,10 @@
+ class ConchTestOpenSSHProcess(protocol.ProcessProtocol):
+ 
+     buf = ''
+-    done = 0
+ 
++    def __init__(self, d):
++        self.deferred = d
++
+     def connectionMade(self):
+         log.msg('MAD(ssh): connection made')
+ 
+@@ -47,17 +49,18 @@
+         log.msg("ERR(ssh): '%s'" % data)
+ 
+     def processEnded(self, reason):
+-        self.done = 1
+-        unittest.assertEquals(reason.value.exitCode, 0, 'exit code was not 0: %s' % reason.value.exitCode)
++        unittest.assertEquals(reason.value.exitCode, 0,
++                              'exit code was not 0: %s' % reason.value.exitCode)
+         self.buf = self.buf.replace('\r\n', '\n')
+         unittest.assertEquals(self.buf, 'goodbye\n')
++        self.deferred.callback(True)
+ 
+ class ConchTestForwardingProcess(protocol.ProcessProtocol):
+ 
+-    def __init__(self, port, fac):
++    def __init__(self, d, port, fac):
++        self.deferred = d
+         self.port = port
+         self.fac = fac
+-        self.done = 0
+         self.connected = 0
+         self.buf = ''
+ 
+@@ -83,7 +86,7 @@
+ 
+     def processEnded(self, reason):
+         log.msg('FORWARDING PROCESS CLOSED')
+-        self.done = 1
++        self.deferred.callback(True)
+ 
+ class ConchTestForwardingPort(protocol.Protocol):
+ 
+@@ -145,7 +148,7 @@
+             if self.spawn:
+                 env = os.environ.copy()
+                 env['PYTHONPATH'] = os.pathsep.join(sys.path)
+-                reactor.callLater(0,reactor.spawnProcess, env=env, *self.spawn)
++                reactor.spawnProcess(env=env, *self.spawn)
+             self.connected = 1
+ 
+         def requestRemoteForwarding(self, remotePort, hostport):
+@@ -239,13 +242,9 @@
+         self.server = reactor.listenTCP(0, fac, interface="127.0.0.1")
+ 
+     def tearDown(self):
+-        try:
+-            self.fac.proto.done = 1
+-        except AttributeError:
+-            pass
+-        else:
+-            self.fac.proto.transport.loseConnection()
+-            reactor.iterate()
++        self.fac.proto.done = 1
++        self.fac.proto.transport.loseConnection()
++        reactor.iterate()
+         d = self.server.stopListening()
+         if d:
+             util.wait(d)
+@@ -260,18 +259,24 @@
+     # actual tests
+ 
+     def testExec(self):
+-        p = ConchTestOpenSSHProcess()
+-        self.execute('echo goodbye', p)
++        d = defer.Deferred()
++        p = ConchTestOpenSSHProcess(d)
++        return self.execute('echo goodbye', p)
+ 
++    def _stopServer(self, ignored, serv):
++        serv.stopListening()
++
+     def testLocalToRemoteForwarding(self):
+         f = EchoFactory()
+         f.fac = self.fac
+         serv = reactor.listenTCP(0, f)
+         port = serv.getHost().port
+         lport = self._getRandomPort()
+-        p = ConchTestForwardingProcess(lport,self.fac)
++        d = defer.Deferred()
++        p = ConchTestForwardingProcess(d, lport,self.fac)
++        d.addBoth(self._stopServer, serv)
+         self.execute('', p, preargs='-N -L%i:127.0.0.1:%i' % (lport, port))
+-        serv.stopListening()
++        return d
+ 
+     def testRemoteToLocalForwarding(self):
+         f = EchoFactory()
+@@ -279,9 +284,11 @@
+         serv = reactor.listenTCP(0, f)
+         port = serv.getHost().port
+         lport = self._getRandomPort()
+-        p = ConchTestForwardingProcess(lport, self.fac)
++        d = defer.Deferred()
++        p = ConchTestForwardingProcess(d, lport, self.fac)
++        d.addBoth(self._stopServer, serv)
+         self.execute('', p, preargs='-N -R %i:127.0.0.1:%i' % (lport, port))
+-        serv.stopListening()
++        return d
+ 
+ class OpenSSHClientTestCase(CmdLineClientTestBase, unittest.TestCase):
+ 
+@@ -305,12 +312,8 @@
+             raise unittest.SkipTest, 'skipping test, cannot find ssh'
+         cmds = (cmdline % port).split()
+         reactor.spawnProcess(p, ssh_path, cmds)
+-        util.spinWhile(lambda: not p.done, timeout=30)
++        return p.deferred
+ 
+-        # cleanup
+-        if not p.done:
+-            p.transport.signalProcess('KILL')
+-            util.spinWhile(lambda: not p.done)
+ 
+ class CmdLineClientTestCase(CmdLineClientTestBase, unittest.TestCase):
+ 
+@@ -333,15 +336,8 @@
+         env = os.environ.copy()
+         env['PYTHONPATH'] = os.pathsep.join(sys.path)
+         reactor.spawnProcess(p, sys.executable, cmds, env=env)
++        return p.deferred
+ 
+-        # wait for process to finish
+-        util.spinWhile(lambda: not p.done, timeout=30)
+-
+-        # cleanup
+-        if not p.done:
+-            p.transport.signalProcess('KILL')
+-            util.spinWhile(lambda: not p.done)
+-
+ class UnixClientTestCase(CmdLineClientTestBase, unittest.TestCase):
+ 
+     def execute(self, args, p, preargs = ''):
+@@ -372,12 +368,7 @@
+         uao = default.SSHUserAuthClient(o['user'], o, conn)
+         d = connect.connect(o['host'], int(o['port']), o, vhk, uao)
+         d.addErrback(lambda f: unittest.fail('Failure connecting to test server: %s' % f))
+-
+-        util.spinWhile(lambda: not p.done, timeout=30)
+-
+-        # cleanup
+-        if not p.done:
+-            p.transport.signalProcess('KILL')
+-            util.spinWhile(lambda: not p.done)
+-        conn.transport.transport.loseConnection()
+-        reactor.iterate()
++        def _loseCon(x):
++            conn.transport.transport.loseConnection()
++        p.deferred.addBoth(_loseCon)
++        return d

@@ -1,0 +1,293 @@
+diff -uNr Twisted_19136/doc/core/howto/listings/pb/pbAnonClient.py Twisted_Anon/doc/core/howto/listings/pb/pbAnonClient.py
+--- Twisted_19136/doc/core/howto/listings/pb/pbAnonClient.py	1969-12-31 21:00:00.000000000 -0300
++++ Twisted_Anon/doc/core/howto/listings/pb/pbAnonClient.py	2006-12-28 16:45:37.265145200 -0200
+@@ -0,0 +1,27 @@
++#! /usr/bin/python
++
++from twisted.spread import pb
++from twisted.internet import reactor
++from twisted.cred import credentials
++
++def main():
++    factory = pb.PBClientFactory()
++    reactor.connectTCP("localhost", 8800, factory)
++
++    #def1 = factory.login(credentials.UsernamePassword("user1", "pass1"))   #Use this to login as authenticated
++    def1 = factory.login(credentials.Anonymous())        #Use this to login as anonymous
++
++    def1.addCallback(connected)
++    def1.addErrback(error)
++    reactor.run()
++
++def error(why):
++    print "----------ERROR------------"
++    print why
++
++def connected(perspective):
++    print "got perspective1 ref:", perspective
++    print "asking it to foo(13)"
++    perspective.callRemote("foo", 13)
++
++main()
+diff -uNr Twisted_19136/doc/core/howto/listings/pb/pbAnonServer.py Twisted_Anon/doc/core/howto/listings/pb/pbAnonServer.py
+--- Twisted_19136/doc/core/howto/listings/pb/pbAnonServer.py	1969-12-31 21:00:00.000000000 -0300
++++ Twisted_Anon/doc/core/howto/listings/pb/pbAnonServer.py	2006-12-28 16:45:37.280769600 -0200
+@@ -0,0 +1,32 @@
++#! /usr/bin/python
++from zope.interface import implements
++
++from twisted.spread import pb
++from twisted.cred import checkers, portal, credentials
++from twisted.internet import reactor
++
++class MyPerspective(pb.Avatar):
++    def __init__(self, name):
++        self.name = name
++    def perspective_foo(self, arg):
++        print "I am", self.name, "perspective_foo(",arg,") called on", self
++
++class MyRealm:
++    implements(portal.IRealm)
++    def requestAvatar(self, avatarId, mind, *interfaces):
++        assert pb.IPerspective in interfaces
++        if avatarId == checkers.ANONYMOUS:
++            return pb.IPerspective, MyPerspective("Anonymous"), lambda:None
++        else:
++            return pb.IPerspective, MyPerspective(avatarId), lambda:None
++
++p = portal.Portal(MyRealm())
++# Here the user/password checker is registered
++c1 = checkers.InMemoryUsernamePasswordDatabaseDontUse(user1="pass1", user2="pass2")
++# Here the anonymous checker is registered, this server accepts both authenticated or anonymous logins
++c2 = checkers.AllowAnonymousAccess()
++
++p.registerChecker(c1)
++p.registerChecker(c2)
++reactor.listenTCP(8800, pb.PBServerFactory(p))
++reactor.run()
+diff -uNr Twisted_19136/doc/core/howto/pb-cred.xhtml Twisted_Anon/doc/core/howto/pb-cred.xhtml
+--- Twisted_19136/doc/core/howto/pb-cred.xhtml	2006-02-10 17:50:14.000000000 -0200
++++ Twisted_Anon/doc/core/howto/pb-cred.xhtml	2006-12-28 16:45:37.280769600 -0200
+@@ -573,6 +573,20 @@
+ that Avatar.</p>
+
+
++<h3>Anonymous Clients</h3>
++
++<a href="listings/pb/pb6serverAnon.py" class="py-listing">pb6serverAnon.py</a>
++<a href="listings/pb/pb6clientAnon.py" class="py-listing">pb6clientAnon.py</a>
++
++<p>The pb6serverAnon.py is is a server based on pb6server.py, that permits the
++anonymous and authenticated logins. Both checkers are registered and the client
++chooses the login method. In this method, one can choose different perspectives
++for each login method.</p>
++
++<p>In client side, the only change is the use of <code>credentials.Anonymous()</code>
++in the <code>PBClientFactory.login</code> method.</p>
++
++
+ <h2>Using Avatars</h2>
+
+
+diff -uNr Twisted_19136/twisted/spread/pb.py Twisted_Anon/twisted/spread/pb.py
+--- Twisted_19136/twisted/spread/pb.py	2006-12-24 16:57:56.000000000 -0200
++++ Twisted_Anon/twisted/spread/pb.py	2006-12-28 17:07:35.370778000 -0200
+@@ -73,7 +73,7 @@
+ from twisted.python import log, failure
+ from twisted.internet import defer, protocol
+ from twisted.cred.portal import Portal
+-from twisted.cred.credentials import ICredentials, IUsernameHashedPassword
++from twisted.cred.credentials import *
+ from twisted.persisted import styles
+ from twisted.python.components import registerAdapter
+
+@@ -1095,16 +1095,36 @@
+     def _cbResponse(self, (challenge, challenger), password, client):
+         return challenger.callRemote("respond", respond(challenge, password), client)
+
++    def _cbLoginAnonymous(self, root, credentials, client):
++        """
++        Passes the credentials to handle anonymous login
++        """
++        return root.callRemote("loginAnonymous", credentials).addCallback(
++            self._cbAnonymousOk, credentials, client)
++
++    def _cbAnonymousOk(self, challenger, username, client):
++        """
++        Receives the AnonymousChallenger class and forwards the credentials
++        """
++        return challenger.callRemote("respond", username, client)
++
+     def login(self, credentials, client=None):
+         """Login and get perspective from remote PB server.
+
+-        Currently only credentials implementing
+-        L{twisted.cred.credentials.IUsernamePassword} are supported.
++        Currently the following credentials are supported:
++        L{twisted.cred.credentials.IUsernamePassword}
++        L{twisted.cred.credentials.IAnonymous}
+
+         @return: Deferred of RemoteReference to the perspective.
+         """
+         d = self.getRootObject()
+-        d.addCallback(self._cbSendUsername, credentials.username, credentials.password, client)
++
++        if IAnonymous.providedBy(credentials):
++            #Handles anonymous logins via credentials.Anonymous passes an empty tuple as anonymous
++            d.addCallback(self._cbLoginAnonymous, (), client)
++        else:
++            #Handles non anonymous logins
++            d.addCallback(self._cbSendUsername, credentials.username, credentials.password, client)
+         return d
+
+
+@@ -1173,8 +1193,6 @@
+         """
+
+
+-
+-
+ class _PortalRoot:
+     """Root object, used to login to portal."""
+
+@@ -1201,6 +1219,14 @@
+         c = challenge()
+         return c, _PortalAuthChallenger(self, username, c)
+
++    def remote_loginAnonymous(self, username):
++        """
++        Handles the anonymous logins via portal
++        Receives an empty tuple as username.
++        Returns an instance to _PortalAuthChallenger
++        """
++        return _PortalAnonymousChallenger(self, username, None)
++
+
+ class _PortalAuthChallenger(Referenceable):
+     """Called with response to password challenge."""
+@@ -1235,3 +1261,12 @@
+         md.update(self.challenge)
+         correct = md.digest()
+         return self.response == correct
++
++
++class _PortalAnonymousChallenger(_PortalAuthChallenger):
++    """
++    Called on anonymous login attempt.
++    Follows almost the same structure from _PortalAuthChallenger
++    """
++
++    implements(IAnonymous)
+diff -uNr Twisted_19136/twisted/test/test_pb.py Twisted_Anon/twisted/test/test_pb.py
+--- Twisted_19136/twisted/test/test_pb.py	2006-12-05 12:35:32.000000000 -0200
++++ Twisted_Anon/twisted/test/test_pb.py	2006-12-28 17:03:49.863812800 -0200
+@@ -1128,3 +1128,109 @@
+         d.addCallback(lambda res: factory.disconnect())
+         return d
+
++
++class AnonymousLoginTestCase(unittest.TestCase):
++    def setUp(self):
++        """
++        The Server uses checkers.AllowAnonymousAccess() to permit Anonymous logins
++        """
++        self.realm = MyRealm()
++        self.realm.p = NonSubclassingPerspective()
++        self.portal = portal.Portal(self.realm)
++        self.checker = checkers.AllowAnonymousAccess()
++        self.portal.registerChecker(self.checker)
++        self.factory = pb.PBServerFactory(self.portal)
++        self.port = reactor.listenTCP(0, self.factory, interface="127.0.0.1")
++        self.portno = self.port.getHost().port
++
++    def tearDown(self):
++        self.port.stopListening()
++
++    def test_anonymousLogin(self):
++        """
++        The client uses credentials.Anonymous() to authenticate to Server
++        """
++        factory = pb.PBClientFactory()
++        d = factory.login(credentials.Anonymous(),"BRAINS!")
++        reactor.connectTCP('127.0.0.1', self.portno, factory)
++        d.addCallback(lambda p: p.callRemote('ANYTHING', 'here', bar='baz'))
++        d.addCallback(self.assertEquals,
++                      ('ANYTHING', ('here',), {'bar': 'baz'}))
++        d.addCallback(lambda res: factory.disconnect())
++        return d
++
++class AnonymousLoginNotPermittedTestCase(unittest.TestCase):
++    def setUp(self):
++        """
++        The anonymous server uses checkers.AllowAnonymousAccess() to permit Anonymous logins
++        The checker has not been added to make the access denied to anonymous
++        """
++        self.realm = MyRealm()
++        self.realm.p = NonSubclassingPerspective()
++        self.portal = portal.Portal(self.realm)
++        self.checker = checkers.InMemoryUsernamePasswordDatabaseDontUse()
++        self.checker.addUser("user", "pass")
++        self.portal.registerChecker(self.checker)
++        self.factory = pb.PBServerFactory(self.portal)
++        self.port = reactor.listenTCP(0, self.factory, interface="127.0.0.1")
++        self.portno = self.port.getHost().port
++
++    def tearDown(self):
++        self.port.stopListening()
++
++    def test_anonymousLoginNotPermitted(self):
++        """
++        The client uses credentials.Anonymous() to authenticate to Server
++        """
++        factory = pb.PBClientFactory()
++        d = factory.login(credentials.Anonymous(),"BRAINS!")
++        reactor.connectTCP('127.0.0.1', self.portno, factory)
++        d.addBoth(lambda res: self.flushLoggedErrors(UnauthorizedLogin))
++        d.addCallback(lambda res: factory.disconnect())
++        return d
++
++
++class MultipleCheckerServerLoginTestCase(unittest.TestCase):
++    def setUp(self):
++        """
++        The Server uses checkers.AllowAnonymousAccess() to permit Anonymous logins
++        """
++        self.realm = MyRealm()
++        self.realm.p = NonSubclassingPerspective()
++        self.portal = portal.Portal(self.realm)
++        self.checker1 = checkers.AllowAnonymousAccess()
++        self.portal.registerChecker(self.checker1)
++        self.checker2 = checkers.InMemoryUsernamePasswordDatabaseDontUse()
++        self.checker2.addUser("user", "pass")
++        self.portal.registerChecker(self.checker2)
++
++        self.factory = pb.PBServerFactory(self.portal)
++        self.port = reactor.listenTCP(0, self.factory, interface="127.0.0.1")
++        self.portno = self.port.getHost().port
++
++    def tearDown(self):
++        self.port.stopListening()
++
++    def test_anonymousLogin(self):
++        """
++        The client uses credentials.Anonymous() to authenticate to Server
++        """
++        factory = pb.PBClientFactory()
++        d = factory.login(credentials.Anonymous(),"BRAINS!")
++        reactor.connectTCP('127.0.0.1', self.portno, factory)
++        d.addCallback(lambda p: p.callRemote('ANYTHING', 'here', bar='baz'))
++        d.addCallback(self.assertEquals,
++                      ('ANYTHING', ('here',), {'bar': 'baz'}))
++        d.addCallback(lambda res: factory.disconnect())
++        return d
++
++    def test_authenticatedLogin(self):
++        factory = pb.PBClientFactory()
++        d = factory.login(credentials.UsernamePassword('user', 'pass'),
++                          "BRAINS!")
++        reactor.connectTCP('127.0.0.1', self.portno, factory)
++        d.addCallback(lambda p: p.callRemote('ANYTHING', 'here', bar='baz'))
++        d.addCallback(self.assertEquals,
++                      ('ANYTHING', ('here',), {'bar': 'baz'}))
++        d.addCallback(lambda res: factory.disconnect())
++        return d

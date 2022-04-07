@@ -1,0 +1,155 @@
+diff --git a/twisted/python/deprecate.py b/twisted/python/deprecate.py
+index 7d71b2a..fb1400b 100644
+--- a/twisted/python/deprecate.py
++++ b/twisted/python/deprecate.py
+@@ -58,7 +58,7 @@ __all__ = [
+ import sys, inspect
+ from warnings import warn, warn_explicit
+ from dis import findlinestarts
+-from functools import wraps
++from functools import update_wrapper
+ 
+ from twisted.python.versions import getVersionString
+ 
+@@ -75,6 +75,10 @@ def _fullyQualifiedName(obj):
+ 
+     @rtype: C{str}.
+     """
++
++    if isinstance(obj, _Deprecated):
++        obj = obj.callable
++
+     try:
+         name = obj.__qualname__
+     except AttributeError:
+@@ -237,6 +241,43 @@ def _appendToDocstring(thingWithDoc, textToAppend):
+ 
+ 
+ 
++class _Deprecated(object):
++    """
++    A deprecated callable.
++
++    """
++
++    def __init__(self, version, callable, replacement=None):
++        self.callable = callable
++        self.replacement = replacement
++        self.deprecatedVersion = version
++
++        update_wrapper(self, callable)
++        _appendToDocstring(
++            self, _getDeprecationDocstring(version, replacement))
++
++
++    def __call__(self, *args, **kwargs):
++        warningString = getDeprecationWarningString(
++            self.callable, self.deprecatedVersion, None, self.replacement)
++        warn(
++            warningString,
++            DeprecationWarning,
++            stacklevel=2)
++        return self.callable(*args, **kwargs)
++
++
++    def __get__(self, *args, **kwargs):
++        callableDescriptor = getattr(self.callable, "__get__", None)
++        if callableDescriptor is None:
++            return self.callable
++        return self.__class__(
++            version=self.deprecatedVersion,
++            replacement=self.replacement,
++            callable=callableDescriptor(*args, **kwargs))
++
++
++
+ def deprecated(version, replacement=None):
+     """
+     Return a decorator that marks callables as deprecated.
+@@ -259,22 +300,9 @@ def deprecated(version, replacement=None):
+         """
+         Decorator that marks C{function} as deprecated.
+         """
+-        warningString = getDeprecationWarningString(
+-            function, version, None, replacement)
+-
+-        @wraps(function)
+-        def deprecatedFunction(*args, **kwargs):
+-            warn(
+-                warningString,
+-                DeprecationWarning,
+-                stacklevel=2)
+-            return function(*args, **kwargs)
+-
+-        _appendToDocstring(deprecatedFunction,
+-                           _getDeprecationDocstring(version, replacement))
+-        deprecatedFunction.deprecatedVersion = version
+-        return deprecatedFunction
+ 
++        return _Deprecated(
++            callable=function, version=version, replacement=replacement)
+     return deprecationDecorator
+ 
+ 
+diff --git a/twisted/python/test/test_deprecate.py b/twisted/python/test/test_deprecate.py
+index 1b4ebd1..e869ad8 100644
+--- a/twisted/python/test/test_deprecate.py
++++ b/twisted/python/test/test_deprecate.py
+@@ -587,9 +587,12 @@ class TestDeprecationWarnings(SynchronousTestCase):
+             simplefilter("always")
+             addStackLevel()
+             self.assertEqual(caught[0].category, DeprecationWarning)
+-            self.assertEqual(str(caught[0].message), getDeprecationWarningString(dummyCallable, version))
++            self.assertEqual(
++                str(caught[0].message),
++                getDeprecationWarningString(dummyCallable, version))
+             # rstrip in case .pyc/.pyo
+-            self.assertEqual(caught[0].filename.rstrip('co'), __file__.rstrip('co'))
++            self.assertEqual(
++                caught[0].filename.rstrip('co'), __file__.rstrip('co'))
+ 
+ 
+     def test_deprecatedPreservesName(self):
+@@ -722,6 +725,42 @@ class TestDeprecationWarnings(SynchronousTestCase):
+             "    " % (__name__,))
+ 
+ 
++    def test_deprecatedMethod(self):
++        """
++        L{deprecated} can deprecate descriptors, including functions within
++        class bodies, and will reflect the proper qualified name of the
++        descriptor when it is accessed on an instance.
++        """
++        version = Version('Twisted', 8, 0, 0)
++
++        class SomeClassWithADeprecatedMethod(object):
++            """
++            I have a method that has been deprecated.
++            """
++            @deprecated(version)
++            def deprecatedMethod(self):
++                """
++                I am a method that has been deprecated.
++                """
++                return 12
++
++        instance = SomeClassWithADeprecatedMethod()
++        with catch_warnings(record=True) as caught:
++            simplefilter("always")
++            self.assertEqual(instance.deprecatedMethod(), 12)
++            self.assertEqual(caught[0].category, DeprecationWarning)
++            self.assertEqual(
++                str(caught[0].message),
++                getDeprecationWarningString(instance.deprecatedMethod, version))
++            # rstrip in case .pyc/.pyo
++            self.assertEqual(
++                caught[0].filename.rstrip('co'), __file__.rstrip('co'))
++
++
++    def test_deprecatedMethodWithReplacement(self):
++        pass
++
++
+ 
+ class TestAppendToDocstring(SynchronousTestCase):
+     """

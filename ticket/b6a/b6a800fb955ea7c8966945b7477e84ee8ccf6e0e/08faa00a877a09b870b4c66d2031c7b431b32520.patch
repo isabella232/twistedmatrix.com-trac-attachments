@@ -1,0 +1,91 @@
+Index: twisted/web/proxy.py
+===================================================================
+--- twisted/web/proxy.py	(revision 40164)
++++ twisted/web/proxy.py	(working copy)
+@@ -49,6 +49,7 @@
+         headers.pop('keep-alive', None)
+         self.headers = headers
+         self.data = data
++        father.notifyFinish().addErrback(self.fatherFailed)
+ 
+ 
+     def connectionMade(self):
+@@ -89,7 +90,13 @@
+             self.transport.loseConnection()
+ 
+ 
++    def fatherFailed(self, failure):
++        if not self._finished:
++            self.transport.loseConnection()
++            self._finished = True
+ 
++
++
+ class ProxyClientFactory(ClientFactory):
+     """
+     Used by ProxyRequest to implement a simple web proxy.
+Index: twisted/web/test/test_proxy.py
+===================================================================
+--- twisted/web/test/test_proxy.py	(revision 40164)
++++ twisted/web/test/test_proxy.py	(working copy)
+@@ -9,6 +9,7 @@
+ from twisted.test.proto_helpers import StringTransportWithDisconnection
+ from twisted.test.proto_helpers import MemoryReactor
+ 
++from twisted.internet import main
+ from twisted.web.resource import Resource
+ from twisted.web.server import Site
+ from twisted.web.proxy import ReverseProxyResource, ProxyClientFactory
+@@ -326,7 +327,8 @@
+         should be added.
+         """
+         client = ProxyClient('GET', '/foo', 'HTTP/1.0',
+-                {"accept": "text/html", "proxy-connection": "foo"}, '', None)
++                {"accept": "text/html", "proxy-connection": "foo"}, '',
++                self.makeRequest('foo'))
+         self.assertEqual(client.headers,
+                 {"accept": "text/html", "connection": "close"})
+ 
+@@ -345,7 +347,8 @@
+         expectedHeaders = headers.copy()
+         expectedHeaders['connection'] = 'close'
+         del expectedHeaders['keep-alive']
+-        client = ProxyClient('GET', '/foo', 'HTTP/1.0', headers, '', None)
++        client = ProxyClient('GET', '/foo', 'HTTP/1.0', headers, '',
++                             self.makeRequest('foo'))
+         self.assertForwardsHeaders(
+             client, 'GET /foo HTTP/1.0', expectedHeaders)
+ 
+@@ -372,8 +375,23 @@
+         self.assertForwardsResponse(
+             request, 200, 'OK', headers.items(), '')
+ 
++    def test_parentDisconnected(self):
++        """
++        Check that the client disconnects if the parent request is dropped.
++        """
++        request = self.makeRequest('foo')
++        client = self.makeProxyClient(request, headers={"accept": "text/html"})
+ 
++        self.assertForwardsHeaders(
++            client, 'GET /foo HTTP/1.0',
++            {'connection': 'close', 'accept': 'text/html'})
+ 
++        self.assertTrue(client.transport.connected)
++        request.processingFailed(main.CONNECTION_LOST)
++        self.assertFalse(client.transport.connected)
++
++
++
+ class ProxyClientFactoryTestCase(TestCase):
+     """
+     Tests for L{ProxyClientFactory}.
+@@ -407,7 +425,7 @@
+         """
+         factory = ProxyClientFactory('GET', '/foo', 'HTTP/1.0',
+                                      {"accept": "text/html"}, 'Some data',
+-                                     None)
++                                     DummyRequest('foo'))
+         proto = factory.buildProtocol(None)
+         self.assertIsInstance(proto, ProxyClient)
+         self.assertEqual(proto.command, 'GET')

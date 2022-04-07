@@ -1,0 +1,114 @@
+Index: twisted/internet/abstract.py
+===================================================================
+--- twisted/internet/abstract.py	(revision 12585)
++++ twisted/internet/abstract.py	(working copy)
+@@ -224,6 +224,12 @@
+             self._writeDisconnecting = True
+             self.startWriting()
+     
++    def abortConnection(self):
++        """Aborts the connection -- default implementation calls
++        self.connectionLost(main.CONNECTION_LOST). 
++        """
++        self.connectionLost(main.CONNECTION_LOST)
++
+     def stopReading(self):
+         """Stop waiting for read availability.
+ 
+Index: twisted/internet/interfaces.py
+===================================================================
+--- twisted/internet/interfaces.py	(revision 12585)
++++ twisted/internet/interfaces.py	(working copy)
+@@ -980,6 +980,12 @@
+         and there is no registered producer.
+         """
+     
++    def abortConnection(self):
++        """Close the connection abruptly.
++        
++        Discards any buffered data, unregisters any producer, and, if
++        possible, notifies the other end of the unclean closure."""
++        
+     def getTcpNoDelay(self):
+         """Return if TCP_NODELAY is enabled."""
+ 
+Index: twisted/internet/tcp.py
+===================================================================
+--- twisted/internet/tcp.py	(revision 12585)
++++ twisted/internet/tcp.py	(working copy)
+@@ -22,6 +22,7 @@
+ import select
+ import operator
+ import warnings
++import struct
+ try:
+     import fcntl
+ except ImportError:
+@@ -139,14 +140,22 @@
+             log.err()
+             return main.CONNECTION_LOST
+ 
+-    def _closeSocket(self):
++    def _closeSocket(self, orderly):
+         try:
+-            self.socket.sock_shutdown(2)
+-        except:
++            if orderly:
++                self.socket.sock_shutdown(2)
++            else:
++                # Set SO_LINGER to 1,0 which, by convention, causes a
++                # connection reset to be sent when close is called,
++                # instead of the standard FIN shutdown sequence.
++                self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER,
++                                       struct.pack("ii", 1, 0))
++        except (SSL.Error, socket.error):
+             pass
++        
+         try:
+             self.socket.close()
+-        except:
++        except (SSL.Error, socket.error):
+             pass
+ 
+     def _postLoseConnection(self):
+@@ -367,17 +376,24 @@
+             else:
+                 return main.CONNECTION_LOST
+ 
+-    def _closeSocket(self):
++    def _closeSocket(self, orderly):
+         """Called to close our socket."""
+-        # This used to close() the socket, but that doesn't *really* close if
+-        # there's another reference to it in the TCP/IP stack, e.g. if it was
+-        # was inherited by a subprocess. And we really do want to close the
+-        # connection. So we use shutdown() instead, and then close() in order
+-        # to release the filedescriptor.
++        # The call to shutdown() before close() isn't really necessary, because
++        # we set FD_CLOEXEC now, which will ensure this is the only process
++        # holding the FD, thus ensuring close() really will shutdown the TCP
++        # socket. However, do it anyways, just to be safe.
+         try:
+-            self.socket.shutdown(2)
++            if orderly:
++                self.socket.shutdown(2)
++            else:
++                # Set SO_LINGER to 1,0 which, by convention, causes a
++                # connection reset to be sent when close is called,
++                # instead of the standard FIN shutdown sequence.
++                self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER,
++                                       struct.pack("ii", 1, 0))
+         except socket.error:
+             pass
++
+         try:
+             self.socket.close()
+         except socket.error:
+@@ -414,7 +430,7 @@
+         """See abstract.FileDescriptor.connectionLost().
+         """
+         abstract.FileDescriptor.connectionLost(self, reason)
+-        self._closeSocket()
++        self._closeSocket(reason.value.__class__ == error.ConnectionDone)
+         protocol = self.protocol
+         del self.protocol
+         del self.socket

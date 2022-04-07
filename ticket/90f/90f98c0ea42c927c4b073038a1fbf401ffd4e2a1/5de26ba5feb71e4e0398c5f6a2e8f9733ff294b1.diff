@@ -1,0 +1,128 @@
+Index: twisted/python/logfile.py
+===================================================================
+--- twisted/python/logfile.py	(revision 18009)
++++ twisted/python/logfile.py	(working copy)
+@@ -9,7 +9,7 @@
+ """
+ 
+ # System Imports
+-import os, glob, string, time
++import os, glob, string, time, gzip
+ 
+ # sibling imports
+ 
+@@ -151,7 +151,41 @@
+ 
+ threadable.synchronize(LogFile)
+ 
++class GzipLogFile(LogFile):
++    def rotate(self):
++        if not (os.access(self.directory, os.W_OK) and os.access(self.path, os.W_OK)):
++            return
++        logs = self.listLogs()
++        logs.reverse()
++        for i in logs:
++            os.rename("%s.%d.gz" % (self.path, i), "%s.%d.gz" % (self.path, i + 1))
++        self._file.close()
+ 
++        newpath = "%s.1" % self.path
++        os.rename(self.path, newpath)
++        gz = gzip.open("%s.gz" % newpath, "wb")
++        newfp = open(newpath)
++        for l in newfp:
++            gz.write(l)
++        gz.close()
++        newfp.close()
++        os.remove(newpath)
++
++        self._openFile()
++
++    def listLogs(self):
++        """Return sorted list of integers - the old logs' identifiers."""
++        result = []
++        for name in glob.glob("%s.*" % self.path):
++            try:
++                counter = int(string.split(name, '.')[-2])
++                if counter:
++                    result.append(counter)
++            except ValueError:
++                pass
++        result.sort()
++        return result
++
+ class DailyLogFile(BaseLogFile):
+     """A log file that is rotated daily (at or after midnight localtime)
+     """
+Index: twisted/test/test_logfile.py
+===================================================================
+--- twisted/test/test_logfile.py	(revision 18009)
++++ twisted/test/test_logfile.py	(working copy)
+@@ -6,7 +6,7 @@
+ from twisted.trial import unittest
+ 
+ # system imports
+-import os, shutil, time
++import os, shutil, time, gzip
+ 
+ # twisted imports
+ from twisted.python import logfile
+@@ -23,7 +23,6 @@
+     
+     def tearDown(self):
+         shutil.rmtree(self.dir)
+-        pass
+     
+     def testWriting(self):
+         log = logfile.LogFile(self.name, self.dir)
+@@ -158,7 +157,51 @@
+         # reset permission so tearDown won't fail
+         os.chmod(self.dir, 0777)
+ 
++class GzipLogFileTestCase(unittest.TestCase):
++    """Test the compressed rotating log file."""
++
++    def setUp(self):
++        self.dir = self.mktemp()
++        os.makedirs(self.dir)
++        self.name = "test.log"
++        self.path = os.path.join(self.dir, self.name)
++    
++    def tearDown(self):
++        #shutil.rmtree(self.dir)
++        pass
++
++    def testRotation(self):
++        # this logfile should rotate every 10 bytes
++        log = logfile.GzipLogFile(self.name, self.dir, rotateLength=10)
+         
++        # test automatic rotation
++        log.write("123")
++        log.write("4567890")
++        log.write("1" * 11)
++        self.assert_(os.path.exists("%s.1.gz" % self.path))
++        g = gzip.open("%s.1.gz" % self.path)
++        self.assertEquals(g.read(), "1234567890")
++        g.close()
++        self.assert_(not os.path.exists("%s.2.gz" % self.path))
++        log.write('')
++        self.assert_(os.path.exists("%s.1.gz" % self.path))
++        self.assert_(os.path.exists("%s.2.gz" % self.path))
++        g = gzip.open("%s.1.gz" % self.path)
++        self.assertEquals(g.read(), "1" * 11)
++        g.close()
++        self.assert_(not os.path.exists("%s.3.gz" % self.path))
++        log.write("3")
++        self.assert_(not os.path.exists("%s.3.gz" % self.path))
++        
++        # test manual rotation
++        log.rotate()
++        self.assert_(os.path.exists("%s.3.gz" % self.path))
++        self.assert_(not os.path.exists("%s.4.gz" % self.path))
++        log.close()
++
++        self.assertEquals(log.listLogs(), [1, 2, 3])
++    
++ 
+ class RiggedDailyLogFile(logfile.DailyLogFile):
+     _clock = 0.0
+ 

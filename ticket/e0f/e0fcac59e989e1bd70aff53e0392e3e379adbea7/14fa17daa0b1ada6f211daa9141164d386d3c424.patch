@@ -1,0 +1,516 @@
+# Bazaar merge directive format 2 (Bazaar 0.90)
+# revision_id: richard@aziz-20100513203852-gx5kuhkurcu3h8go
+# target_branch: http://svn.twistedmatrix.com/bzr/Twisted/branches\
+#   /parameterize-procmon-3775-2/
+# testament_sha1: c3c3b1de723ea1e1c863f33772adda4901896a8a
+# timestamp: 2010-05-13 21:39:47 +0100
+# base_revision_id: svn-v4:bbbe8e31-12d6-0310-92fd-\
+#   ac37d47ddeeb:branches/parameterize-procmon-3775-2:28902
+#
+# Begin patch
+=== modified file 'twisted/runner/procmon.py'
+--- twisted/runner/procmon.py   2010-05-06 00:22:32 +0000
++++ twisted/runner/procmon.py   2010-05-13 19:35:04 +0000
+@@ -5,6 +5,7 @@
+ """
+ Support for starting, monitoring, and restarting child process.
+ """
++import warnings
+
+ from twisted.python import log
+ from twisted.internet import error, protocol, reactor as _reactor
+@@ -108,9 +109,34 @@
+         self.murder = {}
+         self.restart = {}
+
++    def _getActive(self):
++        warnings.warn("active is deprecated since Twisted 10.1.0.  "
++                      "Use running instead.", category=DeprecationWarning,
++                                              stacklevel=2)
++        return self.running
++
++    active = property(_getActive, None)
++
++
++    def _getConsistency(self):
++        warnings.warn("consistency is deprecated since Twisted 10.1.0.",
++                      category=DeprecationWarning, stacklevel=2)
++        return None
++
++    consistency = property(_getConsistency, None)
++
++
++    def _getConsistencyDelay(self):
++        warnings.warn("consistencyDelay is deprecated since Twisted 10.1.0.",
++                      category=DeprecationWarning, stacklevel=2)
++        return 60
++
++    consistencyDelay = property(_getConsistencyDelay, None)
++
+
+     def __getstate__(self):
+         dct = service.Service.__getstate__(self)
++        del dct['_reactor']
+         dct['protocols'] = {}
+         dct['delay'] = {}
+         dct['timeStarted'] = {}
+@@ -126,7 +152,7 @@
+
+         Note that args are passed to the system call, not to the shell. If
+         running the shell is desired, the common idiom is to use
+-        L{ProcessMonitor.addProcess("name", ['/bin/sh', '-c', shell_script])}
++        C{ProcessMonitor.addProcess("name", ['/bin/sh', '-c', shell_script])}
+
+         @param name: A name for this process.  This value must be
+             unique across all processes added to this monitor.
+@@ -211,13 +237,13 @@
+                 self.murder[name].cancel()
+             del self.murder[name]
+
+-        if name in self.protocols:
+-            del self.protocols[name]
++        del self.protocols[name]
+
+-        if self._reactor.seconds()-self.timeStarted[name]<self.threshold:
+-            nextDelay = min(self.delay[name], self.maxRestartDelay)
++        if self._reactor.seconds() - self.timeStarted[name] < self.threshold:
+             # The process died too fast - backoff
+-            self.delay[name] *= 2
++            nextDelay = self.delay[name]
++            self.delay[name] = min(self.delay[name] * 2, self.maxRestartDelay)
++
+         else:
+             # Process had been running for a significant amount of time
+             # restart immediately
+@@ -230,6 +256,7 @@
+                                                          self.startProcess,
+                                                          name)
+
++
+     def startProcess(self, name):
+         """
+         @param name: The name of the process to be started
+
+=== modified file 'twisted/runner/test/test_procmon.py'
+--- twisted/runner/test/test_procmon.py 2010-05-06 00:22:32 +0000
++++ twisted/runner/test/test_procmon.py 2010-05-13 19:35:04 +0000
+@@ -1,4 +1,4 @@
+-# Copyright (c) 2001-2010 Twisted Matrix Laboratories.
++# Copyright (c) 2009-2010 Twisted Matrix Laboratories.
+ # See LICENSE for details.
+
+ """
+@@ -7,24 +7,27 @@
+
+ from twisted.trial import unittest
+ from twisted.runner.procmon import LoggingProtocol, ProcessMonitor
+-from twisted.internet import error
++from twisted.internet.error import (ProcessDone, ProcessTerminated,
++                                    ProcessExitedAlready)
+ from twisted.internet.task import Clock
++from twisted.python.failure import Failure
+ from twisted.test.proto_helpers import MemoryReactor
+
+
+
+ class DummyProcess(object):
+     """
+-    An incomplete and fake L{IProcessTransport} implementation for testing
++    An incomplete and fake L{IProcessTransport} implementation for testing how
++    L{ProcessMonitor} behaves when its monitored processes exit.
++
++    @ivar _terminationDelay: the delay in seconds after which the DummyProcess
++        will appear to exit when it receives a TERM signal
+     """
+
+-    pid = None
+-    status = None
+-    lostProcess = 0
++    pid = 1
+     proto = None
+
+     _terminationDelay = 1
+-    _signalProcessHandler = None
+
+     def __init__(self, reactor, executable, args, environment, path,
+                  proto, uid=None, gid=None, usePTY=0, childFDs=None):
+@@ -44,32 +47,43 @@
+
+     def signalProcess(self, signalID):
+         """
+-        A partial implentation of signalProcess
++        A partial implementation of signalProcess which can only handle TERM and
++        KILL signals.
++         - When a TERM signal is given, the dummy process will appear to exit
++           after L{DummyProcess._terminationDelay} seconds with exit code 0
++         - When a KILL signal is given, the dummy process will appear to exit
++           immediately with exit code 1.
+
+-        @ivar signalID: The signal name or number to be issued to the process.
+-        @type signalID: C{int} or C{str}
++        @param signalID: The signal name or number to be issued to the process.
++        @type signalID: C{str}
+         """
+         params = {
+             "TERM": (self._terminationDelay, 0),
+             "KILL": (0, 1)
+         }
+
+-        if self._signalProcessHandler and self._signalProcessHandler.active():
+-            self._signalProcessHandler.cancel()
++        if self.pid is None:
++            raise ProcessExitedAlready()
+
+         if signalID in params:
+             delay, status = params[signalID]
+             self._signalHandler = self._reactor.callLater(
+-                                    delay,
+-                                    self.proto.processEnded,
+-                                    error.ProcessDone(status))
+-
++                                            delay, self.processEnded, status)
++
++    def processEnded(self, status):
++        self.pid = None
++        statusMap = {
++            0: ProcessDone,
++            1: ProcessTerminated,
++        }
++
++        self.proto.processEnded(Failure(statusMap[status](status)))
+
+
+ class DummyProcessReactor(MemoryReactor, Clock):
+     """
+     @ivar spawnedProcesses: a list that keeps track of the fake process
+-    instances built by C{spawnProcess}.
++        instances built by C{spawnProcess}.
+     @type spawnedProcesses: C{list}
+     """
+     def __init__(self):
+@@ -107,9 +121,26 @@
+         self.reactor = DummyProcessReactor()
+         self.pm = ProcessMonitor(reactor=self.reactor)
+         self.pm.minRestartDelay = 2
+-        self.pm.maxRestartDelay = 15
++        self.pm.maxRestartDelay = 10
+         self.pm.threshold = 10
+
++    def test_getStateIncludesProcesses(self):
++        """
++        The list of monitored processes must be included in the pickle state.
++        """
++        self.pm.addProcess("foo", ["arg1", "arg2"],
++                           uid=1, gid=2, env={})
++        self.assertEquals(self.pm.__getstate__()['processes'],
++                          {'foo': (['arg1', 'arg2'], 1, 2, {})})
++
++
++    def test_getStateExcludesReactor(self):
++        """
++        The private L{ProcessMonitor._reactor} instance variable should not be
++        included in the pickle state.
++        """
++        self.failIfIn('_reactor', self.pm.__getstate__())
++
+
+     def test_addProcess(self):
+         """
+@@ -186,6 +217,16 @@
+         self.assertIn("foo", self.pm.timeStarted.keys())
+
+
++    def test_startProcessAlreadyStarted(self):
++        """
++        L{ProcessMonitor.startProcess} silently returns if the named process is
++        already started.
++        """
++        self.pm.addProcess("foo", ["foo"])
++        self.pm.startProcess("foo")
++        self.assertIdentical(None, self.pm.startProcess("foo"))
++
++
+     def test_startProcessUnknownKeyError(self):
+         """
+         L{ProcessMonitor.startProcess} raises a C{KeyError} if the given
+@@ -205,8 +246,6 @@
+
+         # Configure fake process to die 1 second after receiving term signal
+         timeToDie = self.pm.protocols["foo"].transport._terminationDelay = 1
+-        # Save the next restart delay value for this process.
+-        nextDelay = self.pm.delay["foo"]
+
+         # Advance the reactor to just before the short lived process threshold
+         # and leave enough time for the process to die
+@@ -219,7 +258,7 @@
+         self.reactor.advance(timeToDie)
+
+         # We expect it to be restarted immediately
+-        self.assertEqual(self.reactor.seconds(),
++        self.assertEquals(self.reactor.seconds(),
+                          self.pm.timeStarted["foo"])
+
+
+@@ -239,11 +278,11 @@
+         # If process doesn't die before the killTime, procmon should
+         # terminate it
+         self.reactor.advance(self.pm.killTime - 1)
+-        self.assertEqual(0.0, self.pm.timeStarted["foo"])
++        self.assertEquals(0.0, self.pm.timeStarted["foo"])
+
+         self.reactor.advance(1)
+         # We expect it to be immediately restarted
+-        self.assertEqual(self.reactor.seconds(), self.pm.timeStarted["foo"])
++        self.assertEquals(self.reactor.seconds(), self.pm.timeStarted["foo"])
+
+
+     def test_stopProcessUnknownKeyError(self):
+@@ -278,86 +317,80 @@
+         # Long time passes
+         self.reactor.advance(self.pm.threshold)
+         # Process dies after threshold
+-        self.pm.protocols["foo"].processEnded(error.ProcessDone(0))
++        self.pm.protocols["foo"].processEnded(Failure(ProcessDone(0)))
+         self.assertNotIn("foo", self.pm.protocols)
+         # Process should be restarted immediately
+         self.reactor.advance(0)
+         self.assertIn("foo", self.pm.protocols)
+
+
+-    def test_connectionLostShortLivedProcess(self):
++    def test_connectionLostMurderCancel(self):
+         """
+-        L{ProcessMonitor.connectionLost} postpone restarting a process if it
+-        has been running less than L{ProcessMonitor.threshold} seconds -
+-        backing off each time the process dies too quickly.
++        L{ProcessMonitor.connectionLost} cancels a scheduled process killer and
++        deletes the DelayedCall from the L{ProcessMonitor.murder} list.
+         """
+         self.pm.addProcess("foo", ["foo"])
+         # Schedule the process to start
+         self.pm.startService()
+-
+-        # Advance to within 1s of the threshold, process should have started
++        # Advance 1s to start the process then ask ProcMon to stop it
++        self.reactor.advance(1)
++        self.pm.stopProcess("foo")
++        # A process killer has been scheduled, delayedCall is active
++        self.assertIn("foo", self.pm.murder)
++        delayedCall = self.pm.murder["foo"]
++        self.assertTrue(delayedCall.active())
++        # Advance to the point at which the dummy process exits
++        self.reactor.advance(
++            self.pm.protocols["foo"].transport._terminationDelay)
++        # Now the delayedCall has been cancelled and deleted
++        self.assertFalse(delayedCall.active())
++        self.assertNotIn("foo", self.pm.murder)
++
++
++    def test_connectionLostProtocolDeletion(self):
++        """
++        L{ProcessMonitor.connectionLost} removes the corresponding
++        ProcessProtocol instance from the L{ProcessMonitor.protocols} list.
++        """
++        self.pm.startService()
++        self.pm.addProcess("foo", ["foo"])
++        self.assertIn("foo", self.pm.protocols)
++        self.pm.protocols["foo"].transport.signalProcess("KILL")
++        self.reactor.advance(
++            self.pm.protocols["foo"].transport._terminationDelay)
++        self.assertNotIn("foo", self.pm.protocols)
++
++
++    def test_connectionLostMinMaxRestartDelay(self):
++        """
++        L{ProcessMonitor.connectionLost} will wait at least minRestartDelay s
++        and at most maxRestartDelay s
++        """
++        self.pm.minRestartDelay = 2
++        self.pm.maxRestartDelay = 3
++
++        self.pm.startService()
++        self.pm.addProcess("foo", ["foo"])
++
++        self.assertEqual(self.pm.delay["foo"], self.pm.minRestartDelay)
++        self.reactor.advance(self.pm.threshold - 1)
++        self.pm.protocols["foo"].processEnded(Failure(ProcessDone(0)))
++        self.assertEqual(self.pm.delay["foo"], self.pm.maxRestartDelay)
++
++
++    def test_connectionLostBackoffDelayDoubles(self):
++        """
++        L{ProcessMonitor.connectionLost} doubles the restart delay each time
++        the process dies too quickly.
++        """
++        self.pm.startService()
++        self.pm.addProcess("foo", ["foo"])
+         self.reactor.advance(self.pm.threshold - 1) #9s
+         self.assertIn("foo", self.pm.protocols)
+-
++        self.assertEquals(self.pm.delay["foo"], self.pm.minRestartDelay)
+         # process dies within the threshold and should not restart immediately
+-        self.pm.protocols["foo"].processEnded(error.ProcessDone(0))
+-        self.assertNotIn("foo", self.pm.protocols)
+-
+-        # The process won't have been restarted, we have to wait
+-        # initially for minRestartDelay seconds (2)
+-        nextRestartdelay = self.pm.minRestartDelay
+-        self.reactor.advance(nextRestartdelay) #11s
+-        self.assertIn("foo", self.pm.protocols)
+-
+-        # Advance to within 1s of the threshold and kill the process
+-        self.reactor.advance(self.pm.threshold - 1) #20s
+-        self.assertEquals(self.reactor.seconds(), 20)
+-
+-        nextRestartDelay = self.pm.delay["foo"]
+-        self.assertEquals(nextRestartDelay, 4)
+-
+-        self.pm.protocols["foo"].processEnded(error.ProcessDone(0))
+-        self.assertNotIn("foo", self.pm.protocols)
+-
+-        # Advance to within 1s of the restart time and test that the process is
+-        # restarted in the following second.
+-        self.reactor.advance(nextRestartDelay - 1) #23s
+-        self.assertNotIn("foo", self.pm.protocols)
+-
+-        self.reactor.advance(1) #24s
+-        self.assertIn("foo", self.pm.protocols)
+-
+-        # Advance to within 1s of the threshold and kill the process
+-        self.reactor.advance(self.pm.threshold - 1) #33s
+-
+-        nextRestartDelay = self.pm.delay["foo"]
+-        self.assertEquals(nextRestartDelay, 8)
+-
+-        self.pm.protocols["foo"].processEnded(error.ProcessDone(0))
+-        self.assertNotIn("foo", self.pm.protocols)
+-
+-        # Advance to within 1s of the expected restart time and test that
+-        # process is restarted in the following second.
+-        self.reactor.advance(nextRestartDelay - 1) #40
+-        self.assertNotIn("foo", self.pm.protocols)
+-        self.reactor.advance(1) #41s
+-        self.assertIn("foo", self.pm.protocols)
+-
+-        # Advance to within 1s of the threshold and kill the process
+-        self.reactor.advance(self.pm.threshold - 1) #50s
+-
+-        nextRestartDelay = self.pm.delay["foo"]
+-        self.assertEquals(nextRestartDelay, 16)
+-
+-        self.pm.protocols["foo"].processEnded(error.ProcessDone(0))
+-        self.assertNotIn("foo", self.pm.protocols)
+-
+-        # Advance to within 1s of the expected restart time. This time, the
+-        # restart delay has reached 16s which is above the configured
+-        # maxRestartTime (15s). So this time we find that the process has been
+-        # restarted already.
+-        self.reactor.advance(nextRestartDelay-1) #65s
+-        self.assertIn("foo", self.pm.protocols)
++        self.pm.protocols["foo"].processEnded(Failure(ProcessDone(0)))
++        self.assertEquals(self.pm.delay["foo"], self.pm.minRestartDelay * 2)
+
+
+     def test_startService(self):
+@@ -395,6 +428,27 @@
+         self.assertEquals({}, self.pm.protocols)
+
+
++    def test_stopServiceCancelRestarts(self):
++        """
++        L{ProcessMonitor.stopService} should cancel any scheduled process
++        restarts.
++        """
++        self.pm.addProcess("foo", ["foo"])
++        # Schedule the process to start
++        self.pm.startService()
++        # advance the reactor to start the processes
++        self.reactor.advance(self.pm.threshold)
++        self.assertIn("foo", self.pm.protocols)
++
++        self.reactor.advance(1)
++        # Kill the process early
++        self.pm.protocols["foo"].processEnded(Failure(ProcessDone(0)))
++        self.assertTrue(self.pm.restart['foo'].active())
++        self.pm.stopService()
++        # Scheduled restart should have been cancelled
++        self.assertFalse(self.pm.restart['foo'].active())
++
++
+     def test_stopServiceCleanupScheduledRestarts(self):
+         """
+         L{ProcessMonitor.stopService} should cancel all scheduled process
+@@ -416,4 +470,57 @@
+         self.reactor.advance(6)
+         # The process shouldn't have restarted because stopService has cancelled
+         # all pending process restarts.
+-        self.assertEqual(self.pm.protocols, {})
++        self.assertEquals(self.pm.protocols, {})
++
++
++    def test_activeAttributeEqualsRunning(self):
++        """
++        L{ProcessMonitor.active} unneccessarily duplicates the standard
++        L{IService.running} flag.
++        """
++        self.assertEquals(self.pm.active, self.pm.running)
++        self.pm.startService()
++        self.assertEquals(self.pm.active, self.pm.running)
++        self.active = 0
++
++
++    def test_activeAttributeDeprecation(self):
++        """
++        L{ProcessMonitor.active} unneccessarily duplicates the standard
++        L{IService.running} flag and is therefore deprecated.
++        """
++        def getActive():
++            return self.pm.active
++        expectedMessage = "active is deprecated since Twisted 10.1.0.  Use " \
++                          "running instead."
++
++        self.failUnlessWarns(DeprecationWarning,
++                             expectedMessage, __file__, getActive)
++
++
++    def test_consistencyAttributeDeprecation(self):
++        """
++        L{ProcessMonitor.consistency} is no longer needed since the removal of
++        the ProcessMonitor._checkConsistency function and is therefore
++        deprecated.
++        """
++        def getConsistency():
++            return self.pm.consistency
++        expectedMessage = "consistency is deprecated since Twisted 10.1.0."
++
++        self.failUnlessWarns(DeprecationWarning,
++                             expectedMessage, __file__, getConsistency)
++
++
++    def test_consistencyDelayAttributeDeprecation(self):
++        """
++        L{ProcessMonitor.consistencyDelay} is no longer needed since the
++        removal of the ProcessMonitor._checkConsistency function and is
++        therefore deprecated.
++        """
++        def getConsistencyDelay():
++            return self.pm.consistencyDelay
++        expectedMessage = "consistencyDelay is deprecated since Twisted 10.1.0."
++
++        self.failUnlessWarns(DeprecationWarning,
++                             expectedMessage, __file__, getConsistencyDelay)
+
+=== added file 'twisted/runner/topfiles/1763.misc'
+--- twisted/runner/topfiles/1763.misc   1970-01-01 00:00:00 +0000
++++ twisted/runner/topfiles/1763.misc   2010-05-13 20:38:52 +0000
+@@ -0,0 +1,2 @@
++Remove the ProcessMonitor.active attribute and instead use the standard
++Service.running attribute from the base class.
+
+=== added file 'twisted/runner/topfiles/3775.misc'
+--- twisted/runner/topfiles/3775.misc   1970-01-01 00:00:00 +0000
++++ twisted/runner/topfiles/3775.misc   2010-05-13 20:38:52 +0000
+@@ -0,0 +1,3 @@
++Parameterize the reactor in twisted.runner.procmon.ProcessMonitor for ease of
++testing.
++Add tests for twisted.runner.procmon.ProcessMonitor.

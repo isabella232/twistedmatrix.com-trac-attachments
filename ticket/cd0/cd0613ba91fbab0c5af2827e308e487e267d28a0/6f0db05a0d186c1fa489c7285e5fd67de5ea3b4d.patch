@@ -1,0 +1,96 @@
+Index: ssl.py
+===================================================================
+RCS file: /cvs/Twisted/twisted/internet/ssl.py,v
+retrieving revision 1.44
+diff -u -r1.44 ssl.py
+--- ssl.py      28 Sep 2003 03:30:04 -0000      1.44
++++ ssl.py      30 Sep 2003 18:25:24 -0000
+@@ -45,8 +45,13 @@
+ 
+ # System imports
+ from OpenSSL import SSL
++import md5
+ import socket
+ 
++# Hack! This should be in the python SSL interface, *but isn't*.
++# (grumblegrumble)
++SSL_OP_ALL = 0x0000FFFF
++
+ # sibling imports
+ import tcp, main, interfaces
+ 
+@@ -63,20 +68,71 @@
+         """Return a SSL.Context object. override in subclasses."""
+         raise NotImplementedError
+ 
+-
+ class DefaultOpenSSLContextFactory(ContextFactory):
+-
++    _sessionIdCtxNum = 0
+     def __init__(self, privateKeyFileName, certificateFileName,
+-                 sslmethod=SSL.SSLv23_METHOD):
++                 sslmethod=SSL.SSLv23_METHOD,
++                 verifyPeer=0, verifyDepth=10,
++                 verifyCallback=None,
++                 clientCACertsFile=None):
++        """Initialize an SSL server context.
++
++        privateKeyFileName and certificateFileName should be set to the
++        PEM-encoded key and certificates for this server.
++        
++        verifyPeer can be set to 0 (no verification), 1 (verify client
++        cert but don't fail if none is given), or 2 (verify and require
++        client cert).
++
++        verifyDepth sets how long a certificate chain is allowed.
++        
++        verifyCallback can be set to a function that customizes the
++        verification process at each certificate check. The default is:
++          lambda conn,cert,errno,depth,retcode: return retcode.
++        
++        clientCACertsFile can be set to a file containing (PEM-format)
++        certificates of the CAs to verify clients again. This must be
++        set if verifyPeer is non-zero.
++
++        """
+         self.privateKeyFileName = privateKeyFileName
+         self.certificateFileName = certificateFileName
+         self.sslmethod = sslmethod
++        self.verifyPeer = verifyPeer
++        self.verifyDepth = verifyDepth
++        self.verifyCallback = verifyCallback
++        self.clientCACertsFile = clientCACertsFile
+         self.cacheContext()
+ 
+     def cacheContext(self):
+         ctx = SSL.Context(self.sslmethod)
+         ctx.use_certificate_file(self.certificateFileName)
+         ctx.use_privatekey_file(self.privateKeyFileName)
++
++        ctx.set_verify_depth(self.verifyDepth)
++        
++        if self.clientCACertsFile:
++            ctx.load_client_ca(self.clientCACertsFile)
++            ctx.load_verify_locations(self.clientCACertsFile)
++        
++        if self.verifyPeer != 0:
++            callback = self.verifyCallback
++            if callback == None:
++                callback = lambda conn,cert,errno,depth,retcode: retcode
++            if self.verifyPeer == 2:
++                options = SSL.VERIFY_PEER | SSL.VERIFY_FAIL_IF_NO_PEER_CERT
++            else:
++                options = SSL.VERIFY_PEER
++            ctx.set_verify(options, callback)
++        
++        # turn on fixing SSL client bugs
++        ctx.set_options(SSL_OP_ALL|SSL.OP_SINGLE_DH_USE)
++
++        # session id is supposed to be unique between servers in this process.
++        # i'm unsure what the point is, but it's required. In the sample
++        # code (1 server), it's simply set to 1.
++        DefaultOpenSSLContextFactory._sessionIdCtxNum = DefaultOpenSSLContextFactory._sessionIdCtxNum + 1
++        ctx.set_session_id(md5.new("DefaultOpenSSLContextFactory%d"%DefaultOpenSSLContextFactory._sessionIdCtxNum).digest())
+         self._context = ctx
+ 
+     def __getstate__(self):

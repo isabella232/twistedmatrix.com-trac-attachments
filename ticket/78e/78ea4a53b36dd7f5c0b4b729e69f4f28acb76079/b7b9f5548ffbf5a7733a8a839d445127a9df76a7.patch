@@ -1,0 +1,410 @@
+Index: twisted/application/strports.py
+===================================================================
+--- twisted/application/strports.py	(revision 40046)
++++ twisted/application/strports.py	(working copy)
+@@ -18,13 +18,30 @@
+ 
+ 
+ 
+-def parse(description, factory, default='tcp'):
++def parse(description, factory, default='tcp', quoting=False):
+     """
+     This function is deprecated as of Twisted 10.2.
+ 
+-    @see: L{twisted.internet.endpoints.server}
++    @param description: The description of the listening port, in the syntax
++        described by L{twisted.internet.endpoints.serverFromString}.
++    @type description: C{str}
++
++    @param factory: The protocol factory which will build protocols for
++        connections to this service.
++    @type factory: L{twisted.internet.interfaces.IProtocolFactory}
++
++    @param default: Do not use this parameter. It has been deprecated since
++        Twisted 10.2.0.
++    @type default: C{str} or C{None}
++
++    @param quoting: Whether to allow quoting in the description string or not.
++    @type quoting: C{bool}
++
++    @return: a 3-tuple of (plugin or name, arguments, keyword arguments)
++
++    @see: L{twisted.internet.endpoints.serverFromString}
+     """
+-    return endpoints._parseServer(description, factory, default)
++    return endpoints._parseServer(description, factory, default, quoting)
+ 
+ deprecatedModuleAttribute(
+     Version("Twisted", 10, 2, 0),
+@@ -35,29 +52,32 @@
+ 
+ _DEFAULT = object()
+ 
+-def service(description, factory, default=_DEFAULT, reactor=None):
++def service(description, factory, default=_DEFAULT, quoting=False,
++            reactor=None):
+     """
+     Return the service corresponding to a description.
+ 
+     @param description: The description of the listening port, in the syntax
+-        described by L{twisted.internet.endpoints.server}.
+-
++        described by L{twisted.internet.endpoints.serverFromString}.
+     @type description: C{str}
+ 
+     @param factory: The protocol factory which will build protocols for
+         connections to this service.
+-
+     @type factory: L{twisted.internet.interfaces.IProtocolFactory}
+ 
+-    @type default: C{str} or C{None}
+-
+     @param default: Do not use this parameter. It has been deprecated since
+         Twisted 10.2.0.
++    @type default: C{str} or C{None}
+ 
+-    @rtype: C{twisted.application.service.IService}
++    @param quoting: Whether to allow quoting in the description string or not.
++    @type quoting: C{bool}
+ 
++    @param reactor: The server endpoint will be constructed with this reactor.
++    @type reactor: L{twisted.internet.interfaces.IReactorCore} or C{None}
++
+     @return: the service corresponding to a description of a reliable
+         stream server.
++    @rtype: C{twisted.application.service.IService}
+ 
+     @see: L{twisted.internet.endpoints.serverFromString}
+     """
+@@ -74,7 +94,8 @@
+         warnings.warn(
+             message=message, category=DeprecationWarning, stacklevel=2)
+     svc = StreamServerEndpointService(
+-        endpoints._serverFromStringLegacy(reactor, description, default),
++        endpoints._serverFromStringLegacy(reactor, description, default,
++            quoting),
+         factory)
+     svc._raiseSynchronously = True
+     return svc
+@@ -81,21 +102,34 @@
+ 
+ 
+ 
+-def listen(description, factory, default=None):
+-    """Listen on a port corresponding to a description
++def listen(description, factory, default=None, quoting=False):
++    """
++    Listen on a port corresponding to a description
+ 
++    @param description: The description of the listening port, in the syntax
++        described by L{twisted.internet.endpoints.serverFromString}.
+     @type description: C{str}
++
++    @param factory: The protocol factory which will build protocols for
++        connections to this service.
+     @type factory: L{twisted.internet.interfaces.IProtocolFactory}
++
++    @param default: Do not use this parameter. It has been deprecated since
++        Twisted 10.2.0.
+     @type default: C{str} or C{None}
+-    @rtype: C{twisted.internet.interfaces.IListeningPort}
++
++    @param quoting: Whether to allow quoting in the description string or not.
++    @type quoting: C{bool}
++
+     @return: the port corresponding to a description of a reliable
+     virtual circuit server.
++    @rtype: C{twisted.internet.interfaces.IListeningPort}
+ 
+     See the documentation of the C{parse} function for description
+     of the semantics of the arguments.
+     """
+     from twisted.internet import reactor
+-    name, args, kw = parse(description, factory, default)
++    name, args, kw = parse(description, factory, default, quoting)
+     return getattr(reactor, 'listen'+name)(*args, **kw)
+ 
+ 
+Index: twisted/internet/endpoints.py
+===================================================================
+--- twisted/internet/endpoints.py	(revision 40046)
++++ twisted/internet/endpoints.py	(working copy)
+@@ -1259,7 +1259,7 @@
+     Tokenize a strports string and yield each token.
+ 
+     @param description: a string as described by L{serverFromString} or
+-        L{clientFromString}.
++        L{clientFromString} with quoting disabled.
+ 
+     @return: an iterable of 2-tuples of (L{_OP} or L{_STRING}, string).  Tuples
+         starting with L{_OP} will contain a second element of either ':' (i.e.
+@@ -1291,8 +1291,56 @@
+ 
+ 
+ 
+-def _parse(description):
++def _tokenizeWithQuoting(description):
+     """
++    Tokenize a strports string and yield each token.
++
++    @param description: a string as described by L{serverFromString} or
++        L{clientFromString} with quoting enabled.
++
++    @return: an iterable of 2-tuples of (L{_OP} or L{_STRING}, string).  Tuples
++        starting with L{_OP} will contain a second element of either ':' (i.e.
++        'next parameter') or '=' (i.e. 'assign parameter value').  For example,
++        the string 'hello:{greet=ing}=world' would result in a generator
++        yielding these values::
++
++            _STRING, 'hello'
++            _OP, ':'
++            _STRING, 'greet=ing'
++            _OP, '='
++            _STRING, 'world'
++    """
++    current = ''
++    depth = 0
++    ops = ':='
++    nextOps = {':': ':=', '=': ':'}
++    description = iter(description)
++    for n in description:
++        if depth == 0 and n == '{':
++            depth = 1
++        elif depth == 1 and n == '}':
++            depth = 0
++        elif depth:
++            if n == '{':
++                depth += 1
++            if n == '}':
++                depth -= 1
++            current += n
++        elif n in ops:
++            yield _STRING, current
++            yield _OP, n
++            current = ''
++            ops = nextOps[n]
++        elif n == '\\':
++            current += description.next()
++        else:
++            current += n
++    yield _STRING, current
++
++
++
++def _parse(description, quoting=False):
++    """
+     Convert a description string into a list of positional and keyword
+     parameters, using logic vaguely like what Python does.
+ 
+@@ -1299,11 +1347,15 @@
+     @param description: a string as described by L{serverFromString} or
+         L{clientFromString}.
+ 
++    @param quoting: a boolean that determines which tokenization function
++        to use.
++
+     @return: a 2-tuple of C{(args, kwargs)}, where 'args' is a list of all
+         ':'-separated C{str}s not containing an '=' and 'kwargs' is a map of
+         all C{str}s which do contain an '='.  For example, the result of
+         C{_parse('a:b:d=1:c')} would be C{(['a', 'b', 'c'], {'d': '1'})}.
+     """
++    tokenFunction = _tokenizeWithQuoting if quoting else _tokenize
+     args, kw = [], {}
+     def add(sofar):
+         if len(sofar) == 1:
+@@ -1311,7 +1363,7 @@
+         else:
+             kw[sofar[0]] = sofar[1]
+     sofar = ()
+-    for (type, value) in _tokenize(description):
++    for (type, value) in tokenFunction(description):
+         if type is _STRING:
+             sofar += (value,)
+         elif value == ':':
+@@ -1337,7 +1389,7 @@
+ 
+ _NO_DEFAULT = object()
+ 
+-def _parseServer(description, factory, default=None):
++def _parseServer(description, factory, default=None, quoting=False):
+     """
+     Parse a strports description into a 2-tuple of arguments and keyword
+     values.
+@@ -1355,9 +1407,12 @@
+         and prefix).
+     @type default: C{str} or C{NoneType}
+ 
++    @param quoting: Whether to allow quoting in the description string or not.
++    @type quoting: C{bool}
++
+     @return: a 3-tuple of (plugin or name, arguments, keyword arguments)
+     """
+-    args, kw = _parse(description)
++    args, kw = _parse(description, quoting)
+     if not args or (len(args) == 1 and not kw):
+         deprecationMessage = (
+             "Unqualified strport description passed to 'service'."
+@@ -1385,12 +1440,34 @@
+ 
+ 
+ 
+-def _serverFromStringLegacy(reactor, description, default):
++def _serverFromStringLegacy(reactor, description, default, quoting=False):
+     """
+     Underlying implementation of L{serverFromString} which avoids exposing the
+     deprecated 'default' argument to anything but L{strports.service}.
++
++    @param reactor: The server endpoint will be constructed with this reactor.
++    @type reactor: L{twisted.internet.interfaces.IReactorCore}
++
++    @param description: The strports description to parse.
++    @type description: C{str}
++
++    @param default: Deprecated argument, specifying the default parser mode to
++        use for unqualified description strings (those which do not have a ':'
++        and prefix).
++    @type default: C{str} or C{NoneType}
++
++    @param quoting: Whether to allow quoting in the description string or not.
++    @type quoting: C{bool}
++
++    @return: A new endpoint which can be used to listen with the parameters
++        given by by C{description}.
++    @rtype: L{IStreamServerEndpoint<twisted.internet.interfaces.IStreamServerEndpoint>}
++
++    @raise ValueError: when the 'description' string cannot be parsed.
++
++    @see: L{twisted.internet.endpoints.serverFromString}
+     """
+-    nameOrPlugin, args, kw = _parseServer(description, None, default)
++    nameOrPlugin, args, kw = _parseServer(description, None, default, quoting)
+     if type(nameOrPlugin) is not str:
+         plugin = nameOrPlugin
+         return plugin.parseStreamServer(reactor, *args, **kw)
+@@ -1402,7 +1479,7 @@
+ 
+ 
+ 
+-def serverFromString(reactor, description):
++def serverFromString(reactor, description, quoting=False):
+     """
+     Construct a stream server endpoint from an endpoint description string.
+ 
+@@ -1421,6 +1498,12 @@
+ 
+         serverFromString(reactor, "tcp:80:interface=127.0.0.1")
+ 
++    If quoting is set to True, you can declare literals by surrounding them in
++    braces. For example, you can specify the interface for a TCP6 server
++    endpoint to bind to like this::
++
++        serverFromString(reactor, "tcp6:80:interface={::1}", quoting=True)
++
+     SSL server endpoints may be specified with the 'ssl' prefix, and the
+     private key and certificate files may be specified by the C{privateKey} and
+     C{certKey} arguments::
+@@ -1450,12 +1533,16 @@
+     information.
+ 
+     @param reactor: The server endpoint will be constructed with this reactor.
++    @type reactor: L{twisted.internet.interfaces.IReactorCore}
+ 
+     @param description: The strports description to parse.
++    @type description: C{str}
+ 
++    @param quoting: Whether to allow quoting in the description string or not.
++    @type quoting: C{bool}
++
+     @return: A new endpoint which can be used to listen with the parameters
+         given by by C{description}.
+-
+     @rtype: L{IStreamServerEndpoint<twisted.internet.interfaces.IStreamServerEndpoint>}
+ 
+     @raise ValueError: when the 'description' string cannot be parsed.
+@@ -1462,7 +1549,7 @@
+ 
+     @since: 10.2
+     """
+-    return _serverFromStringLegacy(reactor, description, _NO_DEFAULT)
++    return _serverFromStringLegacy(reactor, description, _NO_DEFAULT, quoting)
+ 
+ 
+ 
+@@ -1657,7 +1744,7 @@
+ 
+ 
+ 
+-def clientFromString(reactor, description):
++def clientFromString(reactor, description, quoting=False):
+     """
+     Construct a client endpoint from a description string.
+ 
+@@ -1721,6 +1808,8 @@
+ 
+     @param description: The strports description to parse.
+ 
++    @param quoting: Whether to allow quoting in the description string or not.
++
+     @return: A new endpoint which can be used to connect with the parameters
+         given by by C{description}.
+     @rtype: L{IStreamClientEndpoint<twisted.internet.interfaces.IStreamClientEndpoint>}
+@@ -1727,7 +1816,7 @@
+ 
+     @since: 10.2
+     """
+-    args, kwargs = _parse(description)
++    args, kwargs = _parse(description, quoting)
+     aname = args.pop(0)
+     name = aname.upper()
+     for plugin in getPlugins(IStreamClientEndpointStringParser):
+Index: twisted/internet/test/test_endpoints.py
+===================================================================
+--- twisted/internet/test/test_endpoints.py	(revision 40046)
++++ twisted/internet/test/test_endpoints.py	(working copy)
+@@ -2305,7 +2305,19 @@
+         self.assertRaises(ValueError, self.parse, "bogus-type:nothing", self.f)
+ 
+ 
++    def test_quoting(self):
++        """
++        When quoting=True, everything within braces should be considered a
++        literal. It should even work for the endpoint type.
++        """
++        self.assertEqual(
++            self.parse('{unix}:{/var/run/finger\\::\\={}=\\::\\}', self.f,
++                quoting=True),
++            ('UNIX', ('/var/run/finger\\::\\={}=\\::\\', self.f),
++             {'mode': 0o666, 'backlog': 50, 'wantPID': True}))
+ 
++
++
+ class ServerStringTests(unittest.TestCase):
+     """
+     Tests for L{twisted.internet.endpoints.serverFromString}.
+Index: twisted/topfiles/6758.feature
+===================================================================
+--- twisted/topfiles/6758.feature	(revision 0)
++++ twisted/topfiles/6758.feature	(working copy)
+@@ -0,0 +1 @@
++twisted.internet.endpoints.serverFromString and twisted.internet.endpoints.clientFromString now has a quoting argument for an enhanced endpoint description syntax.
+\ No newline at end of file
+Index: twisted/words/protocols/jabber/jstrports.py
+===================================================================
+--- twisted/words/protocols/jabber/jstrports.py	(revision 40046)
++++ twisted/words/protocols/jabber/jstrports.py	(working copy)
+@@ -21,11 +21,11 @@
+            "ssl"  : _parseTCPSSL }
+ 
+ 
+-def parse(description, factory):
+-    args, kw = _parse(description)
++def parse(description, factory, quoting=False):
++    args, kw = _parse(description, quoting)
+     return (args[0].upper(),) + _funcs[args[0]](factory, *args[1:], **kw)
+ 
+-def client(description, factory):
++def client(description, factory, quoting=False):
+     from twisted.application import internet
+-    name, args, kw = parse(description, factory)
++    name, args, kw = parse(description, factory, quoting)
+     return getattr(internet, name + 'Client')(*args, **kw)

@@ -1,0 +1,355 @@
+TWISTED FROM SCRATCH, OR THE EVOLUTION OF FINGER: GENTLE ANNOTATIONS
+Updated 2004-04-01 Mike Orr <mso@oz.net>
+Status: first half of original covered
+
+1 - INTRODUCTION
+These notes are meant to be read chapter by chapter in conjunction with "Twisted
+From Scratch, or The Evolution of Finger".  They aim to provide the background
+knowledge assumed in the original, and also to clarify the author's Python
+coding shortcuts.
+
+We'll be building a 'finger' server with many bells and whistles.  We'll start
+with the absolutely smallest application possible and then add features one at
+a time, making each step a functioning application.  
+
+If you're not familiar with 'finger' it's probably because it's not used as
+much nowadays as it used to be.  Basically, if you run 'finger nail' or 'finger
+nail@example.com' the target computer spits out some information about that
+user, for instance:
+
+Login: nail                           Name: Nail Sharp
+Directory: /home/nail                 Shell: /usr/bin/zsh
+Last login Wed Mar 31 18:32 2004 (PST)
+New mail received Thu Apr  1 10:50 2004 (PST)
+     Unread since Thu Apr  1 10:50 2004 (PST)
+No Plan.
+
+If the server does not have the 'fingerd' daemon running you'll get a
+"Connection Refused" error.  Paranoid sysadmins keep 'fingerd' off or limit the
+output to hinder crackers and harassers.  The above format is the standard
+fingerd's default, but an alternate implementation can output anything it
+wants.  E.g., automated responsibility status for everyone in an organization.
+You can also define pseudo "users", which are essentially keywords.
+
+(A daemon is a background process that does a job or handles client requests.
+"daemon" is a Unix term; "service" is the NT equivalent.)
+
+
+-----------------------------------------------------------------------------
+2 - Refuse Connections
+This server is not listening on any port so it can't respond to network
+requests.
+
+If you run 'finger nail' and 'telnet localhost 1079', you'll get a 
+"Connection refused" error since there's no daemon running to respond.
+
+-----------------------------------------------------------------------------
+2a - The Reactor
+Only one reactor is instantiated in any application, but there are several
+reactors to choose from.  'from twisted.internet import reactor' returns the
+current reactor instance.  If you haven't chosen a reactor class yet, it
+automatically chooses the default class.  See the "Reactor Basics" HOWTO for
+more information.
+
+-----------------------------------------------------------------------------
+3 - Do Nothing
+Study the code after the class definitions.  'reactor.listenTCP' opens the
+specified port and uses the factory instance to handles any requests.  For each
+request, the reactor looks up the factory's 'protocol' attribute and
+instantiates it.  In this case, class 'FingerProtocol' processes the request.
+
+To test what the program is (or isn't) doing, run 'telnet localhost 1079'
+(or 'nc localhost 1079' if you prefer).  Type the desired username ("moshez"
+for the tutorial) and press Enter.  Press ctrl-D to finish your input.  If
+'nc' refuses to quit, press ctrl-C or ctrl-\.  If 'telnet' refuses to quit,
+press ctrl-], then at the "telnet>" prompt type "quit" or ctrl-D.
+
+-----------------------------------------------------------------------------
+8 - Output from Non-empty Factory
+'FingerFactory' uses some coding shortcuts.  The obvious one is that 
+usernames/output text are defined via keyword arguments.  The less obvious one
+is that 'FingerFactory.getUser' generates the output text via Python's
+ standard 'dict.get' method, which happens to let us define the "Not found"
+value in the same step.
+
+-----------------------------------------------------------------------------
+9 - Use Deferreds
+Deferreds are a complicated topic, and the Deferred HOWTO is not the clearest
+explanation.  (http://twistedmatrix.com/documents/current/howto/defer)  One
+paragraph though is key: "The basic idea behind Deferreds is to keep
+the CPU active as much as possible. If one task is waiting on data, rather than
+have the CPU (and the program!) idle waiting for that data (a process normally
+called 'blocking'), the program performs other operations in the meantime, and
+waits for some signal that data is ready to be processed before returning to
+that process."  Other systems use threads to get around the blocking problem,
+but Twisted does not use threads for performance reasons.  
+
+Deferreds require you to restructure your code.  Rather than simply calling a
+slow function and then operating on the result, you divide both the slow
+function and the calling routine into two parts, stuff to execute
+now and stuff to execute later.  In both cases, the stuff to execute later
+gets encapsulated in a new function.  Execution happens like this:
+
+1. The calling routine calls the slow function.
+
+2. The slow function executes everything "before the wait".  Everything "after
+   the wait" goes into a new function, which we'll call the "Deferred action".
+   The slow function then creates a Deferred, schedules a job to execute the
+   deferred action, and returns the Deferred.
+       from twisted.internet import reactor, defer
+       d = defer.Deferred()
+       reactor.callLater(SECONDS_FLOAT, DEFERRED_ACTION, *args, **kw)
+       return d
+   This tells the reactor to call DEFERRED_ACTION after SECONDS_FLOAT.
+   The action will need access to the Deferred, so it should be passed as an
+   argument or available as an instance variable.
+
+3. The calling routine receives a Deferred rather than the result itself, so 
+   it can't operate on the result directly.  Instead it registers a callback
+   function which will operate on the result when it's ready.
+       d = SLOW_FUNCTION(...)
+       d.addCallback(CALLBACK)
+   The callback will be called with one argument: the result.  You can register
+   multiple callbacks and they will be called in order, the result of one being
+   passed to the next.  This allows generic functions to act as filters,
+   similar to a pipeline in Unix or nested functions in Python.  The callbacks
+   must fully dispose of the result -- e.g., by writing it to the output stream
+   or saving it in an instance variable -- because the reactor will *throw the
+   result away* after the last callback finishes.
+
+4. The calling routine can also register "errbacks", which are called if the
+   deferred action recognizes an error condition or a callback raises an
+   exception.  The first errback is called with a
+   'twisted.python.failure.Failure' instance.  There's a complicated
+   interaction between callbacks and errbacks, which is diagrammed in the
+   Deferred HOWTO, section "Visual Explanation", step 2.  For simplicity:
+   a. Register exactly one errback (no more, no less) before registering any
+      callbacks.
+   b. Have the errback return a string error message, which will hopefully be
+      logged to stderr.  Do not let the errback fall off the bottom (implicitly
+      returning 'None').
+   c. If no callbacks get called but no error appears either, assume there's
+      an invisible error which isn't being logged.  See "Unhandled errors"
+      in the Deferred HOWTO.
+
+5. After 'SECONDS_FLOAT', the reactor calls 'DEFERRED_ACTION(*args, **kw)'.
+   If the result still isn't ready, the action registers itself to be called
+   again after another delay.  If the result *is* ready, the action uses
+   'd.callback(RESULT)' to pass it to whoever should receive it.  
+
+6. "Whoever should receive it" is the callbacks, which are called in order.
+
+7. If the action detects an error, it calls 'd.errback(Failure_INSTANCE)'
+   instead of 'd.callback'.  The errbacks will be executed rather than the
+   callbacks.
+
+
+Let's look at how these principles are applied in the example.  The deferred
+action is a fast-running expression consisting of one dictionary method.
+Since this can execute without delay, the not-so-slow function 
+('FingerFactory.getUser') uses 'defer.succeed' to forward it.  That's a module
+function that creates a Deferred, wraps a result in it, and returns the 
+Deferred, all in one step.
+
+The calling routine ('FingerProtocol.lineReceived') contains a lot of coding
+shortcuts, so let's look at its counterpart in section 20 (Write Readable Code)
+instead.  Find the method 'FingerProtocol.lineReceived' near the top.  The
+calling routine registers an errback and a callback just like above.
+
+What if the slow function did have to wait for the result?  In that case you'd
+probably want something like this.
+    from twisted.internet import reactor, defer
+    def deferredAction(d):
+        if not RESULT_IS_READY:
+            reactor.callLater(2, deferredAction, d)
+            return
+        d.callback(RESULT)
+    reactor.callLater(2, deferredAction, d)
+
+The example in the Deferred HOWTO is simpler than this but not very useful.
+    for twisted.internet import reactor, defer
+    d = defer.Deferred()
+    reactor.callLater(2, d.callback, RESULT)
+This takes a shortcut by scheduling 'd.callback' directly.  Since the result is
+passed in at the same time, it must already be known.  That's why this example
+is useless: you might as well have called 'defer.suceed' instead and saved
+yourself some typing.
+
+-----------------------------------------------------------------------------
+10 - Run 'finger' Locally
+'twisted.internet.utils.getProcessOutput' is a non-blocking counterpart to
+Python's 'commands.getOutput', which runs a shell command and captures its
+standard output.  (The argument signature is different, and there may be other
+subtle differences too.)  Note that it returns a Deferred, *not* the output
+itself.  Since 'FingerProtocol.lineReceived' is already expecting a Deferred,
+it doesn't need to be changed.  
+
+Note that we don't know nor care how 'getProcessOutput' handles its action,
+whether in one chunk or many.  All we know is that our callbacks or errback
+will be called some time in the future.
+
+-----------------------------------------------------------------------------
+11 - Read Status from the Web
+'twisted.web.client.getPage' is a non-blocking counterpart to Python's
+'urllib2.urlopen(URL).read()', which invokes a web request and captures the
+output.  (As above, there may be subtle differences between the two.)  Since it
+also returns a Deferred, it's a drop-in replacement for 'getProcessOutput'.
+
+-----------------------------------------------------------------------------
+12 - Use Application
+The operating system expects daemons to adhere to certain behavioral standards
+so that standard tools can start/stop/query them.  Therefore, the usual way to
+run a Twisted application is via the 'twistd' daemon, which handles all that
+behavioral stuff for you.  There are several ways to tell 'twistd' where your
+application is, but the way shown here is an 'application' attribute in a
+Python module.  
+
+Compare the code after the class definitions with its counterpart in section 3
+(Do Nothing).  'internet.TCPServer' is the application-aware counterpart to
+'reactor.listenTCP'.  The application object does not have any apparent
+reference to the protocol or the factory.  We can thus assume that 'twistd'
+doesn't do anything with TCPServers, it just assumes that whichever ones have
+been started are the ones that should run.  So what is the application object
+good for?  According to its API documentation
+(http://twistedmatrix.com/documents/current/api/twisted.application.service.html#Application),
+'twisted.application.service.Application' "returns an object supporting the
+IService, IServiceCollection, IProcess and sob.IPersistable interfaces, with
+the given parameters."  So let's look at those interfaces.  All except the last
+are defined in the same module as 'Application'.
+
+IService : an object that can be started and stopped in a standardized manner.
+    Hooks are provided for custom start/stop code, and methods to link this
+    service to a parent.  The stop action is deferrable.
+
+IServiceCollection : a collection of services (IService).  You can iterate over
+    all the services or fetch one by name.  Because 'application' is both a
+    service and a service collection, it can contain child services.  It can
+    then start/stop all the child services at once, or fetch a particular child
+    service whenever desired.
+
+IProcess : an process that knows the process name, user ID, and group ID it
+    should run as.
+
+twisted.persisted.sob.IPersistable : an object that can be serialized to a 
+    file in any of several formats (pickle, xml, Python source), optionally
+    protected by an encryption passphrase (GPG?).
+
+The application becomes the parent of the TCPServer we opened, allowing it to
+manage it.
+
+Note that the word "service" is used here slightly differently than how NT
+defines it.  'twistd' is an NT service and can be managed by NT tools (true?),
+but child services are not visible to NT tools.
+
+-----------------------------------------------------------------------------
+13 - twistd
+You read the previous section about twistd, right?
+
+Now that your daemon is running on the standard finger port, you can test it
+with the standard finger command: 'finger moshez'.
+
+-----------------------------------------------------------------------------
+14 - Setting Message By Local Users
+This program has two protocol-factory-TCPServer pairs, which are both child
+services of the application.
+
+The FingerSetterFactory is initialized with the FingerFactory instance so it
+can access the 'users' dictionary.  The factory uses Python shortcuts.  An
+equivalent orthodox factory would look like this:
+    from twisted.internet import protocol
+    class FingerSetterFactory(protocol.ServerFactory):
+        def __init__(self, ff):
+            self.ff = ff
+        def setUser(self, user, value):
+            self.ff.users[user] = value
+
+'FingerProtocol.connectionList' also uses Python shortcuts.  An equivalent
+orthodox method is:
+    def connectionLost(self, reason):
+        user = self.lines[0]
+        value = self.lines[1]
+        self.factory.setUser(user, value)
+
+-----------------------------------------------------------------------------
+15 - Using Services to Make Dependencies Sane
+Instead of defining factory classes, we define a common service class with
+methods that create the factory on the fly.  The service also contains methods
+the factory will depend on.  The author argues that this is a better design
+than the previous.  The factory-creation methods follow this pattern:
+
+1. Instantiate a generic server factory
+('twisted.internet.protocol.ServerFactory).
+
+2. Set the protocol class (just like our factory class would have done).
+
+3. Copy a service method to the factory as a function attribute.  The function
+   won't have access to the factory's 'self', but that's OK because as a bound
+   method it has access to the service's 'self', which is what it needs.
+   For 'getUser', copy a custom method we've defined in the service.  For
+   'setUser', copy a standard method of the 'users' dictionary.
+
+-----------------------------------------------------------------------------
+16 - Read Status File
+Here there is no 'FingerSetterFactory', so nothing listening on port 1079 for
+interactive updates.  Instead the service itself refreshes the data from a
+file every 30 seconds.  The service overrides the standard 'startService' and
+'stopService' hooks.  
+
+'startService' calls '_read', which loads the data and then schedules itself to
+run again after 30 seconds (and so on, and so on...).  It saves the return
+value of the scheduled job so 'stopService' can cancel it.
+
+'FingerService.getFingerFactory' copies 'startService' to the
+dynamically-created factory.  There's no apparent reason for this since
+'fingerProtocol.getUser' never calls it.
+
+
+-----------------------------------------------------------------------------
+17 - Announce on the Web, Too
+This is one of those showoff programs that adds a web server just because it
+can.  
+
+To do this, the service defines a method 'getResource'.  It returns a generic
+'twisted.web.resource.Resource' and sets a function attribute 'getChild'.
+Again the author uses Python shortcuts, an orthodox version would look like:
+
+    from twisted.web import resource, server, static
+    class MyResource(resource.Resource):
+        def getChild(self, path, request):
+            """'path' is a string. 
+                'request' is a 'twisted.protocols.http.Request'.
+            """
+            user = path
+            value = self.users.get(user, 
+                "No such user.<p/>http://this.site/user")
+            contentType = "text/html"
+            value = cgi.excape(value)
+            contentType = cgi.escape(contentType)
+            output = "<h1>%s</h1><p>%s</p>" % (value, contentType)
+            return static.Data(output)
+    class FingerService(service.Service):
+        ....
+        def getResource(self):
+            return MyResource()
+
+I don't know why the original wants to display "text/html" literally,
+but that's what it does.
+
+The application then opens a TCPServer listening on port 8000 for the web 
+service.
+
+'FingerService.__init__' and '_read' are slightly different than in the previous
+example.  The previous version never clears out the 'users' dict after
+instantiation; it only adds or replaces entries.  This is probably bad because
+obsolete entries will remain.  The current example rectifies this by clearing
+out 'users' before each refresh.  If 'users' were being shared in a 
+multithreaded program we'd need a lock to prevent another thread from reading
+it while the database is being populated.  But since this program is not
+multithreaded we don't have to worry about that.  
+
+-----------------------------------------------------------------------------
+18 - Announce on IRC Too
+This follows a more or less similar pattern as the previous example.  We won't
+get into the internals of IRC here.
+
+# vim: sw=4 ts=4 expandtab ai tw=79

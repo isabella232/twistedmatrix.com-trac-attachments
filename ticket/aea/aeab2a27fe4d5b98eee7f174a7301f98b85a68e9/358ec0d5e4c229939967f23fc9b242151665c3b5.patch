@@ -1,0 +1,124 @@
+diff --git a/twisted/web/client.py b/twisted/web/client.py
+index d5a04a5..a8938b8 100644
+--- a/twisted/web/client.py
++++ b/twisted/web/client.py
+@@ -622,7 +622,7 @@ def _makeGetterFactory(url, factoryFactory, contextFactory=None,
+     return factory
+ 
+ 
+-def getPage(url, contextFactory=None, *args, **kwargs):
++def oldGetPage(url, contextFactory=None, *args, **kwargs):
+     """
+     Download a web page as a string.
+ 
+@@ -638,6 +638,110 @@ def getPage(url, contextFactory=None, *args, **kwargs):
+         *args, **kwargs).deferred
+ 
+ 
++from twisted.internet.protocol import Protocol
++
++
++class GetPageProtocol(Protocol):
++    def __init__(self, code, phrase):
++        assert isinstance(code, int)
++        self.code = code
++        self.phrase = phrase
++        self.deferred = defer.Deferred()
++        self.data = []
++
++    def dataReceived(self, data):
++        self.data.append(data)
++
++    def connectionLost(self, reason):
++        from twisted.web.error import Error as tweError
++
++        data = ''.join(self.data)
++        try:
++            if reason.check(ResponseDone):
++                if 200 <= self.code < 300:
++                    self.deferred.callback(data)
++                else:
++                    self.deferred.errback(tweError(str(self.code),
++                                                   self.phrase,
++                                                   data))
++            elif reason.check(ResponseFailed):
++                self.deferred.errback(PartialDownloadError(self.code,
++                                                           self.phrase,
++                                                           data))
++            else:
++                self.deferred.errback(reason)
++        except Exception, e:
++            self.deferred.errback(e)
++
++
++
++def compatGetPage(url, contextFactory=None, method=b'GET', postdata=None,
++                  headers=None, agent=b"Twisted PageGetter", timeout=0,
++                  cookies=None, followRedirect=True, redirectLimit=20,
++                  afterFoundGet=False):
++
++    from cStringIO import StringIO
++    import cookielib
++
++    _headers = Headers()
++
++    if headers is not None:
++        for key, value in headers.iteritems():
++            assert isinstance(key, str)
++            assert isinstance(value, str)
++            _headers.addRawHeader(key, value)
++
++    if cookies is not None:
++        for cookie, cookval in cookies.items():
++            _headers.addRawHeader('Cookie', '%s=%s' % (cookie, cookval))
++
++    if postdata is not None:
++        bp = FileBodyProducer(StringIO(postdata))
++    else:
++        bp = None
++
++    if not timeout:
++        timeout = None
++
++    _agent = CookieAgent(Agent(reactor,
++                               contextFactory=contextFactory,
++                               connectTimeout=timeout),
++                         cookielib.CookieJar())
++
++    if followRedirect:
++        _agent = RedirectAgent(_agent,
++                               redirectLimit=redirectLimit)
++
++    d = _agent.request(method, url, headers=_headers, bodyProducer=bp)
++
++    def _getPageResponded(response):
++        from twisted.web.error import Error as tweError
++
++        if response.length != 0:
++            proto = GetPageProtocol(response.code, response.phrase)
++            response.deliverBody(proto)
++            return proto.deferred
++        else:
++            if response.code >= 400:
++                raise tweError(str(response.code), response.phrase, '')
++            return ''
++
++    def _getPageError(reason):
++        from twisted.internet.error import TimeoutError as tieTimeoutError
++
++        if reason.check(tieTimeoutError):
++            raise defer.TimeoutError
++        else:
++            return reason
++
++    d.addCallbacks(_getPageResponded, _getPageError)
++
++    return d
++
++
++getPage = compatGetPage
++
++
+ def downloadPage(url, file, contextFactory=None, *args, **kwargs):
+     """
+     Download a web page to a file.

@@ -1,0 +1,115 @@
+? _trial_temp
+? names-authority.patch
+? protocols/irc.patch
+? python/oldplugin.py
+? python/tpypdiff
+Index: names/authority.py
+===================================================================
+RCS file: /cvs/Twisted/twisted/names/authority.py,v
+retrieving revision 1.12
+diff -u -r1.12 authority.py
+--- names/authority.py	27 May 2003 01:00:45 -0000	1.12
++++ names/authority.py	19 Jul 2003 20:46:46 -0000
+@@ -66,11 +66,11 @@
+             for record in self.records[name.lower()]:
+                 if record.TYPE == type or type == dns.ALL_RECORDS:
+                     results.append(
+-                        dns.RRHeader(name, record.TYPE, dns.IN, ttl, record)
++                        dns.RRHeader(name, record.TYPE, dns.IN, ttl, record, auth=True)
+                     )
+                 elif record.TYPE == dns.NS and type != dns.ALL_RECORDS:
+                     authority.append(
+-                        dns.RRHeader(name, record.TYPE, dns.IN, ttl, record)
++                        dns.RRHeader(name, record.TYPE, dns.IN, ttl, record, auth=True)
+                     )
+             
+             for record in results + authority:
+@@ -79,7 +79,7 @@
+                     for rec in self.records.get(n.lower(), ()):
+                         if rec.TYPE == dns.A:
+                             additional.append(
+-                                dns.RRHeader(n, dns.A, dns.IN, ttl, rec)
++                                dns.RRHeader(n, dns.A, dns.IN, ttl, rec, auth=True)
+                             )
+             return defer.succeed((results, authority, additional))
+         except KeyError:
+@@ -93,11 +93,11 @@
+         if self.soa[0].lower() == name.lower():
+             # Wee hee hee hooo yea
+             ttl = max(self.soa[1].minimum, self.soa[1].expire)
+-            results = [dns.RRHeader(self.soa[0], dns.SOA, dns.IN, ttl, self.soa[1])]
++            results = [dns.RRHeader(self.soa[0], dns.SOA, dns.IN, ttl, self.soa[1], auth=True)]
+             for (k, r) in self.records.items():
+                 for rec in r:
+                     if rec.TYPE != dns.SOA:
+-                        results.append(dns.RRHeader(k, rec.TYPE, dns.IN, ttl, rec))
++                        results.append(dns.RRHeader(k, rec.TYPE, dns.IN, ttl, rec, auth=True))
+             results.append(results[0])
+             return defer.succeed((results, (), ()))
+         return defer.fail(failure.Failure(dns.DomainError(name)))
+Index: names/server.py
+===================================================================
+RCS file: /cvs/Twisted/twisted/names/server.py,v
+retrieving revision 1.33
+diff -u -r1.33 server.py
+--- names/server.py	13 Mar 2003 01:06:27 -0000	1.33
++++ names/server.py	19 Jul 2003 20:46:52 -0000
+@@ -102,6 +102,10 @@
+     def gotResolverResponse(self, (ans, auth, add), protocol, message, address):
+         message.rCode = dns.OK
+         message.answers = ans
++        for x in ans:
++            if x.isAuthoritative():
++                message.auth = 1
++                break
+         message.authority = auth
+         message.additional = add
+         self.sendReply(protocol, message, address)
+Index: protocols/dns.py
+===================================================================
+RCS file: /cvs/Twisted/twisted/protocols/dns.py,v
+retrieving revision 1.67
+diff -u -r1.67 dns.py
+--- protocols/dns.py	30 Jun 2003 03:53:07 -0000	1.67
++++ protocols/dns.py	19 Jul 2003 20:47:07 -0000
+@@ -358,7 +358,7 @@
+     
+     cachedResponse = None
+ 
+-    def __init__(self, name='', type=A, cls=IN, ttl=0, payload=None):
++    def __init__(self, name='', type=A, cls=IN, ttl=0, payload=None, auth=False):
+         """
+         @type name: C{str}
+         @param name: The name about which this reply contains information.
+@@ -382,6 +382,7 @@
+         self.cls = cls
+         self.ttl = ttl
+         self.payload = payload
++        self.auth = auth
+ 
+ 
+     def encode(self, strio, compDict=None):
+@@ -404,17 +405,17 @@
+         self.type, self.cls, self.ttl, self.rdlength = r
+ 
+ 
++    def isAuthoritative(self):
++        return self.auth
++
++
+     def __str__(self):
+         t = QUERY_TYPES.get(self.type, EXT_QUERIES.get(self.type, 'UNKNOWN (%d)' % self.type))
+         c = QUERY_CLASSES.get(self.cls, 'UNKNOWN (%d)' % self.cls)
+-        return '<RR %s %s %s %ds>' % (self.name, t, c, self.ttl)
+-
++        return '<RR name=%r type=%s class=%s ttl=%ds auth=%s>' % (self.name, t, c, self.ttl, self.auth and 'True' or 'False')
+ 
+-    def __repr__(self):
+-        return 'RR(%r, %d, %d, %d)' % (
+-            str(self.name), self.type, self.cls, self.ttl
+-        )
+ 
++    __repr__ = __str__
+ 
+ class SimpleRecord:
+     """

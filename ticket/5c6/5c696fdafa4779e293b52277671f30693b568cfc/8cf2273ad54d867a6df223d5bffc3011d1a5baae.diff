@@ -1,0 +1,104 @@
+diff --git a/docs/core/howto/defer-intro.rst b/docs/core/howto/defer-intro.rst
+index d56b39f..90b57d5 100644
+--- a/docs/core/howto/defer-intro.rst
++++ b/docs/core/howto/defer-intro.rst
+@@ -345,6 +345,11 @@ a couple of things are happening here:
+ #. we use ``returnValue`` to propagate the final result of our function.
+    Because this function is a generator, we cannot use the return statement; that would be a syntax error.
+ 
++.. note::
++
++    On Python 3.3 and above, instead of writing ``returnValue(json.loads(responseBody))`` you can instead write ``return json.loads(responseBody)``.
++    This can be a significant readability advantage, but unfortunately if you need compatibility with Python 2, this isn't an option.
++
+ Both versions of ``getUsers`` present exactly the same API to their callers: both return a ``Deferred`` that fires with the parsed JSON body of the request.
+ Though the ``inlineCallbacks`` version looks like synchronous code, which blocks while waiting for the request to finish, each ``yield`` statement allows other code to run while waiting for the ``Deferred`` being yielded to fire.
+ 
+diff --git a/twisted/internet/defer.py b/twisted/internet/defer.py
+index fb1e65d..6a58bbb 100644
+--- a/twisted/internet/defer.py
++++ b/twisted/internet/defer.py
+@@ -1112,9 +1112,9 @@ def _inlineCallbacks(result, g, deferred):
+                 result = result.throwExceptionIntoGenerator(g)
+             else:
+                 result = g.send(result)
+-        except StopIteration:
++        except StopIteration as e:
+             # fell off the end, or "return" statement
+-            deferred.callback(None)
++            deferred.callback(getattr(e, "value", None))
+             return deferred
+         except _DefGen_Return as e:
+             # returnValue() was called; time to give a result to the original
+@@ -1236,6 +1236,14 @@ def inlineCallbacks(f):
+             else:
+                 # will trigger an errback
+                 raise Exception('DESTROY ALL LIFE')
++
++    If you are using Python 3.3 or later, it is possible to use the C{return}
++    statement instead of L{returnValue}::
++
++        @inlineCallbacks
++        def loadData(url):
++            response = yield makeRequest(url)
++            return json.loads(respoonse)
+     """
+     @wraps(f)
+     def unwindGenerator(*args, **kwargs):
+diff --git a/twisted/internet/test/test_inlinecb.py b/twisted/internet/test/test_inlinecb.py
+index fe5e9af..67a8f5f 100644
+--- a/twisted/internet/test/test_inlinecb.py
++++ b/twisted/internet/test/test_inlinecb.py
+@@ -11,9 +11,45 @@ well.
+ 
+ from __future__ import division, absolute_import
+ 
++import sys
++
+ from twisted.trial.unittest import TestCase
+ from twisted.internet.defer import Deferred, returnValue, inlineCallbacks
+ 
++
++class StopIterationReturnTests(TestCase):
++    """
++    On Python 3.3 and newer generator functions may use the C{return} statement
++    with a value, which is attached to the L{StopIteration} exception that is
++    raised.
++
++    L{inlineCallbacks} will use this value when it fires the C{callback}.
++    """
++
++    def test_returnWithValue(self):
++        """
++        If the C{return} statement has a value it is propogated back to the
++        L{Deferred} that the C{inlineCallbacks} function returned.
++        """
++        environ = {"inlineCallbacks": inlineCallbacks}
++        exec("""
++@inlineCallbacks
++def f(d):
++    yield d
++    return 14
++        """, environ)
++        d1 = Deferred()
++        d2 = environ["f"](d1)
++        d1.callback(None)
++        self.assertEqual(self.successResultOf(d2), 14)
++
++
++
++if sys.version_info < (3, 3):
++    StopIterationReturnTests.skip = "Test requires Python 3.3 or greater"
++
++
++
+ class NonLocalExitTests(TestCase):
+     """
+     It's possible for L{returnValue} to be (accidentally) invoked at a stack
+diff --git a/twisted/topfiles/7624.feature b/twisted/topfiles/7624.feature
+new file mode 100644
+index 0000000..27fae12
+--- /dev/null
++++ b/twisted/topfiles/7624.feature
+@@ -0,0 +1 @@
++inlineCallbacks now supports using the return statement with a value on Python 3

@@ -1,0 +1,123 @@
+Index: twisted/trial/test/test_runner.py
+===================================================================
+--- twisted/trial/test/test_runner.py	(Revision 16335)
++++ twisted/trial/test/test_runner.py	(Arbeitskopie)
+@@ -98,6 +98,9 @@
+         self.runner = runner.TrialRunner(CapturingReporter, stream=self.stream)
+         self.test = TestImports('test_imports')
+ 
++    def tearDown(self):
++        self.runner._tearDownLogFile()
++        
+     def _getObservers(self):
+         from twisted.python import log
+         return log.theLogPublisher.observers
+@@ -133,6 +136,7 @@
+     
+     def setUp(self):
+         unittest.TestCase.setUp(self)
++        self.runners = []        
+         self.config = trial.Options()
+         # whitebox hack a reporter in, because plugins are CACHED and will
+         # only reload if the FILE gets changed.
+@@ -183,18 +187,28 @@
+             'addSuccess',
+             'stopTest',
+             ]
+-        
++
++    def tearDown(self):
++        for x in self.runners:
++            x._tearDownLogFile()
++        self.runners = []
++
+     def parseOptions(self, args):
+         self.config.parseOptions(args)
+ 
+     def getRunner(self):
+-        return trial._makeRunner(self.config)
++        r = trial._makeRunner(self.config)
++        self.runners.append(r)
++        return r
+     
+     def test_runner_can_get_reporter(self):
+         self.parseOptions([])
+         reporter = self.config['reporter']
+         my_runner = self.getRunner()
+-        self.assertEqual(reporter, my_runner._makeResult().__class__)
++        try:
++            self.assertEqual(reporter, my_runner._makeResult().__class__)
++        finally:
++            my_runner._tearDownLogFile()
+ 
+     def test_runner_get_result(self):
+         self.parseOptions([])
+@@ -205,7 +219,10 @@
+     def test_runner_working_directory(self):
+         self.parseOptions(['--temp-directory', 'some_path'])
+         runner = self.getRunner()
+-        self.assertEquals(runner.workingDirectory, 'some_path')
++        try:
++            self.assertEquals(runner.workingDirectory, 'some_path')
++        finally:
++            runner._tearDownLogFile()
+ 
+     def test_runner_dry_run(self):
+         self.parseOptions(['--dry-run', '--reporter', 'capturing',
+Index: twisted/trial/runner.py
+===================================================================
+--- twisted/trial/runner.py	(Revision 16335)
++++ twisted/trial/runner.py	(Arbeitskopie)
+@@ -392,6 +392,7 @@
+         return dbg
+     
+     def _setUpTestdir(self):
++        self._tearDownLogFile()
+         currentDir = os.getcwd()
+         testdir = os.path.normpath(os.path.abspath(self.workingDirectory))
+         if os.path.exists(testdir):
+@@ -441,10 +442,17 @@
+         self._setUpLogFile()
+         self._setUpLogWarnings()
+ 
+-    def _setUpLogFile(self):
++    def _tearDownLogFile(self):
+         if self._logFileObserver is not None:
++            log.removeObserver(self._logFileObserver.emit)
++            self._logFileObserver = None
++        if self._logFileObject is not None:
+             self._logFileObject.close()
+-            log.removeObserver(self._logFileObserver.emit)
++            self._logFileObject = None
++            
++            
++    def _setUpLogFile(self):
++        self._tearDownLogFile()
+         if self.logfile == '-':
+             logFile = sys.stdout
+         else:
+@@ -478,14 +486,18 @@
+             # open question - should this be self.debug() instead.
+             debugger = self._getDebugger()
+             oldDir = self._setUpTestdir()
+-            self._setUpLogging()
+-            debugger.runcall(suite.run, result)
+-            os.chdir(oldDir)
++            try:
++                self._setUpLogging()
++                debugger.runcall(suite.run, result)
++            finally:
++                os.chdir(oldDir)
+         else:
+             oldDir = self._setUpTestdir()
+-            self._setUpLogging()
+-            suite.run(result)
+-            os.chdir(oldDir)
++            try:
++                self._setUpLogging()
++                suite.run(result)
++            finally:
++                os.chdir(oldDir)
+         endTime = time.time()
+         result.printErrors()
+         result.writeln(result.separator)

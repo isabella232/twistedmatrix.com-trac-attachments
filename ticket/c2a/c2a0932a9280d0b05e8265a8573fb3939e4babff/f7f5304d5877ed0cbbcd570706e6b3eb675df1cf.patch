@@ -1,0 +1,193 @@
+diff --git a/twisted/internet/_sslverify.py b/twisted/internet/_sslverify.py
+index 3af601b..20119fa 100644
+--- a/twisted/internet/_sslverify.py
++++ b/twisted/internet/_sslverify.py
+@@ -626,6 +626,7 @@ class OpenSSLCertificateOptions(object):
+     A factory for SSL context objects for both SSL servers and clients.
+     """
+ 
++    _contextFactory = SSL.Context
+     _context = None
+     # Older versions of PyOpenSSL didn't provide OP_ALL.  Fudge it here, just in case.
+     _OP_ALL = getattr(SSL, 'OP_ALL', 0x0000FFFF)
+@@ -646,7 +647,8 @@ class OpenSSLCertificateOptions(object):
+                  enableSingleUseKeys=True,
+                  enableSessions=True,
+                  fixBrokenPeers=False,
+-                 enableSessionTickets=False):
++                 enableSessionTickets=False,
++                 extraCertChain=None):
+         """
+         Create an OpenSSL context SSL connection context factory.
+ 
+@@ -694,6 +696,13 @@ class OpenSSLCertificateOptions(object):
+         controlling session tickets. This option is off by default, as some
+         server implementations don't correctly process incoming empty session
+         ticket extensions in the hello.
++
++        @param extraCertChain: List of certificates that I{complete} your
++            verification chain if the certificate authority that signed your
++            C{certificate} isn't widely supported.  Do I{not} add
++            C{certificate} to it.
++
++        @type extraCertChain: C{list} of L{OpenSSL.crypto.X509}
+         """
+ 
+         if (privateKey is None) != (certificate is None):
+@@ -708,6 +717,10 @@ class OpenSSLCertificateOptions(object):
+             raise ValueError("Specify client CA certificate information if and"
+                              " only if enabling certificate verification")
+         self.verify = verify
++        if extraCertChain is not None and None in (privateKey, certificate):
++            raise ValueError("A private key and a certificate are required "
++                             "when adding a supplemental certificate chain.")
++        self.extraCertChain = extraCertChain or []
+ 
+         self.caCerts = caCerts
+         self.verifyDepth = verifyDepth
+@@ -741,13 +754,15 @@ class OpenSSLCertificateOptions(object):
+ 
+ 
+     def _makeContext(self):
+-        ctx = SSL.Context(self.method)
++        ctx = self._contextFactory(self.method)
+         # Disallow insecure SSLv2. Applies only for SSLv23_METHOD.
+         ctx.set_options(SSL.OP_NO_SSLv2)
+ 
+         if self.certificate is not None and self.privateKey is not None:
+             ctx.use_certificate(self.certificate)
+             ctx.use_privatekey(self.privateKey)
++            for extraCert in self.extraCertChain:
++                ctx.add_extra_chain_cert(extraCert)
+             # Sanity check
+             ctx.check_privatekey()
+ 
+diff --git a/twisted/test/test_sslverify.py b/twisted/test/test_sslverify.py
+index caa6b49..df906d5 100644
+--- a/twisted/test/test_sslverify.py
++++ b/twisted/test/test_sslverify.py
+@@ -118,6 +118,42 @@ class WritingProtocol(protocol.Protocol):
+         self.factory.onLost.errback(reason)
+ 
+ 
++
++class FakeContext:
++    """
++    Introspectable fake of an OpenSSL.SSL.Context.
++    """
++
++    def __init__(self, method):
++        self._method = method
++        self._extraCertChain = []
++
++    def set_options(self, options):
++        pass
++
++    def use_certificate(self, certificate):
++        self._certificate = certificate
++
++    def use_privatekey(self, privateKey):
++        self._privateKey = privateKey
++
++    def check_privatekey(self):
++        return None
++
++    def set_verify(self, flags, callback):
++        self._verify = flags, callback
++
++    def set_verify_depth(self, depth):
++        self._verifyDepth = depth
++
++    def set_session_id(self, sessionID):
++        self._sessionID = sessionID
++
++    def add_extra_chain_cert(self, cert):
++        self._extraCertChain.append(cert)
++
++
++
+ class OpenSSLOptions(unittest.TestCase):
+     serverPort = clientConn = None
+     onServerLost = onClientLost = None
+@@ -144,6 +180,7 @@ class OpenSSLOptions(unittest.TestCase):
+             O=b"CA Test Certificate",
+             CN=b"ca2")[1]
+         self.caCerts = [self.caCert1, self.caCert2]
++        self.extraCertChain = self.caCerts
+ 
+ 
+     def tearDown(self):
+@@ -211,6 +248,7 @@ class OpenSSLOptions(unittest.TestCase):
+                                                    certificate=self.sCert)
+         self.assertEqual(opts.privateKey, self.sKey)
+         self.assertEqual(opts.certificate, self.sCert)
++        self.assertEqual(opts.extraCertChain, [])
+ 
+ 
+     def test_constructorDoesNotAllowVerifyWithoutCACerts(self):
+@@ -247,6 +285,58 @@ class OpenSSLOptions(unittest.TestCase):
+         self.assertEqual(self.caCerts, opts.caCerts)
+ 
+ 
++    def test_constructorSetsExtraChain(self):
++        """
++        Setting C{extraCertChain} sets both if C{certificate} and C{privateKey}
++        are set too.
++        """
++        opts = sslverify.OpenSSLCertificateOptions(
++            privateKey=self.sKey,
++            certificate=self.sCert,
++            extraCertChain=self.extraCertChain,
++        )
++        self.assertEqual(self.extraCertChain, opts.extraCertChain)
++
++
++    def test_constructorDoesNotAllowExtraChainWithoutPrivateKey(self):
++        """
++        A C{extraCertChain} without C{privateKey} doesn't make sense and is
++        thus rejected.
++        """
++        self.assertRaises(
++            ValueError,
++            sslverify.OpenSSLCertificateOptions,
++            certificate=self.sCert,
++            extraCertChain=self.extraCertChain,
++        )
++
++
++    def test_constructorDoesNotAllowExtraChainWithOutPrivateKey(self):
++        """
++        A C{extraCertChain} without C{certificate} doesn't make sense and is
++        thus rejected.
++        """
++        self.assertRaises(
++            ValueError,
++            sslverify.OpenSSLCertificateOptions,
++            privateKey=self.sKey,
++            extraCertChain=self.extraCertChain,
++        )
++
++
++    def test_extraChainFilesAreAddedIfSupplied(self):
++        opts = sslverify.OpenSSLCertificateOptions(
++            privateKey=self.sKey,
++            certificate=self.sCert,
++            extraCertChain=self.extraCertChain,
++        )
++        opts._contextFactory = lambda method: FakeContext(method)
++        ctx = opts.getContext()
++        self.assertEqual(self.sKey, ctx._privateKey)
++        self.assertEqual(self.sCert, ctx._certificate)
++        self.assertEqual(self.extraCertChain, ctx._extraCertChain)
++
++
+     def test_abbreviatingDistinguishedNames(self):
+         """
+         Check that abbreviations used in certificates correctly map to
+diff --git a/twisted/topfiles/2061.feature b/twisted/topfiles/2061.feature
+new file mode 100644
+index 0000000..7b2cba3
+--- /dev/null
++++ b/twisted/topfiles/2061.feature
+@@ -0,0 +1 @@
++twisted.internet.ssl.CertificateOptions now supports chain certificates.

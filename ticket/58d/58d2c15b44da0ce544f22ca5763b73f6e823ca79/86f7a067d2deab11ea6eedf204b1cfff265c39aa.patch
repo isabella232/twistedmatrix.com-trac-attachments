@@ -1,0 +1,167 @@
+=== modified file 'twisted/application/app.py'
+--- twisted/application/app.py	2011-07-31 01:05:44 +0000
++++ twisted/application/app.py	2011-10-04 14:50:48 +0000
+@@ -3,6 +3,7 @@
+ # See LICENSE for details.
+ 
+ import sys, os, pdb, getpass, traceback, signal
++from operator import attrgetter
+ 
+ from twisted.python import runtime, log, usage, failure, util, logfile
+ from twisted.python.versions import Version
+@@ -12,7 +13,7 @@
+ from twisted.persisted import sob
+ from twisted.application import service, reactors
+ from twisted.internet import defer
+-from twisted import copyright
++from twisted import copyright, plugin
+ 
+ # Expose the new implementation of installReactor at the old location.
+ from twisted.application.reactors import installReactor
+@@ -492,13 +493,15 @@
+     """
+     zsh_actions = {"reactor" : _reactorZshAction}
+     messageOutput = sys.stdout
++    _getReactorTypes = staticmethod(reactors.getReactorTypes)
+ 
+ 
+     def opt_help_reactors(self):
+         """
+         Display a list of possibly available reactor names.
+         """
+-        for r in reactors.getReactorTypes():
++        rcts = sorted(self._getReactorTypes(), key=attrgetter('shortName'))
++        for r in rcts:
+             self.messageOutput.write('    %-4s\t%s\n' %
+                                      (r.shortName, r.description))
+         raise SystemExit(0)
+@@ -574,6 +577,8 @@
+                    "rundir":"_dirs"}
+     #zsh_actionDescr = {"logfile":"log file name", "random":"random seed"}
+ 
++    _getPlugins = staticmethod(plugin.getPlugins)
++
+     def __init__(self, *a, **kw):
+         self['debug'] = False
+         usage.Options.__init__(self, *a, **kw)
+@@ -620,10 +625,9 @@
+ 
+ 
+     def subCommands(self):
+-        from twisted import plugin
+-        plugins = plugin.getPlugins(service.IServiceMaker)
++        plugins = self._getPlugins(service.IServiceMaker)
+         self.loadedPlugins = {}
+-        for plug in plugins:
++        for plug in sorted(plugins, key=attrgetter('tapname')):
+             self.loadedPlugins[plug.tapname] = plug
+             yield (plug.tapname, None, lambda: plug.options(), plug.description)
+     subCommands = property(subCommands)
+
+=== modified file 'twisted/test/test_twistd.py'
+--- twisted/test/test_twistd.py	2011-07-31 01:05:44 +0000
++++ twisted/test/test_twistd.py	2011-10-04 14:51:32 +0000
+@@ -24,9 +24,9 @@
+ 
+ from twisted.trial import unittest
+ 
+-from twisted.application import service, app
++from twisted.application import service, app, reactors
+ from twisted.scripts import twistd
+-from twisted.python import log, reflect
++from twisted.python import log
+ from twisted.python.usage import UsageError
+ from twisted.python.log import ILogObserver
+ from twisted.python.versions import Version
+@@ -166,6 +166,90 @@
+     """
+     Non-platform-specific tests for the pltaform-specific ServerOptions class.
+     """
++    def test_subCommands(self):
++        """
++        subCommands is built from IServiceMaker plugins, and is sorted
++        alphabetically.
++        """
++        class FakePlugin(object):
++            def __init__(self, name):
++                self.tapname = name
++                self._options = 'options for ' + name
++                self.description = 'description of ' + name
++
++            def options(self):
++                return self._options
++
++        apple = FakePlugin('apple')
++        banana = FakePlugin('banana')
++        coconut = FakePlugin('coconut')
++        donut = FakePlugin('donut')
++
++        def getPlugins(interface):
++            self.assertEqual(interface, IServiceMaker)
++            yield coconut
++            yield banana
++            yield donut
++            yield apple
++
++        config = twistd.ServerOptions()
++        from twisted import plugin
++        from twisted.application.service import IServiceMaker
++        self.assertEqual(config._getPlugins, plugin.getPlugins)
++        config._getPlugins = getPlugins
++
++        # "subCommands is a list of 4-tuples of (command name, command
++        # shortcut, parser class, documentation)."
++        subCommands = config.subCommands
++        expectedOrder = [apple, banana, coconut, donut]
++
++        from itertools import izip
++        for subCommand, expectedCommand in izip(subCommands, expectedOrder):
++            name, shortcut, parserClass, documentation = subCommand
++            self.assertEqual(name, expectedCommand.tapname)
++            self.assertEqual(shortcut, None)
++            self.assertEqual(parserClass(), expectedCommand._options),
++            self.assertEqual(documentation, expectedCommand.description)
++
++
++    def test_opt_help_reactors(self):
++        """
++        Reactor names are listed alphabetically.
++        """
++        class FakeReactorInstaller(object):
++            def __init__(self, name):
++                self.shortName = 'name of ' + name
++                self.description = 'description of ' + name
++
++        apple = FakeReactorInstaller('apple')
++        banana = FakeReactorInstaller('banana')
++        coconut = FakeReactorInstaller('coconut')
++        donut = FakeReactorInstaller('donut')
++
++        def getReactorTypes():
++            yield coconut
++            yield banana
++            yield donut
++            yield apple
++
++        config = twistd.ServerOptions()
++        self.assertEqual(config._getReactorTypes, reactors.getReactorTypes)
++        config._getReactorTypes = getReactorTypes
++        config.messageOutput = StringIO.StringIO()
++
++        self.assertRaises(SystemExit, config.parseOptions, ['--help-reactors'])
++        helpOutput = config.messageOutput.getvalue()
++        indexes = []
++        for reactor in apple, banana, coconut, donut:
++            def getIndex(s):
++                self.assertIn(s, helpOutput)
++                indexes.append(helpOutput.index(s))
++
++            getIndex(reactor.shortName)
++            getIndex(reactor.description)
++
++        self.assertEqual(indexes, sorted(indexes), 'reactor descriptions were not in alphabetical order: %r' % (helpOutput,))
++
+ 
+     def test_postOptionsSubCommandCausesNoSave(self):
+         """
+

@@ -1,0 +1,152 @@
+Index: twisted/web/http.py
+===================================================================
+--- twisted/web/http.py	(revision 32494)
++++ twisted/web/http.py	(working copy)
+@@ -563,7 +563,9 @@
+     sentLength = 0 # content-length of response, or total bytes sent via chunking
+     etag = None
+     lastModified = None
+-    args = None
++    _args = None # .args is a property that will parse and store request args here
++    _orig_method = None # http method request originally called with
++    _orig_uri = None # uri request originally called with
+     path = None
+     content = None
+     _forceSSL = 0
+@@ -725,10 +727,13 @@
+         @param version: The HTTP version of this request.
+         """
+         self.content.seek(0,0)
+-        self.args = {}
+         self.stack = []
+ 
+-        self.method, self.uri = command, path
++        # since argument parsing is now deferred to a property we want to
++        # have explicit references to the original method and original uri
++        # to parse against in case they are subsequently changed by
++        # application code
++        self.method, self.uri = self._orig_method, self._orig_uri = command, path
+         self.clientproto = version
+         x = self.uri.split('?', 1)
+ 
+@@ -736,20 +741,44 @@
+             self.path = self.uri
+         else:
+             self.path, argstring = x
+-            self.args = parse_qs(argstring, 1)
+ 
+         # cache the client and server information, we'll need this later to be
+         # serialized and sent with the request so CGIs will work remotely
+         self.client = self.channel.transport.getPeer()
+         self.host = self.channel.transport.getHost()
+ 
+-        # Argument processing
+-        args = self.args
++        self.process()
++
++    def args(self):
++        """
++        Return query or post arguments dict of the request on demand.
++
++        If the arguments have already been parsed, they will be returned
++        immediately, otherwise the first access will parse arguments
++        from the url or body and return it.
++        """
++        if self._args is not None:
++            return self._args
++
++        # Parse query string arguments
++        x = self._orig_uri.split('?', 1)
++        if len(x) != 1:
++            self._args = parse_qs(x[1], 1)
++        else:
++            self._args = {}
++
++        # Parse post body arguments
++        args = self._args
+         ctype = self.requestHeaders.getRawHeaders('content-type')
+         if ctype is not None:
+             ctype = ctype[0]
+ 
+-        if self.method == "POST" and ctype:
++        if self._orig_method == "POST" and ctype:
++
++            # preserve location in content stream
++            curr_loc = self.content.tell()
++            self.content.seek(0, 0)
++
+             mfd = 'multipart/form-data'
+             key, pdict = cgi.parse_header(ctype)
+             if key == 'application/x-www-form-urlencoded':
+@@ -768,11 +797,11 @@
+                         self.channel.transport.loseConnection()
+                         return
+                     raise
+-            self.content.seek(0, 0)
++            # restore previous location in content stream
++            self.content.seek(curr_loc, 0)
++        return args
++    args = property(args)
+ 
+-        self.process()
+-
+-
+     def __repr__(self):
+         return '<%s %s %s>'% (self.method, self.uri, self.clientproto)
+ 
+Index: twisted/web/test/test_http.py
+===================================================================
+--- twisted/web/test/test_http.py	(revision 32494)
++++ twisted/web/test/test_http.py	(working copy)
+@@ -826,6 +826,42 @@
+ 
+         self.runRequest(httpRequest, MyRequest)
+ 
++    def test_formNotParsedUntilArgsAccessed(self):
++        """
++        The post body is not parsed until request.args is accessed.
++        """
++        query = 'key=value'
++        httpRequest = '''\
++POST / HTTP/1.0
++Content-Length: %d
++Content-Type: application/x-www-form-urlencoded
++
++%s''' % (len(query), query)
++
++        testcase = self
++        self.parse_qs_calls = []
++        orig_parse_qs = http.parse_qs
++        def parse_qs(query_string, *args):
++            testcase.parse_qs_calls.append(query_string)
++            return orig_parse_qs(query_string, *args)
++        self.patch(http, 'parse_qs', parse_qs)
++        class MyRequest(http.Request):
++            def process(self):
++                testcase.assertEquals(self.method, "POST")
++                # Arguments have not been parsed:
++                testcase.assertEquals(testcase.parse_qs_calls, [])
++                # But have been after first access to self.args:
++                testcase.assertEquals(self.args["key"], ["value"])
++                testcase.assertEquals(testcase.parse_qs_calls, [query])
++
++                # Reading from the content file-like must produce the entire
++                # request body.
++                testcase.assertEquals(self.content.read(), query)
++                testcase.didRequest = 1
++                self.finish()
++
++        self.runRequest(httpRequest, MyRequest)
++
+     def testMissingContentDisposition(self):
+         req = '''\
+ POST / HTTP/1.0
+@@ -864,7 +900,7 @@
+                 # The tempfile API used to create content returns an
+                 # instance of a different type depending on what platform
+                 # we're running on.  The point here is to verify that the
+-                # request body is in a file that's on the filesystem. 
++                # request body is in a file that's on the filesystem.
+                 # Having a fileno method that returns an int is a somewhat
+                 # close approximation of this. -exarkun
+                 testcase.assertIsInstance(self.content.fileno(), int)

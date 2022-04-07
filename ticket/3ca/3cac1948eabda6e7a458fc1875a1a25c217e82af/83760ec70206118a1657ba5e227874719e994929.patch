@@ -1,0 +1,97 @@
+diff --git twisted/application/internet.py twisted/application/internet.py
+index a30f418..0c8ce49 100644
+--- twisted/application/internet.py
++++ twisted/application/internet.py
+@@ -226,11 +226,12 @@ class TimerService(_VolatileDataService):
+     when it stops.
+     """
+ 
+-    volatile = ['_loop']
++    volatile = ['_loop', '_loopFinshed']
+ 
+     def __init__(self, step, callable, *args, **kwargs):
+         self.step = step
+         self.call = (callable, args, kwargs)
++        self.clock = None
+ 
+     def startService(self):
+         service.Service.startService(self)
+@@ -240,7 +241,9 @@ class TimerService(_VolatileDataService):
+         # LoopingCall were a _VolatileDataService, we wouldn't need to do
+         # this.
+         self._loop = task.LoopingCall(callable, *args, **kwargs)
+-        self._loop.start(self.step, now=True).addErrback(self._failed)
++        self._loop.clock = _maybeGlobalReactor(self.clock)
++        self._loopFinished = self._loop.start(self.step, now=True)
++        self._loopFinished.addErrback(self._failed)
+ 
+     def _failed(self, why):
+         # make a note that the LoopingCall is no longer looping, so we don't
+@@ -252,7 +255,9 @@ class TimerService(_VolatileDataService):
+     def stopService(self):
+         if self._loop.running:
+             self._loop.stop()
+-        return service.Service.stopService(self)
++        self._loopFinished.addCallback(lambda _:
++                service.Service.stopService(self))
++        return self._loopFinished
+ 
+ 
+ 
+diff --git twisted/application/test/test_internet.py twisted/application/test/test_internet.py
+index 9e058d7..afcdbcf 100644
+--- twisted/application/test/test_internet.py
++++ twisted/application/test/test_internet.py
+@@ -11,9 +11,10 @@ from zope.interface.verify import verifyClass
+ 
+ from twisted.internet.protocol import Factory
+ from twisted.trial.unittest import TestCase
+-from twisted.application.internet import StreamServerEndpointService
++from twisted.application.internet import StreamServerEndpointService, TimerService
+ from twisted.internet.interfaces import IStreamServerEndpoint, IListeningPort
+ from twisted.internet.defer import Deferred, CancelledError
++from twisted.internet.task import Clock
+ 
+ class FakeServer(object):
+     """
+@@ -250,3 +251,40 @@ class TestEndpointService(TestCase):
+         self.assertEqual(len(stoppingErrors), 1)
+ 
+ 
++
++class TestTimerService(TestCase):
++    """
++    Tests for L{twisted.application.internet.TimerService}.
++
++    @ivar timer: service to test
++    @type timer: L{TimerService}
++
++    @ivar clock: source of time
++    @type clock: L{Clock}
++
++    @ivar deferred: deferred returned by L{TestTimerService.call}.
++    @type deferred: L{Deferred}
++    """
++
++
++    def setUp(self):
++        self.timer = TimerService(2, self.call)
++        self.clock = self.timer.clock = Clock()
++        self.deferred = Deferred()
++
++
++    def call(self):
++        return self.deferred
++
++
++    def test_stopServiceWaits(self):
++        """
++        When L{TimerService.stopService} is called while a call is in progress.
++        the L{Deferred} returned doesn't fire until after the call finishes.
++        """
++        self.timer.startService()
++        self.clock.advance(0)
++        d = self.timer.stopService()
++        self.assertNoResult(d)
++        self.deferred.callback(object())
++        self.assertIs(self.successResultOf(d), None)

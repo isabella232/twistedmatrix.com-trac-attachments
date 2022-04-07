@@ -1,0 +1,102 @@
+Index: twisted/test/test_pb.py
+===================================================================
+--- twisted/test/test_pb.py	(revision 16675)
++++ twisted/test/test_pb.py	(working copy)
+@@ -363,10 +363,22 @@
+ 
+ pb.setUnjellyableForClass(NewStyleCopy2, NewStyleCopy2)
+ 
++
++class NewStyleCacheCopy(pb.Cacheable, pb.RemoteCache, object):
++    def getStateToCacheAndObserveFor(self, perspective, observer):
++        return self.__dict__
++pb.setCopierForClass(NewStyleCacheCopy, NewStyleCacheCopy)
++
+ class Echoer(pb.Root):
+     def remote_echo(self, st):
+         return st
+ 
++class CachedReturner(pb.Root):
++    def __init__(self, cache):
++        self.cache = cache
++    def remote_giveMeCache(self, st):
++        return self.cache
++
+ class NewStyleTestCase(unittest.TestCase):
+     ref = None
+     
+@@ -418,6 +430,34 @@
+         self.failIf(res is orig) # no cheating :)
+ 
+ 
++class NewStyleCachedTestCase(unittest.TestCase):
++    ref = None
++    
++    def tearDown(self):
++        if self.ref:
++            self.ref.broker.transport.loseConnection()
++        return self.server.stopListening()
++
++    def testNewStyleCache(self):
++        orig = NewStyleCacheCopy()
++        orig.s = "value"
++        self.server = reactor.listenTCP(0, pb.PBServerFactory(CachedReturner(orig)))
++        f = pb.PBClientFactory()
++        reactor.connectTCP("localhost", self.server.getHost().port, f)
++        d = f.getRootObject()
++        d.addCallback(self._testNewStyleCache_1, orig)
++        return d
++    def _testNewStyleCache_1(self, ref, orig):
++        self.ref = ref
++        d = ref.callRemote("giveMeCache", orig)
++        d.addCallback(self._testNewStyleCache_2, orig)
++        return d
++    def _testNewStyleCache_2(self, res, orig):
++        self.failUnless(isinstance(res, NewStyleCacheCopy))
++        self.failUnlessEqual(res.s, "value")
++        self.failIf(res is orig) # no cheating :)
++
++
+ class BrokerTestCase(unittest.TestCase):
+     thunkResult = None
+ 
+Index: twisted/spread/flavors.py
+===================================================================
+--- twisted/spread/flavors.py	(revision 16675)
++++ twisted/spread/flavors.py	(working copy)
+@@ -35,7 +35,7 @@
+ 
+ # sibling imports
+ from jelly import setUnjellyableForClass, setUnjellyableForClassTree, setUnjellyableFactoryForClass, unjellyableRegistry
+-from jelly import Jellyable, Unjellyable, _Dummy
++from jelly import Jellyable, Unjellyable, _Dummy, _DummyNewStyle
+ from jelly import setInstanceState, getInstanceState
+ 
+ # compatibility
+@@ -444,7 +444,10 @@
+             return setInstanceState(self, unjellier, jellyList)
+         self.broker = unjellier.invoker
+         self.luid = jellyList[1]
+-        cProxy = _Dummy()
++        if isinstance(self.__class__, type): #new-style class
++            cProxy = _DummyNewStyle()
++        else:
++            cProxy = _Dummy()
+         cProxy.__class__ = self.__class__
+         cProxy.__dict__ = self.__dict__
+         # XXX questionable whether this was a good design idea...
+Index: twisted/spread/jelly.py
+===================================================================
+--- twisted/spread/jelly.py	(revision 16675)
++++ twisted/spread/jelly.py	(working copy)
+@@ -738,6 +738,10 @@
+     """(Internal)
+     Dummy class, used for unserializing instances.
+     """
++class _DummyNewStyle(object):
++    """(Internal)
++    Dummy class, used for unserializing instances of new-style classes.
++    """
+ 
+ 
+ 

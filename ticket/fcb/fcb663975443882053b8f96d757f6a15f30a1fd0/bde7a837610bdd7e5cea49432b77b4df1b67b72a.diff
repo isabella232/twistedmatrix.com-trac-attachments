@@ -1,0 +1,218 @@
+Index: twisted/test/test_digestauth.py
+===================================================================
+--- twisted/test/test_digestauth.py	(revision 33585)
++++ twisted/test/test_digestauth.py	(working copy)
+@@ -26,20 +26,13 @@
+     def __init__(self, *args, **kwargs):
+         super(FakeDigestCredentialFactory, self).__init__(*args, **kwargs)
+         self.privateKey = "0"
++        self.fakeTime = 0
+ 
+-
+-    def _generateNonce(self):
+-        """
+-        Generate a static nonce
+-        """
+-        return '178288758716122392881254770685'
+-
+-
+     def _getTime(self):
+         """
+         Return a stable time
+         """
+-        return 0
++        return self.fakeTime
+ 
+ 
+ 
+@@ -355,38 +348,6 @@
+         self.assertFalse(creds.checkPassword(self.password + 'wrong'))
+ 
+ 
+-    def test_multiResponse(self):
+-        """
+-        L{DigestCredentialFactory.decode} handles multiple responses to a
+-        single challenge.
+-        """
+-        challenge = self.credentialFactory.getChallenge(self.clientAddress.host)
+-
+-        nc = "00000001"
+-        clientResponse = self.formatResponse(
+-            nonce=challenge['nonce'],
+-            response=self.getDigestResponse(challenge, nc),
+-            nc=nc,
+-            opaque=challenge['opaque'])
+-
+-        creds = self.credentialFactory.decode(clientResponse, self.method,
+-                                              self.clientAddress.host)
+-        self.assertTrue(creds.checkPassword(self.password))
+-        self.assertFalse(creds.checkPassword(self.password + 'wrong'))
+-
+-        nc = "00000002"
+-        clientResponse = self.formatResponse(
+-            nonce=challenge['nonce'],
+-            response=self.getDigestResponse(challenge, nc),
+-            nc=nc,
+-            opaque=challenge['opaque'])
+-
+-        creds = self.credentialFactory.decode(clientResponse, self.method,
+-                                              self.clientAddress.host)
+-        self.assertTrue(creds.checkPassword(self.password))
+-        self.assertFalse(creds.checkPassword(self.password + 'wrong'))
+-
+-
+     def test_failsWithDifferentMethod(self):
+         """
+         L{DigestCredentialFactory.decode} returns an L{IUsernameHashedPassword}
+@@ -669,3 +630,91 @@
+         opaque = self.credentialFactory._generateOpaque(
+             "long nonce " * 10, None)
+         self.assertNotIn('\n', opaque)
++    
++    
++    def test_reusedNonce(self):
++        """
++        L{DigestCredentialFactory.decode} raises L{LoginFailed} when the given
++        same nonce twice
++        """
++        credentialFactory = FakeDigestCredentialFactory(self.algorithm,
++                                                        self.realm)
++        challenge = credentialFactory.getChallenge(self.clientAddress.host)
++
++        key = '%s,%s,%s' % (challenge['nonce'],
++                            self.clientAddress.host,
++                            '0')
++        digest = md5(key + credentialFactory.privateKey).hexdigest()
++        ekey = b64encode(key)
++
++        nonceOpaque = '%s-%s' % (digest, ekey.strip('\n'))
++        
++        self.assertEqual(credentialFactory._verifyOpaque(
++                nonceOpaque,
++                challenge['nonce'],
++                self.clientAddress.host),
++            True)
++
++        self.assertRaises(
++            LoginFailed,
++            credentialFactory._verifyOpaque,
++            nonceOpaque,
++            challenge['nonce'],
++            self.clientAddress.host)
++    
++    
++    def test_nonceTimeoutCleanup(self):
++        """
++        L{DigestCredentialFactory.decode} raises L{LoginFailed} when the given
++        same nonce twice
++        """
++        credentialFactory = FakeDigestCredentialFactory(self.algorithm,
++                                                        self.realm)
++        challenge = credentialFactory.getChallenge(self.clientAddress.host)
++
++        key = '%s,%s,%s' % (challenge['nonce'],
++                            self.clientAddress.host,
++                            str(credentialFactory.fakeTime))
++        digest = md5(key + credentialFactory.privateKey).hexdigest()
++        ekey = b64encode(key)
++
++        nonceOpaque = '%s-%s' % (digest, ekey.strip('\n'))
++        
++        self.assertEqual(credentialFactory._verifyOpaque(
++                nonceOpaque,
++                challenge['nonce'],
++                self.clientAddress.host),
++            True)
++
++        credentialFactory.fakeTime = 10000
++        timeoutChallenge = credentialFactory.getChallenge(self.clientAddress.host)
++        key = '%s,%s,%s' % (timeoutChallenge['nonce'],
++                            self.clientAddress.host,
++                            str(credentialFactory.fakeTime))
++        digest = md5(key + credentialFactory.privateKey).hexdigest()
++        ekey = b64encode(key)
++
++        nonceOpaque = '%s-%s' % (digest, ekey.strip('\n'))
++        
++        self.assertEqual(credentialFactory._verifyOpaque(
++                nonceOpaque,
++                timeoutChallenge['nonce'],
++                self.clientAddress.host),
++            True)
++        
++        # setting the clock back, using the forwarded time earlier as the
++        # "cleanup mechanism"
++        credentialFactory.fakeTime = 0
++        key = '%s,%s,%s' % (challenge['nonce'],
++                            self.clientAddress.host,
++                            str(credentialFactory.fakeTime))
++        digest = md5(key + credentialFactory.privateKey).hexdigest()
++        ekey = b64encode(key)
++
++        nonceOpaque = '%s-%s' % (digest, ekey.strip('\n'))
++        
++        self.assertEqual(credentialFactory._verifyOpaque(
++                nonceOpaque,
++                challenge['nonce'],
++                self.clientAddress.host),
++            True)
+\ No newline at end of file
+Index: twisted/cred/credentials.py
+===================================================================
+--- twisted/cred/credentials.py	(revision 33585)
++++ twisted/cred/credentials.py	(working copy)
+@@ -7,6 +7,7 @@
+ from zope.interface import implements, Interface
+ 
+ import hmac, time, random
++from collections import deque
+ from twisted.python.hashlib import md5
+ from twisted.python.randbytes import secureRandom
+ from twisted.cred._digest import calcResponse, calcHA1, calcHA2
+@@ -197,6 +198,8 @@
+         self.algorithm = algorithm
+         self.authenticationRealm = authenticationRealm
+         self.privateKey = secureRandom(12)
++        self.nonces = set()
++        self.nonceTimestamps = deque()
+ 
+ 
+     def getChallenge(self, address):
+@@ -226,7 +229,15 @@
+ 
+         @rtype: C{str}
+         """
+-        return secureRandom(12).encode('hex')
++        
++        # clean up old nonces
++        while self.nonceTimestamps and int(self._getTime()) - self.nonceTimestamps[0][1] > self.CHALLENGE_LIFETIME_SECS:
++            nonce, age = self.nonceTimestamps.popleft()
++            self.nonces.remove(nonce)
++        
++        # keep track of nonce age
++        nonce = secureRandom(12).encode('hex')
++        return nonce
+ 
+ 
+     def _getTime(self):
+@@ -285,6 +296,10 @@
+         if len(keyParts) != 3:
+             raise error.LoginFailed('Invalid response, invalid opaque value')
+ 
++        if nonce in self.nonces:
++            raise error.LoginFailed(
++                'Invalid response, nonce already used')
++        
+         if keyParts[0] != nonce:
+             raise error.LoginFailed(
+                 'Invalid response, incompatible opaque/nonce values')
+@@ -310,6 +325,9 @@
+         if digest != opaqueParts[0]:
+             raise error.LoginFailed('Invalid response, invalid opaque value')
+ 
++        self.nonces.add(nonce)
++        self.nonceTimestamps.append((nonce, int(self._getTime())))
++
+         return True
+ 
+ 

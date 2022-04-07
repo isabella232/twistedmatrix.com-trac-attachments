@@ -1,0 +1,127 @@
+Index: names/client.py
+===================================================================
+--- names/client.py	(revision 1)
++++ names/client.py	(working copy)
+@@ -240,8 +240,16 @@
+         for (d, q, t) in self.pending:
+             self.queryTCP(q, t).chainDeferred(d)
+         del self.pending[:]
++        
++    def connectionLost(self, protocol):
++        #this method is needed because DNSClientFactory.buildProtocol()
++        #passes self.controller to dns.DNSProtocol as the controller.
++        #self.controller is this resolver, and this method (e.g., 
++        #resolver.connectionLost) will be called from dns.DNSProtocol.connectionLost
++        #when the tcp protocol created by queryTCP disconnects.
++        if protocol in self.connections:
++            self.connections.remove(protocol)
+ 
+-
+     def messageReceived(self, message, protocol, address = None):
+         log.msg("Unexpected message (%d) received from %r" % (message.id, address))
+ 
+Index: names/test/test_client.py
+===================================================================
+--- names/test/test_client.py	(revision 1)
++++ names/test/test_client.py	(working copy)
+@@ -661,3 +661,100 @@
+             "instead.")
+         self.assertEqual(warnings[0]['category'], DeprecationWarning)
+         self.assertEqual(len(warnings), 1)
++    
++class ResolverTcpDisconnectTest(unittest.TestCase):
++    
++    def test_protocolDisconnectAfterTrunc(self):
++        """
++        Tests the specific case that connectionLost gets called
++        on a resolver when the UDP query is truncated and that
++        results in a TCP query that eventually the protocol disconnects
++        on and calls the "controller" connectionLost method which actually 
++        connectionLost on the client.Resolver
++        """
++        protocols = []
++        
++        class NeverGetHere(Exception):
++            pass
++
++        class FakeUDPProtocol(object):
++            def __init__(self):
++                self.transport = StubPort()
++
++            def query(self, address, query, timeout=10, id=None):
++                protocols.append(self)
++                return results.pop(0)
++            
++            def connectionLost(self, reason):
++                pass
++
++        class FakeTCPProtocol(object):
++            
++            def __init__(self, controller):
++                self.transport = StubPort()
++                self.controller = controller
++
++            def query(self, address, query, timeout=10, id=None):
++                protocols.append(self)
++                return defer.succeed(dns.Message())   
++            
++            def makeConnection(self, transport):
++                pass
++            
++            def connectionLost(self, reason):
++                self.controller.connectionLost(reason)
++                
++        from twisted.internet import protocol
++        class FakeProtocolFactory(protocol.ClientFactory):
++
++            def __init__(self, controller, timeout=10):
++                self.controller = controller
++                self.timeout = timeout
++                
++            def clientConnectionLost(self, connector, reason):
++                raise NeverGetHere
++            
++            def buildProtocol(self, addr):
++                #mimics client.Resolver.buildProtocol
++                # but adds the line protocols.append(p)
++                # so the test code can get a reference to the 
++                # protocol...
++                #the problem is that it passes self.controller 
++                # to the protocol. self.controller, which is 
++                # the resolver, didn't have a connectionLost method
++                # which will be called when the TCP protocol disconnects.
++                p = FakeTCPProtocol(self.controller)
++                p.factory = self
++                protocols.append(p)
++                return p
++            
++        class FakeClientResolver(client.Resolver):
++            
++            resolverConnectionLostCalled = False
++            
++            def connectionLost(self, reason):
++                self.resolverConnectionLostCalled = True
++        
++        resolver = FakeClientResolver(servers=[('127.0.0.1', 53)])
++        resolver.factory = FakeProtocolFactory(resolver)
++        
++        message = dns.Message()
++        message.queries = [dns.Query('bingo')]
++        message.trunc = True
++        result = defer.succeed(message)
++        results = [result]
++                
++        resolver._connectedProtocol = FakeUDPProtocol
++        resolver.query(dns.Query('foo.example.com'))
++        resolver.factory.buildProtocol(('example.com', 53))
++        protocols[1].connectionLost("reason doesn't matter")
++        
++        #proves the point that connectionLost is called on the Resolver
++        self.assertTrue(resolver.resolverConnectionLostCalled)
++        
++        #get rid of the delayed calls caused by queryTCP
++        # (Client.resolveAddress and Client.failIfNotConnected)
++        delayedCalls = resolver._reactor.getDelayedCalls()
++        for dCall in delayedCalls:
++            dCall.cancel()
++        

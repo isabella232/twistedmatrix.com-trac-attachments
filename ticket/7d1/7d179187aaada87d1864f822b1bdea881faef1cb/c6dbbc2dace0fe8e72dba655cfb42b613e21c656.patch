@@ -1,0 +1,137 @@
+Index: twisted/protocols/test/test_tls.py
+===================================================================
+--- twisted/protocols/test/test_tls.py	(Revision 45107)
++++ twisted/protocols/test/test_tls.py	(Arbeitskopie)
+@@ -22,7 +22,7 @@
+     # imports will work.
+     from OpenSSL.crypto import X509Type
+     from OpenSSL.SSL import (TLSv1_METHOD, Error, Context, ConnectionType,
+-                             WantReadError)
++                             WantReadError, ZeroReturnError)
+     from twisted.internet.ssl import PrivateCertificate
+     from twisted.test.ssl_helpers import (ClientTLSContext, ServerTLSContext,
+                                           certPath)
+@@ -37,6 +37,7 @@
+ from twisted.internet.protocol import Protocol, ClientFactory, ServerFactory
+ from twisted.internet.task import TaskStopped
+ from twisted.protocols.loopback import loopbackAsync, collapsingPumpPolicy
++from twisted.protocols.policies import ProtocolWrapper
+ from twisted.trial.unittest import TestCase
+ from twisted.test.test_tcp import ConnectionLostNotifyingProtocol
+ from twisted.test.proto_helpers import StringTransport
+@@ -853,7 +854,55 @@
+         return disconnectDeferred
+ 
+ 
++    def test_peerIgnoresCloseAlert(self):
++        """
++        L{TLSMemoryBIOProtocol.loseConnection} must
++        close the TLS connection even when remote peer does not
++        respond to the tls close alert.
++        """
++        clientFactory = ClientFactory()
++        clientFactory.protocol = Protocol
+ 
++        clientContextFactory, handshakeDeferred = (
++            HandshakeCallbackContextFactory.factoryAndDeferred())
++        wrapperFactory = TLSMemoryBIOFactory(
++            clientContextFactory, True, clientFactory)
++        sslClientProtocol = wrapperFactory.buildProtocol(None)
++
++        serverFactory = ServerFactory()
++        serverFactory.protocol = Protocol
++
++        serverContextFactory = ServerTLSContext()
++        wrapperFactory = TLSMemoryBIOFactory(
++            serverContextFactory, False, serverFactory)
++        sslServerProtocol = wrapperFactory.buildProtocol(None)
++
++        def patched__flush_receiveBIO(self):
++            # Patch receiveBIO, so that server ignores close alert.
++            while not self._lostTLSConnection:
++                try:
++                    bytes = self._tlsConnection.recv(2 ** 15)
++                except WantReadError:
++                    break
++                except ZeroReturnError:
++                    # Ignore close alert
++                    break
++                else:
++                    self._handshakeDone = True
++                    if not self._aborted:
++                        ProtocolWrapper.dataReceived(self, bytes)
++            self._flushSendBIO()
++
++        sslServerProtocol._flush_receiveBIO = patched__flush_receiveBIO
++        connectionDeferred = loopbackAsync(sslServerProtocol, sslClientProtocol)
++
++        def cbHandshake(ignored):
++            # Shutdown the client
++            sslClientProtocol.loseConnection()
++        handshakeDeferred.addCallback(cbHandshake)
++        return connectionDeferred
++
++
+ class TLSProducerTests(TestCase):
+     """
+     The TLS transport must support the IConsumer interface.
+Index: twisted/protocols/tls.py
+===================================================================
+--- twisted/protocols/tls.py	(Revision 45107)
++++ twisted/protocols/tls.py	(Arbeitskopie)
+@@ -40,6 +40,7 @@
+ 
+ from OpenSSL.SSL import Error, ZeroReturnError, WantReadError
+ from OpenSSL.SSL import TLSv1_METHOD, Context, Connection
++from OpenSSL.SSL import RECEIVED_SHUTDOWN
+ 
+ try:
+     Connection(Context(TLSv1_METHOD), None)
+@@ -366,9 +367,6 @@
+                 # TLS has shut down and no more TLS data will be received over
+                 # this connection.
+                 self._shutdownTLS()
+-                # Passing in None means the user protocol's connnectionLost
+-                # will get called with reason from underlying transport:
+-                self._tlsShutdownFinished(None)
+             except Error as e:
+                 # Something went pretty wrong.  For example, this might be a
+                 # handshake failure (because there were no shared ciphers, because
+@@ -425,22 +423,18 @@
+     def _shutdownTLS(self):
+         """
+         Initiate, or reply to, the shutdown handshake of the TLS layer.
++        The method calls L{transport.loseConnection} without waiting
++        for a reply to the close alert of the remote peer.
+         """
+         try:
+-            shutdownSuccess = self._tlsConnection.shutdown()
++            self._tlsConnection.set_shutdown(RECEIVED_SHUTDOWN)
++            self._tlsConnection.shutdown()
+         except Error:
+-            # Mid-handshake, a call to shutdown() can result in a
+-            # WantWantReadError, or rather an SSL_ERR_WANT_READ; but pyOpenSSL
+-            # doesn't allow us to get at the error.  See:
+-            # https://github.com/pyca/pyopenssl/issues/91
+-            shutdownSuccess = False
++            pass
++
+         self._flushSendBIO()
+-        if shutdownSuccess:
+-            # Both sides have shutdown, so we can start closing lower-level
+-            # transport. This will also happen if we haven't started
+-            # negotiation at all yet, in which case shutdown succeeds
+-            # immediately.
+-            self.transport.loseConnection()
++        self._lostTLSConnection = True
++        self.transport.loseConnection()
+ 
+ 
+     def _tlsShutdownFinished(self, reason):
+Index: twisted/topfiles/7926.bugfix
+===================================================================
+--- twisted/topfiles/7926.bugfix	(Revision 0)
++++ twisted/topfiles/7926.bugfix	(Arbeitskopie)
+@@ -0,0 +1,2 @@
++twisted.protocols.TLSMemoryBIOProtocol.loseConnection() now
++ closes the TLS connection even when remote peer does not respond to the tls close alert.

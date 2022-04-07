@@ -1,0 +1,289 @@
+Index: twisted/internet/base.py
+===================================================================
+--- twisted/internet/base.py	(revision 12473)
++++ twisted/internet/base.py	(working copy)
+@@ -90,7 +90,8 @@
+         elif self.called:
+             raise error.AlreadyCalled
+         else:
+-            new_time = seconds() + secondsFromNow
++            from twisted.internet import reactor
++            new_time = reactor._clock() + secondsFromNow
+             if new_time < self.time:
+                 self.delayed_time = 0
+                 self.time = new_time
+@@ -171,6 +172,7 @@
+ 
+     def __init__(self):
+         self.threadCallQueue = []
++        self._clock = seconds
+         self._eventTriggers = {}
+         self._pendingTimedCalls = []
+         self._newTimedCalls = []
+@@ -372,13 +374,18 @@
+ 
+     # IReactorTime
+ 
++    def installClock(self, clock):
++        oldClock = self._clock
++        self._clock = clock
++        return oldClock
++
+     def callLater(self, _seconds, _f, *args, **kw):
+         """See twisted.internet.interfaces.IReactorTime.callLater.
+         """
+         assert callable(_f), "%s is not callable" % _f
+         assert sys.maxint >= _seconds >= 0, \
+                "%s is not greater than or equal to 0 seconds" % (_seconds,)
+-        tple = DelayedCall(seconds() + _seconds, _f, args, kw,
++        tple = DelayedCall(self._clock() + _seconds, _f, args, kw,
+                            self._cancelCallLater,
+                            self._moveCallLaterSooner)
+         self._newTimedCalls.append(tple)
+@@ -438,7 +445,7 @@
+         if not self._pendingTimedCalls:
+             return None
+         
+-        return max(0, self._pendingTimedCalls[0].time - seconds())
++        return max(0, self._pendingTimedCalls[0].time - self._clock())
+         
+     def runUntilCurrent(self):
+         """Run all pending timed calls.
+@@ -459,7 +466,7 @@
+         # insert new delayed calls now
+         self._insertNewDelayedCalls()
+         
+-        now = seconds()
++        now = self._clock()
+         while self._pendingTimedCalls and (self._pendingTimedCalls[0].time <= now):
+             call = heappop(self._pendingTimedCalls)
+             if call.cancelled:
+Index: twisted/internet/interfaces.py
+===================================================================
+--- twisted/internet/interfaces.py	(revision 12473)
++++ twisted/internet/interfaces.py	(working copy)
+@@ -377,10 +377,28 @@
+         @see: L{twisted.internet.protocol.ProcessProtocol}
+         """
+ 
++class IClock(Interface):
++    def __call__(self):
++        """Return the current time, as a floating point offset in seconds
++        since the first call to this function.
++        """
++
+ class IReactorTime(Interface):
+     """Time methods that a Reactor should implement.
+     """
+ 
++    def installClock(self, clock):
++        """Cause the reactor to use the specific IClock object.
++        
++        The behavior of changing clocks while the reactor is running is
++        undefined.  Programs should generally only install a clock before
++        calling reactor.run().
++        
++        Returns the previously installed clock object.  If no clock was
++        previously installed, an object representing the default clock is
++        returned.
++        """
++
+     def callLater(self, delay, callable, *args, **kw):
+         """Call a function later.
+ 
+Index: twisted/test/test_internet.py
+===================================================================
+--- twisted/test/test_internet.py	(revision 12473)
++++ twisted/test/test_internet.py	(working copy)
+@@ -5,6 +5,7 @@
+ from twisted.trial import unittest
+ from twisted.trial.util import spinUntil
+ from twisted.internet import reactor, protocol, error, app, abstract, interfaces
++
+ try:
+     from twisted.internet import ssl
+ except ImportError:
+@@ -20,8 +21,8 @@
+ import time
+ import threading
+ import types
++from operator import setitem
+ 
+-
+ class SystemEventTestCase(unittest.TestCase):
+     def setUp(self):
+         self.triggers = []
+@@ -193,76 +194,116 @@
+                               r.removeSystemEventTrigger, None)
+ 
+ 
++class DeterministicClock(object):
++    def __init__(self, reactor, initialTime = 1000):
++        self.reactor = reactor
++        self._now = initialTime
++    
++    def advance(self, amount):
++        self._now += amount
++        self.reactor.callLater(0, self.reactor.crash)
++        reactor.run()
++        
++    
++    def __call__(self):
++        return self._now
++
+ class InterfaceTestCase(unittest.TestCase):
++    called = False
++    calledArgs = calledKwArgs = calledTime = None
+ 
+-    _called = 0
++    def setUpClass(self):
++        self.clock = DeterministicClock(reactor)
++        self.originalClock = reactor.installClock(self.clock)
++    
++    def tearDownClass(self):
++        reactor.installClock(self.originalClock)
+ 
+-    def _callback(self, x, **d):
+-        """Callback for testCallLater"""
+-        self.assertEquals(x, 1)
+-        self.assertEquals(d, {'a': 1})
+-        self._called = 1
+-        self._calledTime = time.time()
++    def callback(self, *a, **kw):
++        self.called = True
++        self.calledArgs = a
++        self.calledKwArgs = kw
++        self.calledTime = self.clock()
+ 
+-    def testCallLater(self):
+-        # add and remove a callback
+-        def bad():
+-            raise RuntimeError, "this shouldn't have been called"
+-        i = reactor.callLater(0.1, bad)
++    def testCancelledCallLater(self):
++        clock = self.clock
++        
++        i = reactor.callLater(1.0, self.callback, bad=True)
++        clock.advance(0.5)
++        self.failUnless(i.active())
++        self.failIf(self.called)
+         i.cancel()
++        self.failIf(i.active())
++        self.failIf(self.called)
++        clock.advance(1.0)
++        self.failIf(i.active())
++        self.failIf(self.called)
+ 
++    def testRanCallLater(self):
++        clock = self.clock
++        
++        start = clock()
++        i = reactor.callLater(1.0, self.callback, good=True)
++        clock.advance(1.0)
++        self.failIf(i.active())
++        self.failUnless(self.called)
++        self.assertEquals(self.calledArgs, ())
++        self.assertEquals(self.calledKwArgs, {'good': True})
++        self.assertEquals(self.calledTime, start + 1.0)
++        
++    def testProgrammingErrors(self):
++        clock = self.clock
++
++        i = reactor.callLater(1.0, self.callback, bad=True)
++        i.cancel()
+         self.assertRaises(error.AlreadyCancelled, i.cancel)
+-
+-        i = reactor.callLater(0.5, self._callback, 1, a=1)
+-        start = time.time()
+-
+-        spinUntil(lambda :self._called, 5)
+-
+-        self.assertApproximates(self._calledTime, start + 0.5, 0.2 )
++        self.assertRaises(error.AlreadyCancelled, i.delay, 1.0)
++        self.assertRaises(error.AlreadyCancelled, i.reset, 1.0)
++        
++        i = reactor.callLater(1.0, self.callback, good=True)
++        clock.advance(2.0)
++        self.failUnless(self.called)
+         self.assertRaises(error.AlreadyCalled, i.cancel)
++        self.assertRaises(error.AlreadyCalled, i.delay, 1.0)
++        self.assertRaises(error.AlreadyCalled, i.reset, 1.0)
+ 
+-        del self._called
+-        del self._calledTime
++    def testCallLaterDelayAndReset(self):
++        clock = self.clock
++        start = clock()
+ 
+-    def _resetcallback(self):
+-        self._resetcallbackTime = time.time()
++        calls = {}
+ 
+-    def _delaycallback(self):
+-        self._delaycallbackTime = time.time()
++        ireset = reactor.callLater(1.0, setitem, calls, 'reset', True)
++        idelay = reactor.callLater(1.5, setitem, calls, 'delay', True)
+ 
+-    def testCallLaterDelayAndReset(self):
+-        # this test will fail if the test host is busy and this script is
+-        # delayed by more than about 100ms
+-        self._resetcallbackTime = None
+-        self._delaycallbackTime = None
+-        ireset = reactor.callLater(0.4, self._resetcallback)
+-        idelay = reactor.callLater(0.5, self._delaycallback)
+-        start = time.time()
+-        # chug a little before delaying
+-        while time.time() - start < 0.2:
+-            reactor.iterate(0.01)
+-        ireset.reset(0.4) # move expiration from 0.4 to (now)0.2+0.4=0.6
+-        idelay.delay(0.3) # move expiration from 0.5 to (orig)0.5+0.3=0.8
+-        # both should be called sometime during this
+-        while time.time() - start < 2:
+-            reactor.iterate(0.01)
+-        ireset_elapsed = self._resetcallbackTime - start
+-        idelay_elapsed = self._delaycallbackTime - start
+-        #self.assertApproximates(ireset_elapsed, 0.6, 0.4,
+-        #                        "ireset fired at %f (wanted 0.6)" % \
+-        #                        ireset_elapsed)
+-        #self.assertApproximates(idelay_elapsed, 0.8, 0.4,
+-        #                        "idelay fired at %f (wanted 0.8)" % \
+-        #                        idelay_elapsed)
+-        self.failUnless(idelay_elapsed >= ireset_elapsed,
+-                        "got %f, %f" % (idelay_elapsed, ireset_elapsed))
+-        self.failUnless(ireset_elapsed >= (0.6-0.05),
+-                        "got %f (wanted 0.6)" % ireset_elapsed)
+-        self.failUnless(idelay_elapsed >= (0.8-0.05),
+-                        "got %f (wanted 0.8)" % idelay_elapsed)
++        clock.advance(0.5)
++        
++        # Move expiration from (orig) = 1.0 to (now) + 1.25 = 1.0 + 1.25 = 2.25
++        ireset.reset(1.25)
++        
++        # Move expiration from (orig) = 1.5 to (orig) + 1.0 = 1.5 + 1.0 = 2.5
++        idelay.delay(1.0)
++        
++        # Move forward, but not enough to trigger either, unless they
++        # haven't been moved into the future correctly.
++        clock.advance(1.0)
++        
++        self.failUnless(ireset.active())
++        self.failUnless(idelay.active())
++        self.assertEquals(calls, {})
++        
++        # Move forward just enough to trigger ireset
++        clock.advance(0.75)
++        
++        self.failIf(ireset.active())
++        self.failUnless(idelay.active())
++        self.assertEquals(calls, {'reset': True})
++        
++        # Move forward enough to trigger idelay
++        clock.advance(0.25)
+ 
+-        del self._resetcallbackTime
+-        del self._delaycallbackTime
++        self.failIf(idelay.active())
++        self.assertEquals(calls, {'reset': True, 'delay': True})
+ 
+     def testCallLaterTime(self):
+         d = reactor.callLater(10, lambda: None)

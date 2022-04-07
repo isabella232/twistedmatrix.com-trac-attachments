@@ -1,0 +1,367 @@
+Index: twisted/test/test_protocols.py
+===================================================================
+--- twisted/test/test_protocols.py	(Revision 29769)
++++ twisted/test/test_protocols.py	(Arbeitskopie)
+@@ -607,20 +607,49 @@
+ 
+     def test_consumeLength(self):
+         """
+-        C{_consumeLength} returns the expected length of the netstring,
+-        including the trailing comma. If the length exceeds the
+-        biggest allowed netstring length specified in C{MAX_LENGTH},
+-        C{_consumeLength} raises a L{basic.NetstringParseError}.
++        C{_consumeLength} returns the expected length of the
++        netstring, including the trailing comma.
+         """
+-        self.netstringReceiver._currentData = "12:"
++        self.netstringReceiver._remainingData = "12:"
+         length = self.netstringReceiver._consumeLength()
+-        self.assertEquals(length, 13)
++        self.assertEquals(self.netstringReceiver._expectedPayloadSize, 13)
++
++
++    def test_consumeLengthBorderCase1(self):
++        """
++        C{_consumeLength} works as expected if the length specification
++        contains the value of C{MAX_LENGTH} (border case).
++        """
++        self.netstringReceiver._remainingData = "12:"
++        self.netstringReceiver.MAX_LENGTH = 12
++        length = self.netstringReceiver._consumeLength()
++        self.assertEquals(self.netstringReceiver._expectedPayloadSize, 13)
++
++
++    def test_ConsumeLengthBorderCase2(self):
++        """
++        C{_consumeLength} raises a L{basic.NetstringParseError} if
++        the length specification exceeds the value of C{MAX_LENGTH}
++        by 1 (border case).
++        """
++        self.netstringReceiver._remainingData = "12:"
+         self.netstringReceiver.MAX_LENGTH = 11
+         self.assertRaises(basic.NetstringParseError,
+                           self.netstringReceiver._consumeLength)
+ 
+ 
++    def test_ConsumeLengthBorderCase3(self):
++        """
++        C{_consumeLength} raises a L{basic.NetstringParseError} if
++        the length specification exceeds the value of C{MAX_LENGTH}
++        by more than 1.
++        """
++        self.netstringReceiver._remainingData = "1000:"
++        self.netstringReceiver.MAX_LENGTH = 11
++        self.assertRaises(basic.NetstringParseError,
++                          self.netstringReceiver._consumeLength)
+ 
++
+ class IntNTestCaseMixin(LPTestCaseMixin):
+     """
+     TestCase mixin for int-prefixed protocols.
+Index: twisted/protocols/basic.py
+===================================================================
+--- twisted/protocols/basic.py	(Revision 29769)
++++ twisted/protocols/basic.py	(Arbeitskopie)
+@@ -65,10 +65,28 @@
+         received.
+     @type MAX_LENGTH: C{int}
+ 
+-    @ivar _MAX_LENGTH_SIZE: Defines the number of digits necessary to represent
+-        C{MAX_LENGTH} as a string.
+-    @type _MAX_LENGTH_SIZE: C{float}
++    @ivar _LENGTH: A pattern describing all strings that contain a netstring
++        length specification. Examples for length specifications are '0:',
++        '12:', and '179:'. '007:' is no valid length specification, since
++        leading zeros are not allowed.
++    @type _LENGTH: C{re.Match}
+ 
++    @ivar _LENGTH_PREFIX: A pattern describing all strings that contain
++        the first part of a netstring length specification (without the
++        trailing comma). Examples are '0', '12', and '179'. '007' does not
++        start a netstring length specification, since leading zeros are
++        not allowed.
++    @type _LENGTH_PREFIX: C{re.Match}
++
++    @ivar _PARSING_LENGTH: Indicates that the C{NetstringReceiver} is in
++        the state of parsing the length portion of a netstring.
++    @type _PARSING_LENGTH: C{int}
++
++    @ivar _PARSING_PAYLOAD: Indicates that the C{NetstringReceiver} is in
++        the state of parsing the payload portion (data and trailing comma)
++        of a netstring.
++    @type _PARSING_PAYLOAD: C{int}
++
+     @ivar brokenPeer: Indicates if the connection is still functional
+     @type brokenPeer: C{int}
+ 
+@@ -76,26 +94,22 @@
+         (C{PARSING_LENGTH}) or the payload (C{PARSING_PAYLOAD}) of a netstring
+     @type _state: C{int}
+ 
+-    @ivar _currentData: Holds the chunk of data that has not yet been consumed
+-    @type _currentData: C{string}
++    @ivar _remainingData: Holds the chunk of data that has not yet been consumed
++    @type _remainingData: C{string}
+ 
+-    @ivar _payload: Holds the payload portion of a netstring
++    @ivar _payload: Holds the payload portion of a netstring including the
++        trailing comma
+     @type _payload: C{cStringIO.StringIO}
+ 
+-    @ivar _expectedLength: Holds the payload size plus one for the trailing
++    @ivar _expectedPayloadSize: Holds the payload size plus one for the trailing
+         comma.
+-    @type _expectedLength: C{int}
++    @type _expectedPayloadSize: C{int}
+     """
+     MAX_LENGTH = 99999
+-    _MAX_LENGTH_SIZE = math.ceil(math.log10(MAX_LENGTH)) + 1
++    _LENGTH = re.compile('(0|[1-9]\d*)(:)')
+ 
+-    _LENGTH = re.compile('(0)(:)|([1-9]\d*)(:)')
++    _LENGTH_PREFIX = re.compile('(0|[1-9]\d*)$')
+ 
+-    # The following pattern describes all valid partial netstring length
+-    # specifications. It is used to check the netstring validity when the
+-    # length specification is received in several chunks.
+-    _LENGTH_PREFIX = re.compile('(\d+)$')
+-
+     # Some error information for NetstringParseError instances.
+     _MISSING_LENGTH = ("The received netstring does not start with a "
+                                 "length specification.")
+@@ -118,11 +132,11 @@
+         Initializes the protocol.
+         """
+         protocol.Protocol.makeConnection(self, transport)
+-        self._currentData = ""
+-        self._currentDataSize = 0
++        self._remainingData = ""
++        self._currentPayloadSize = 0
+         self._payload = cStringIO.StringIO()
+         self._state = self._PARSING_LENGTH
+-        self._expectedLength = 0
++        self._expectedPayloadSize = 0
+         self.brokenPeer = 0
+ 
+ 
+@@ -153,8 +167,8 @@
+             netstring
+         @type data: C{str}
+         """
+-        self._currentData += data
+-        while self._currentData:
++        self._remainingData += data
++        while self._remainingData:
+             try:
+                 self._consumeData()
+             except IncompleteNetstring:
+@@ -176,11 +190,21 @@
+         raise NotImplementedError()
+ 
+ 
++    def _maxLengthSize(self):
++        """
++        Calculate and return the string size of C{self.MAX_LENGTH}.
++
++        @return: The size of the string representation for C{self.MAX_LENGTH}
++        @rtype: C{float}
++        """
++        return math.ceil(math.log10(self.MAX_LENGTH)) + 1
++
++
+     def _consumeData(self):
+         """
+-        Consumes the content of C{self._currentData}.
++        Consumes the content of C{self._remainingData}.
+ 
+-        @raise IncompleteNetstring: if C{self._currentData} does not
++        @raise IncompleteNetstring: if C{self._remainingData} does not
+             contain enough data to complete the current netstring.
+         @raise NetstringParseError: if the received data do not
+             form a valid netstring.
+@@ -194,36 +218,35 @@
+ 
+     def _consumeLength(self):
+         """
+-        Consumes the length portion of C{self._currentData}.
++        Consumes the length portion of C{self._remainingData}.
+ 
+-        @raise IncompleteNetstring: if C{self._currentData} contains
++        @raise IncompleteNetstring: if C{self._remainingData} contains
+             a partial length specification (digits without trailing
+             comma).
+         @raise NetstringParseError: if the received data do not form a valid
+             netstring.
+         """
+-        lengthMatch = self._LENGTH.match(self._currentData)
++        lengthMatch = self._LENGTH.match(self._remainingData)
+         if not lengthMatch:
+             self._checkPartialLengthSpecification()
+             raise IncompleteNetstring()
+         self._processLength(lengthMatch)
+ 
+-        if self._expectedLength > self.MAX_LENGTH:
++        if self._expectedPayloadSize > self.MAX_LENGTH + 1:
+             raise NetstringParseError(self._TOO_LONG % (self.MAX_LENGTH,))
+-        return self._expectedLength
+ 
+ 
+     def _checkPartialLengthSpecification(self):
+         """
+         Makes sure that the received data represents a valid number.
+ 
+-        Checks if C{self._currentData} represents a number smaller or
++        Checks if C{self._remainingData} represents a number smaller or
+         equal to C{self.MAX_LENGTH}.
+ 
+-        @raise NetstringParseError: if C{self._currentData} is no
++        @raise NetstringParseError: if C{self._remainingData} is no
+             number or is too big (checked by L{extractLength}).
+         """
+-        partialLengthMatch = self._LENGTH_PREFIX.match(self._currentData)
++        partialLengthMatch = self._LENGTH_PREFIX.match(self._remainingData)
+         if not partialLengthMatch:
+             raise NetstringParseError(self._MISSING_LENGTH)
+         lengthSpecification = (partialLengthMatch.group(1))
+@@ -234,10 +257,10 @@
+         """
+         Processes the length definition of a netstring.
+ 
+-        Extracts and stores in C{self._expectedLength} the number
++        Extracts and stores in C{self._expectedPayloadSize} the number
+         representing the netstring size.  Removes the prefix
+         representing the length specification from
+-        C{self._currentData}.
++        C{self._remainingData}.
+ 
+         @raise NetstringParseError: if the received netstring does not
+             start with a number or the number is bigger than
+@@ -246,14 +269,12 @@
+             a netstring length specification
+         @type lengthMatch: C{re.Match}
+         """
+-        endOfNumber = (lengthMatch.end(1) if lengthMatch.group(1) else
+-                       lengthMatch.end(3))
+-        startOfData = (lengthMatch.end(2) if lengthMatch.group(2) else
+-                       lengthMatch.end(4))
+-        lengthString = self._currentData[:endOfNumber]
++        endOfNumber = lengthMatch.end(1)
++        startOfData = lengthMatch.end(2)
++        lengthString = self._remainingData[:endOfNumber]
+         # Expect payload plus trailing comma:
+-        self._expectedLength = self._extractLength(lengthString) + 1
+-        self._currentData = self._currentData[startOfData:]
++        self._expectedPayloadSize = self._extractLength(lengthString) + 1
++        self._remainingData = self._remainingData[startOfData:]
+ 
+ 
+     def _extractLength(self, lengthAsString):
+@@ -290,7 +311,7 @@
+         to convert them to an integer (which might trigger a
+         MemoryError).
+         """
+-        if len(lengthAsString) > self._MAX_LENGTH_SIZE:
++        if len(lengthAsString) > self._maxLengthSize():
+             raise NetstringParseError(self._TOO_LONG % (self.MAX_LENGTH,))
+ 
+ 
+@@ -299,14 +320,14 @@
+         Sets up variables necessary for consuming the payload of a netstring.
+         """
+         self._state = self._PARSING_PAYLOAD
+-        self._currentDataSize = 0
++        self._currentPayloadSize = 0
+         self._payload.seek(0)
+         self._payload.truncate()
+ 
+ 
+     def _consumePayload(self):
+         """
+-        Consumes the payload portion of C{self._currentData}.
++        Consumes the payload portion of C{self._remainingData}.
+ 
+         If the payload is complete, checks for the trailing comma and
+         processes the payload. If not, raises an L{IncompleteNetstring}
+@@ -318,7 +339,7 @@
+         comma.
+         """
+         self._extractPayload()
+-        if self._currentDataSize < self._expectedLength:
++        if self._currentPayloadSize < self._expectedPayloadSize:
+             raise IncompleteNetstring()
+         self._checkForTrailingComma()
+         self._state = self._PARSING_LENGTH
+@@ -327,24 +348,25 @@
+ 
+     def _extractPayload(self):
+         """
+-        Extracts payload information from C{self._currentData}.
++        Extracts payload information from C{self._remainingData}.
+ 
+-        Splits C{self._currentData} at the end of the netstring.  The
++        Splits C{self._remainingData} at the end of the netstring.  The
+         first part becomes C{self._payload}, the second part is stored
+-        in C{self._currentData}.
++        in C{self._remainingData}.
+ 
+         If the netstring is not yet complete, the whole content of
+-        C{self._currentData} is moved to C{self._payload}.
++        C{self._remainingData} is moved to C{self._payload}.
+         """
+         if self._payloadComplete():
+-            remainingPayloadSize = self._expectedLength - self._currentDataSize
+-            self._payload.write(self._currentData[:remainingPayloadSize])
+-            self._currentData = self._currentData[remainingPayloadSize:]
+-            self._currentDataSize = self._expectedLength
++            remainingPayloadSize = (self._expectedPayloadSize -
++                                    self._currentPayloadSize)
++            self._payload.write(self._remainingData[:remainingPayloadSize])
++            self._remainingData = self._remainingData[remainingPayloadSize:]
++            self._currentPayloadSize = self._expectedPayloadSize
+         else:
+-            self._payload.write(self._currentData)
+-            self._currentDataSize += len(self._currentData)
+-            self._currentData = ""
++            self._payload.write(self._remainingData)
++            self._currentPayloadSize += len(self._remainingData)
++            self._remainingData = ""
+ 
+ 
+     def _payloadComplete(self):
+@@ -356,8 +378,8 @@
+             netstring
+         @rtype: C{bool}
+         """
+-        return (len(self._currentData) + self._currentDataSize >=
+-                self._expectedLength)
++        return (len(self._remainingData) + self._currentPayloadSize >=
++                self._expectedPayloadSize)
+ 
+ 
+     def _processPayload(self):
+Index: doc/core/benchmarks/netstringreceiver.py
+===================================================================
+--- doc/core/benchmarks/netstringreceiver.py	(Revision 29769)
++++ doc/core/benchmarks/netstringreceiver.py	(Arbeitskopie)
+@@ -188,10 +188,9 @@
+ 
+     def configureCombination(self, chunkSize, numberOfChunks):
+         """
+-        Updates C{MAX_LENGTH} and C{MAX_LENGTH_SIZE} for
+-        {self.netstringReceiver} (to avoid C{NetstringParseErrors}
+-        that might be raised if the size exceeds the default
+-        C{MAX_LENGTH}).
++        Updates C{MAX_LENGTH} for {self.netstringReceiver} (to avoid
++        C{NetstringParseErrors} that might be raised if the size
++        exceeds the default C{MAX_LENGTH}).
+ 
+         Calculates and returns one 'chunk' of data and the total size
+         of the netstring.
+@@ -209,7 +208,6 @@
+         dataSize = chunkSize * numberOfChunks
+         self.netstringReceiver.MAX_LENGTH = dataSize
+         numberOfDigits = math.ceil(math.log10(dataSize)) + 1
+-        self.netstringReceiver.MAX_LENGTH_SIZE = numberOfDigits
+         return chunk, dataSize
+ 
+ 

@@ -1,0 +1,242 @@
+Index: twisted/topfiles/5086.feature
+===================================================================
+--- twisted/topfiles/5086.feature	(revision 0)
++++ twisted/topfiles/5086.feature	(working copy)
+@@ -0,0 +1 @@
++IReactorUDP.listenUDP, IUDPTransport.write and IUDPTransport.connect now accept ipv6 address literals.
+\ No newline at end of file
+Index: twisted/internet/test/test_udp.py
+===================================================================
+--- twisted/internet/test/test_udp.py	(revision 38893)
++++ twisted/internet/test/test_udp.py	(working copy)
+@@ -20,11 +20,13 @@
+ from twisted.internet.defer import Deferred, maybeDeferred
+ from twisted.internet.interfaces import (
+     ILoggingContext, IListeningPort, IReactorUDP)
+-from twisted.internet.address import IPv4Address
++from twisted.internet.address import IPv4Address, IPv6Address
+ from twisted.internet.protocol import DatagramProtocol
+ 
+ from twisted.internet.test.connectionmixins import (LogObserverMixin,
+                                                     findFreePort)
++from twisted.internet import protocol, error, defer, interfaces, udp
++from twisted.test.test_udp import Server, GoodClient
+ 
+ 
+ class UDPPortMixin(object):
+@@ -48,8 +50,14 @@
+         """
+         return "(UDP Port %s Closed)" % (port.getHost().port,)
+ 
++    def getIPv6ListeningPort(self, reactor, protocol):
++        """
++        Get a UDP port binded to ipv6 interface.
++        """
++        return reactor.listenUDP(0, protocol, "::1")
+ 
+ 
++
+ class DatagramTransportTestsMixin(LogObserverMixin):
+     """
+     Mixin defining tests which apply to any port/datagram based transport.
+@@ -162,7 +170,18 @@
+         self.assertEqual(
+             port.getHost(), IPv4Address('UDP', host, portNumber))
+ 
++    def test_getHostIPv6(self):
++        """
++        L{IListeningPort.getHost} returns an L{IPv6Address} giving a
++        IPv6 address, the port number that the protocol is listening on
++        and the port number.
++        """
++        reactor = self.buildReactor()
++        port = self.getIPv6ListeningPort(reactor, DatagramProtocol())
++        addr = port.getHost()
++        self.assertEqual(addr.host, "::1")
+ 
++
+     def test_logPrefix(self):
+         """
+         Datagram transports implement L{ILoggingContext.logPrefix} to return a
+@@ -215,4 +234,114 @@
+         port = reactor.listenUDP(0, DatagramProtocol())
+         self.assertIn(repr(port.getHost().port), str(port))
+ 
++    def test_bindToIPv6Interface(self):
++        """
++        Binds to ipv6 interface.
++        """
++        reactor = self.buildReactor()
++        server = Server()
++        p = reactor.listenUDP(0, server, interface="::1")
++        self.assertEqual(p.getHost().host, "::1")
++
++        return p.stopListening()
++
++    def performTransferServerClient(self, reactor, interface,
++                                    cbServerStarted,
++                                    cbClientStarted,
++                                    cbSendsFinished,
++                                    cbFinished):
++        """
++        Creates UDP server and client.
++        @param cbServerStarted: execute when server starts.
++        @param cbClientStarted: execute when client starts.
++        @param cbSendsFinished: execute when packets are send.
++        @param cbFinished: execute tear down.
++        """
++        server = Server()
++        serverStarted = server.startedDeferred = defer.Deferred()
++        port1 = reactor.listenUDP(0, server, interface=interface)
++
++        client = GoodClient()
++        clientStarted = client.startedDeferred = defer.Deferred()
++
++        d = serverStarted.addCallback(cbServerStarted, reactor, client,
++                                      interface, cbClientStarted)
++        d.addCallback(cbClientStarted, client, server, interface)
++        #FIXME the following two do not seem to execute
++        d.addCallback(cbSendsFinished, client, server)
++        d.addCallback(cbFinished, port1, self.port2)
++
++
++        return d
++
++    #FIXME (almost) code duplication with twisted.test.test_udp
++    def cbServerStarted(self, ignored, reactor, client, interface, d):
++        self.port2 = reactor.listenUDP(0, client, interface=interface)
++        return d
++
++    def cbClientStarted(self, ignored, client, server, interface):
++        client.transport.connect(interface,
++                                 server.transport.getHost().port)
++        cAddr = client.transport.getHost()
++        sAddr = server.transport.getHost()
++
++        serverSend = client.packetReceived = defer.Deferred()
++        server.transport.write(b"hello", (cAddr.host, cAddr.port))
++        
++        clientWrites = [
++            (b"a",),
++            (b"b", None),
++            (b"c", (sAddr.host, sAddr.port))]
++
++        def cbClientSend(ignored):
++            if clientWrites:
++                nextClientWrite = server.packetReceived = defer.Deferred()
++                nextClientWrite.addCallback(cbClientSend)
++                client.transport.write(*clientWrites.pop(0))
++                return nextClientWrite
++
++        # No one will ever call .errback on either of these Deferreds,
++        # but there is a non-trivial amount of test code which might
++        # cause them to fail somehow.  So fireOnOneErrback=True.
++        return defer.DeferredList([
++                cbClientSend(None),
++                serverSend], fireOnOneErrback=True)
++
++
++    def cbSendsFinished(self, ignored, client, server):
++        cAddr = client.transport.getHost()
++        sAddr = server.transport.getHost()
++        clientAddr = cAddr.host, cAddr.port
++        serverAddr = sAddr.host, sAddr.port
++
++        
++        self.assertEqual(
++            client.packets,
++            [(b"hello", serverAddr)])
++        self.assertEqual(
++            server.packets,
++            [(b"a", clientAddr),
++             (b"b", clientAddr),
++             (b"c", clientAddr)])
++
++
++    def cbFinished(self, ignored, port1, port2):
++        return defer.DeferredList([
++                defer.maybeDeferred(port1.stopListening),
++                defer.maybeDeferred(port2.stopListening)],
++                                  fireOnOneErrback=True)
++
++
++    def test_connectAndWriteToIPv6Interface(self):
++        """
++        Connects and writes to ipv6 address.
++        """
++        reactor = self.buildReactor()
++        return self.performTransferServerClient(reactor, "::1",
++                                                self.cbServerStarted,
++                                                self.cbClientStarted,
++                                                self.cbSendsFinished,
++                                                self.cbFinished)
++
++
+ globals().update(UDPServerTestsBuilder.makeTestCaseClasses())
+Index: twisted/internet/udp.py
+===================================================================
+--- twisted/internet/udp.py	(revision 38893)
++++ twisted/internet/udp.py	(working copy)
+@@ -80,6 +80,7 @@
+         self.interface = interface
+         self.setLogStr()
+         self._connectedAddr = None
++        self._setAddressFamily()
+ 
+     def __repr__(self):
+         if self._realPortNumber is not None:
+@@ -207,7 +208,7 @@
+         """
+         if self._connectedAddr:
+             raise RuntimeError("already connected, reconnecting is not currently supported")
+-        if not abstract.isIPAddress(host):
++        if not abstract.isIPAddress(host) and not abstract.isIPv6Address(host):
+             raise ValueError("please pass only IP addresses, not domain names")
+         self._connectedAddr = (host, port)
+         self.socket.connect((host, port))
+@@ -252,7 +253,17 @@
+         logPrefix = self._getLogPrefix(self.protocol)
+         self.logstr = "%s (UDP)" % logPrefix
+ 
++    def _setAddressFamily(self):
++        """
++        Resolve address family for the socket.
++        """
++        if abstract.isIPv6Address(self.interface):
++            self.addressFamily = socket.AF_INET6
++        elif abstract.isIPAddress(self.interface):
++            self.addressFamily = socket.AF_INET
++        
+ 
++
+     def logPrefix(self):
+         """
+         Return the prefix to log with.
+@@ -262,11 +273,15 @@
+ 
+     def getHost(self):
+         """
+-        Returns an IPv4Address.
++        Returns an IPv4Address or IPv6Address.
+ 
+         This indicates the address from which I am connecting.
+         """
+-        return address.IPv4Address('UDP', *self.socket.getsockname())
++        addr = self.socket.getsockname()
++        if self.addressFamily == socket.AF_INET:
++            return address.IPv4Address('UDP', *addr)
++        elif self.addressFamily == socket.AF_INET6:
++            return address.IPv6Address('UDP', *(addr[:2]))
+ 
+ 
+ 
+@@ -332,7 +347,8 @@
+     UDP Port that supports multicasting.
+     """
+ 
+-    def __init__(self, port, proto, interface='', maxPacketSize=8192, reactor=None, listenMultiple=False):
++    def __init__(self, port, proto, interface='', maxPacketSize=8192,
++                 reactor=None, listenMultiple=False):
+         """
+         @see: L{twisted.internet.interfaces.IReactorMulticast.listenMulticast}
+         """

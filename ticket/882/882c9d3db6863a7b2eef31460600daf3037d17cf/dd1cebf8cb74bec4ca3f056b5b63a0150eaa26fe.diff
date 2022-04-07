@@ -1,0 +1,409 @@
+Hi Thomas & Paul,
+
+This is a review of branches/session-2710-5.
+
+This diff is over 3000 lines long. Although sometimes work can't be broken up,
+you should make an effort. The time it takes to review a branch scales
+non-linearly with the size of the diff.
+
+Before you get into the review, I want to thank both of you for taking the time
+to do this work. Conch more than any other part of Twisted will benefit from
+better tests and being easier to test.
+
+There's going to be another review round-trip and there *are* bits of the diff
+that I have serious issues with. Still, the patch as a whole shows clear
+thinking and a strong desire to separate concerns that were previously mixed
+together. You're attention to backwards compatibility is also greatly
+appreciated.
+
+Because I'm coming to this branch cold, I'm going to be doing a full review.
+Personally, I hate it when an old branch of mine is subject to a fresh review
+by a fresh reviewer -- it means a lot of decisions get questioned again and
+feels like a lot of work little or no reason. It's also likely that the new
+reviewer will contradict the old reviewer.
+
+I'm going to try as hard as I can to focus only on code cleanliness, and to
+assume that you and the previous reviewers knew what they were doing. What
+that means is I'll flag everything that's wrong and everything that I don't
+get, and I'll try to distinguish between the two.
+
+I'd very much appreciate it if you could respond to each of my points, even if
+it is to say "no, I don't think I'll do that". The priority now is getting
+this branch landed. If you reply point-wise, my re-review can probably be done
+trivially.
+
+Also, feel free to grab me on IRC or on skype ('blackjml') if you want to
+discuss any of these points.
+
+{{{
+> Index: twisted/conch/test/test_filetransfer.py
+> ===================================================================
+> --- twisted/conch/test/test_filetransfer.py	(revision 23210)
+> +++ twisted/conch/test/test_filetransfer.py	(working copy)
+> @@ -56,11 +56,6 @@
+>          return os.path.join(os.getcwd(), self.homeDir)
+>  
+>  
+> -class ConchSessionForTestAvatar:
+> -
+> -    def __init__(self, avatar):
+> -        self.avatar = avatar
+> -
+>  if unix:
+>      if not hasattr(unix, 'SFTPServerForUnixConchUser'):
+>          # unix should either be a fully working module, or None.  I'm not sure
+> @@ -463,7 +458,7 @@
+>          self.interceptConnectionLost(sftpServer)
+>  
+>          # close session
+> -        testSession.closeReceived()
+> +        testSession.closed()
+>
+}}}
+
+XXX
+I don't know what this is for. Let's see if I find out.
+
+{{{
+>          self.assertSFTPConnectionLost()
+>  
+> Index: twisted/conch/scripts/conch.py
+> ===================================================================
+> --- twisted/conch/scripts/conch.py	(revision 23210)
+> +++ twisted/conch/scripts/conch.py	(working copy)
+> @@ -8,20 +8,21 @@
+>  
+>  #""" Implementation module for the `conch` command.
+>  #"""
+}}}
+
+Please either delete this comment, or uncomment the docstring and make
+it comply with Twisted conventions.
+
+> +    def __setattr__(self, k, v):
+> +        """
+> +        Trap the 'client' attribute, what used to be the old name (roughly) for
+> +        'sessionApplication', and 'session', which triggers setting up
+> +        _DeprecatedSSHSession as our application factory.
+> +        """
+> +        if k == 'client':
+> +            # Someone is trying to inform us of an old-style client.  Clear the
+> +            # buffers (because this would not have previously delivered any
+> +            # data, only delivered subsequent data) and set the old-style
+> +            # "client" object up as a new-style processProtocol.
+> +            self.earlyData = ''
+> +            self.earlyExtended = []
+> +            self.setupSession(_TransportToProcessProtocol(v.transport))
+> +        if k == 'session' and v is not None:
+> +            # Someone is trying to inform us of an old-style session.  Wrap it
+> +            # in a _DeprecatedSSHSession.
+> +            self.applicationFactory = _DeprecatedSSHSession(self, v)
+> +        self.__dict__[k] = v
+> +
+}}}
+
+> I saw the '__setattr__' and had a moment of quiet terror. Now I see that it's
+> there for backwards compatibility -- this code will make my life easier, so
+> thanks :)
+> 
+> However, I think that you could and should implement this with properties.
+
+Setting properties doesn't work on old-style classes, and switching a class
+from old-style to new-style is a backwards-incompatible change.
+
+{{{
+> +
+> +    def applicationFactory(self):
+> +        """
+> +        Produce an applicationFactory dynamically if one does not yet exist.
+> +        """
+> +        if self.avatar is not None:
+> +            factoryCandidate = ISessionApplicationFactory(self.avatar, None)
+> +            if factoryCandidate is None:
+> +                # Maybe it implements the old version.
+> +                oldStyle = ISession(self.avatar, None)
+> +                if oldStyle is not None:
+> +                    # See __setattr__ above.
+> +                    self.session = oldStyle
+> +                else:
+> +                    # Maybe it doesn't implement either.  The test
+> +                    # SFTP server doesn't implement a session, because
+> +                    # subsystems were just looked up in the avatar.
+> +                    # Use a _SubsystemOnlyApplicationFactory.
+> +                    self.applicationFactory = _SubsystemOnlyApplicationFactory(
+> +                        self)
+> +            else:
+> +                self.applicationFactory = factoryCandidate
+> +            return self.applicationFactory
+> +    applicationFactory = property(applicationFactory)
+> +
+}}}
+
+> This method doesn't do what it says it does. The check at the beginning is
+> for whether 'self.avatar' is None. Calling this method multiple times will
+> create an applicationFactory multiple times. Is this deliberate? If so, please
+> update the docstring. If not, then I *think* you need to change the guard at
+> the top of the function.
+
+This method won't be called multiple times.  As I mentioned about, setting
+properties doesn't work on old-style classes.  When we assign a value to
+self.applicationFactory in this method, it overwrites the property so this
+method is only ever called once.
+
+{{{
+> +
+> +    # This used to be set in the older SSHSession implementation.
+> +    session = None
+> +
+}}}
+
+> And this needs to have a getter. I'm sorry, but there's code out there that
+> uses this.
+
+See __setattr__.
+
+{{{
+> +
+>      def request_subsystem(self, data):
+> -        subsystem, ignored= common.getNS(data)
+> +        """
+> +        The remote side has requested a subsystem.  Payload::
+> +            string  subsystem name
+> +
+> +        Try to get a subsystem object by calling our adapter's lookupSubsystem
+> +        method.  If that method returns a subsystem, then connect to our
+> +        client and return True.  Otherwise, return False.
+> +        """
+}}}
+
+> I'm surprised you don't return the subsystem. Why don't you?
+
+Because that's not how the class works.  See ssh/channel.py:SSHChannel.
+
+{{{
+> +
+>      def dataReceived(self, data):
+> -        if not self.client:
+> -            #self.conn.sendClose(self)
+> -            self.buf += data
+> +        """
+> +        We got data from the remote side.  If we have an application,
+> +        send the data to it.  Otherwise, buffer the data.
+> +
+> +        @type data: C{str}
+> +        """
+> +        if self.sessionApplication is None:
+> +            self.earlyData += data
+}}}
+
+> Perhaps `StringIO` would be more appropriate than a string for `earlyData`. If
+> you think so, whack an XXX comment somewhere in this file saying so -- this
+> branch is already too big. Be sure to put your name and the date on the
+> comment.
+
+I switched it to a list of str.  I didn't need the whole overhead of StringIO,
+but appeneding to the list is more efficient.
+
+
+{{{
+> +    def changeWindowSize(self, windowSize, wantReply=False):
+> +        """
+> +        Inform the other side that the local terminal size has changed.
+> +
+> +        @param windowSize: the new size of the window: (rows, cols, xpixels,
+> +                           ypixels)
+> +        @type windowSize: C{tuple}
+> +        @param wantReply: True if we want a reply to this request.
+> +        @type wantReply: C{bool}
+> +
+> +        @returns: if wantReply, a Deferred that will be called back when
+> +                  the request has succeeded or fails; else, None.
+> +        @rtype: C{Deferred}/C{None}
+> +        """
+> +        data = packRequest_window_change(windowSize)
+> +        return self.conn.sendRequest(self, 'window-change', data,
+> +                wantReply=wantReply)
+> +
+}}}
+
+> I'm guessing that this wantReply business is for backwards compat? It seems a
+> little strange otherwise.
+
+See ssh/connection.py:SSHConnection.sendRequest().
+
+{{{
+> +
+> +
+> +class _SubsystemOnlyApplicationFactory:
+>      """
+> +    An application factory which which is only good for looking up a
+> +    subsystem.  It is used when there is not an ISession adapter
+> +    defined for the avatar.  Its use is deprecated.
+> +    """
+}}}
+
+> If it's deprecated then please make sure it issues a deprecation warning when
+> used. See twisted.python.deprecate.
+
+It does, in the applicationFactory getter.
+
+{{{
+> +
+> +
+>      def __init__(self, proto):
+>          self.proto = proto
+>  
+> -    def connectionMade(self): self.proto.connectionMade()
+>  
+> -    def outReceived(self, data): self.proto.dataReceived(data)
+> +    def __getattr__(self, attr):
+> +        """
+> +        This class did not previously exist, so some uses expect this object
+> +        to implement the Protocol interface.  To handle this case, we pass
+> +        requests through to the wrapped object.
+> +        """
+> +        return getattr(self.proto, attr)
+>
+}}}
+
+> Is there a reason for not using proxyForInterfaces?
+
+Because I don't know anything about proxyForInterfaces?  How would that work?
+
+{{{
+>  def wrapProcessProtocol(inst):
+> +    """
+> +    If we're passed a C{Protocol}, wrap it in a C{ProcessProtocol}.
+> +    Otherwise, just return what we were passed.
+> +    """
+>      if isinstance(inst, protocol.Protocol):
+> -        return _ProtocolWrapper(inst)
+> +        return _ProtocolToProcessProtocol(inst)
+>      else:
+>          return inst
+>
+}}}
+
+> Can you use adapters for this instead?
+
+> If not, add a XXX comment saying that you *should* use adapters, and ideally,
+> file a bug about it.
+
+Maybe, but why not just be explicit about what I'm doing?
+
+{{{
+> +                self.session.conn.sendRequest(self.session, 'exit-signal',
+> +                        common.NS(signame[3:]) + chr(coreDumped) +
+> +                        common.NS('') + common.NS(''))
+> +            elif err.exitCode is not None:
+> +                log.msg('exitCode: %r' % (err.exitCode,))
+> +                self.session.conn.sendRequest(self.session, 'exit-status',
+> +                        struct.pack('>L', err.exitCode))
+}}}
+
+> What if 'err' has no exitCode and no signal?
+
+Then no special request is sent.  It's optional, a hint to the client about
+what happened on the server side.
+
+{{{
+> +class SSHSessionProcessProtocolApplication:
+> +    """
+> +    Another layer of wrapping to make the old-style ISession
+> +    implemention work.  This adapts SSHSessionProcessProtocol to
+> +    ISessionApplication.
+> +
+> +    @ivar processProtocol: the C{SSHSessionProcessProtocol} we're adapting.
+> +    """
+> +
+}}}
+
+Gosh there are a lot of these. I think it would be worth giving a summary in
+the module-level docstring. I'm starting to find it all a bit confusing.
+
+{{{
+> +
+> +    implements(ISessionApplication)
+> +
+> +
+}}}
+
+> No adapter registration?
+
+We manually wrap the ProcessProtocol in execCommand/openShell to be more
+explict about what's happening.
+
+{{{
+>      return term, winSize, modes
+>  
+> +
+> +
+>  def packRequest_pty_req(term, (rows, cols, xpixel, ypixel), modes):
+> -    """Pack a pty-req request so that it is suitable for sending.
+> +    """
+> +    Pack a pty-req request so that it is suitable for sending.
+>  
+>      NOTE: modes must be packed before being sent here.
+>      """
+>      termPacked = common.NS(term)
+>      winSizePacked = struct.pack('>4L', cols, rows, xpixel, ypixel)
+> -    modesPacked = common.NS(modes) # depend on the client packing modes
+> +    if not isinstance(modes, str):
+> +        modes = ''.join([chr(m[0]) + struct.pack('>L', m[1]) for m in modes])
+> +    else:
+> +        warnings.warn("packRequest_pty_req should be packing the modes.",
+> +                      DeprecationWarning, stacklevel=2)
+}}}
+
+> There's an API for this now: twisted.python.deprecate.
+
+Thanks for letting me know about that.  It doesn't quite work here since
+t.p.deprecate wraps the function, but it was good for some other methods.
+
+{{{
+> 
+>     def connectionMade(self):
+>         """
+>         Set up the instance variables.
+>         """
+}}}
+
+> Not the most helpful docstring in the world. Nothing obviously better springs
+> to mind. I see you use this in other places too.
+
+What other information would you like in the docstring?
+
+{{{ 
+>     def test_requestWindowChangeGetsSession(self):
+>         """
+>         If an ISession adapter isn't already present, request_window_change
+>         should get one.
+>         """
+>         s, d = self._testGetsSession()
+>         return d.callback((s.requestReceived, 'window_change',
+>             session.packRequest_window_change((1, 1, 1, 1))))
+>
+}}}
+
+> This is a long, long way from idiomatic Twisted code.
+
+> Looking back at _testGetsSession, everything up to and including the
+> assertIdentical line could easily go into setUp. Then, the tests could simply
+> call the methods they are testing and then do the assertion manually.
+
+> From all I can see, the Deferred is a red herring.
+
+I refactored these into their own TestCase, OldSessionWithNoAvatarTestCase,
+
+{{{
+>         self.assertTrue(ret)
+>         self.assertTrue(session.ISessionApplication.providedBy(
+>                 self.session.sessionApplication))
+}}}
+
+> I really dislike the way this combines an assertion with code that exercises
+> the system-under-test. It makes it harder to understand the expected
+> behaviour. You do it a lot in this file, and I'd really appreciate it if you
+> could change the tests to not do it.
+
+I don't understand this comment.

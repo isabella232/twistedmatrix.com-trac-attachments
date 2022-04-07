@@ -1,0 +1,264 @@
+Index: twisted/mail/test/test_options.py
+===================================================================
+--- twisted/mail/test/test_options.py	(revision 30430)
++++ twisted/mail/test/test_options.py	(working copy)
+@@ -42,3 +42,21 @@
+             '--maildirdbmdomain', 'example.com=example.com',
+             '--aliases', self.aliasFilename])
+ 
++
++
++    def testPop3sOptionDeprecation(self):
++        """
++        Test that using --pop3s emits a warning.
++        """
++        options = Options()
++        options.parseOptions(['--pop3s', '8484', '--certificate', '/dev/null'])
++        options.postOptions()
++        #warnings = self.flushWarnings()
++        warnings = self.flushWarnings([self.testPop3sOptionDeprecation])
++        print warnings
++        self.assertEquals(warnings[0]['category'], DeprecationWarning)
++        self.assertEquals(len(warnings), 2)
++
++
++
++
+Index: twisted/mail/topfiles/4739.feature
+===================================================================
+--- twisted/mail/topfiles/4739.feature	(revision 0)
++++ twisted/mail/topfiles/4739.feature	(revision 0)
+@@ -0,0 +1 @@
++Allow strports to be passed to the twistd mail plugin to specify server listening options while maintaining the ability to take just a port number for backward compatibility.  Multiple --pop3 options can be specified.  A single --pop3 0 disables all pop3 and --smtp 0 disables all smtp.
+Index: twisted/mail/tap.py
+===================================================================
+--- twisted/mail/tap.py	(revision 30430)
++++ twisted/mail/tap.py	(working copy)
+@@ -1,5 +1,5 @@
+ # -*- test-case-name: twisted.mail.test.test_options -*-
+-# Copyright (c) 2001-2004 Twisted Matrix Laboratories.
++# Copyright (c) 2001-2011 Twisted Matrix Laboratories.
+ # See LICENSE for details.
+ 
+ 
+@@ -7,7 +7,7 @@
+ """
+ 
+ import os
+-import sys
++import warnings
+ 
+ from twisted.mail import mail
+ from twisted.mail import maildir
+@@ -18,38 +18,95 @@
+ from twisted.python import usage
+ 
+ from twisted.cred import checkers
+-from twisted.application import internet
+ 
++from twisted.internet import endpoints
++from twisted.internet import reactor
+ 
++
++PROTO_DISABLED = object()
++
++
+ class Options(usage.Options):
+     synopsis = "[options]"
+ 
+     optParameters = [
+-        ["pop3", "p", 8110, "Port to start the POP3 server on (0 to disable).", usage.portCoerce],
+-        ["pop3s", "S", 0, "Port to start the POP3-over-SSL server on (0 to disable).", usage.portCoerce],
+-        ["smtp", "s", 8025, "Port to start the SMTP server on (0 to disable).", usage.portCoerce],
+-        ["certificate", "c", None, "Certificate file to use for SSL connections"],
++        ["pop3s", "S", "0", 
++            """Port to start the POP3-over-SSL server on (0 to disable,
++               DEPRECATED: use '--pop3 ssl:port:privateKye=certificate.pem'
++               instead)."""],
++
++        ["certificate", "c", None,
++            """Certificate file to use for SSL connections (DEPRECATED)"""],
++
+         ["relay", "R", None,
+-            "Relay messages according to their envelope 'To', using the given"
+-            "path as a queue directory."],
+-        ["hostname", "H", None, "The hostname by which to identify this server."],
++            """Relay messages according to their envelope 'To', using the 
++               given path as a queue directory."""],
++
++        ["hostname", "H", None,
++            """The hostname by which to identify this server."""],
+     ]
+ 
+     optFlags = [
+         ["esmtp", "E", "Use RFC 1425/1869 SMTP extensions"],
+-        ["disable-anonymous", None, "Disallow non-authenticated SMTP connections"],
++        ["disable-anonymous", None,
++            "Disallow non-authenticated SMTP connections"],
+     ]
+     zsh_actions = {"hostname" : "_hosts"}
+ 
+     longdesc = "This creates a mail.tap file that can be used by twistd."
+ 
++    proto_defaults = dict(pop3=["tcp:8110"], smtp=["tcp:8025"])
++
+     def __init__(self):
+         usage.Options.__init__(self)
+         self.service = mail.MailService()
+         self.last_domain = None
++        self['pop3'] = self.proto_defaults['pop3']
++        self['smtp'] = self.proto_defaults['smtp']
+ 
++    def addEndpoint(self, service, portspec):
++        """
++        Given a 'service' (pop3 or smtp), add a portspec to its
++        list of listener ports.
++        """
++        if self[service] is PROTO_DISABLED:
++            return
++        if portspec == '0':
++            self[service] = PROTO_DISABLED
++        else:
++            if self[service] is self.proto_defaults[service]:
++                self[service] = []
++            self[service].append(portspec)
++
++    def opt_pop3(self, strport):
++        """
++        Add a pop3 port listener on the specified strport.  You can specify
++        multiple ports. A bare TCP port number can be specified, but should be
++        considered deprecated. [SSL Example: ssl:8995:privateKey=mycert.pem]
++        [default: tcp:8110] Note: Just one instance of --pop3 0 disables all
++        pop3 ports.
++        """
++        self.addEndpoint('pop3', strport)
++    opt_p = opt_pop3
++
++    def opt_smtp(self, strport):
++        """
++        Add an smtp port listener on the specified strport.  You can listen
++        on multiple ports by specifying multiple --smtp optionsA bare TCP port
++        number can be specified, but should be considered deprecated. [SSL
++        Example: ssl:8465:privateKey=mycert.pem] [default: tcp:8025] Note: Just
++        one instance of --smtp 0 disables all smtp ports.  NOTE: Using the
++        --certificate option causes ALL smtp ports to use SSL.  Don't use
++        the deprecated --certificate option if you want to mix-and-match.
++        """
++        self.addEndpoint('smtp', strport)
++    opt_s = opt_smtp
++
+     def opt_passwordfile(self, filename):
+-        """Specify a file containing username:password login info for authenticated ESMTP connections."""
++        """
++        Specify a file containing username:password login info for
++        authenticated ESMTP connections.
++        """
+         ch = checkers.OnDiskUsernamePasswordDatabase(filename)
+         self.service.smtpPortal.registerChecker(ch)
+     opt_P = opt_passwordfile
+@@ -68,7 +125,8 @@
+         try:
+             name, path = domain.split('=')
+         except ValueError:
+-            raise usage.UsageError("Argument to --maildirdbmdomain must be of the form 'name=path'")
++            raise usage.UsageError("Argument to --maildirdbmdomain must "
++                                             "be of the form 'name=path'")
+ 
+         self.last_domain = maildir.MaildirDirdbmDomain(self.service, os.path.abspath(path))
+         self.service.addDomain(name, self.last_domain)
+@@ -114,20 +172,31 @@
+     opt_A = opt_aliases
+ 
+     def postOptions(self):
+-        if self['pop3s']:
++        if self['pop3s'] != '0':
+             if not self['certificate']:
+                 raise usage.UsageError("Cannot specify --pop3s without "
+-                                       "--certificate")
++                                       "--certificate or an ssl: strport")
+             elif not os.path.exists(self['certificate']):
+                 raise usage.UsageError("Certificate file %r does not exist."
+                                        % self['certificate'])
++            endpoint = toStrport(self['pop3s'], self['certificate'])
++            self.addEndpoint('pop3', endpoint)
++            warnings.warn("The --pop3s option is deprecated; use --pop3 with "
++                    "an ssl strport instead.", category=DeprecationWarning,
++                    stacklevel=2)
+ 
+         if not self['disable-anonymous']:
+             self.service.smtpPortal.registerChecker(checkers.AllowAnonymousAccess())
+ 
+-        if not (self['pop3'] or self['smtp'] or self['pop3s']):
++        if self['pop3'] is PROTO_DISABLED and self['smtp'] is PROTO_DISABLED:
+             raise usage.UsageError("You cannot disable all protocols")
+ 
++        if self['certificate']:
++            warnings.warn("The --certificate option is deprecated; "
++                    "use strports with ssl descriptions instead.",
++                    category=DeprecationWarning, stacklevel=2)
++
++
+ class AliasUpdater:
+     def __init__(self, domains, domain):
+         self.domains = domains
+@@ -135,6 +204,20 @@
+     def __call__(self, new):
+         self.domain.setAliasGroup(alias.loadAliasFile(self.domains, new))
+ 
++
++def toStrport(description, certificate=None):
++    """
++    Tries to guess whether a description is a valid strport
++    and assumes just a TCP port otherwise.  If a certificate
++    file is present, formulate an ssl strport.
++    """
++    if ":" in description:
++        return description
++    if certificate:
++        return "ssl:%s:privateKey=%s" % (description, certificate)
++    return "tcp:%s" % description
++        
++
+ def makeService(config):
+     if config['esmtp']:
+         rmType = relaymanager.SmartHostESMTPRelayingManager
+@@ -160,26 +243,24 @@
+         helper.setServiceParent(config.service)
+         config.service.domains.setDefaultDomain(default)
+ 
+-    ctx = None
+-    if config['certificate']:
+-        from twisted.mail.protocols import SSLContextFactory
+-        ctx = SSLContextFactory(config['certificate'])
++    if config['pop3'] is not PROTO_DISABLED:
++        f = config.service.getPOP3Factory()
++        for description in config['pop3']:
++            description = toStrport(description)
++            endpoint = endpoints.serverFromString(reactor, description)
++            endpoint.listen(f)
+ 
+-    if config['pop3']:
+-        s = internet.TCPServer(config['pop3'], config.service.getPOP3Factory())
+-        s.setServiceParent(config.service)
+-    if config['pop3s']:
+-        s = internet.SSLServer(config['pop3s'],
+-                               config.service.getPOP3Factory(), ctx)
+-        s.setServiceParent(config.service)
+-    if config['smtp']:
++    if config['smtp'] is not PROTO_DISABLED:
+         f = smtpFactory()
+-        f.context = ctx
+         if config['hostname']:
+             f.domain = config['hostname']
+             f.fArgs = (f.domain,)
+         if config['esmtp']:
+             f.fArgs = (None, None) + f.fArgs
+-        s = internet.TCPServer(config['smtp'], f)
+-        s.setServiceParent(config.service)
++        for description in config['smtp']:
++            description = toStrport(description)
++            endpoint = endpoints.serverFromString(reactor, description)
++            endpoint.listen(f)
++
+     return config.service
++

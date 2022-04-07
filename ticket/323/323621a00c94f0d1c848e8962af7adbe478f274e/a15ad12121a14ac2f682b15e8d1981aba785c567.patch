@@ -1,0 +1,75 @@
+Index: twisted/web/test/test_webclient.py
+===================================================================
+--- twisted/web/test/test_webclient.py	(revision 22720)
++++ twisted/web/test/test_webclient.py	(working copy)
+@@ -128,6 +128,7 @@
+         FilePath(name).child("file").setContent("0123456789")
+         r = static.File(name)
+         r.putChild("redirect", util.Redirect("/file"))
++        r.putChild("redirectLoop", util.Redirect("/redirectLoop"))
+         r.putChild("wait", LongTimeTakingResource())
+         r.putChild("error", ErrorResource())
+         r.putChild("nolength", NoLengthResource())
+@@ -300,6 +301,11 @@
+     def _cbCheckLocation(self, exc):
+         self.assertEquals(exc.location, "/file")
+ 
++    def testRedirectLoop(self):
++        d = client.getPage(self.getURL("redirectLoop"))
++        d = self.assertFailure(d, error.RedirectLoop)
++        return d
++
+     def testPartial(self):
+         name = self.mktemp()
+         f = open(name, "wb")
+Index: twisted/web/error.py
+===================================================================
+--- twisted/web/error.py	(revision 22720)
++++ twisted/web/error.py	(working copy)
+@@ -27,6 +27,12 @@
+         Error.__init__(self, code, message, response)
+         self.location = location
+ 
++class RedirectLoop(Error):
++    def __init__(self, code, message = None, response = None, location = None):
++        message = message or ("%s to %s" % (http.responses.get(code), location))
++        Error.__init__(self, code, message, response)
++        self.location = location
++
+ class ErrorPage(resource.Resource):
+     def __init__(self, status, brief, detail):
+         resource.Resource.__init__(self)
+Index: twisted/web/client.py
+===================================================================
+--- twisted/web/client.py	(revision 22720)
++++ twisted/web/client.py	(working copy)
+@@ -84,6 +84,17 @@
+         if self.followRedirect:
+             scheme, host, port, path = \
+                 _parse(url, defaultPort=self.transport.getPeer().port)
++
++            count = self.factory.redirectionLoops[url] = self.factory.redirectionLoops.setdefault(url, 0) + 1
++            if count >= self.factory.redirectLimit:
++                self.factory.noPage(
++                    failure.Failure(
++                        error.RedirectLoop(
++                            self.status, 'Infinite redirection loop detected', location = url)))
++                self.quietLoss = 1
++                self.transport.loseConnection()
++                return
++
+             self.factory.setURL(url)
+ 
+             if self.factory.scheme == 'https':
+@@ -202,8 +213,10 @@
+ 
+     def __init__(self, url, method='GET', postdata=None, headers=None,
+                  agent="Twisted PageGetter", timeout=0, cookies=None,
+-                 followRedirect=1):
++                 followRedirect=1, redirectLimit=5):
+         self.protocol.followRedirect = followRedirect
++        self.redirectLimit = redirectLimit
++        self.redirectionLoops = {}
+         self.timeout = timeout
+         self.agent = agent
+ 

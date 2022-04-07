@@ -1,0 +1,167 @@
+Index: twisted/test/test_ftp.py
+===================================================================
+--- twisted/test/test_ftp.py	(revision 30631)
++++ twisted/test/test_ftp.py	(working copy)
+@@ -64,6 +64,9 @@
+         self.buffer += data
+     def connectionLost(self, reason):
+         self.d.callback(self)
++    def write(self, content):
++        self.transport.write(content)
++        self.transport.loseConnection()
+ 
+ 
+ 
+@@ -82,10 +85,21 @@
+         os.mkdir(self.directory)
+         self.dirPath = filepath.FilePath(self.directory)
+ 
++        # Create a "/home" directory and home for "user"
++        self.homeDirectory = self.mktemp()
++        os.mkdir(self.homeDirectory)
++        self.homeDirPath = filepath.FilePath(self.homeDirectory)
++        self.userHome = self.homeDirPath.child('user')
++        if not self.userHome.exists():
++          self.userHome.createDirectory()
++
+         # Start the server
+-        p = portal.Portal(ftp.FTPRealm(self.directory))
++        p = portal.Portal(ftp.FTPRealm(self.directory, self.homeDirectory))
+         p.registerChecker(checkers.AllowAnonymousAccess(),
+                           credentials.IAnonymous)
++        p.registerChecker(checkers.InMemoryUsernamePasswordDatabaseDontUse(
++                              user='password'),
++                          credentials.IUsernamePassword)
+         self.factory = ftp.FTPFactory(portal=p,
+                                       userAnonymous=self.userAnonymous)
+         port = reactor.listenTCP(0, self.factory, interface="127.0.0.1")
+@@ -162,7 +176,18 @@
+             chainDeferred=d)
+ 
+ 
++    def _userLogin(self):
++        # Log in
++        d = self.assertCommandResponse(
++                'USER user',
++                ['331 Password required for user.'])
++        return self.assertCommandResponse(
++                'PASS password',
++                ['230 User logged in, proceed'],
++                chainDeferred=d)
+ 
++
++
+ class FTPAnonymousTestCase(FTPServerTestCase):
+     """
+     Simple tests for an FTP server with different anonymous username.
+@@ -435,6 +460,8 @@
+         return d.addCallback(gotPASV)
+ 
+     def _download(self, command, chainDeferred=None):
++        # Send a command to the server and download the response from the
++        # DTP connection
+         if chainDeferred is None:
+             chainDeferred = defer.succeed(None)
+ 
+@@ -451,6 +478,22 @@
+             return downloader.buffer
+         return chainDeferred.addCallback(downloadDone)
+ 
++
++    def _upload(self, command, content, chainDeferred=None):
++        # Send a command to the server and upload content through the DTP
++        # connection
++        if chainDeferred is None:
++            chainDeferred = defer.succeed(None)
++
++        chainDeferred.addCallback(self._makeDataConnection)
++        def queueCommand(uploader):
++            # wait for the command to return, send content immediately
++            d1 = self.client.queueStringCommand(command)
++            uploader.write(content)
++            return d1
++        return chainDeferred.addCallback(queueCommand)
++
++
+     def testEmptyLIST(self):
+         # Login
+         d = self._anonymousLogin()
+@@ -570,7 +613,78 @@
+         return d.addCallback(checkDownload)
+ 
+ 
++    def test_RESTContinuedDownload(self):
++        """
++        REST on an existing file with a positive offset followed by a RETR for
++        that file will return that file's content starting at that offset.
++        """
++        # Login
++        d = self._anonymousLogin()
+ 
++        # Create some content in a file in the current working directory
++        readfile = self.dirPath.child('test.txt').open('w')
++        readfile.write('x' * 1000)
++        readfile.close()
++
++        d = self.assertCommandResponse(
++                'REST 500',
++                ['350 Requested file action pending further information.'],
++                chainDeferred=d)
++
++        d = self._download('RETR test.txt', chainDeferred=d)
++        def checkDownload(download):
++          self.assertEquals('x' * 500, download)
++        return d.addCallback(checkDownload)
++    test_RESTContinuedDownload.todo = "Need to implement REST server-side"
++
++
++    def test_APPEContinuedUpload(self):
++        """
++        APPE on an existing file appends sent data to that file.
++        """
++        # Login
++        d = self._userLogin()
++
++        # Create some content in a file in the home directory
++        appendfile = self.userHome.child('test.txt').open('w')
++        appendfile.write('x' * 500)
++        appendfile.close()
++
++        d = self._upload('APPE test.txt', 'x' * 500, chainDeferred=d)
++
++        def checkContents(ignored=None):
++          appendfile = self.userHome.child('test.txt').open('r')
++          contents = appendfile.read()
++          appendfile.close()
++          self.assertEquals('x' * 1000, contents)
++        return d.addCallback(checkContents)
++    test_APPEContinuedUpload.todo = "Need to implement APPE server-side"
++
++
++    def test_STORUploadFile(self):
++        """
++        STOR on a non-existing file saves sent data to the that file.
++        """
++        # Login
++        d = self._userLogin()
++
++        # Ensure file does not exist yet
++        appendfile = self.userHome.child('test.txt')
++        if appendfile.exists():
++          appendfile.remove()
++
++        # Upload file
++        d = self._upload('STOR test.txt', 'x' * 1000, chainDeferred=d)
++
++        def checkContents(ignored=None):
++          appendfile = self.userHome.child('test.txt').open('r')
++          contents = appendfile.read()
++          appendfile.close()
++          self.assertEquals('x' * 1000, contents)
++        return d.addCallback(checkContents)
++
++
++
+ class FTPServerPortDataConnectionTestCase(FTPServerPasvDataConnectionTestCase):
+     def setUp(self):
+         self.dataPorts = []

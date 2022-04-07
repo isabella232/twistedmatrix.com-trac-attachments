@@ -1,0 +1,79 @@
+Index: twisted/internet/endpoints.py
+===================================================================
+--- twisted/internet/endpoints.py	(revision 18181)
++++ twisted/internet/endpoints.py	(working copy)
+@@ -1,39 +1,26 @@
+ # -*- test-case-name: twisted.test.test_endpoints -*-
+-
++import new
+ from zope.interface import implements, providedBy, directlyProvides
+ 
+ from twisted.internet import interfaces
+ from twisted.internet import defer, protocol
+ from twisted.internet.protocol import ClientFactory, Protocol
+ 
+-class _WrappingProtocol(Protocol):
+-    """I wrap another protocol in order to notify my user when a connection has 
+-    been made.
+-    """
+-    def __init__(self, factory, wrappedProtocol):
+-        self.factory = factory
+-        self.wrappedProtocol = wrappedProtocol
+-        
+-    def connectionMade(self):
+-        """XXX: As soon as I am connected, I connect my wrappedProtocol, giving 
+-        it my transport. Is it okay for a transport to be associated with more
+-        than one protocol? Transport calls dataReceived on me and I in turn call
+-        dataReceived on my wrappedProtocol. The wrappedProtocol may call 
+-        transport.write or transport.loseConnection etc
+-        """
+-        
+-        self.wrappedProtocol.makeConnection(self.transport)
+-        self.factory.deferred.callback(self.wrappedProtocol)
+-        
+-    def dataReceived(self, data):
+-        return self.wrappedProtocol.dataReceived(data)
+ 
+-    def connectionLost(self, reason):
+-        return self.wrappedProtocol.connectionLost(reason)
+-        
+-class _WrappingFactory(ClientFactory):
+-    protocol = _WrappingProtocol
++class CallbackWhenFirstCalledMethodWrapper(object):
++    def __init__(self, wrapped, onCalled):
++        self.wrapped = wrapped
++        self.onCalled = onCalled
++    
++    def __call__(self, otherSelf, *args, **kwargs):
++        self.onCalled.callback(otherSelf)
++        boundMethodName = self.wrapped.__name__
++        setattr(otherSelf, boundMethodName, self.wrapped)
++        del self.wrapped
++        return getattr(otherSelf, boundMethodName)(*args, **kwargs)
+ 
++
++class _WrappingFactory(ClientFactory):
+     def __init__(self, wrappedFactory):
+         self.wrappedFactory = wrappedFactory
+         self.deferred = defer.Deferred()
+@@ -44,7 +31,11 @@
+         except:
+             self.deferred.errback()
+         else:
+-            return self.protocol(self, proto)
++            wrapper = CallbackWhenFirstCalledMethodWrapper(proto.connectionMade, 
++                                                           self.deferred)
++            proto.connectionMade = new.instancemethod(wrapper, proto, 
++                                                      proto.__class__)
++            return proto
+ 
+     def clientConnectionFailed(self, connector, reason):
+         self.deferred.errback(reason)
+@@ -98,6 +89,7 @@
+             listenArgs["contextFactory"] = self.sslContextFactory
+         return defer.execute(listenMethod, self.port, wf, **listenArgs)
+ 
++
+ class UNIXEndpoint(object):
+     implements(interfaces.IClientEndpoint, interfaces.IServerEndpoint)
+ 

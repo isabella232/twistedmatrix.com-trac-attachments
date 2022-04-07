@@ -1,0 +1,122 @@
+diff --git a/twisted/application/app.py b/twisted/application/app.py
+index c348eb3..2945569 100644
+--- a/twisted/application/app.py
++++ b/twisted/application/app.py
+@@ -644,7 +644,21 @@ class ServerOptions(usage.Options, ReactorSelectionMixin):
+                    plug.description)
+     subCommands = property(subCommands)
+ 
+-
++def compose(services, options=ServerOptions):
++    plugins = options._getPlugins(service.IServiceMaker)
++    pluginsByName = {}
++    for plug in plugins:
++        pluginsByName[plug.tapname] = plug
++    ret = service.MultiService()
++    for serviceName, serviceOptions in services.iteritems():
++        serviceOptions = list(serviceOptions)
++        plug = pluginsByName[serviceOptions.pop(0)]
++        optionParser = plug.options()
++        optionParser.parseOptions(serviceOptions)
++        subService = plug.makeService(optionParser)
++        subService.setName(serviceName)
++        subService.setServiceParent(ret)
++    return ret
+ 
+ def run(runApp, ServerOptions):
+     config = ServerOptions()
+diff --git a/twisted/test/test_application.py b/twisted/test/test_application.py
+index 6f6bf36..0f62fd2 100644
+--- a/twisted/test/test_application.py
++++ b/twisted/test/test_application.py
+@@ -8,6 +8,7 @@ L{twisted.persisted.sob}.
+ 
+ import copy, os, pickle
+ from StringIO import StringIO
++from zope.interface import implementer
+ 
+ from twisted.trial import unittest
+ from twisted.application import service, internet, app
+@@ -881,3 +882,82 @@ class PluggableReactorTests(TwistedModulesMixin, unittest.TestCase):
+                                ['--reactor', 'fakereactortest', 'subcommand'])
+         self.assertIn(message, e.args[0])
+         self.assertIn("help-reactors", e.args[0])
++
++
++@implementer(service.IServiceMaker)
++class ServiceMaker1(object):
++
++    tapname = 'service1'
++
++    class options(usage.Options):
++
++        optParameters = [["port", "p", None, "port to port on"]]
++
++    def makeService(self, opts):
++        ret = service.Service()
++        ret.awesomePort = opts['port']
++        return ret
++
++@implementer(service.IServiceMaker)
++class ServiceMaker2(object):
++
++    tapname = 'service2'
++
++    class options(usage.Options):
++
++        optParameters = [["poort", "o", None, "poort is like port plus o"]]
++
++    def makeService(self, opts):
++        ret = service.Service()
++        ret.lessAwesomePort = opts['poort']
++        return ret
++
++class PluginReturner(object):
++
++    def __init__(self, *plugins):
++        self._plugins = plugins
++
++    def _getPlugins(self, iface):
++        self._lastIface = iface
++        return self._plugins
++
++class ComposeTests(unittest.TestCase):
++
++    def test_oneThing(self):
++        returner = PluginReturner(ServiceMaker1())
++        parameters = dict(woohoo=['service1', '--port', 'WOO'])
++        composedService = app.compose(parameters, returner)
++        services = list(composedService)
++        byName = composedService.getServiceNamed('woohoo')
++        self.assertEquals(services, [byName])
++        self.assertEqual(byName.awesomePort, 'WOO')
++
++    def test_oneThingTwoPlugins(self):
++        returner = PluginReturner(ServiceMaker1(), ServiceMaker2())
++        parameters = dict(woohoo=['service1', '--port', 'WOO'])
++        composedService = app.compose(parameters, returner)
++        services = list(composedService)
++        byName = composedService.getServiceNamed('woohoo')
++        self.assertEquals(services, [byName])
++        self.assertEqual(byName.awesomePort, 'WOO')
++
++    def test_twoThingsTwoPlugins(self):
++        returner = PluginReturner(ServiceMaker1(), ServiceMaker2())
++        parameters = dict(woohoo=['service1', '--port', 'WOO'],
++                          weehee=['service2', '--poort', 'WOW'])
++        composedService = app.compose(parameters, returner)
++        services = set(composedService)
++        woohoo = composedService.getServiceNamed('woohoo')
++        weehee = composedService.getServiceNamed('weehee')
++        self.assertEquals(services, set([woohoo, weehee]))
++        self.assertEqual(woohoo.awesomePort, 'WOO')
++        self.assertEqual(weehee.lessAwesomePort, 'WOW')
++
++    def test_oneIterable(self):
++        returner = PluginReturner(ServiceMaker1())
++        parameters = dict(woohoo=iter(['service1', '--port', 'WOO']))
++        composedService = app.compose(parameters, returner)
++        services = list(composedService)
++        byName = composedService.getServiceNamed('woohoo')
++        self.assertEquals(services, [byName])
++        self.assertEqual(byName.awesomePort, 'WOO')

@@ -1,0 +1,399 @@
+diff --git docs/core/howto/ssl.rst docs/core/howto/ssl.rst
+index ab0056c..26700dc 100644
+--- docs/core/howto/ssl.rst
++++ docs/core/howto/ssl.rst
+@@ -52,6 +52,8 @@ For clients, we can use :api:`twisted.internet.ssl.optionsForClientTLS`.
+ This takes two arguments, ``hostname`` (which indicates what hostname must be advertised in the server's certificate) and optionally ``trustRoot``.
+ By default, :api:`twisted.internet.ssl.optionsForClientTLS <optionsForClientTLS>` tries to obtain the trust roots from your platform, but you can specify your own.
+ 
++You may obtain an object suitable to pass as the ``trustRoot=`` parameter with an explicit list of :api:`twisted.internet.ssl.Certificate` or :api:`twisted.internet.ssl.PrivateCertificate` instances that shall be trusted by calling :api:`twisted.internet.ssl.trustRootFromCertificates`.
++
+ .. note::
+ 
+    Currently, Twisted only supports loading of OpenSSL's default trust roots.
+diff --git twisted/internet/_newtls.py twisted/internet/_newtls.py
+index a990cbd..6214c20 100644
+--- twisted/internet/_newtls.py
++++ twisted/internet/_newtls.py
+@@ -100,8 +100,9 @@ def startTLS(transport, contextFactory, normal, bypass):
+             a client (C{True}) or a server (C{False})
+           - a settable C{TLS} attribute which can be used to mark the fact
+             that SSL has been started
+-          - settable C{getHandle} and C{getPeerCertificate} attributes so
+-            these L{ISSLTransport} methods can be added to it
++          - settable C{getHandle}, C{getPeerCertificate} and
++            C{getPeerCertificateChain} attributes so these
++            L{ISSLTransport} methods can be added to it
+           - a C{protocol} attribute referring to the L{IProtocol} currently
+             connected to the transport, which can also be set to a new
+             L{IProtocol} for the transport to deliver data to
+@@ -142,6 +143,7 @@ def startTLS(transport, contextFactory, normal, bypass):
+ 
+     transport.getHandle = tlsProtocol.getHandle
+     transport.getPeerCertificate = tlsProtocol.getPeerCertificate
++    transport.getPeerCertificateChain = tlsProtocol.getPeerCertificateChain
+ 
+     # Mark the transport as secure.
+     directlyProvides(transport, ISSLTransport)
+diff --git twisted/internet/_sslverify.py twisted/internet/_sslverify.py
+index da0c772..c935185 100644
+--- twisted/internet/_sslverify.py
++++ twisted/internet/_sslverify.py
+@@ -385,8 +385,6 @@ class DistinguishedName(dict):
+         if attr not in _x509names:
+             raise AttributeError("%s is not a valid OpenSSL X509 name field" % (attr,))
+         realAttr = _x509names[attr]
+-        if not isinstance(value, bytes):
+-            value = value.encode("ascii")
+         self[realAttr] = value
+ 
+ 
+@@ -542,6 +540,29 @@ class Certificate(CertBase):
+     peerFromTransport = classmethod(peerFromTransport)
+ 
+ 
++    def peerChainFromTransport(Class, transport):
++        """
++        Get the certificate chain for the remote end of the given
++        transport.
++        """
++        method = getattr(transport.getHandle(), "get_peer_cert_chain", None)
++        if method is None:
++            raise CertificateError(
++                "non-TLS transport %r did not have peer certificate "
++                "chain" % (transport,)
++            )
++        chain = method()
++        if not chain:
++            raise CertificateError(
++                "TLS transport %r has no certificate chain" % (transport,)
++            )
++        cert_chain = []
++        for cert in chain:
++            cert_chain.append(Class(cert))
++        return cert_chain
++    peerChainFromTransport = classmethod(peerChainFromTransport)
++
++
+     def hostFromTransport(Class, transport):
+         """
+         Get the certificate for the local end of the given transport.
+@@ -1012,6 +1033,32 @@ class OpenSSLCertificateAuthorities(object):
+ 
+ 
+ 
++def trustRootFromCertificates(certificates):
++    """
++    From a list of L{Certificate} or L{PrivateCertificate} instances
++    this returns an object which implements C{IOpenSSLTrustRoot} and
++    is hence suitable for use as the trustRoot= keyword argument to
++    L{optionsForClientTLS}
++
++    @param certificates: All certificates which will be trusted.
++    @type certificates: C{iterable} of L{CertBase}
++    """
++
++    certs = []
++    for cert in certificates:
++        # PrivateCertificate or Certificate are both okay
++        if isinstance(cert, CertBase):
++            cert = cert.original
++        else:
++            raise TypeError(
++                "certificates items must be twisted.iternet.ssl.CertBase"
++                " instances"
++            )
++        certs.append(cert)
++    return OpenSSLCertificateAuthorities(certs)
++
++
++
+ @implementer(IOpenSSLTrustRoot)
+ class OpenSSLDefaultPaths(object):
+     """
+diff --git twisted/internet/interfaces.py twisted/internet/interfaces.py
+index b10f38d..6938f45 100644
+--- twisted/internet/interfaces.py
++++ twisted/internet/interfaces.py
+@@ -2243,6 +2243,11 @@ class ISSLTransport(ITCPTransport):
+         Return an object with the peer's certificate info.
+         """
+ 
++    def getPeerCertificateChain():
++        """
++        Return a list of L{twisted.internet.ssl.Certificate} instances
++        representing the chain of certificates, with the root last.
++        """
+ 
+ 
+ class INegotiated(ISSLTransport):
+diff --git twisted/internet/ssl.py twisted/internet/ssl.py
+index eb560aa..275b14e 100644
+--- twisted/internet/ssl.py
++++ twisted/internet/ssl.py
+@@ -229,6 +229,7 @@ from twisted.internet._sslverify import (
+     platformTrust, OpenSSLDefaultPaths, VerificationError,
+     optionsForClientTLS, ProtocolNegotiationSupport,
+     protocolNegotiationMechanisms,
++    trustRootFromCertificates,
+ )
+ 
+ __all__ = [
+@@ -242,4 +243,5 @@ __all__ = [
+ 
+     'VerificationError', 'optionsForClientTLS',
+     'ProtocolNegotiationSupport', 'protocolNegotiationMechanisms',
++    'trustRootFromCertificates',
+ ]
+diff --git twisted/protocols/tls.py twisted/protocols/tls.py
+index 2ae9ca6..8bc9ac0 100644
+--- twisted/protocols/tls.py
++++ twisted/protocols/tls.py
+@@ -62,6 +62,7 @@ from twisted.internet.main import CONNECTION_LOST
+ from twisted.internet.protocol import Protocol
+ from twisted.internet.task import cooperate
+ from twisted.protocols.policies import ProtocolWrapper, WrappingFactory
++from twisted.internet._sslverify import Certificate
+ 
+ 
+ @implementer(IPushProducer)
+@@ -586,6 +587,16 @@ class TLSMemoryBIOProtocol(ProtocolWrapper):
+         return self._tlsConnection.get_peer_certificate()
+ 
+ 
++    def getPeerCertificateChain(self):
++        """
++        Returns a L{sequence} of L{twisted.internet.ssl.Certificate}
++        instances representing the certificate chain of the other
++        end. The first Certificate is the remote host's certificate
++        and the last is the root.
++        """
++        return Certificate.peerChainFromTransport(self)
++
++
+     @property
+     def negotiatedProtocol(self):
+         """
+diff --git twisted/test/test_ssl.py twisted/test/test_ssl.py
+index e498a99..5db260d 100644
+--- twisted/test/test_ssl.py
++++ twisted/test/test_ssl.py
+@@ -148,13 +148,13 @@ class RecordingClientProtocol(protocol.Protocol):
+ 
+     def __init__(self):
+         self.deferred = defer.Deferred()
+-
+-
+-    def connectionMade(self):
+-        self.transport.getPeerCertificate()
++        self.peerCert = None
++        self.certChain = None
+ 
+ 
+     def dataReceived(self, data):
++        self.certChain = self.transport.getPeerCertificateChain()
++        self.peerCert = self.transport.getPeerCertificate()
+         self.deferred.callback(data)
+ 
+ 
+@@ -482,6 +482,38 @@ class BufferingTests(unittest.TestCase):
+             self.assertEqual, b"+OK <some crap>\r\n")
+ 
+ 
++    @defer.inlineCallbacks
++    def test_peerCertificates(self):
++        serverProto = self.serverProto = SingleLineServerProtocol()
++        clientProto = self.clientProto = RecordingClientProtocol()
++
++        server = protocol.ServerFactory()
++        client = self.client = protocol.ClientFactory()
++
++        server.protocol = lambda: serverProto
++        client.protocol = lambda: clientProto
++
++        sCTX = ssl.DefaultOpenSSLContextFactory(certPath, certPath)
++        cCTX = ssl.ClientContextFactory()
++
++        port = reactor.listenSSL(0, server, sCTX, interface='127.0.0.1')
++        self.addCleanup(port.stopListening)
++
++        reactor.connectSSL('127.0.0.1', port.getHost().port, client, cCTX)
++
++        pem = FilePath(__file__.encode("utf-8")).sibling(b"server.pem").getContent()
++        expectedCert = ssl.Certificate.loadPEM(pem)
++
++        # only after we've received some data will the SSL handshake
++        # be completely-complete
++        data = yield clientProto.deferred
++
++        # verify the certificate and chain are what we expect
++        peer = ssl.Certificate(clientProto.peerCert)
++        self.assertEqual(peer, expectedCert)
++        self.assertEqual([expectedCert], clientProto.certChain)
++
++
+ 
+ class ConnectionLostTests(unittest.TestCase, ContextGeneratingMixin):
+     """
+diff --git twisted/test/test_sslverify.py twisted/test/test_sslverify.py
+index 0fed93d..68b1156 100644
+--- twisted/test/test_sslverify.py
++++ twisted/test/test_sslverify.py
+@@ -54,6 +54,7 @@ from twisted.internet.error import ConnectionClosed
+ from twisted.python.compat import nativeString, _PY3
+ from twisted.python.constants import NamedConstant, Names
+ from twisted.python.filepath import FilePath
++from twisted.python.modules import getModule
+ 
+ from twisted.trial import unittest, util
+ from twisted.internet import protocol, defer, reactor
+@@ -67,6 +68,7 @@ if not skipSSL:
+     from twisted.internet import _sslverify as sslverify
+     from twisted.protocols.tls import TLSMemoryBIOFactory
+ 
++
+ # A couple of static PEM-format certificates to be used by various tests.
+ A_HOST_CERTIFICATE_PEM = """
+ -----BEGIN CERTIFICATE-----
+@@ -110,6 +112,8 @@ A_PEER_CERTIFICATE_PEM = """
+ -----END CERTIFICATE-----
+ """
+ 
++A_HOST_KEYPAIR = getModule(__name__).filePath.sibling('server.pem').getContent()
++
+ 
+ 
+ class DummyOpenSSL(object):
+@@ -1235,6 +1239,36 @@ class OpenSSLOptionsTests(unittest.TestCase):
+                 lambda result: self.assertEqual(result, WritingProtocol.byte))
+ 
+ 
++class CertificatePeerTests(unittest.TestCase):
++    """
++    Tests for the peer factory-functions on Certificate
++    """
++
++    def test_peerChainNonTls(self):
++        class FakeTransport:
++            def getHandle(self):
++                return None
++        obj = FakeTransport()
++        error = self.assertRaises(
++            CertificateError,
++            sslverify.Certificate.peerChainFromTransport, obj,
++        )
++
++
++    def test_peerChainMissing(self):
++        class FakeTransport:
++            def getHandle(self):
++                class FakeOpenSSL:
++                    def get_peer_cert_chain(self):
++                        return None
++                return FakeOpenSSL()
++        obj = FakeTransport()
++        error = self.assertRaises(
++            CertificateError,
++            sslverify.Certificate.peerChainFromTransport, obj,
++        )
++
++
+ 
+ class DeprecationTests(unittest.SynchronousTestCase):
+     """
+@@ -2156,6 +2190,87 @@ class ConstructorsTests(unittest.TestCase):
+ 
+ 
+ 
++class MultipleCertificateTrustRootTests(unittest.TestCase):
++    """
++    Test the behavior of the trustRootFromCertificates() API call.
++    """
++
++    if skipSSL:
++        skip = skipSSL
++
++    def test_trustRootFromCertificatesPrivatePublic(self):
++        """
++        trustRootFromCertificates must accept either Certificate or
++        PrivateCertificate and accept a connection with valid
++        certificates.
++        """
++        cert0 = sslverify.PrivateCertificate.loadPEM(A_HOST_KEYPAIR)
++        cert1 = sslverify.Certificate.loadPEM(A_HOST_CERTIFICATE_PEM)
++
++        mt = sslverify.trustRootFromCertificates([cert0, cert1])
++
++        # Verify that the returned object acts correctly when used as
++        # a trustRoot= param to optionsForClientTLS
++        sProto, cProto, pump = loopbackTLSConnectionInMemory(
++            trustRoot=mt,
++            privateKey=cert0.privateKey.original,
++            serverCertificate=cert0.original,
++        )
++
++        # This connection should succeed
++        self.assertEqual(cProto.wrappedProtocol.data, b'greetings!')
++        self.assertEqual(cProto.wrappedProtocol.lostReason, None)
++
++    def test_trustRootFromCertificatesPrivatePublicUntrusted(self):
++        """
++        trustRootFromCertificates should return a trust-root that rejects
++        connections using unknown certificates.
++        """
++        cert0 = sslverify.PrivateCertificate.loadPEM(A_HOST_KEYPAIR)
++        cert1 = sslverify.Certificate.loadPEM(A_HOST_CERTIFICATE_PEM)
++
++        # this test is the same as the above, except we do NOT include
++        # the server's cert ('cert0') in the list of trusted
++        # certificates.
++        mt = sslverify.trustRootFromCertificates([cert1])
++
++        # verify that the returned object acts correctly when used as
++        # a trustRoot= param to optionsForClientTLS
++        sProto, cProto, pump = loopbackTLSConnectionInMemory(
++            trustRoot=mt,
++            privateKey=cert0.privateKey.original,
++            serverCertificate=cert0.original,
++        )
++
++        # this connection should fail, so no data was received.
++        self.assertEqual(cProto.wrappedProtocol.data, b'')
++
++        # It was an L{SSL.Error}.
++        self.assertEqual(cProto.wrappedProtocol.lostReason.type, SSL.Error)
++
++        # Some combination of OpenSSL and PyOpenSSL is bad at reporting errors.
++        err = cProto.wrappedProtocol.lostReason.value
++        self.assertEqual(err.args[0][0][2], 'tlsv1 alert unknown ca')
++
++    def test_trustRootFromCertificatesOpenSslObjects(self):
++        """
++        trustRootFromCertificates rejects 'real' OpenSSL X509 objects.
++        """
++        private = sslverify.PrivateCertificate.loadPEM(A_HOST_KEYPAIR)
++        cert0 = private.original
++
++        exception = self.assertRaises(
++            TypeError,
++            sslverify.trustRootFromCertificates, [cert0],
++        )
++        self.assertEqual(
++            "certificates items must be twisted.internet.ssl.CertBase"
++            " instances",
++            exception.args[0],
++        )
++
++
++
+ class OpenSSLCipherTests(unittest.TestCase):
+     """
+     Tests for twisted.internet._sslverify.OpenSSLCipher.
+diff --git twisted/topfiles/7671.feature twisted/topfiles/7671.feature
+new file mode 100644
+index 0000000..882ddcd
+--- /dev/null
++++ twisted/topfiles/7671.feature
+@@ -0,0 +1 @@
++twisted.iternet.ssl.trustRootFromCertificates returns an object suitable for use as trustRoot= to twisted.internet.ssl.optionsForClientTLS that trusts multiple certificates.
+\ No newline at end of file

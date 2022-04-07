@@ -1,0 +1,68 @@
+--- /Library/Frameworks/Python.framework/Versions/2.5/lib/python2.5/site-packages/twisted/internet/task.py	2006-11-12 08:37:11.000000000 -0500
++++ twisted/internet/task.py	2008-01-16 16:46:41.000000000 -0500
+@@ -33,10 +33,10 @@
+ 
+     call = None
+     running = False
+-    deferred = None
+     interval = None
+     count = None
+     starttime = None
++    _iteration = 0
+ 
+     def _callLater(self, delay):
+         from twisted.internet import reactor
+@@ -48,6 +48,7 @@
+         self.f = f
+         self.a = a
+         self.kw = kw
++        self.completionDeferreds = {}   # map iteration numbers to deferreds that fire when they are done
+ 
+     def start(self, interval, now=True):
+         """Start running function every interval seconds.
+@@ -69,7 +70,8 @@
+         if interval < 0:
+             raise ValueError, "interval must be >= 0"
+         self.running = True
+-        d = self.deferred = defer.Deferred()
++        self._iteration += 1
++        d = self.completionDeferreds[self._iteration] = defer.Deferred()
+         self.starttime = self._seconds()
+         self.count = 0
+         self.interval = interval
+@@ -88,22 +90,30 @@
+         if self.call is not None:
+             self.call.cancel()
+             self.call = None
+-            d, self.deferred = self.deferred, None
++            d = self.completionDeferreds.pop(self._iteration)
+             d.callback(self)
+ 
+     def __call__(self):
++        # in these callback and errback methods, care must be taken to not
++        # assume that the state of self has not changed unexpectedly.
++        # Especially, the LoopingCall might have been stopped and started
++        # between the time that the last time __call__ was called, and when cb
++        # or eb gets called.
++
+         def cb(result):
+-            if self.running:
++            if self.running and self._iteration == iterationAtStart:
+                 self._reschedule()
+             else:
+-                d, self.deferred = self.deferred, None
++                d = self.completionDeferreds.pop(iterationAtStart)
+                 d.callback(self)
+ 
+         def eb(failure):
+-            self.running = False
+-            d, self.deferred = self.deferred, None
++            if self._iteration == iterationAtStart:
++                self.running = False
++            d = self.completionDeferreds.pop(iterationAtStart)
+             d.errback(failure)
+ 
++        iterationAtStart = self._iteration
+         self.call = None
+         d = defer.maybeDeferred(self.f, *self.a, **self.kw)
+         d.addCallback(cb)

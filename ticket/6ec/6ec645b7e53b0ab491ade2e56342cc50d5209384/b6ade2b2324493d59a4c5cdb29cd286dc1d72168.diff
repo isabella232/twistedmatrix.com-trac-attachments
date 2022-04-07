@@ -1,0 +1,166 @@
+Index: twisted/test/test_ftp.py
+===================================================================
+--- twisted/test/test_ftp.py	(revision 28417)
++++ twisted/test/test_ftp.py	(working copy)
+@@ -9,6 +9,7 @@
+ 
+ import os
+ import errno
++from StringIO import StringIO
+ 
+ from zope.interface import implements
+ 
+@@ -2616,18 +2617,21 @@
+ 
+     def test_write(self):
+         """
+-        Test L{ftp.IWriteFile}: the implementation should have a receive method
+-        returning a C{Deferred} with fires with a consumer ready to receive
+-        data to be written.
++        Test L{ftp.IWriteFile}: the implementation should have a receive
++        method returning a C{Deferred} which fires with a consumer ready to
++        receive data to be written. It should also have a close() method that
++        returns a Deferred.
+         """
+         content = 'elbbow\n'
+         def cbGet(writer):
+-            return writer.receive().addCallback(cbReceive)
+-        def cbReceive(consumer):
++            return writer.receive().addCallback(cbReceive, writer)
++        def cbReceive(consumer, writer):
+             producer = TestProducer(content, consumer)
+             consumer.registerProducer(None, True)
+             producer.start()
+             consumer.unregisterProducer()
++            return writer.close().addCallback(cbClose)
++        def cbClose(ignored):
+             self.assertEquals(self.getFileContent(), content)
+         return self.getFileWriter().addCallback(cbGet)
+ 
+@@ -2669,3 +2673,55 @@
+         Return the content of the temporary file.
+         """
+         return self.root.child(self.filename).getContent()
++
++
++class CloseTestWriter:
++    implements(ftp.IWriteFile)
++    closeStarted = False
++    def receive(self):
++        self.s = StringIO()
++        fc = ftp.FileConsumer(self.s)
++        return defer.succeed(fc)
++    def close(self):
++        self.closeStarted = True
++        return self.d
++
++class CloseTestShell:
++    def openForWriting(self, segs):
++        return defer.succeed(self.writer)
++
++class FTPCloseTest(unittest.TestCase):
++    """Tests that the server invokes IWriteFile.close"""
++
++    def test_write(self):
++        """Confirm that FTP uploads (i.e. ftp_STOR) correctly call and wait
++        upon the IWriteFile object's close() method"""
++        f = ftp.FTP()
++        f.workingDirectory = ["root"]
++        f.shell = CloseTestShell()
++        f.shell.writer = CloseTestWriter()
++        f.shell.writer.d = defer.Deferred()
++        f.factory = ftp.FTPFactory()
++        f.factory.timeOut = None
++        f.makeConnection(StringIO())
++
++        di = ftp.DTP()
++        di.factory = ftp.DTPFactory(f)
++        f.dtpInstance = di
++        di.makeConnection(None)#
++
++        stor_done = []
++        d = f.ftp_STOR("path")
++        d.addCallback(stor_done.append)
++        # the writer is still receiving data
++        self.assertFalse(f.shell.writer.closeStarted, "close() called early")
++        di.dataReceived("some data here")
++        self.assertFalse(f.shell.writer.closeStarted, "close() called early")
++        di.connectionLost("reason is ignored")
++        # now we should be waiting in close()
++        self.assertTrue(f.shell.writer.closeStarted, "close() not called")
++        self.assertFalse(stor_done)
++        f.shell.writer.d.callback("allow close() to finish")
++        self.assertTrue(stor_done)
++
++        return d # just in case an errback occurred
+Index: twisted/protocols/ftp.py
+===================================================================
+--- twisted/protocols/ftp.py	(revision 28417)
++++ twisted/protocols/ftp.py	(working copy)
+@@ -1122,7 +1122,6 @@
+                 cons = ASCIIConsumerWrapper(cons)
+ 
+             d = self.dtpInstance.registerConsumer(cons)
+-            d.addCallbacks(cbSent, ebSent)
+ 
+             # Tell them what to doooo
+             if self.dtpInstance.isConnected:
+@@ -1135,6 +1134,8 @@
+         def cbOpened(file):
+             d = file.receive()
+             d.addCallback(cbConsumer)
++            d.addCallback(lambda ignored: file.close())
++            d.addCallbacks(cbSent, ebSent)
+             return d
+ 
+         def ebOpened(err):
+@@ -1507,7 +1508,16 @@
+         @rtype: C{Deferred} of C{IConsumer}
+         """
+ 
++    def close():
++        """
++        Perform any post-write work that needs to be done. This method may
++        only be invoked once on each provider, and will always be invoked
++        after receive().
+ 
++        @rtype: C{Deferred} of anything: the value is ignored. The FTP client
++        will not see their upload request complete until this Deferred has
++        been fired.
++        """
+ 
+ def _getgroups(uid):
+     """Return the primary and supplementary groups for the given UID.
+@@ -1868,6 +1878,8 @@
+         # FileConsumer will close the file object
+         return defer.succeed(FileConsumer(self.fObj))
+ 
++    def close(self):
++        return defer.succeed(None)
+ 
+ 
+ class FTPRealm:
+Index: twisted/vfs/adapters/ftp.py
+===================================================================
+--- twisted/vfs/adapters/ftp.py	(revision 28417)
++++ twisted/vfs/adapters/ftp.py	(working copy)
+@@ -295,6 +295,11 @@
+         """
+         return defer.succeed(IConsumer(self.node))
+ 
++    def close(self):
++        """
++        Perform post-write actions.
++        """
++        return defer.succeed(None)
+ 
+ 
+ class _FileToConsumerAdapter(object):
+--- /dev/null	2010-02-22 18:45:52.000000000 -0500
++++ twisted/topfiles/3462.feature	2010-02-22 21:43:46.000000000 -0500
+@@ -0,0 +1,5 @@
++twisted.protocol.ftp.IWriteFile now has a close() method, which can return a
++Deferred. Previously a STOR command would finish immediately upon the receipt
++of the last byte of the uploaded file. With close(), the backend can delay
++the finish until it has performed some other slow action (like storing the
++data to a virtual filesystem).

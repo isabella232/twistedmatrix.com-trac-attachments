@@ -1,0 +1,172 @@
+Index: twisted/web/http.py
+===================================================================
+--- twisted/web/http.py	(revision 31014)
++++ twisted/web/http.py	(working copy)
+@@ -235,33 +235,6 @@
+         hh, mm, ss)
+     return s
+ 
+-
+-# a hack so we don't need to recalculate log datetime every hit,
+-# at the price of a small, unimportant, inaccuracy.
+-_logDateTime = None
+-_logDateTimeUsers = 0
+-_resetLogDateTimeID = None
+-
+-def _resetLogDateTime():
+-    global _logDateTime
+-    global _resetLogDateTime
+-    global _resetLogDateTimeID
+-    _logDateTime = datetimeToLogString()
+-    _resetLogDateTimeID = reactor.callLater(1, _resetLogDateTime)
+-
+-def _logDateTimeStart():
+-    global _logDateTimeUsers
+-    if not _logDateTimeUsers:
+-        _resetLogDateTime()
+-    _logDateTimeUsers += 1
+-
+-def _logDateTimeStop():
+-    global _logDateTimeUsers
+-    _logDateTimeUsers -= 1;
+-    if (not _logDateTimeUsers and _resetLogDateTimeID
+-        and _resetLogDateTimeID.active()):
+-        _resetLogDateTimeID.cancel()
+-
+ def timegm(year, month, day, hour, minute, second):
+     """
+     Convert time tuple in GMT to seconds since epoch, GMT
+@@ -1750,6 +1723,14 @@
+         self.logPath = logPath
+         self.timeOut = timeout
+ 
++        self._logDateTime = None
++        self._logDateTimeCallback = None
++
++    def _updateLogDateTime(self):
++        self._logDateTime = datetimeToLogString()
++        self._logDateTimeCallback = reactor.callLater(1,
++                self._updateLogDateTime)
++
+     def buildProtocol(self, addr):
+         p = protocol.ServerFactory.buildProtocol(self, addr)
+         # timeOut needs to be on the Protocol instance cause
+@@ -1758,7 +1739,9 @@
+         return p
+ 
+     def startFactory(self):
+-        _logDateTimeStart()
++        if not self._logDateTimeCallback:
++            self._updateLogDateTime()
++
+         if self.logPath:
+             self.logFile = self._openLogFile(self.logPath)
+         else:
+@@ -1769,8 +1752,11 @@
+             if self.logFile != log.logfile:
+                 self.logFile.close()
+             del self.logFile
+-        _logDateTimeStop()
+ 
++        if self._logDateTimeCallback and self._logDateTimeCallback.active():
++            self._logDateTimeCallback.cancel()
++            self._logDateTimeCallback = None
++
+     def _openLogFile(self, path):
+         """
+         Override in subclasses, e.g. to use twisted.python.logfile.
+@@ -1794,7 +1780,7 @@
+             line = '%s - - %s "%s" %d %s "%s" "%s"\n' % (
+                 request.getClientIP(),
+                 # request.getUser() or "-", # the remote user is almost never important
+-                _logDateTime,
++                self._logDateTime,
+                 '%s %s %s' % (self._escape(request.method),
+                               self._escape(request.uri),
+                               self._escape(request.clientproto)),
+Index: twisted/web/test/test_distrib.py
+===================================================================
+--- twisted/web/test/test_distrib.py	(revision 31014)
++++ twisted/web/test/test_distrib.py	(working copy)
+@@ -25,14 +25,9 @@
+ 
+ 
+ class MySite(server.Site):
+-    def stopFactory(self):
+-        if hasattr(self, "logFile"):
+-            if self.logFile != log.logfile:
+-                self.logFile.close()
+-            del self.logFile
++    pass
+ 
+ 
+-
+ class PBServerFactory(pb.PBServerFactory):
+     """
+     A PB server factory which keeps track of the most recent protocol it
+@@ -71,7 +66,6 @@
+             self.sub.publisher.broker.transport.loseConnection()
+         else:
+             dl[1].callback(None)
+-        http._logDateTimeStop()
+         if self.port1 is not None:
+             dl.append(self.port1.stopListening())
+         if self.port2 is not None:
+Index: twisted/web/test/test_web.py
+===================================================================
+--- twisted/web/test/test_web.py	(revision 31014)
++++ twisted/web/test/test_web.py	(working copy)
+@@ -804,7 +804,7 @@
+         self.request = DummyRequestForLogTest(self.site, False)
+ 
+     def testSimple(self):
+-        http._logDateTime = "[%02d/%3s/%4d:%02d:%02d:%02d +0000]" % (
++        self.site._logDateTime = "[%02d/%3s/%4d:%02d:%02d:%02d +0000]" % (
+             25, 'Oct', 2004, 12, 31, 59)
+         self.site.log(self.request)
+         self.site.logFile.seek(0)
+@@ -813,7 +813,7 @@
+             '1.2.3.4 - - [25/Oct/2004:12:31:59 +0000] "GET /dummy HTTP/1.0" 123 - "-" "-"\n')
+ 
+     def testMethodQuote(self):
+-        http._logDateTime = "[%02d/%3s/%4d:%02d:%02d:%02d +0000]" % (
++        self.site._logDateTime = "[%02d/%3s/%4d:%02d:%02d:%02d +0000]" % (
+             25, 'Oct', 2004, 12, 31, 59)
+         self.request.method = 'G"T'
+         self.site.log(self.request)
+@@ -823,7 +823,7 @@
+             '1.2.3.4 - - [25/Oct/2004:12:31:59 +0000] "G\\"T /dummy HTTP/1.0" 123 - "-" "-"\n')
+ 
+     def testRequestQuote(self):
+-        http._logDateTime = "[%02d/%3s/%4d:%02d:%02d:%02d +0000]" % (
++        self.site._logDateTime = "[%02d/%3s/%4d:%02d:%02d:%02d +0000]" % (
+             25, 'Oct', 2004, 12, 31, 59)
+         self.request.uri='/dummy"withquote'
+         self.site.log(self.request)
+@@ -833,7 +833,7 @@
+             '1.2.3.4 - - [25/Oct/2004:12:31:59 +0000] "GET /dummy\\"withquote HTTP/1.0" 123 - "-" "-"\n')
+ 
+     def testProtoQuote(self):
+-        http._logDateTime = "[%02d/%3s/%4d:%02d:%02d:%02d +0000]" % (
++        self.site._logDateTime = "[%02d/%3s/%4d:%02d:%02d:%02d +0000]" % (
+             25, 'Oct', 2004, 12, 31, 59)
+         self.request.clientproto='HT"P/1.0'
+         self.site.log(self.request)
+@@ -843,7 +843,7 @@
+             '1.2.3.4 - - [25/Oct/2004:12:31:59 +0000] "GET /dummy HT\\"P/1.0" 123 - "-" "-"\n')
+ 
+     def testRefererQuote(self):
+-        http._logDateTime = "[%02d/%3s/%4d:%02d:%02d:%02d +0000]" % (
++        self.site._logDateTime = "[%02d/%3s/%4d:%02d:%02d:%02d +0000]" % (
+             25, 'Oct', 2004, 12, 31, 59)
+         self.request.headers['referer'] = 'http://malicious" ".website.invalid'
+         self.site.log(self.request)
+@@ -853,7 +853,7 @@
+             '1.2.3.4 - - [25/Oct/2004:12:31:59 +0000] "GET /dummy HTTP/1.0" 123 - "http://malicious\\" \\".website.invalid" "-"\n')
+ 
+     def testUserAgentQuote(self):
+-        http._logDateTime = "[%02d/%3s/%4d:%02d:%02d:%02d +0000]" % (
++        self.site._logDateTime = "[%02d/%3s/%4d:%02d:%02d:%02d +0000]" % (
+             25, 'Oct', 2004, 12, 31, 59)
+         self.request.headers['user-agent'] = 'Malicious Web" Evil'
+         self.site.log(self.request)

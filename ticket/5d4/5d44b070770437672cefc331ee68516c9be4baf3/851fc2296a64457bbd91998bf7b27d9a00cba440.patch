@@ -1,0 +1,680 @@
+Index: twisted/test/test_udp.py
+===================================================================
+--- twisted/test/test_udp.py	(revision 38687)
++++ twisted/test/test_udp.py	(working copy)
+@@ -168,7 +168,72 @@
+ 
+         return d.addCallback(cbStarted, p)
+ 
++    def test_bindToIPv6Interface(self):
++        """
++        Bind to ipv6 interface.
++        """
++        server = Server()
++        p = reactor.listenUDP(0, server, interface="::1")
++        self.assertEqual(p.getHost().host, "::1")
+ 
++        return p.stopListening()
++
++    def cbServerStarted(self, ignored, client, interface, d):
++        self.port2 = reactor.listenUDP(0, client, interface=interface)
++        return d
++
++    def cbClientStarted(self, ignored, client, server, interface):
++        client.transport.connect(interface,
++                                 server.transport.getHost().port)
++        cAddr = client.transport.getHost()
++        sAddr = server.transport.getHost()
++
++        serverSend = client.packetReceived = defer.Deferred()
++        server.transport.write(b"hello", (cAddr.host, cAddr.port))
++
++        clientWrites = [
++            (b"a",),
++            (b"b", None),
++            (b"c", (sAddr.host, sAddr.port))]
++
++        def cbClientSend(ignored):
++            if clientWrites:
++                nextClientWrite = server.packetReceived = defer.Deferred()
++                nextClientWrite.addCallback(cbClientSend)
++                client.transport.write(*clientWrites.pop(0))
++                return nextClientWrite
++
++        # No one will ever call .errback on either of these Deferreds,
++        # but there is a non-trivial amount of test code which might
++        # cause them to fail somehow.  So fireOnOneErrback=True.
++        return defer.DeferredList([
++                cbClientSend(None),
++                serverSend], fireOnOneErrback=True)
++
++
++    def cbSendsFinished(self, ignored, client, server, addressAddition=()):
++        cAddr = client.transport.getHost()
++        sAddr = server.transport.getHost()
++        clientAddr = (cAddr.host, cAddr.port) + addressAddition
++        serverAddr = (sAddr.host, sAddr.port) + addressAddition
++        self.assertEqual(
++            client.packets,
++            [(b"hello", serverAddr)])
++        self.assertEqual(
++            server.packets,
++            [(b"a", clientAddr),
++             (b"b", clientAddr),
++             (b"c", clientAddr)])
++
++
++    def cbFinished(self, ignored, port1, port2):
++        return defer.DeferredList([
++            defer.maybeDeferred(port1.stopListening),
++            defer.maybeDeferred(port2.stopListening)],
++            fireOnOneErrback=True)
++
++
++
+     def test_bindError(self):
+         """
+         A L{CannotListenError} exception is raised when attempting to bind a
+@@ -192,81 +257,42 @@
+         d.addCallback(cbFinished)
+         return d
+ 
+-
+-    def test_sendPackets(self):
++    def performTransferServerClient(self, interface, addressAddition=()):
+         """
+-        Datagrams can be sent with the transport's C{write} method and
+-        received via the C{datagramReceived} callback method.
++        Helper method that creates UDP server and client,
++        connects the client to the server, sends some packets
++        and asserts addresses.
+         """
+         server = Server()
+         serverStarted = server.startedDeferred = defer.Deferred()
+-        port1 = reactor.listenUDP(0, server, interface="127.0.0.1")
++        port1 = reactor.listenUDP(0, server, interface=interface)
+ 
+         client = GoodClient()
+         clientStarted = client.startedDeferred = defer.Deferred()
+ 
+-        def cbServerStarted(ignored):
+-            self.port2 = reactor.listenUDP(0, client, interface="127.0.0.1")
+-            return clientStarted
++        d = serverStarted.addCallback(self.cbServerStarted, client, interface,
++                                      clientStarted)
++        d.addCallback(self.cbClientStarted, client, server, interface)
++        d.addCallback(self.cbSendsFinished, client, server, addressAddition)
++        d.addCallback(self.cbFinished, port1, self.port2)
+ 
+-        d = serverStarted.addCallback(cbServerStarted)
++        return d
+ 
+-        def cbClientStarted(ignored):
+-            client.transport.connect("127.0.0.1",
+-                                     server.transport.getHost().port)
+-            cAddr = client.transport.getHost()
+-            sAddr = server.transport.getHost()
++    def test_writeToIPv6Interface(self):
++        """
++        Send packets to ipv6 address.
++        """
++        return self.performTransferServerClient("::1", (0, 0))
+ 
+-            serverSend = client.packetReceived = defer.Deferred()
+-            server.transport.write(b"hello", (cAddr.host, cAddr.port))
+ 
+-            clientWrites = [
+-                (b"a",),
+-                (b"b", None),
+-                (b"c", (sAddr.host, sAddr.port))]
++    def test_sendPackets(self):
++        """
++        Datagrams can be sent with the transport's C{write} method and
++        received via the C{datagramReceived} callback method.
++        """
++        return self.performTransferServerClient("127.0.0.1")
+ 
+-            def cbClientSend(ignored):
+-                if clientWrites:
+-                    nextClientWrite = server.packetReceived = defer.Deferred()
+-                    nextClientWrite.addCallback(cbClientSend)
+-                    client.transport.write(*clientWrites.pop(0))
+-                    return nextClientWrite
+ 
+-            # No one will ever call .errback on either of these Deferreds,
+-            # but there is a non-trivial amount of test code which might
+-            # cause them to fail somehow.  So fireOnOneErrback=True.
+-            return defer.DeferredList([
+-                cbClientSend(None),
+-                serverSend],
+-                fireOnOneErrback=True)
+-
+-        d.addCallback(cbClientStarted)
+-
+-        def cbSendsFinished(ignored):
+-            cAddr = client.transport.getHost()
+-            sAddr = server.transport.getHost()
+-            self.assertEqual(
+-                client.packets,
+-                [(b"hello", (sAddr.host, sAddr.port))])
+-            clientAddr = (cAddr.host, cAddr.port)
+-            self.assertEqual(
+-                server.packets,
+-                [(b"a", clientAddr),
+-                 (b"b", clientAddr),
+-                 (b"c", clientAddr)])
+-
+-        d.addCallback(cbSendsFinished)
+-
+-        def cbFinished(ignored):
+-            return defer.DeferredList([
+-                defer.maybeDeferred(port1.stopListening),
+-                defer.maybeDeferred(self.port2.stopListening)],
+-                fireOnOneErrback=True)
+-
+-        d.addCallback(cbFinished)
+-        return d
+-
+-
+     def test_connectionRefused(self):
+         """
+         A L{ConnectionRefusedError} exception is raised when a connection
+@@ -500,6 +526,10 @@
+ 
+ class MulticastTestCase(unittest.TestCase):
+ 
++    localhost = "127.0.0.1"
++    multicast = "225.0.0.250"
++    all = "0.0.0.0"
++
+     def setUp(self):
+         self.server = Server()
+         self.client = Client()
+@@ -530,11 +560,12 @@
+         """
+         self.assertEqual(self.server.transport.getLoopbackMode(), 1)
+         addr = self.server.transport.getHost()
+-        joined = self.server.transport.joinGroup("225.0.0.250")
++        joined = self.server.transport.joinGroup(self.multicast,
++                                                 self.all)
+ 
+         def cbJoined(ignored):
+             d = self.server.packetReceived = Deferred()
+-            self.server.transport.write(b"hello", ("225.0.0.250", addr.port))
++            self.server.transport.write(b"hello", (self.multicast, addr.port))
+             return d
+         joined.addCallback(cbJoined)
+ 
+@@ -542,7 +573,7 @@
+             self.assertEqual(len(self.server.packets), 1)
+             self.server.transport.setLoopbackMode(0)
+             self.assertEqual(self.server.transport.getLoopbackMode(), 0)
+-            self.server.transport.write(b"hello", ("225.0.0.250", addr.port))
++            self.server.transport.write(b"hello", (self.multicast, addr.port))
+ 
+             # This is fairly lame.
+             d = Deferred()
+@@ -562,19 +593,19 @@
+         Test C{getOutgoingInterface} and C{setOutgoingInterface}.
+         """
+         self.assertEqual(
+-            self.client.transport.getOutgoingInterface(), "0.0.0.0")
++            self.client.transport.getOutgoingInterface(), self.all)
+         self.assertEqual(
+-            self.server.transport.getOutgoingInterface(), "0.0.0.0")
++            self.server.transport.getOutgoingInterface(), self.all)
+ 
+-        d1 = self.client.transport.setOutgoingInterface("127.0.0.1")
+-        d2 = self.server.transport.setOutgoingInterface("127.0.0.1")
++        d1 = self.client.transport.setOutgoingInterface(self.localhost)
++        d2 = self.server.transport.setOutgoingInterface(self.localhost)
+         result = gatherResults([d1, d2])
+ 
+         def cbInterfaces(ignored):
+             self.assertEqual(
+-                self.client.transport.getOutgoingInterface(), "127.0.0.1")
++                self.client.transport.getOutgoingInterface(), self.localhost)
+             self.assertEqual(
+-                self.server.transport.getOutgoingInterface(), "127.0.0.1")
++                self.server.transport.getOutgoingInterface(), self.localhost)
+         result.addCallback(cbInterfaces)
+         return result
+ 
+@@ -583,18 +614,18 @@
+         """
+         Test that multicast a group can be joined and left.
+         """
+-        d = self.client.transport.joinGroup("225.0.0.250")
++        d = self.client.transport.joinGroup(self.multicast, self.all)
+ 
+         def clientJoined(ignored):
+-            return self.client.transport.leaveGroup("225.0.0.250")
++            return self.client.transport.leaveGroup(self.multicast, self.all)
+         d.addCallback(clientJoined)
+ 
+         def clientLeft(ignored):
+-            return self.server.transport.joinGroup("225.0.0.250")
++            return self.server.transport.joinGroup(self.multicast, self.all)
+         d.addCallback(clientLeft)
+ 
+         def serverJoined(ignored):
+-            return self.server.transport.leaveGroup("225.0.0.250")
++            return self.server.transport.leaveGroup(self.multicast, self.all)
+         d.addCallback(serverJoined)
+ 
+         return d
+@@ -607,7 +638,7 @@
+         """
+         # 127.0.0.1 is not a multicast address, so joining it should fail.
+         return self.assertFailure(
+-            self.client.transport.joinGroup("127.0.0.1"),
++            self.client.transport.joinGroup(self.localhost, self.all),
+             error.MulticastJoinError)
+     if runtime.platform.isWindows() and not runtime.platform.isVista():
+         test_joinFailure.todo = "Windows' multicast is wonky"
+@@ -619,14 +650,14 @@
+         received from it.
+         """
+         c = Server()
+-        p = reactor.listenMulticast(0, c)
++        p = reactor.listenMulticast(0, c, interface=self.all)
+         addr = self.server.transport.getHost()
+ 
+-        joined = self.server.transport.joinGroup("225.0.0.250")
++        joined = self.server.transport.joinGroup(self.multicast, self.all)
+ 
+         def cbJoined(ignored):
+             d = self.server.packetReceived = Deferred()
+-            c.transport.write(b"hello world", ("225.0.0.250", addr.port))
++            c.transport.write(b"hello world", (self.multicast, addr.port))
+             return d
+         joined.addCallback(cbJoined)
+ 
+@@ -650,18 +681,19 @@
+         """
+         firstClient = Server()
+         firstPort = reactor.listenMulticast(
+-            0, firstClient, listenMultiple=True)
++            0, firstClient, listenMultiple=True, interface=self.all)
+ 
+         portno = firstPort.getHost().port
+ 
+         secondClient = Server()
+         secondPort = reactor.listenMulticast(
+-            portno, secondClient, listenMultiple=True)
++            portno, secondClient, listenMultiple=True, interface=self.all)
+ 
+-        theGroup = "225.0.0.250"
+-        joined = gatherResults([self.server.transport.joinGroup(theGroup),
+-                                firstPort.joinGroup(theGroup),
+-                                secondPort.joinGroup(theGroup)])
++        theGroup = self.multicast
++        joined = gatherResults([self.server.transport.joinGroup(theGroup,
++                                                                self.all),
++                                firstPort.joinGroup(theGroup, self.all),
++                                secondPort.joinGroup(theGroup, self.all)])
+ 
+ 
+         def serverJoined(ignored):
+@@ -689,7 +721,43 @@
+                                  "processes can listen, but not multiple sockets "
+                                  "in same process?")
+ 
++class IPv6MulticastTestCase(MulticastTestCase):
+ 
++    localhost = "::1"
++    multicast = "ffb1::"
++    all = "::"
++
++    def setUp(self):
++        self.server = Server()
++        self.client = Client()
++        self.port1 = reactor.listenMulticast(0, self.server, interface="::")
++        self.port2 = reactor.listenMulticast(0, self.client, interface="::")
++        self.client.transport.connect(
++            "::1", self.server.transport.getHost().port)
++
++    def test_interface(self):
++        """
++        Test C{getOutgoingInterface} and C{setOutgoingInterface}.
++        """
++        self.assertEqual(
++            self.client.transport.getOutgoingInterface(), self.all)
++        self.assertEqual(
++            self.server.transport.getOutgoingInterface(), self.all)
++
++        d1 = self.client.transport.setOutgoingInterface(self.localhost)
++        d2 = self.server.transport.setOutgoingInterface(self.localhost)
++        result = gatherResults([d1, d2])
++
++        def cbInterfaces(ignored):
++            self.assertEqual(
++                self.client.transport.getOutgoingInterface(), self.all)
++            self.assertEqual(
++                self.server.transport.getOutgoingInterface(), self.all)
++        result.addCallback(cbInterfaces)
++        return result
++
++
++    
+ if not interfaces.IReactorUDP(reactor, None):
+     UDPTestCase.skip = "This reactor does not support UDP"
+     ReactorShutdownInteraction.skip = "This reactor does not support UDP"
+Index: twisted/internet/test/test_address.py
+===================================================================
+--- twisted/internet/test/test_address.py	(revision 38687)
++++ twisted/internet/test/test_address.py	(working copy)
+@@ -199,8 +199,23 @@
+         """
+         return IPv6Address("TCP", "::2", 0)
+ 
++    def buildWholeAddress(self):
++        """
++        Like L{buldAddress}, but assigns all fields specific to
++        ipv6 (including flow info and scope id)
++        """
++        return IPv6Address("TCP", "FE80::", 1, 1, None)
+ 
++    def test_specificFields(self):
++        """
++        Simply check if ipv6 specific fields exist.
++        """
++        addr = self.buildWholeAddress()
++        self.assertTrue(hasattr(addr, "flowInfo"))
++        self.assertTrue(hasattr(addr, "scopeId"))
+ 
++
++
+ class UNIXAddressTestCase(unittest.SynchronousTestCase, AddressTestCaseMixin):
+     addressArgSpec = (("name", "%r"),)
+ 
+Index: twisted/internet/test/test_udp.py
+===================================================================
+--- twisted/internet/test/test_udp.py	(revision 38687)
++++ twisted/internet/test/test_udp.py	(working copy)
+@@ -20,7 +20,7 @@
+ from twisted.internet.defer import Deferred, maybeDeferred
+ from twisted.internet.interfaces import (
+     ILoggingContext, IListeningPort, IReactorUDP)
+-from twisted.internet.address import IPv4Address
++from twisted.internet.address import IPv4Address, IPv6Address
+ from twisted.internet.protocol import DatagramProtocol
+ 
+ from twisted.internet.test.connectionmixins import (LogObserverMixin,
+@@ -48,8 +48,14 @@
+         """
+         return "(UDP Port %s Closed)" % (port.getHost().port,)
+ 
++    def getIPv6ListeningPort(self, reactor, protocol):
++        """
++        Get a UDP port binded to ipv6 interface.
++        """
++        return reactor.listenUDP(0, protocol, "::1")
+ 
+ 
++
+ class DatagramTransportTestsMixin(LogObserverMixin):
+     """
+     Mixin defining tests which apply to any port/datagram based transport.
+@@ -162,7 +168,21 @@
+         self.assertEqual(
+             port.getHost(), IPv4Address('UDP', host, portNumber))
+ 
++    def test_getHostIPv6(self):
++        """
++        L{IListeningPort.getHost} returns an L{IPv6Address} giving a
++        IPv6 address, the port number that the protocol is listening on
++        and the port number.
++        """
++        reactor = self.buildReactor()
++        port = self.getIPv6ListeningPort(reactor, DatagramProtocol())
++        addr = port.getHost()
++        self.assertEqual(addr.host, "::1")
++        self.assertEqual(addr.flowInfo, 0)
++        self.assertEqual(addr.scopeId, 0)
+ 
++
++
+     def test_logPrefix(self):
+         """
+         Datagram transports implement L{ILoggingContext.logPrefix} to return a
+Index: twisted/internet/abstract.py
+===================================================================
+--- twisted/internet/abstract.py	(revision 38687)
++++ twisted/internet/abstract.py	(working copy)
+@@ -9,7 +9,9 @@
+ from __future__ import division, absolute_import
+ 
+ from socket import AF_INET6, inet_pton, error
++from struct import unpack
+ 
++
+ from zope.interface import implementer
+ 
+ # Twisted Imports
+@@ -526,5 +528,13 @@
+         return False
+     return True
+ 
++#Look:
++#http://stackoverflow.com/questions/10558441/inet-aton-similar-function-for-ipv6
++def covertIPv6ToInteger(address):
++    """Convert ipv6 address to integer"""
++    address = inet_pton(AF_INET6, address)
++    a, b = unpack(">QQ", address)
++    return (a << 64) | b
+ 
+-__all__ = ["FileDescriptor", "isIPAddress", "isIPv6Address"]
++__all__ = ["FileDescriptor", "isIPAddress", "isIPv6Address",
++           "covertIPv6ToInteger"]
+Index: twisted/internet/base.py
+===================================================================
+--- twisted/internet/base.py	(revision 38687)
++++ twisted/internet/base.py	(working copy)
+@@ -564,7 +564,7 @@
+         if not name:
+             # XXX - This is *less than* '::', and will screw up IPv6 servers
+             return defer.succeed('0.0.0.0')
+-        if abstract.isIPAddress(name):
++        if abstract.isIPAddress(name) or abstract.isIPv6Address(name):
+             return defer.succeed(name)
+         return self.resolver.getHostByName(name, timeout)
+ 
+Index: twisted/internet/address.py
+===================================================================
+--- twisted/internet/address.py	(revision 38687)
++++ twisted/internet/address.py	(working copy)
+@@ -77,6 +77,14 @@
+         IPv6 address; for example, "::1".
+     @type host: C{str}
+     """
++    def __init__(self, type, host, port, flowInfo=0, scopeId=0, _bwHack=None):
++        _IPAddress.__init__(self, type, host, port)
++        self.flowInfo = flowInfo
++        self.scopeId = scopeId
++        if _bwHack is not None:
++            warnings.warn("twisted.internet.address.IPv4Address._bwHack "
++                          "is deprecated since Twisted 11.0",
++                          DeprecationWarning, stacklevel=2)
+ 
+ 
+ 
+Index: twisted/internet/udp.py
+===================================================================
+--- twisted/internet/udp.py	(revision 38687)
++++ twisted/internet/udp.py	(working copy)
+@@ -80,6 +80,7 @@
+         self.interface = interface
+         self.setLogStr()
+         self._connectedAddr = None
++        self.setAddressFamily()
+ 
+     def __repr__(self):
+         if self._realPortNumber is not None:
+@@ -207,7 +208,7 @@
+         """
+         if self._connectedAddr:
+             raise RuntimeError("already connected, reconnecting is not currently supported")
+-        if not abstract.isIPAddress(host):
++        if not abstract.isIPAddress(host) and not abstract.isIPv6Address(host):
+             raise ValueError("please pass only IP addresses, not domain names")
+         self._connectedAddr = (host, port)
+         self.socket.connect((host, port))
+@@ -252,7 +253,20 @@
+         logPrefix = self._getLogPrefix(self.protocol)
+         self.logstr = "%s (UDP)" % logPrefix
+ 
++    def setAddressFamily(self):
++        """
++        Resolve address family for the socket.
++        """
++        if abstract.isIPv6Address(self.interface):
++            if not socket.has_ipv6:
++                raise RuntimeError("IPV6 is not supported, "+\
++                                       "compile with ipv6 support")
++            self.addressFamily = socket.AF_INET6
++        elif abstract.isIPAddress(self.interface):
++            self.addressFamily = socket.AF_INET
++        
+ 
++
+     def logPrefix(self):
+         """
+         Return the prefix to log with.
+@@ -262,11 +276,14 @@
+ 
+     def getHost(self):
+         """
+-        Returns an IPv4Address.
++        Returns an IPv4Address or IPv6Address.
+ 
+         This indicates the address from which I am connecting.
+         """
+-        return address.IPv4Address('UDP', *self.socket.getsockname())
++        if self.addressFamily == socket.AF_INET:
++            return address.IPv4Address('UDP', *self.socket.getsockname())
++        elif self.addressFamily == socket.AF_INET6:
++            return address.IPv6Address('UDP', *self.socket.getsockname())
+ 
+ 
+ 
+@@ -276,53 +293,76 @@
+     """
+ 
+     def getOutgoingInterface(self):
+-        i = self.socket.getsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_IF)
+-        return socket.inet_ntoa(struct.pack("@i", i))
++        i = self.socket.getsockopt(self.IPLayer, self.multicastOUT)
++        #FIXME This might be a bug.
++        if self.IPLayer == socket.IPPROTO_IPV6:
++            addr = struct.pack("@i", i)
++            addr = addr.ljust(16, '\x00')
++        else:
++            addr = struct.pack("@i", i)
++        return socket.inet_ntop(self.addressFamily, addr)
+ 
+     def setOutgoingInterface(self, addr):
+         """Returns Deferred of success."""
+         return self.reactor.resolve(addr).addCallback(self._setInterface)
+ 
+     def _setInterface(self, addr):
+-        i = socket.inet_aton(addr)
+-        self.socket.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_IF, i)
++        i = socket.inet_pton(self.addressFamily, addr)
++        self.socket.setsockopt(self.IPLayer, self.multicastOUT, i)
+         return 1
+ 
+     def getLoopbackMode(self):
+-        return self.socket.getsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_LOOP)
++        return self.socket.getsockopt(self.IPLayer, self.multicastLoop)
+ 
+     def setLoopbackMode(self, mode):
+-        mode = struct.pack("b", operator.truth(mode))
+-        self.socket.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_LOOP, mode)
++        if self.IPLayer != socket.IPPROTO_IPV6:
++            mode = struct.pack("b", operator.truth(mode))
++        self.socket.setsockopt(self.IPLayer, self.multicastLoop, mode)
+ 
+     def getTTL(self):
+-        return self.socket.getsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL)
++        return self.socket.getsockopt(self.IPLayer, self.multicastHops)
+ 
+     def setTTL(self, ttl):
+-        ttl = struct.pack("B", ttl)
+-        self.socket.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, ttl)
++        if self.IPLayer != socket.IPPROTO_IPV6:
++            ttl = struct.pack("B", ttl)
++        self.socket.setsockopt(self.IPLayer, self.multicastHops, ttl)
+ 
++    def _checkIPVersions(self, addr1, addr2):
++        """Check if address versions match"""
++        addrIsIPv6 = abstract.isIPv6Address(addr1)
++        interfaceIsIPv6 = abstract.isIPv6Address(addr2)
++        if addrIsIPv6 and interfaceIsIPv6:
++            pass
++        elif not addrIsIPv6 and not addrIsIPv6:
++            pass
++        else:
++            raise RuntimeError("IP version mismatch")
++
+     def joinGroup(self, addr, interface=""):
+         """Join a multicast group. Returns Deferred of success."""
++        self._checkIPVersions(addr, interface)
+         return self.reactor.resolve(addr).addCallback(self._joinAddr1, interface, 1)
+ 
+     def _joinAddr1(self, addr, interface, join):
+         return self.reactor.resolve(interface).addCallback(self._joinAddr2, addr, join)
+ 
+     def _joinAddr2(self, interface, addr, join):
+-        addr = socket.inet_aton(addr)
+-        interface = socket.inet_aton(interface)
++
++        addr = socket.inet_pton(self.addressFamily, addr)
++        interface = socket.inet_pton(self.addressFamily, interface)
+         if join:
+-            cmd = socket.IP_ADD_MEMBERSHIP
++            cmd = self.multicastJoin
+         else:
+-            cmd = socket.IP_DROP_MEMBERSHIP
++            cmd = self.multicastLeave
+         try:
+-            self.socket.setsockopt(socket.IPPROTO_IP, cmd, addr + interface)
++            self.socket.setsockopt(self.IPLayer, cmd, addr + interface)
+         except socket.error as e:
+-            return failure.Failure(error.MulticastJoinError(addr, interface, *e.args))
++            return failure.Failure(error.MulticastJoinError(
++                    addr, interface, *e.args))
+ 
+     def leaveGroup(self, addr, interface=""):
+         """Leave multicast group, return Deferred of success."""
++        self._checkIPVersions(addr, interface)
+         return self.reactor.resolve(addr).addCallback(self._joinAddr1, interface, 0)
+ 
+ 
+@@ -331,12 +371,26 @@
+     """
+     UDP Port that supports multicasting.
+     """
++    IPLayer = socket.IPPROTO_IP
++    multicastJoin = socket.IP_ADD_MEMBERSHIP
++    multicastLeave = socket.IP_DROP_MEMBERSHIP
++    multicastOUT = socket.IP_MULTICAST_IF
++    multicastLoop = socket.IP_MULTICAST_LOOP
++    multicastHops = socket.IP_MULTICAST_TTL
+ 
+     def __init__(self, port, proto, interface='', maxPacketSize=8192, reactor=None, listenMultiple=False):
+         """
+         @see: L{twisted.internet.interfaces.IReactorMulticast.listenMulticast}
+         """
+         Port.__init__(self, port, proto, interface, maxPacketSize, reactor)
++        if abstract.isIPv6Address(interface):
++            self.IPLayer = socket.IPPROTO_IPV6
++            self.multicastJoin = socket.IPV6_JOIN_GROUP
++            self.multicastLeave = socket.IPV6_LEAVE_GROUP
++            self.multicastOUT = socket.IPV6_MULTICAST_IF
++            self.multicastLoop = socket.IPV6_MULTICAST_LOOP
++            self.multicastHops = socket.IPV6_MULTICAST_HOPS
++
+         self.listenMultiple = listenMultiple
+ 
+     def createInternetSocket(self):

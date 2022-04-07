@@ -1,0 +1,86 @@
+Index: basic.py
+===================================================================
+--- basic.py	(from Twisted-2.0.0)
++++ basic.py
+@@ -180,6 +180,10 @@
+     
+     @cvar delimiter: The line-ending delimiter to use. By default this is
+                      '\\r\\n'.
++                     Subclasses and instances MAY set a different input_delimiter
++                     in order to have different line-splitting behaviour on
++                     input, while still using delimiter as the output line
++                     delimiter.
+     @cvar MAX_LENGTH: The maximum length of a line to allow (If a
+                       sent line is longer than this, the connection is dropped).
+                       Default is 16384.
+@@ -189,11 +193,11 @@
+     delimiter = '\r\n'
+     MAX_LENGTH = 16384
+     paused = False
+-    
++
+     def clearLineBuffer(self):
+         """Clear buffered data."""
+         self.__buffer = ""
+-    
++
+     def dataReceived(self, data):
+         """Protocol.dataReceived.
+         Translates bytes into lines, and calls lineReceived (or
+@@ -201,8 +205,31 @@
+         """
+         self.__buffer = self.__buffer+data
+         lastoffset=0
++        try:
++            # see if the dual-use (input and output) delimiter has been overridden
++            delimiter = self.input_delimiter
++        except AttributeError:
++            # default to the dual-use delimiter, to preserve previous behaviour
++            delimiter = self.delimiter
+         while self.line_mode and not self.paused:
+-            offset=self.__buffer.find(self.delimiter, lastoffset)
++            if delimiter is None:
++                # It makes no sense not to have a delimiter - that would be the
++                # same as raw mode. So treat this as meaning 'tolerant Internet
++                # line delimiter'; should be '\r\n' but allow '\n'.
++                # See HTTP 1.1 Specification - 19.3 Tolerant Applications:
++                #   http://www.w3.org/Protocols/rfc2616/rfc2616-sec19.html#sec19.3
++                offset=self.__buffer.find('\n', lastoffset)
++                if offset > 0 and self.__buffer[offset-1] == '\r':
++                    offset -= 1
++                    delimiter_len = 2
++                    this_delimiter = '\r\n'
++                else:
++                    delimiter_len = 1
++                    this_delimiter = '\n'
++            else:
++                # specified delimiter
++                offset=self.__buffer.find(delimiter, lastoffset)
++                delimiter_len = len(delimiter)
+             if offset == -1:
+                 self.__buffer=self.__buffer[lastoffset:]
+                 if len(self.__buffer) > self.MAX_LENGTH:
+@@ -210,15 +237,20 @@
+                     self.__buffer=''
+                     return self.lineLengthExceeded(line)
+                 break
+-            
++
+             line=self.__buffer[lastoffset:offset]
+-            lastoffset=offset+len(self.delimiter)
++            lastoffset=offset+delimiter_len
+             
+             if len(line) > self.MAX_LENGTH:
+                 line=self.__buffer[lastoffset:]
+                 self.__buffer=''
+                 return self.lineLengthExceeded(line)
+-            why = self.lineReceived(line)
++            if delimiter is None:
++                # A subclass with no specified delimiter may be interested in what
++                # the actual line terminator was.
++                why = self.lineReceived(line, line_terminator=this_delimiter)
++            else:
++                why = self.lineReceived(line)
+             if why or self.transport and self.transport.disconnecting:
+                 self.__buffer = self.__buffer[lastoffset:]
+                 return why

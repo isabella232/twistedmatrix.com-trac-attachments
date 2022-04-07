@@ -1,0 +1,2616 @@
+Index: twisted/mail/maildir.py
+===================================================================
+RCS file: /ext/cvshome/public/tds/twisted-1.1.0/twisted/mail/maildir.py,v
+retrieving revision 1.1.1.1
+retrieving revision 1.8
+diff -u -r1.1.1.1 -r1.8
+--- twisted/mail/maildir.py	30 Oct 2003 23:11:45 -0000	1.1.1.1
++++ twisted/mail/maildir.py	16 Nov 2003 00:37:37 -0000	1.8
+@@ -15,16 +15,18 @@
+ # License along with this library; if not, write to the Free Software
+ # Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
+ 
+-"""Maildir-style mailbox support
++"""Maildir-style mailbox support (with courier extensions)
+ """
+ 
+ from __future__ import generators
+ 
+ import os
++import errno
+ import stat
+ import socket
+ import time
+ import md5
++import shutil
+ 
+ try:
+     import cStringIO as StringIO
+@@ -52,8 +54,1981 @@
+   server administrator.
+ '''
+ 
++# Exceptions
++class MaildirError(Exception): 
++    """Maildir base exception.
++
++    @ivar path: The full path to the maildir, a folder of that maildir or a 
++        message in the maildir that caused the error. 
++    @type path: str
++    @ivar maildir: The full path to the maildir.
++    @type maildir: str
++    """
++    def __init__(self, maildir, mesg='Error occured for maildir: %(path)s.'):
++        self.maildir     = maildir
++        self.path        = maildir
++        self._message     = mesg
++
++    def __str__(self):
++        return self._message % self.__dict__
++
++class MaildirTemporaryFailure(MaildirError):
++    """Maildir temporary failure exception: caller should try again later.
++    """
++    pass
++
++class MaildirFatalError(MaildirError):
++    """Maildir fatal error exception."""
++    pass
++
++class MaildirFolderError(MaildirFatalError):
++    """Maildir base exception for folder fatal errors."""    
++    def __init__(self, maildir, folder, mesg='Error occured for maildir folder: %(path)s'):
++        MaildirFatalError.__init__(self, maildir, mesg)
++        self.folder = folder
++        self.path   = os.path.join(maildir, folder)
++
++class MaildirExistsError(MaildirFatalError): 
++    """Maildir exists error: raised by the L{create<Maildir.create>} method
++    if the maildir already exists.
++    """
++    def __init__(self, maildir, mesg='Maildir already exists: %(path)s.'):
++        MaildirFatalError.__init__(self, maildir, mesg)
++
++class MaildirFolderExistsError(MaildirFolderError):
++    """Maildir folder exists error: raised by the L{createFolder<Maildir.createFolder>} method
++    if the maildir folder already exists.
++    """
++    def __init__(self, maildir, folder, mesg='Maildir folder already exists: %(path)s.'):
++        MaildirFolderError.__init__(self, maildir, folder, mesg)
++
++class MaildirNotFoundError(MaildirFatalError): 
++    """Maildir not found error: raised by various methods of L{Maildir} if the maildir 
++    does not exist.
++    """
++    def __init__(self, maildir, mesg='Maildir not found: %(path)s.'):
++        MaildirFatalError.__init__(self, maildir, mesg)
++
++class MaildirFolderNotFoundError(MaildirFolderError):
++    """Maildir folder not found error: raised by various methods of L{Maildir} if the 
++    maildir folder does not exist.
++    """
++    def __init__(self, maildir, folder, mesg='Maildir folder not found: %(path)s'):
++        MaildirFolderError.__init__(self, maildir, folder, mesg)
++
++class MaildirNotEmptyError(MaildirFatalError): 
++    """Maildir not empty error: raised by the L{delete<Maildir.delete>} method
++    if the maildir or one of it's folders is not empty.
++    """
++    def __init__(self, maildir, mesg='Maildir not empty: %(path)s.'):
++        MaildirFatalError.__init__(self, maildir, mesg)
++
++class MaildirFolderNotEmptyError(MaildirFolderError): 
++    """Maildir folder not empty error: raised by the L{deleteFolder<Maildir.deleteFolder>} 
++    method if the maildir folder is not empty.
++    """
++    def __init__(self, maildir, folder, mesg='Maildir folder not empty: %(path)s'):
++        MaildirFolderError.__init__(self, maildir, folder, mesg)
++
++class MaildirInvalidError(MaildirFatalError):
++    """Maildir invalid error: raised by various methods of L{Maildir} if the maildir
++    is corrupt somehow.
++    """
++    def __init__(self, maildir, mesg='Invalid maildir: %(path)s'):
++        MaildirFatalError.__init__(self, maildir, mesg)
++ 
++class MaildirInvalidFolderError(MaildirFolderError): 
++    """Maildir folder invalid error: raised by various methods of L{Maildir} if the maildir
++    folder is corrupt somehow.
++    """
++    def __init__(self, maildir, folder, mesg='Invalid maildir folder: %(path)s'):
++        MaildirFolderError.__init__(self, maildir, folder, mesg)
++
++class MaildirMessageError(MaildirFatalError):
++    """Maildir message error: base class for all maildir message related errors.
++
++    @ivar mesgfile: The filename of the message this error is about.
++    @type mesgfile: str
++    @ivar mesgdir: The directory (new or cur) in the maildir where the message is located. 
++    @type mesgdir: str
++    """
++    def __init__(self, maildir, mesgdir, mesgfile, mesg='Maildir message error: %(path)s'):
++        MaildirFatalError.__init__(self, maildir, mesg)
++ 
++        self.mesgfile = mesgfile
++        self.mesgdir  = mesgdir
++        self.path     = os.path.join( self.path, self.mesgdir, self.mesgfile)
++
++class MaildirInvalidMessageError(MaildirMessageError):
++    """Maildir invalid message error: raised by various methods of L{Maildir} if the requested
++    maildir message is invalid.
++    """
++    def __init__(self, maildir, mesgdir, mesgfile, mesg='Invalid maildir message: %(path)s'):
++        MaildirMessageError.__init__(self, maildir, mesgdir, mesgfile, mesg)
++
++class MaildirMessageNotFoundError(MaildirMessageError):
++    """Maildir message not found error: raised by various methods of L{Maildir} if the requested
++    maildir message is not found.
++    """
++    def __init__(self, maildir, mesgdir, mesgfile, mesg='Maildir message not found: %(path)s'):
++        MaildirMessageError.__init__(self, maildir, mesgdir, mesgfile, mesg)
++
++class MaildirFilesystemError(MaildirFatalError): 
++    """Maildir filesystem error: raised if the maildir contains cross-filesystem symbolic 
++    links.
++    """
++    pass
++
++class MaildirQuotaError(MaildirTemporaryFailure): 
++    """Maildir quota error: raised if something goes wrong with the quota enforcement.
++    """
++    pass
++
++class MaildirNoQuotaError(MaildirQuotaError): 
++    """Maildir no quota error: raised if checking quota while it is not specified.
++    """
++    def __init__(self, maildir, mesg='No quota defined while checking quota for: %s'):
++        MaildirQuotaError.__init__(self, maildir, mesg)
++
++class MaildirQuotaExceededError(MaildirQuotaError): 
++    """Maildir quota exceeded error: raised if the maildir is over quota.
++    
++
++    @ivar size: The actual storage (bytes) used by the messages in this maildir.
++    @type size: int
++    @ivar count: The actual number of messages in this maildir.
++    @type count: int
++    @ivar size_quota: The maximum storage (bytes) usage of messages in this maildir.
++    @type size_quota: int
++    @ivar count_quota: The maximum number of messages in this maildir.
++    @type count_quota: int
++    """
++    def __init__(self, maildir, size, count, size_quota, count_quota):
++        MaildirQuotaError.__init__(self, maildir)
++
++        self.size        = size
++        self.count       = count
++        self.size_quota  = size_quota
++        self.count_quota = count_quota
++
++    def __str__(self):
++        if self.size > self.size_quota:
++            return 'Maildir size quota exceeded: mailbox is too large.'
++        else:
++            return 'Maildir message count quota exceeded: too many messages in mailbox.'
++
++class MaildirFileError(MaildirTemporaryFailure):  
++    """Maildir file error: raised if something went wrong while handling a maildir file.
++    """
++    pass
++
++class MaildirSizeFileError(MaildirFileError): 
++    """Maildir sizefile error: raised if something went wrong with the maildirsize file
++    indicating it should be replaced.
++    """
++    pass
++
++class MaildirSizeFileExpiredError(MaildirSizeFileError): 
++    """Maildir sizefile expired error: raised if the maildirsize file has become too long 
++    and should be recreated.
++    """
++    pass
++ 
++class Maildir:
++    """Class representing a Maildir++(courier extensions) compatible maildir. This class is 
++    pretty much based on the maildir++ implementation of 
++    U{courier<http://www.courier-mta.org/>}. It supports folders and quota enforcement. 
++
++    @see: The U{maildir manpage<http://www.qmail.org/man/man5/maildir.html>} and 
++        the U{Maildir++ README<http://www.inter7.com/courierimap/README.maildirquota.html>}.
++
++    @ivar path: The path to this maildir. See L{constructor<__init__>} for
++        more details.
++    @type path: str
++    @ivar quota: The quota specification for this maildir. See L{constructor<__init__>} for
++        more details.
++    @type quota: str
++
++    @cvar _hostname: The hostname of this machine. This variable is updated once it's needed 
++        and is not updated after that. It is used my the L{_constructFilename} method to 
++        generate a globally unique filename.
++    @type _hostname: str
++    @cvar _pid: The pid of this process. This variable is updated once it's needed
++        and is not updated after that. It is used my the L{_constructFilename} method to
++        generate a globally unique filename.
++    @type _pid: int
++    @cvar _unique: A number that is increased every time a filename is generated by
++        L{_constructFilename}. This is used to ensure filenames are always unique, even if
++        they are created by the same process.
++    @type _unique: int
++    """
++
++    _hostname    = None
++    _pid         = None
++    _unique      = 0
++ 
++    def __init__( self, path, quota=None ):
++        """This is the Maildir class constructor.
++
++        @param path: This is the path to the maildir directory. It does not need to
++            exist: it can be created with the L{create} method. 
++        @type path: str
++        @param quota: This is a quota specification. It is a string that can consist
++            of multiple fields separated by a ',' (this is not enforced). Each field
++            is a number directly followed by 'C' or 'S'. If it is 'S' then the number
++            specifies the maximum size in bytes of the maildir, but if it is 'C' then
++            the number specifies the maximum number of messages in the maildir. The 
++            two types of quota can exist together. If multiple 'S' or 'C' specifications
++            are given always the last ones are valid. If 'C' and 'S' are omitted 'S' is 
++            assumed.
++            Both types of quota include folders, but the 'Trash' folder and messages 
++            marked as deleted are not counted.
++        @type quota: str
++        """
++
++        self.path        = path
++        self.quota       = quota
++
++        self.mds_fp      = None
++
++        self._hostname    = None
++        self._pid         = None
++        self._unique      = 0
++
++        # Sanity check
++        if os.path.exists(os.path.join(self.path, 'maildirfolder')):
++            # Ok, this is a folder. Move one dir up.
++            (folder, self.path) = os.path.split(self.path)
++
++    def __del__(self):
++        """This is the maildir class destructor.
++        It closes any open filedescriptors used by this class instance.
++        """
++
++        if self.mds_fp:
++            self.mds_fp.close()
++
++    def _safeOpen( self, filename, mode, perm=0700, create=0 ):
++        """This method opens a file and checks for strange symlink setups that
++        might break this mailbox.
++        @param filename: This is the full path of the file to open.
++        @type filename: String
++        @param mode: This the mode in which the file is opened. This is quite 
++            compatible with python's file function.
++        @type mode: str
++        @param perm: This is the set of permission bits to set for the file if it is 
++            created.
++        @type perm: int
++        @param create: This specifies if the file should actually be created before
++            opening it. This will raise an OSError if it already exists.
++        @type create: bool
++        
++        @raise OSError: Will be raised if the file already exists 
++            (I{errno} = EEXIST) and I{create}=1 or if the file does not exist 
++            (I{errno} = ENOENT) and I{create}=0. This exception can also be raised for 
++            other system failures (e.g. no space on device). 
++        @raise MaildirFileSystemError: Will only be raised if the maildir
++            contains cross filesystem (symbolic) links. This maildir implementation will
++            refuse to work in those circumstance.
++
++        @return: A python file object of the opened/created file.
++        @rtype: file
++        """
++
++        if create:
++           m = os.O_CREAT
++        else:
++           m = 0
++
++        # Build low level open flags
++        if 'a' in mode:
++            m = m | os.O_RDWR | os.O_APPEND
++
++        if 'r' in mode: 
++            m = m | os.O_RDWR
++  
++        if 'w' in mode:
++            m = m | os.O_WRONLY
++
++        fd = -1
++        try:
++            fd = os.open(filename, m, perm)
++    
++            stat1 = os.fstat(fd)
++            stat2 = os.lstat(filename)
++        except:
++            if fd > -1:
++                os.close(fd)
++            raise
++
++        if stat1.st_dev != stat2.st_dev or stat1.st_ino != stat2.st_ino:
++            raise MaildirFileSystemError(self.path,
++                'The use of cross-filesystem symbolic links in maildirs is not allowed.')
++
++        if create:
++            return os.fdopen( fd, mode )        
++        else:
++            return os.fdopen( fd, mode + '+' )
++
++    def _readMaildirSize( self ):
++        """Reads the maildirsize file and returns the calculated size of the maildir 
++        and the specified quota.
++
++        @return: A tuple with the retrieved data. This tuple looks like: 
++            ( storage usage (bytes), number of messages, number of lines in maildirsize 
++            file, the timestamp maildirsize was last updated, the quota specification 
++            string retrieved from the maildirsize file )
++        @rtype: (int, int, int, int, str)
++            
++        """
++        msize   = 0
++        mcount  = 0
++        nlines  = 0
++        quota   = None
++
++        filename = os.path.join( self.path, 'maildirsize' )        
++        success = 0
++
++        # Try to open the 'maildirsize' file 
++        try:
++            try:
++                # Stat the file
++                stat_info = os.stat(filename)
++
++                if stat_info.st_size > 5120:
++                    self._closeMaildirSizeFile()
++                    os.remove(filename)
++                    raise MaildirSizeFileExpiredError( self.path,
++                        'Maildirsize file has expired.' )
++
++                if self.mds_fp is None:
++                    # Open the file
++                    self.mds_fp = self._safeOpen( filename, 'a' )
++ 
++                self.mds_fp.seek(0)
++                data = self.mds_fp.read(5120)
++
++                # Summarize the byte and count values
++                p     = 0
++                first = 1
++                while p < len(data):
++                    s = p
++
++                    while p < len(data):
++                        if data[p] == '\n':
++                            line = data[s:p]
++                            break
++
++                        p = p + 1
++  
++                    p = p + 1
++
++                    if first:
++                        first = 0
++                        quota = line
++                        continue
++
++                    try:
++                        if ' ' in line:
++                            n, c = line.split(' ', 1)
++                        else:
++                            raise MaildirSizeFileError( self.path,
++                                'Maildirsize file is corrupt.' )      
++            
++                        msize  = msize  + int(n)
++                        mcount = mcount + int(c)
++                    except ValueError:
++                        raise MaildirSizeFileError( self.path,
++                            'Maildirsize file is corrupt.' )
++
++                    nlines = nlines + 1
++            except OSError, e:
++                self._closeMaildirSizeFile()
++
++                if e.errno == errno.ENOENT:
++                    raise MaildirSizeFileExpiredError( self.path,
++                        'Maildirsize file has expired.' )
++                else:
++                    raise MaildirSizeFileError( self.path,
++                        'Failed to read maildirsize file.' )
++
++            if (mcount == 0 and msize != 0 ) or nlines == 0 or \
++                (msize < 0 and mcount > 0) or (msize > 0 and mcount < 0):
++                raise MaildirSizeFileError( self.path, 
++                    'Maildirsize file is corrupt.' )
++ 
++            success = 1
++        finally:
++            if not success:
++                 self._closeMaildirSizeFile()
++
++        # Success
++        return ( msize, mcount, nlines, stat_info.st_mtime, quota )
++
++    def _parseQuota( self ):
++        """Parses a quota specification and returns the parsed quota values.
++        
++        @return: A tuple containing the maximum storage usage in bytes and 
++            the maximum number of messages in the maildir.
++        @rtype: (int,int)
++        """
++        
++        if self.quota is None or self.quota == '':
++            raise MaildirNoQuotaError(self.path)
++
++        size_quota  = 0
++        count_quota = 0
++
++        q = self.quota
++
++        # Scan the quota specification for quotas
++        p = 0
++        while p < len(q):
++            # Find start of a quota specification
++            if ord(q[p]) < ord('0') or ord(q[p]) > ord('9'):
++                p = p + 1
++                continue
++
++            # Build an integer from the digits
++            i = 0
++            while ord(q[p]) >= ord('0') and ord(q[p]) <= ord('9'):
++                i = i * 10 + (ord(q[p]) - ord('0'))
++                p = p + 1
++
++            if q[p] == 'C':
++                # Message count quota
++                count_quota = i
++            else:
++                # Maildir size quota
++                size_quota = i
++
++        return (size_quota, count_quota)
++   
++    def exists( self ):
++        """Indicates maildir existance.
++ 
++        @raise MaildirInvalidError: Raised if the maildir does exist, 
++            but does not appear to be valid.
++
++        @return: 1 if the maildir exists and 0 otherwise
++        @rtype: bool       
++        """
++
++        try: 
++            self._verify()
++        except MaildirNotFoundError:
++            return 0
++
++        return 1
++    
++    def existsFolder( self, folder ):
++        """Indicates maildir folder existance.
++
++        @raise MaildirFolderInvalidError: Raised if the maildir folder 
++            does exist, but does not appear to be valid.
++
++        @return: 1 if the maildir folder exists and 0 otherwise
++        @rtype: bool
++        """
++
++        try:
++            self._verifyFolder( '.' + folder )
++        except MaildirFolderNotFoundError:
++            return 0
++            
++        return 1
++
++    def _verify( self ):
++        """Does some sanity checks on this maildir object and raises exceptions 
++        if violations are found.
++ 
++        @return: Nothing
++        """
++
++        if not os.path.exists( self.path ):
++            raise MaildirNotFoundError(self.path)
++
++        for sd in ['cur', 'new', 'tmp']:
++            if not os.path.exists( os.path.join(self.path, sd) ):
++                raise MaildirInvalidError(self.path)
++
++    def _verifyFolder( self, folder ):
++        """Does some sanity checks on this maildir folder and raises exceptions
++        if violations are found.
++
++        @return: Nothing
++        """
++
++        path = os.path.join(self.path, folder)
++
++        if folder[0] != '.' or folder == '.' or folder =='..':
++            raise MaildirInvalidFolderError(self.path, folder)
++
++        if not os.path.exists(path):
++            raise MaildirFolderNotFoundError(self.path, folder)
++
++        if not os.path.exists(os.path.join(path,'maildirfolder')):
++            raise MaildirInvalidFolderError(self.path, folder)
++ 
++        return path
++
++    def _constructFilename( self, ident='', size=None, flags=None, filename=None ):
++        """Generates a unique filename for a new message in this maildir. It can also add
++        attribute values to an existing filename.
++
++        @param ident: An optional string specifying an identifier for this message. It 
++            will be included in the filename and can be used to easily locate special 
++            messages (e.g. delivery generated warnings) in the maildir.
++        @type ident: str
++        @param size: An optional integer specifying the size of this message. This is a 
++            shortcut for the quota system and it is included in the filename so stat'ing
++            every message file is no longer necessary.
++        @type size: int
++        @param flags: An optional list of flags for this message. Flags are appended to the 
++            filename and are used by mail readers to identify read, seen or trashed (etc) mail 
++            in the maildir.
++        @type flags: list of flags (characters)
++        @param filename: If this parameter is specified no new file basename is generated. This
++            one is then used instead. This is very useful in combination with L{_parseFilename} to 
++            alter attributes on an existing filename. 
++        @type filename: str
++        
++        @return: The generated filename
++        @rtype: str
++        """
++
++        if filename is None or filename == '':
++            tm       = time.time()
++            seconds  = str(int(tm))
++            mseconds = str(int((tm-int(tm))*10e6))        
++ 
++            self._unique += 1
++     
++            if self._hostname is None:
++                self._hostname = socket.gethostname().\
++                    replace('/', r'\057').replace(':', r'\072')
++
++            if self._pid is None:
++                self._pid      = os.getpid()
++
++            if ident == '' or ident is None: 
++                filename = '%s.M%sP%sQ%d.%s' % \
++                    (seconds, mseconds, str(self._pid), self._unique, self._hostname )
++            else:
++                filename = '%s.M%sP%sQ%d_%s.%s' % \
++                    (seconds, mseconds, str(self._pid), self._unique, ident, self._hostname )
++        
++        if not (size is None or size <= 0):
++            filename = '%s,S=%d' % (filename, size) 
++
++        if not (flags is None or len(flags) == 0):
++            filename = '%s:2,%s' % (filename, ''.join(flags))
++
++        return filename
++
++    def _newMaildirFile( self, ident=''):
++        """Opens a new maildir file (typically a message). It takes care of race conditions,
++        by waiting a few seconds if the generated filename seems to exist. Although this is 
++        VERY unlikely since microseconds are included in the filename. 
++
++        @return: A tuple containing the filaname and the file object opened for it.
++        @rtype: (str,file)
++        """
++
++        retries  = 3
++        while (1):
++            file = self._constructFilename(ident=ident)
++            path = os.path.join(self.path, 'tmp', file)
++
++            if not os.path.exists(path):
++                # Ok, create it
++                try:
++                    fp = self._safeOpen(path, 'a', 0644, create=1)
++                except OSError, e:
++                    if e.errno != errno.EEXIST:
++                        raise
++                break
++
++            ## Highly unlikely to happen
++            fp = None
++            if retries > 0:
++                retries = retries - 1
++            else:
++                raise MaildirFileError( self.path, 
++                    'Failed to create new file for message.' ) 
++            time.sleep(1)
++
++        return( file, fp )
++   
++    def _newMaildirSizeFile( self ):
++        """Opens a new maildirsize file. It takes care of race conditions, by waiting 
++        a few seconds if the generated filename seems to exist. Although this is
++        VERY unlikely since microseconds are included in the filename. The new file is 
++        created in the tmp directory of the maildir and the caller is supposed to move 
++        it to the maildir root later.
++
++        @return: The filename of the new maildirsize file in the tmp directory.
++        @rtype: str
++        """
++
++        retries  = 3
++        while (1):
++            file = self._constructFilename( ident='NeWmAiLdIrSiZe' )
++            path = os.path.join( self.path, 'tmp', file )
++
++            if not os.path.exists(path):
++                # Ok, create it
++                self._closeMaildirSizeFile()
++
++                try:
++                    self.mds_fp = self._safeOpen(path, 'a', 0644, create=1)
++                except OSError, e:
++                    if e.errno != errno.EEXIST:
++                        raise
++                break
++
++            ## Highly unlikely to happen
++            self.mds_fp = None
++            if retries > 0:
++                retries = retries - 1
++            else:
++                raise MaildirSizeFileError( self.path, 'Failed to create new maildirsize file.')
++            time.sleep(1)
++
++        return file
++
++    def _openMaildirSizeFile( self ):
++        """Opens the maildirsize file and returns a file object for it.
++       
++        @return: Open file object for the maildirsize file
++        @rtype: file
++        """
++
++        file = os.path.join(self.path, 'maildirsize')
++
++        self._closeMaildirSizeFile()
++        self.mds_fp = self._safeOpen( file, 'a', 0644 )
++
++        return file
++
++    def _closeMaildirSizeFile( self ):
++        """Closes the maildirsize file and sets the internal file object for it to None so 
++        other methods know it's not open.
++
++        @return: Nothing
++        """
++        if self.mds_fp:
++            self.mds_fp.close()
++            self.mds_fp = None
++             
++    def _statCurNew( self, folder=None):
++        """Get the time of the last changes on this maildir (folder). This is used to make 
++        sure the maildir did not change while we were recalculating it's size.
++        
++        @return: The timestamp of the latest directory change.
++        @rtype: int
++        """
++
++        maxtime = 0
++
++        if folder is None: 
++            dir = self.path
++        else:
++            dir = os.path.join(self.path, folder)
++            if folder[0] != '.' or folder == '.' or folder =='..' or \
++                folder == '.Trash' or \
++                not os.path.exists(os.path.join(dir,'maildirfolder')):
++                raise MaildirInvalidFolderError( self.path, folder )
++
++        for sd in ['new', 'cur']:
++            try:
++                stat_info = os.stat( os.path.join(dir, sd) )
++                if stat_info.st_mtime > maxtime:
++                    maxtime = stat_info.st_mtime
++            except: 
++                pass
++
++        return maxtime
++
++    def _countCurNew( self, folder=None ):
++        """Counts the total number of messages and the total amount of used storage for 
++        this maildir (folder).
++
++        @return: A tuple containing the counted values and the timestamp of the last 
++            directory change. The tuple looks like: 
++            ( storage usage(bytes), number of messages, last update )
++        @rtype: (int,int,int)
++        """
++
++        msize   = 0
++        mcount  = 0
++        maxtime = 0
++
++        if folder is None:
++            dir = self.path
++        else: 
++            dir = os.path.join(self.path, folder)
++            if folder[0] != '.' or folder == '.' or folder =='..' or \
++                folder == '.Trash' or \
++                not os.path.exists(os.path.join(dir,'maildirfolder')):
++                raise MaildirInvalidFolderError( self.path, folder )
++
++        for sd in ['new', 'cur']: 
++            try:
++                (s, c, t) = self._countSubDir( sd, folder )
++ 
++                msize  = msize + s
++                mcount = mcount + c
++                if t > maxtime:
++                    maxtime = t
++            except MaildirNotFoundError:
++                pass
++
++        return ( msize, mcount, maxtime ) 
++
++    def _parseFilename( self, filename ):
++        """Parses a maildir message filename and returns it's attributes (size and flags).
++        
++        @return: A tuple containing the parsed information. The tuple looks like:
++            ( the bare filename (without attributes), file size, a list of file flags )
++        @rtype: ( str, int, list of char )
++        """
++        name = filename
++
++        flags = []
++
++        # Find the end of the size specification
++        p = filename.find(':') - 1 
++        if p < 0:
++            p = len(filename) - 1
++        else:
++            name = filename[0:p]
++
++            # Check flags 
++            q = p + 1
++            if q < len(filename) - 3 and filename[q+1] == '2' and \
++                filename[q+2] == ',':
++                q += 3
++
++                while q < len(filename) and filename[q] >= 'A' and \
++                    filename[q] <= 'Z':
++                    flags.append(filename[q]);
++                    q += 1
++                
++        # Find the start of the size specification    
++        found = 0
++        while p >= 0:
++            if filename[p] == os.sep:
++                break
++
++            if filename[p] == ',' and filename[p+1] == 'S' and \
++                filename[p+2] == '=':
++                found = 1
++                name = filename[0:p]
++                p += 3
++                
++                break
++
++            p -= 1
++
++        # Get the size value
++        if found:
++            size = 0
++            while p < len(filename) and ord(filename[p]) >= ord('0') and \
++                ord(filename[p]) <= ord('9'):
++                size = size * 10 + (ord(filename[p]) - ord('0'))
++                p += 1
++            
++            return (name, size, flags)
++
++        return (name, None, flags)
++
++    def _countSubDir( self, subdir, folder=None ):
++        """Counts the total number of messages and the total amount of used storage for
++        this subdirectory (e.g. cur or new) of this maildir (folder).
++
++        @return: A tuple containing the counted values and the timestamp of the last
++            directory change. The tuple looks like:
++            ( storage usage(bytes), number of messages, last update )
++        @rtype: (int,int,int)
++        """
++       
++        msize     = 0
++        mcount    = 0
++
++        if folder == None:
++            dir = os.path.join( self.path, subdir )
++        else:
++            dir = os.path.join( self.path, folder, subdir )
++        try:
++            stat_info = os.stat(dir)
++            maxtime   = stat_info.st_mtime 
++        except:
++            raise MaildirNotFoundError(dir)
++
++        for file in os.listdir(dir):
++            if file[0] == '.':
++                continue
++
++            # Try to parse size and status from filename
++            (name, size, flags) = self._parseFilename(file)
++ 
++            # Do not count deleted files
++            if 'T' in flags:
++                continue
++
++            if not size is None:
++                msize = msize + size
++            else:
++                # Obviously we did not create this file, try the 
++                # old way.
++                try:
++                    stat_info = os.stat(os.path.join(dir, file))
++                    msize = msize + stat_info.st_size
++                except:
++                    # Skip this file in case of race condition.
++                    continue
++
++            mcount = mcount + 1
++
++        return ( msize, mcount, maxtime )
++
++    def _updateMaildirSize( self, msize, mcount, recreate=0):
++        """Updates the maildir size file with the specified number of 
++        extra messages and extra used storage. These values can also be
++        negative indicating the removal of messages.
++
++        @param msize: This is the amount of storage usage in bytes added to 
++            this maildir. This can be negative indicating the removal of 
++            messages.
++        @type msize: int
++        @param mcount: This is the amount of messages addes to this maildir. 
++            This can be negative indicating the removal of messages.
++        @type mcount: int
++        @param recreate: If > 0 the maildirsize is recreated no matter if it 
++            exists already. The maildir is recounted in the process. 
++        @type recreate: int
++
++        @return: Nothing
++        """
++
++        if self.quota is None:
++            # No quota
++            quota = ''
++        else:
++            quota = self.quota
++
++        newfile = None 
++        try:
++            # Create file object for maildirsize file if it is not given
++            isnew = 0
++            if recreate:
++                self._closeMaildirSizeFile()
++                file = newfile = self._newMaildirSizeFile()
++                isnew = 1
++            else:
++                if self.mds_fp is None:
++                    try:
++                        file = self._openMaildirSizeFile()
++                    except OSError, e:
++                        if e.errno == errno.ENOENT:
++                            file = newfile = self._newMaildirSizeFile()            
++                            isnew = 1
++                        else:
++                            raise
++                else:
++                    file = '<open>'
++ 
++            self.mds_fp.seek(0,2)
++
++            data = ''
++            if isnew:
++                data = quota + '\n'
++
++            data = data + ("%d %d\n" % (msize, mcount))
++      
++            self.mds_fp.write(data)
++            self.mds_fp.flush()
++        except:
++            # Always close the file object if something goes wrong
++            self._closeMaildirSizeFile()
++            raise
++
++        if newfile:
++            self._closeMaildirSizeFile()
++
++            try:
++                try:
++                    os.rename(os.path.join(self.path,'tmp',newfile), os.path.join(self.path, 'maildirsize'))
++                except OSError, e:
++                    if e.errno == errno.EEXIST:
++                        os.remove(os.path.join(self.path,'maildirsize'))
++                        os.rename(os.path.join(self.path,'tmp',newfile), os.path.join(self.path, 'maildirsize'))
++            except:
++                os.remove(os.path.join(self.path,'tmp',newfile))
++                raise
++
++    def _checkQuota( self, xtra_size, xtra_count, no_recount=0):
++        """Check if the specified amount of extra storage usage and messages would
++        violate the quota policy. This method should be called before an L{_updateMaildirSize} 
++        call that could increase the maildirsize.
++        
++        @param xtra_size: The amount of extra storage in bytes to be added to this maildir.
++        @type xtra_size: int
++        @param xtra_count: The amount od extra messages to be added to this maildir.
++        @type xtra_count: int
++        @param no_recount: If > 0 under no circumstances the maildirsize file is recreated. This 
++            prevents the maildir from beeing recounted. Currently this parameter is only useful
++            for debugging purposes
++        @type no_recount: bool
++        
++        @raise MaildirQuotaExceededError: Raised if this addition to the maildir would violate the
++            quota policy.
++        @raise OSError: Can be raised due to various system failures during I{os.rename}, I{os.close},
++            and I{os.remove}.
++ 
++        @return: The return value is identical to L{getQuotaUsage}.       
++        """
++        (msize, mcount, qsize, qcount) = self.getQuotaUsage(no_recount,xtra_size,xtra_count)
++
++        # Check if we are over quota
++        if (qsize == 0 or msize + xtra_size <= qsize) and \
++           (qcount == 0 or mcount + xtra_count <= qcount ):
++            return (msize, mcount, qsize, qcount)
++
++        # Raise appropriate exception
++        raise MaildirQuotaExceededError(
++            self.path, msize, mcount, qsize, qcount )
++
++    def getQuotaUsage( self, no_recount=0, xtra_size=0, xtra_count=0 ):
++        """This method retrieves info about the current maildir size and the associated quota. 
++
++        @param no_recount: If > 0 under no circumstances the maildirsize file is recreated. This
++            prevents the maildir from beeing recounted. Currently this parameter is only useful
++            for debugging purposes
++        @type no_recount: bool
++
++        @param xtra_size: The amount of extra storage in bytes to be added to this maildir. This 
++            parameter is only useful to make sure everything is recounted (every 15 minutes) if 
++            the maildir seems to go over quota with this extra storage usage..
++        @type xtra_size: int
++        @param xtra_count: The amount od extra messages to be added to this maildir. This
++            parameter is only useful to make sure everything is recounted (every 15 minutes) if
++            the maildir seems to go over quota with this extra storage usage..
++        @type xtra_count: int
++
++        @raise OSError: Can be raised due to various system failures during I{os.rename}, I{os.close},
++            and I{os.remove}.
++
++        @return: A tuple with maildir size and quota information. This tuple looks like:
++            ( total storage usage (bytes), total number of messages in maildir,
++            maximum storage usage (bytes), maximum number of messages in maildir ).
++            If these last two tuple elements are zero they indicate that the specified quota
++            is disabled and as such the amount of storage used and/or the number of messages in the
++            maildir can be unlimited (untill the filesystem is full ofcourse).
++        @rtype: (int,int,int,int)
++        """
++        # Get current timestamp
++        tm = int(time.time())
++
++        # Read the maildirsize file (if any)
++        try:
++            try:
++                ( msize, mcount, nlines, mtime, quota ) = \
++                    self._readMaildirSize()
++
++                # Get the quota if we don't have one
++                if self.quota is None:
++                    self.quota = quota
++
++                # If the saved quota differs from our own we need to rebuild the
++                # maildir size file so others will see the change. 
++                if self.quota == quota:       
++                    # Parse the quota to work with (fails if no quota defined)
++                    (size_quota, count_quota) = self._parseQuota()
++
++                    # Check if we would go over quota
++                    if (size_quota == 0 or msize + xtra_size <= size_quota) and \
++                        (count_quota == 0 or mcount + xtra_count <= count_quota ):
++                            return (msize, mcount, size_quota, count_quota)
++
++                    # Make sure the maildir is recounted every 15 minutes if it
++                    # is going over quota.
++                    if no_recount or (nlines == 1 and tm < mtime + 15*60):
++                            return (msize, mcount, size_quota, count_quota)
++            except MaildirSizeFileError:
++                pass
++        except:
++            self._closeMaildirSizeFile()
++            raise
++
++        # Recount the messages and the total storage usage
++        if no_recount:
++            self._updateMaildirSize( msize, mcount, 1 )
++        else:
++            (msize,mcount) = self._recount()
++
++        # Parse the quota to work with (fails if no quota defined)
++        (size_quota, count_quota) = self._parseQuota()
++
++        return (msize, mcount, size_quota, count_quota)
++
++    def _recount(self):
++        """Recounts the number of messages and the total occupied storage.
++        It creates a new maildirsize file with the new values.
++         
++        @return: A tuple specifying the storage occupation and the number 
++            of messages in the maildir. The tuple looks like:
++            ( storage usage (bytes), number of messages in maildir )
++        @rtype: ( int, int )
++        """
++
++        # Count the bytes and messages in this maildir
++        ( msize, mcount, maxtime ) = self._countCurNew()
++        
++        # Process all the folders as well
++        for folder in os.listdir(self.path):
++            if os.path.isdir( os.path.join(self.path, folder) ):
++                try:
++                    ( ms, mc, mt ) = self._countCurNew( folder )            
++                    msize  = msize + ms
++                    mcount = mcount + mc
++
++                    if mt > maxtime:
++                        maxtime = mt
++                except MaildirInvalidFolderError:
++                    pass
++
++        # Create the maildirsize file in the maildir tmp directory
++        self._updateMaildirSize( msize, mcount, 1 )
++  
++        # Stat all files again
++        try:
++            maxtime2 = self._statCurNew()
++
++            for folder in os.listdir(self.path):
++                if os.path.isdir(os.path.join(self.path,folder)):
++                    try:
++                        mt = self._statCurNew(folder)
++
++                        if mt > maxtime2:
++                            maxtime2 = mt 
++                    except MaildirInvalidFolderError:
++                        pass
++        except:
++            self.close_maildirsize_file()
++            raise
++
++        if (maxtime2 != maxtime):
++            raise MaildirTemporaryFailure( self.path,
++                'Maildir changed while updating maildirsize' )
++
++        return (msize, mcount)
++
++    def _initialize(self, dir=None):
++        """Creates the necessary structure inside a maildir (folder). 
++        
++        @param dir: The path to the directory where this structure should 
++            be created.
++
++        @raise OSError: Can be raised due to various system errors during
++            I{os.mkdir}. 
++       
++        @return: Nothing
++        """
++        if not dir:
++            dir = self.path
++ 
++        for sd in ['tmp', 'new', 'cur']:
++            # Attempt creation of directory
++            try:
++                os.mkdir(os.path.join(dir, sd), 0700)
++            except OSError, e:
++                # It's not fatal if it already exists
++                if not e.errno == errno.EEXIST:
++                    raise
++
++    def _isEmptyDir(self, dir=None, ignore_trash=1, ignored=[], ignore_other=1):
++        """Indicates if the specified maildir directory (root or folder) is empty
++
++        @param dir: The directory to check. This can be the maildir root or the root
++            of a maildir folder. In general this directory should contain the 
++            directories 'new' and 'cur', although no exceptions are raised if none is 
++            found.
++        @type dir: str
++        @param ignored: A list of files or directories to ignore if present. The
++            maildir directories 'new' and 'cur' cannot be ignored and the
++            directory 'tmp' is always ignored.
++        @type ignored: list of str
++        @param ignore_other: If >0 I{isEmpty} will ignore all non maildir files
++            and directories regardless of the I{ignored} parameter.
++        @type ignore_other: bool
++
++        @raise OSError: Can be raised due to various system errors occuring during 
++            I{os.listdir} or I{os.path.isdir}.
++
++        @return: This method returns 1 if this directory is found to be empty and
++            0 otherwise.
++        @rtype: bool
++        """
++
++        if not dir:
++            dir = self.path
++
++        for file in os.listdir(dir):
++            path = os.path.join(dir,file)
++
++            if os.path.isdir(path):
++                if file in ['new', 'cur']:
++                    if ignore_trash:
++                        for fl in os.listdir(path):
++                            # Check if this file is flagged as deleted
++                            (nm,size,flags) = self._parseFilename(fl)
++                            if not 'T' in flags:
++                                return 0
++                    else:
++                        # Check if this subdir is empty
++                        if len(os.listdir(path)) > 0:
++                            return 0
++                else:
++                    if not (file == 'tmp' or file in ignored or ignore_other):
++                        return 0                 
++            else:
++                if not (file in ignored or ignore_other):
++                    return 0
++
++        return 1
++
++    def _deinitialize(self, dir=None):
++        """Deletes the specified directory tree. It silently refuses to
++        delete root directories like /etc /var etc. 
++        
++        @param dir: The root of the directory tree to remove.
++        @type dir: str
++         
++        @return: Nothing
++        """
++        if not dir:
++            dir = self.path
++
++        # Safeguard: prevent errorneous deletion of /usr /etc /var...
++        if dir[0] == os.sep and (dir.count(os.sep) == 1 or \
++            (dir[len(dir)-1] == os.sep and dir.count(os.sep) <= 2)):
++            return
++
++        shutil.rmtree(dir)
++
++    def createFolder(self, folder, may_exist=0):
++        """Creates the specified folder inside this maildir. 
++
++        @param may_exist: If >0 no exceptions will be raised if this maildir folder
++            already exists.
++        @type may_exist: bool
++
++        @raise MaildirInvalidFolderError: Raised if the specified folder is invalid
++            (e.g. the name is invalid)
++        @raise MaildirFolderExistsError: Raised if the maildir folder already exists 
++            and I{may_exist}=0
++        @raise OSError: Can be raised due to various system errors occuring during
++            I{os.mkdir}
++
++        @return: Nothing
++        """
++
++        if folder is None or folder == '' or folder == '.':
++            raise MaildirInvalidFolderError(self.path, self.path, '.' + folder)
++
++        path = os.path.join(self.path, '.' + folder)
++
++        # Attempt folder creation.
++        try:
++            os.mkdir( path, 0700 )
++        except OSError, e:
++            # It's not fatal if it already exists
++            if e.errno != errno.EEXIST:
++                raise
++            else:
++                if not may_exist:
++                    raise MaildirFolderExistsError(self.path, '.' + folder)
++               
++        # Create tmp, new and cur directories
++        self._initialize(path)
++
++        # Touch 'maildirfolder' indicating this is a maildir folder
++        try:
++            open(os.path.join(path, 'maildirfolder'), 'w').close()
++        except OSError, e:
++            # It's not fatal if it already exists
++            if not e.errno == errno.EEXIST:
++                raise
++
++    def create(self, may_exist=0):
++        """Creates the maildir specified in the L{constructor's<__init__>} 
++        I{path} parameter. If certain elements of the path do not exist they are
++        created on the fly. It also creates the reserved Trash folder.
++
++        @param may_exist: If >0 no exceptions will be raised if this maildir already  
++            exists.
++        @type may_exist: bool
++       
++        @raise MaildirExistsError: Raised if the maildir already exists and 
++            I{may_exist}=0
++        @raise OSError: Can be raised due to various system errors occuring during
++            I{os.mkdir}
++       
++        @return: Nothing 
++        """
++        
++        try:
++            os.makedirs(self.path, 0700)
++        except OSError, e:
++            if e.errno == errno.EEXIST:
++                if not may_exist: 
++                    raise MaildirExistsError(self.path)
++            else:
++                raise
++
++        # Create necessary directory structure
++        self._initialize()
++        self.createFolder('Trash', may_exist=may_exist)
++
++    def _isEmptyFolder( self, folder, ignore_trash=1, ignored=[], ignore_other=1 ): 
++        """Indicates if the specified maildir folder is empty.
++        
++        This method is identical to L{isEmptyFolder} except for the fact that this method
++        expects the folder name to begin with '.'
++        """
++        path = self._verifyFolder(folder)
++
++        ignored.append('maildirfolder')
++
++        return self._isEmptyDir( path, ignore_trash=ignore_trash, ignored=ignored, 
++            ignore_other=ignore_other)
++
++    def isEmptyFolder( self, folder, ignore_trash=1, ignored=[], ignore_other=1 ):
++        """Indicates if the specified maildir folder is empty.
++
++        @param ignored: A list of files or directories to ignore if present. The
++            maildir directories 'new' and 'cur' cannot be ignored and the
++            directory 'tmp' is always ignored.
++        @type ignored: list of str
++        @param ignore_other: If >0 I{isEmpty} will ignore all non maildir files
++            and directories regardless of the I{ignored} parameter.
++        @type ignore_other: bool
++        @param ignore_trash: If > 0 I{isEmpty} will ignore any messages in the
++            Trash folder. This is the default behaviour.
++        @type ignore_trash: bool
++
++        @raise MaildirInvalidFolderError: Raised if the folder name is invalid or if
++            the directory specified is actually not a maildir folder.
++        @raise MaildirFolderNotFoundError: Raised if the given folder does not exist
++            within this maildir or if this maildir does not exist at all.
++        @raise OSError: Can be raised due to various system errors occuring during
++            I{os.listdir} or I{os.path.isdir}.
++
++        @return: This method returns 1 if this maildir folder is found to be empty and
++            0 otherwise.
++        @rtype: bool
++        """
++        return self._isEmptyFolder( '.' + folder, ignore_trash=ignore_trash, ignored=ignored, 
++            ignore_other=ignore_other )
++           
++    def _deleteFolder(self, folder, trash=1):
++        """Identical to L{deleteFolder}, but this method assumes the folder
++        to be emtpy. So it does not accept the I{must_empty} and I{rm_other} parameters
++        and just removes the folder entirely without checking.
++
++        @param folder: The name of the folder to delete. This name must be the real
++            name of the folder directory, so it must start with '.'.
++        @type folder: str
++        @param trash: If > 0 the deleted messages are moved to the Trash folder instead 
++            of actually being deleted. If the specified folder is the Trash folder itself 
++            this parameter is ignored.
++        @type trash: bool
++        
++ 
++        @raise MaildirInvalidFolderError: Raised if the folder name is invalid or if 
++            the directory specified is actually not a maildir folder.
++        @raise MaildirFolderNotFoundError: Raised if the given folder does not exist 
++            within this maildir or if this maildir does not exist at all.
++        @raise OSError: Can be raised due to various system errors occuring during
++            I{os.listdir},I{os.path.isdir} or I{os.remove}.
++ 
++        @return: Nothing
++        """
++        if folder == '.Trash':
++            raise MaildirInvalidFolderError(self.path, folder)
++
++        path = self._verifyFolder(folder)
++
++        self._purgeDir( 'new', max_age=-1, folder=folder, trash=trash )        
++        self._purgeDir( 'cur', max_age=-1, folder=folder, trash=trash )
++
++        self._deinitialize(path) 
++
++    def deleteFolder( self, folder, must_empty=1, rm_other=1, trash=1):
++        """Deletes the specified maildir folder. If I{must_empty}=0 any messages in the 
++        folder are moved to the Trash folder. The Trash folder is reserved and cannot
++        be deleted. 
++
++        @param folder: The name of the folder to delete.
++        @type folder: str 
++        @param must_empty: If >0 this maildir must be empty or else I{delete}
++            will refuse to delete it by raising an exception.
++        @type must_empty: bool
++        @param rm_other: If >0 I{delete} will also remove files and directories
++            that are not actually part of this maildir. Like courier cache files
++            for example. If such files are found and I{rm_other}=0 an exception
++            will be raised. This parameter is ignored if I{must_empty}=0.
++        @type rm_other: bool
++        @param trash: If > 0 the deleted messages are moved to the Trash folder instead
++            of actually being deleted. If the specified folder is the Trash folder itself
++            this parameter is ignored.
++        @type trash: bool
++
++        @raise MaildirFolderNotFoundError: Will be raised if this maildir does not exist.
++        @raise MaildirFolderNotEmptyError: Will be raised if I{must_empty}>0 and messages
++            are present in the maildir folder. Will also be raised if I{must_empty}>0 and
++            I{rm_other}=0 and other files and directories are present in the maildir 
++            folder.
++        @raise MaildirInvalidFolderError: Will be raised if the specified folder is 
++            invalid (e.g. it does not contain the empty 'maildirfolder' file or an 
++            attempt is made to delete the Trash folder which is reserved).
++        @raise OSError: Can be raised due to various system errors occuring during
++            I{os.listdir}, I{os.path.isdir} or I{os.remove}.
++
++        @return: Nothing
++        """
++
++        if must_empty and not \
++            self._isEmptyFolder( '.' + folder, ignore_trash=1, ignore_other=rm_other ):
++            raise MaildirFolderNotEmptyError(self.path, '.' + folder)
++
++        self._deleteFolder( '.' + folder )
++
++    def isEmpty(self, ignore_trash=1, ignored=[], ignore_other=1 ):
++        """Indicates if the whole maildir is empty.
++
++        @param ignored: A list of files or directories to ignore if present. The
++            maildir directories 'new' and 'cur' cannot be ignored and the 
++            directory 'tmp' is always ignored. 
++        @type ignored: list of str
++        @param ignore_other: If >0 I{isEmpty} will ignore all non maildir files 
++            and directories regardless of the I{ignored} parameter.
++        @type ignore_other: bool
++        @param ignore_trash: If > 0 I{isEmpty} will ignore any messages in the 
++            Trash folder. This is the default behaviour.
++        @type ignore_trash: bool
++
++        @raise OSError: Can be raised due to various system errors occuring during
++            I{os.listdir} or I{os.path.isdir}.
++
++        @return: This method returns 1 if this maildir is found to be empty and 
++            0 otherwise.
++        @rtype: bool
++        """    
++
++        self._verify()
++
++        ignored.append('maildirsize')
++
++        for file in os.listdir(self.path):
++            path = os.path.join(self.path,file)
++            if os.path.isdir(path) and not (ignore_trash and file == '.Trash'):
++                try:
++                    if not self._isEmptyFolder( file, ignore_trash=ignore_trash,
++                        ignore_other=ignore_other):
++                        return 0
++                    ignored.append(file)
++                except MaildirInvalidFolderError:
++                    pass
++       
++        return self._isEmptyDir( self.path, ignore_trash=ignore_trash, ignored=ignored, 
++            ignore_other=ignore_other)
++
++    def delete(self, must_empty=1, rm_other=1):
++        """Deletes this maildir.
++        
++        @param must_empty: If >0 this maildir must be empty or else I{delete}
++            will refuse to delete it by raising an exception.
++        @type must_empty: bool
++        @param rm_other: If >0 I{delete} will also remove files and directories 
++            that are not actually part of this maildir. Like courier cache files 
++            for example. If such files are found and I{rm_other}=0 an exception 
++            will be raised. This parameter is ignored if I{must_empty}=0.
++        @type rm_other: bool
++
++        @raise MaildirNotFoundError: Will be raised if this maildir does not exist.
++        @raise MaildirNotEmptyError: Will be raised if I{must_empty}>0 and messages 
++            are present in the maildir. Will also be raised if I{must_empty}>0 and 
++            I{rm_other}=0 and other files and directories are present in the maildir.
++        @raise OSError: Can be raised due to various system errors occuring during
++            I{os.listdir},I{os.path.isdir} or I{os.remove}.
++ 
++        @return: Nothing
++        """
++        
++        if not os.path.exists(self.path):
++            raise MaildirNotFoundError(self.path)
++
++        if must_empty and not \
++            self.isEmpty( ignore_trash=1, ignore_other=rm_other ):
++            raise MaildirNotEmptyError(self.path)
++
++        self._deinitialize( self.path )
++
++    def startMessage(self, address, messageClass):
++        """Starts the delivery of a message to this maildir by opening
++        a file in the tmp dir. 
++
++        @param address: The address this messages was to be delivered to.
++        @type address: str
++        @param messageClass: The class of the message object to return.
++        @type messageClass: class of mail.FileMessage
++
++        @return: A new message object. This object can be used to send 
++            lines to the newly generated file. This message's I{eomReceived}
++            method automatically calls this class' L{finishMessage} method.
++        @rtype: instance of mail.FileMessage
++        """
++
++        # Sanity check
++        if not mail.FileMessage in messageClass.__bases__:
++            raise MaildirError( self.path, 'Invalid message class')
++            
++        (filename, fp) = self._newMaildirFile()
++
++        tmp_path = os.path.join(self.path, 'tmp', filename)
++        new_path = os.path.join(self.path, 'new', filename)
++  
++        return messageClass(address, fp, self, tmp_path, new_path)
++
++    def finishMessage(self, mesg):
++        """Finishes the delivery of a message to this maildir. First it 
++        checks if the new message would violate the quota for this maildir.
++        If this is ok the message object gets the filename to rename itself to.
++        This method should be called by the message object itself.
++ 
++        @param mesg: The message to finish
++        @type mesg: object of class maildir.FileMessage
++
++        @return: Nothing
++        """
++        try:
++           self._checkQuota(mesg.size,1)
++        except MaildirNoQuotaError:
++           pass
++
++        self._updateMaildirSize(mesg.size, 1)
++     
++        mesg.finalName = "%s,S=%d" % (mesg.finalName, mesg.size) 
++
++    def _purgeDir(self, dir, max_age=0, folder=None, trash=1): 
++        """Purges files older than I{max_age} seconds in the specified
++        directory of the specified maildir (folder).
++        
++        @param dir: The directory to purge ('new','cur' or 'tmp')
++        @type dir: str
++        @param max_age: Purge files older than this number of seconds. The
++            default is 36 hours.
++        @type max_age: int      
++        @param folder: The folder where the I{dir} is located. If it is I{None} 
++            or not specified the I{dir} within the maildir itself is purged.
++        @type folder: str
++        @param trash: If > 0 the old messages are moved to the Trash folder
++            instead of being deleted. If the specified folder is the Trash
++            folder itself this parameter is ignored.
++        @type trash: bool
++
++        @raise MaildirNotFoundError: Raised if the maildir does not exist.
++        @raise MaildirFolderNotFoundError: Raised if the folder does not exist.
++        @raise MaildirInvalidError: Raised if the maildir seems to be invalid.
++        @raise MaildirFolderInvalidError: Raised if the folder seems to be invalid.
++        @raise OSError: Can be raised due to various system errors during
++            I{os.listdir}, I{os.stat} or I{os.remove}
++
++        @return: Nothing
++        """
++        tm = time.time()
++  
++        self._verify()
++
++        if folder is None:
++            dpath = os.path.join(self.path,dir)
++        else:
++            dpath = os.path.join(self._verifyFolder(folder),dir)          
++
++        # Make sure whe have a trash folder at all
++        if trash:
++            self.createFolder('Trash', may_exist=1)
++ 
++        count_change = 0
++        size_change  = 0
++
++        for file in os.listdir(dpath):
++            # Ignore hidden files
++            if file[0] == '.':
++                continue
++ 
++            path = os.path.join(dpath,file)
++            if os.stat(path).st_ctime < tm - max_age:
++                # Delete the file from this directory or move it
++                # to the trash folder if told to do so. Trashed files
++                # are never moved to the trash folder. 
++                if folder != '.Trash' and trash:
++                    (name,size,flags) = self._parseFilename(file)
++                    if 'T' in flags:
++                       os.remove(path)
++                    else:
++                       tpath = os.path.join(self.path, '.Trash', dir, file)
++                       os.rename(path, tpath)
++                      
++                       # Make sure the maildirsize stays consistent
++                       if size is None:
++                           size = os.stat(self.path).st_size
++                       size_change  -= size
++                       count_change -= 1
++                else:
++                    os.remove(path)
++                    if folder != '.Trash':
++                        (name,size,flags) = self._parseFilename(file)
++ 
++                        # Make sure the maildirsize stays consistent
++                        if not 'T' in flags:
++                            if size is None:
++                                size = os.stat(self.path).st_size
++                            size_change  -= size
++                            count_change -= 1
++                            
++        if count_change != 0 or size_change != 0:
++            self._updateMaildirSize(size_change, count_change)
++
++    def purgeTemp(self, max_age=(60*60*36), folder=None):
++        """Purges files older than I{max_age} seconds in the 'tmp' 
++        directory of the specified maildir (folder).
++
++        @param max_age: Purge files older than this number of seconds. The
++            default is 36 hours.
++        @type max_age: int
++        @param folder: The folder where the I{dir} is located. If it is I{None}
++            or not specified the I{dir} within the maildir itself is purged.
++        @type folder: str
++
++        @raise MaildirNotFoundError: Raised if the maildir does not exist.
++        @raise MaildirFolderNotFoundError: Raised if the folder does not exist.
++        @raise MaildirInvalidError: Raised if the maildir seems to be invalid.
++        @raise MaildirFolderInvalidError: Raised if the folder seems to be invalid.
++        @raise OSError: Can be raised due to various system errors during
++            I{os.listdir}, I{os.stat} or I{os.remove}
++
++        @return: Nothing
++        """
++ 
++        if not folder is None:
++            folder = '.' + folder
++ 
++        self._purgeDir('tmp', max_age=max_age, folder=folder, trash=0)
++
++    def purgeFolder(self, folder, max_age=(60*60*36), trash=1):
++        """Purges files older than I{max_age} seconds in the 'cur'
++        directory of the specified maildir (folder).
++
++        @param max_age: Purge files older than this number of seconds. The
++            default is 36 hours.
++        @type max_age: int
++        @param folder: The folder where the I{dir} is located. If it is I{None}
++            or not specified the I{dir} within the maildir itself is purged.
++        @type folder: str
++        @param trash: If > 0 the old messages are moved to the Trash folder
++            instead of being deleted. If the specified folder is the Trash 
++            folder itself this parameter is ignored. 
++        @type trash: bool
++
++        @raise MaildirNotFoundError: Raised if the maildir does not exist.
++        @raise MaildirFolderNotFoundError: Raised if the folder does not exist.
++        @raise MaildirInvalidError: Raised if the maildir seems to be invalid.
++        @raise MaildirFolderInvalidError: Raised if the folder seems to be invalid.
++        @raise OSError: Can be raised due to various system errors during
++            I{os.listdir}, I{os.stat} or I{os.remove}
++
++        @return: Nothing
++        """
++        if not folder is None:
++            folder = '.' + folder
++
++        self._purgeDir('cur', max_age=max_age, folder=folder, trash=trash)
++
++    def listMessages(self, folder=None, subdir=None):
++        """Get info about messages in this maildir. 
++
++        @param folder: The folder to get the messages from (optional)
++        @type folder: str
++        @param subdir: The subdir in this maildir (folder) to list messages
++            for. This subdir can be one of 'new' and 'cur'. If this parameter is
++            not specified or None, both subdirs are listed. New and unseen messages
++            are stored in 'new' and are moved to 'cur' by a mailreader when they are
++            read.
++        @type subdir: str
++
++        @raise MaildirNotFoundError: Raised if the maildir does not exist.
++        @raise MaildirFolderNotFoundError: Raised if the folder does not exist.
++        @raise MaildirInvalidError: Raised if the maildir seems to be invalid.
++        @raise MaildirFolderInvalidError: Raised if the folder seems to be invalid.
++        @raise OSError: Can be raised due to various system errors during
++            I{os.listdir} or I{os.stat}.
++
++        @return: A list of message specification tuples. Each tuple looks like 
++            ((filename,subdir),name,size,flags). The 'name' field is the actual message 
++            name without the size specification and flags appended to it. The 'flags' 
++            field is a list of flags (e.g. 'T' for Trash or 'S' for Seen etc.). 
++
++            A message is uniquely identified by it's name, but for performance reasons the 
++            Maildir class requires the filename and the subdir to retrieve the message. 
++            The (filename,subdir) pair can be used directly as the message parameter to 
++            methods like L{openMessage} and L{deleteMessage}. The 'subdir' field is one 
++            of 'new' and 'cur' indicating the file is recent or not.
++        @rtype: list of ((str,str),str,int,list of char)
++        """
++        self._verify()
++
++        # Construct the path
++        if folder is None:
++           dir = self.path
++        else:
++           dir = self._verifyFolder(folder)
++
++        self.purgeTemp(folder=folder)
++
++        if subdir is None:
++           subdirs = ['new','cur']
++        else:
++           assert subdir in ['new','cur']
++           subdirs = [subdir]
++           
++        # List all messages
++        list = []
++        for sd in subdirs:
++            for file in os.listdir(os.path.join(dir, sd)):
++                # Ignore hidden 
++                if file[0] == '.':
++                   continue
++
++                path = os.path.join(dir, sd, file)
++
++                # Try to parse size and status from filename
++                (name, size, flags) = self._parseFilename(file)
++
++                if size is None:                
++                    # Obviously we did not create this file, try the
++                    # old way (slow).
++                    try:
++                        size = os.stat(path).st_size
++                    except:
++                        # Skip this file in case of race condition.
++                        continue
++
++                list.append(((file, sd), name, size, flags))
++
++        return list
++   
++    def _findMessage(self, message, folder=None, get_fdata=0):
++        """Returns the full path and the actual filename for the specified 
++        message file. It compensates for filename changes (e.g. due to appended flags).
++
++        @param message: A tuple specifying the filename of the message followed by the
++            maildir subdirectory it can be found in. On disk this filename and subdir
++            can change due to attribute changes by mail readers, but this is compensated
++            for. Refer to L{listMessages} for more info.
++        @type message: (str,str)
++        @param folder: The name of the folder this message can be found in. If None the
++            maildir itself is used.
++        @type folder: str
++        @param get_fdata: Specifies if this method should return the file attributes,
++            like size and flags, for the message as well. Since this takes (potentially) 
++            more processing time this data acquisition is optional. 
++        @type get_fdata: bool
++
++        @return: The return type of this method is a complex tuple. It always starts with 
++            the message (a tuple of the filename and the subdirectory it is found in) followed 
++            by the full path to the message. Depending on the I{get_fdate} parameter the 
++            tuple contains a third field. This field is a tuple as well and it looks the 
++            same as the return value of L{_parseFilename} (actually it is most of the time the
++            returned value from this method). So the tuple looks like: 
++            ((filename, subdirectory), full path
++            [,( the bare filename (without attributes), file size, a list of file flags )])
++        @rtype: ((str,str),str[,(str,int,list of flags(characters)])
++  
++        """
++        filename,subdir = message
++
++        self._verify()
++
++        # Construct the path
++        if folder is None:
++           path = self.path
++        else:
++           path = self._verifyFolder('.'+folder)
++ 
++        if '/' in filename or filename[0] == '.':
++            raise MaildirInvalidMessageError(path,subdir,filename)
++
++        if os.path.exists(os.path.join(path,subdir,filename)):
++            if get_fdata:
++                return ((filename,subdir), os.path.join(path,subdir,filename), 
++                    self._parseFilename(filename))
++            else:
++                return ((filename,subdir), os.path.join(path,subdir,filename))
++
++        # Maybe someone moved this file from new to cur
++        if subdir == 'new' and \
++            os.path.exists(os.path.join(path,'cur',filename)):
++                if get_fdata:
++                    return ((filename,subdir), os.path.join(path,'cur',filename),
++                        self._parseFilename(filename))
++                else:
++                    return ((filename,subdir), os.path.join(path,'cur',filename))
++            
++        # Couldn't find this message right away.. maybe someone changed some flags
++        # in the mean time. Search for the new filename. Although it is very unlikely 
++        # that someone whould change the size, it is still ignored in the search.
++        if subdir == 'new':
++            subdirs = ['new', 'cur']
++        else:
++            subdirs = ['cur']
++
++        for sd in subdirs:
++            for file in os.listdir(os.path.join(path,sd)):
++                # Abbreviations...
++                f1 = filename
++                f2 = file
++                p1 = 0
++                p2 = 0
++
++                size  = 0
++                flags = []
++                name  = file
++
++                # Compare filenames
++                while p1 < len(f1) and p2 < len(f2):
++                    # Ignore size specifications
++                    if p1 < len(f1) + 3 and f1[p1:p1+3] == ',S=':
++                        p1 += 3
++                        # Skip size
++                        while p1 < len(f1) and \
++                            ord(f1[p1]) >= ord('0') and ord(f1[p1]) <= ord('9'):
++                            p1 += 1
++  
++                    if p2 < len(f2) + 3 and f2[p2:p2+3] == ',S=':
++                        name = file[0:p2]
++                        p2 += 3
++                        # Skip size
++                        while p2 < len(f2) and \
++                            ord(f2[p2]) >= ord('0') and ord(f2[p2]) <= ord('9'):
++                            size = size * 10 + (ord(f2[p2]) - ord('0'))
++                            p2 += 1
++
++                    # Check if both filenames have ended and therefore are equal
++                    if ( p1 == len(f1) or f1[p1] == ':' ) and \
++                        ( p2 == len(f2) or f2[p2] == ':' ): 
++                        # Found the message file
++                        if get_fdata:
++                            if name == file:
++                                name = file[0:p2]
++
++                            if p2 < len(f2) + 3 and f2[p2:p2+3] == ':2,':
++                                p2 += 3
++
++                                while p2 < len(f2) and f2[p2] >= 'A' and f2[p2] <= 'Z':
++                                    flags.append(f2[p2]);
++                                    p2 += 1
++ 
++                            return ((file,sd),os.path.join(path,sd,file),(name,size,flags))
++                        else:
++                            return ((file,sd),os.path.join(path,sd,file))
++
++                    # Break if filenames differ
++                    if f1[p1] != f2[p2]:
++                        break
++
++                    p1 += 1
++                    p2 += 1
++
++        # Not found
++        raise MaildirMessageNotFoundError(path,subdir,filename)  
++
++    def openMessage(self, message, folder=None):
++        """Opens a message file and returns a file object for it.
++        @param message: A tuple specifying the filename of the message followed by the 
++            maildir subdirectory it can be found in. On disk this filename and subdir 
++            can change due to attribute changes by mail readers, but this is compensated 
++            for. Refer to L{listMessages} for more info.
++        @type message: (str,str)
++        @param folder: The name of the folder this message can be 
++            found in. If None the maildir itself is used.
++        @type folder: str
++  
++        @return: Open file object.
++        @rtype: file
++        """
++        (message,path) = self._findMessage(message,folder=folder)
++ 
++        return open(path)
++
++    def deleteMessage(self, message, folder=None):
++        """Deletes a message file. It is moved to the Trash folder to be deleted 
++        later. Of the specified folder is the Trash folder the message is purged. 
++
++        @param message: A tuple specifying the filename of the message followed by the
++            maildir subdirectory it can be found in. On disk this filename and subdir
++            can change due to attribute changes by mail readers, but this is compensated
++            for. Refer to L{listMessages} for more info.
++        @type message: (str,str)  
++        @param folder: The name of the folder this message can be found in. If None the 
++            maildir itself is used.
++        @type folder: str
++ 
++        @raise OSError: This can be raised due to various system errors during I{os.rename},
++            I{os.remove} and I{os.close}
++ 
++        @return: Nothing
++        """
++        ((file,subdir),path,(name,size,flags)) = \
++            self._findMessage(message,folder=folder,get_fdata=1)
++
++        if folder == 'Trash':
++           # Purge it (cannot be undeleted anymore).
++           os.remove(path)
++        else:
++           tpath= os.path.join( self.path, '.Trash', 'cur', file)
++           os.rename(path, tpath)
++
++           self._updateMaildirSize(-1 * size, -1)
++
++    def undeleteMessage(self, message, folder=None):
++        """Undeletes a message file. It is moved from the Trash folder to the folder
++        it came from.
++
++        @param message: A tuple specifying the filename of the message followed by the
++            subdir it was originally found in. On disk this filename and subdir
++            can change due to attribute changes by mail readers, but this is compensated
++            for.
++        @type message: (str,str)
++        @param folder: The name of the folder this message came from. If not specified 
++            it is moved back to the maildir itself (INBOX)
++        @type folder: str
++
++        @raise MaildirQuotaExceededError: Raised if this readdition to the maildir would violate 
++            the quota policy. Messages cannot be undeleted if the maildir is full.
++        @raise OSError: This can be raised due to various system errors during I{os.rename},
++            I{os.remove} and I{os.close}
++
++        @return: Nothing
++        """
++
++        (filename,subdir)  = message
++        ((tfile,sd),tpath,(name,size,flags)) = \
++            self._findMessage((filename,'cur'),folder='Trash',get_fdata=1)        
++
++        try:
++           self._checkQuota(size,1)
++        except MaildirNoQuotaError:
++           pass
++
++        self._updateMaildirSize(size, 1)
++        #self._closeMaildirSizeFile()
++
++        # Construct the path
++        if folder is None:
++           path = os.path.join(self.path,subdir,tfile)
++        else:
++           path = os.path.join(self._verifyFolder(folder),subdir,tfile)
++        os.rename(tpath, path)
++
++    def _setMessageAttributes(self, message, flags=None, size=None, folder=None):
++        """Changes the message attributes  (flags and size). 
++        FIXME: Are size changes useful at all?  
++
++        @param message: A tuple specifying the filename of the message followed by the
++            maildir subdirectory it can be found in. On disk this filename and subdir
++            can change due to attribute changes by mail readers, but this is compensated
++            for.
++        @type message: (str,str)
++        @param flags: The flags to set for this message. If not set the old ones are 
++            preserved.
++        @type flags: list of flags (characters)
++        @param size: The size to set for this message. If not set the old size is 
++            preserved.
++        @type size: int     
++        @param folder: The name of the folder this message can be found in. If None the 
++            maildir itself (INBOX) is used.
++        @type folder: str
++
++        @raise MaildirQuotaExceededError: Raised if the size change of this message would violate
++            the quota policy.
++        @raise OSError: This can be raised due to various system errors during I{os.rename}.
++
++        @return: Nothing
++        """
++
++        (filename,subdir)     = message
++        ((file,subdir),fpath,(name,fsize,fflags)) = \
++            self._findMessage(message,folder=folder,get_fdata=1)
++
++        # Make sure we know the size of a file 
++        if fsize is None:
++            try:
++                fsize = os.stat(fpath).st_size
++            except OSError, e:
++                if e.errno == errno.ENOENT:
++                    raise MaildirMessageNotFoundError(fpath,subdir,file)
++
++        # Make sure the maildirsize file stays consistent.
++        size_change  = 0
++        count_change = 0
++ 
++        if not 'T' in fflags and 'T' in flags:
++           size_change = -1 * fsize
++           count_change = -1
++        elif 'T' in fflags and not 'T' in flags:
++           count_change = 1
++           if not size is None:
++               size_change = size
++           else:
++               size_change = fsize
++        else:
++           if not size is None:
++               size_change = size - fsize
++           
++        if size_change != 0 or count_change != 0:
++           try:
++               self._checkQuota(size_change,count_change)
++           except MaildirNoQuotaError:
++               pass
++
++        if not size is None:
++           fsize = size
++       
++        if not flags is None:
++           fflags = flags        
++
++        file = self._constructFilename(ident='', size=fsize, flags=fflags, filename=name)
++
++        # Construct the new path
++        if folder is None:
++           path = os.path.join(self.path,subdir,file)
++        else:
++           path = os.path.join(self._verifyFolder(folder),subdir,file)
++
++        os.rename(fpath,path)
++
++        if size_change != 0 or count_change != 0:
++           self._updateMaildirSize(size_change, count_change)
++
++        return (file,subdir)
++
+ class _MaildirNameGenerator:
+-    """Utility class to generate a unique maildir name
++    """Utility class to generate a unique maildir name.
++    DEPRICATED: Use the Maildir class instead
+     """
+     n = 0
+     p = os.getpid()
+@@ -67,26 +2042,20 @@
+         return '%s.M%sP%sQ%s.%s' % (seconds, microseconds,
+                                     self.p, self.n, self.s)
+ 
+-_generateMaildirName = _MaildirNameGenerator().generate
++_generateMaildirName = Maildir('/tmp/frop')._constructFilename
+ 
+ def initializeMaildir(dir):
+-    if not os.path.isdir(dir):
+-        os.mkdir(dir, 0700)
+-        for subdir in ['new', 'cur', 'tmp', '.Trash']:
+-            os.mkdir(os.path.join(dir, subdir), 0700)
+-        for subdir in ['new', 'cur', 'tmp']:
+-            os.mkdir(os.path.join(dir, '.Trash', subdir), 0700)
+-        # touch
+-        open(os.path.join(dir, '.Trash', 'maildirfolder'), 'w').close()
+-
++    Maildir(dir).create(may_exist=1)
+ 
+ class MaildirMessage(mail.FileMessage):
+     size = None
+ 
+-    def __init__(self, address, fp, *a, **kw):
++    def __init__(self, address, fp, md, *a, **kw):
+         header = "Delivered-To: %s\n" % address
+         fp.write(header)
+-        self.size = len(header)
++        self.size    = len(header)
++        self.address = address 
++        self.maildir = md
+         mail.FileMessage.__init__(self, fp, *a, **kw)
+ 
+     def lineReceived(self, line):
+@@ -94,7 +2063,12 @@
+         self.size += len(line)+1
+ 
+     def eomReceived(self):
+-        self.finalName = self.finalName+',S=%d' % self.size
++        try:
++            self.maildir.finishMessage(self)
++        except MaildirQuotaExceededError, e:
++            raise smtp.SMTPBadRcpt(self.address, code=452,
++                resp=str(e))
++            
+         return mail.FileMessage.eomReceived(self)
+ 
+ class AbstractMaildirDomain:
+@@ -149,12 +2123,10 @@
+             name, domain = user.split('@', 1)
+         else:
+             name, domain = user.dest.local, user.dest.domain
++
+         dir = self.userDirectory(name)
+-        fname = _generateMaildirName()
+-        filename = os.path.join(dir, 'tmp', fname)
+-        fp = open(filename, 'w')
+-        return MaildirMessage('%s@%s' % (name, domain), fp, filename,
+-                              os.path.join(dir, 'new', fname))
++        md = Maildir(dir)
++        return md.startMessage('%s@%s' % (name, domain), MaildirMessage)
+     
+     def willRelay(self, user, protocol):
+         return False
+@@ -175,33 +2147,31 @@
+     def __init__(self, path):
+         """Initialize with name of the Maildir mailbox
+         """
+-        self.path = path
+-        self.list = []
+-        self.deleted = {}
+-        initializeMaildir(path)
+-        for name in ('cur', 'new'):
+-            for file in os.listdir(os.path.join(path, name)):
+-                self.list.append((file, os.path.join(path, name, file)))
++        self.list    = []
++        self.deleted = []
++        
++        # Initialize maildir
++        self.md = Maildir(path)
++        self.md.create(may_exist=1)
++        
++        # Get all messages currently in the maildir
++        self.list = self.md.listMessages()        
+         self.list.sort()
+-        self.list = [e[1] for e in self.list]
+ 
+     def listMessages(self, i=None):
+         """Return a list of lengths of all files in new/ and cur/
+         """
+         if i is None:
+-            ret = []
+-            for mess in self.list:
+-                if mess:
+-                    ret.append(os.stat(mess)[stat.ST_SIZE])
+-                else:
+-                    ret.append(0)
+-            return ret
+-        return self.list[i] and os.stat(self.list[i])[stat.ST_SIZE] or 0
++            return [s for (m,n,s,f) in self.list]
++
++        if self.list[i] == 0:
++            return 0
++        return self.list[i][2]
+ 
+     def getMessage(self, i):
+         """Return an open file-pointer to a message
+         """
+-        return open(self.list[i])
++        return self.md.openMessage(self.list[i][0])
+ 
+     def getUidl(self, i):
+         """Return a unique identifier for a message
+@@ -210,7 +2180,7 @@
+         It is globally unique because this is how Maildirs are designed.
+         """
+         # Returning the actual filename is a mistake.  Hash it.
+-        base = os.path.basename(self.list[i])
++        base = os.path.basename(self.list[i][1])
+         return md5.md5(base).hexdigest()
+ 
+     def deleteMessage(self, i):
+@@ -219,11 +2189,9 @@
+         This only moves a message to the .Trash/ subfolder,
+         so it can be undeleted by an administrator.
+         """
+-        trashFile = os.path.join(
+-            self.path, '.Trash', 'cur', os.path.basename(self.list[i])
+-        )
+-        os.rename(self.list[i], trashFile)
+-        self.deleted[self.list[i]] = trashFile
++        self.md.deleteMessage(self.list[i][0])
++        
++        self.deleted.append(self.list[i])
+         self.list[i] = 0
+ 
+     def undeleteMessages(self):
+@@ -232,21 +2200,19 @@
+         This moves any messages from .Trash/ subfolder back to their
+         original position, and empties out the deleted dictionary.
+         """
+-        for (real, trash) in self.deleted.items():
++        for (m,n,s,f) in self.deleted:
+             try:
+-                os.rename(trash, real)
+-            except OSError, (err, estr):
+-                import errno
+-                # If the file has been deleted from disk, oh well!
+-                if err != errno.ENOENT:
+-                    raise
+-                # This is a pass
++                self.md.undeleteMessage(m)
++            except MaildirMessageNotFoundError:
++                pass
+             else:
++                # Reinsert the message into the list
+                 try:
+-                    self.list[self.list.index(0)] = real
++                    self.list[self.list.index(0)] = (m,n,s,f)
+                 except ValueError:
+-                    self.list.append(real)
+-        self.deleted.clear()
++                    self.list.append((m,n,s,f))
++
++        self.deleted = []
+ 
+ class StringListMailbox:
+     __implements__ = (pop3.IMailbox,)
+Index: twisted/test/test_mail.py
+===================================================================
+RCS file: /ext/cvshome/public/tds/twisted-1.1.0/twisted/test/test_mail.py,v
+retrieving revision 1.1.1.1
+retrieving revision 1.6
+diff -u -r1.1.1.1 -r1.6
+--- twisted/test/test_mail.py	30 Oct 2003 23:11:46 -0000	1.1.1.1
++++ twisted/test/test_mail.py	15 Nov 2003 23:38:13 -0000	1.6
+@@ -18,10 +18,12 @@
+ import os
+ import md5
+ import shutil
++import string
+ import smtplib
+ import pickle
+ import StringIO
+ import rfc822
++import time
+ 
+ from twisted.trial import unittest
+ from twisted.protocols import smtp
+@@ -198,15 +200,22 @@
+ class MaildirTestCase(unittest.TestCase):
+     def setUp(self):
+         self.d = self.mktemp()
+-        mail.maildir.initializeMaildir(self.d)
+     
+     def tearDown(self):
+-        shutil.rmtree(self.d)
++        try:
++            shutil.rmtree(self.d)
++        except:
++            pass
+ 
+-    def testInitializer(self):
+-        d = self.d
+-        trash = os.path.join(d, '.Trash')
++    def testCreate(self):
++        md = mail.maildir.Maildir(self.d)
++        md.create()
++
++        d      = self.d
++        trash  = os.path.join(d, '.Trash')
++        folder = os.path.join(d, '.Folder')
+ 
++        # Check if everything is created properly
+         self.failUnless(os.path.exists(d) and os.path.isdir(d))
+         self.failUnless(os.path.exists(os.path.join(d, 'new')))
+         self.failUnless(os.path.exists(os.path.join(d, 'cur')))
+@@ -215,6 +224,7 @@
+         self.failUnless(os.path.isdir(os.path.join(d, 'cur')))
+         self.failUnless(os.path.isdir(os.path.join(d, 'tmp')))
+         
++        # Check if Trash folder is created correctly
+         self.failUnless(os.path.exists(os.path.join(trash, 'new')))
+         self.failUnless(os.path.exists(os.path.join(trash, 'cur')))
+         self.failUnless(os.path.exists(os.path.join(trash, 'tmp')))
+@@ -222,10 +232,334 @@
+         self.failUnless(os.path.isdir(os.path.join(trash, 'cur')))
+         self.failUnless(os.path.isdir(os.path.join(trash, 'tmp')))
+ 
++        # Check some other folder as well
++        md.createFolder('Folder')
++        self.failUnless(os.path.exists(os.path.join(folder, 'new')))
++        self.failUnless(os.path.exists(os.path.join(folder, 'cur')))
++        self.failUnless(os.path.exists(os.path.join(folder, 'tmp')))
++        self.failUnless(os.path.isdir(os.path.join(folder, 'new')))
++        self.failUnless(os.path.isdir(os.path.join(folder, 'cur')))
++        self.failUnless(os.path.isdir(os.path.join(folder, 'tmp')))
++ 
++        # Maildir should not create this file by default
++        self.failIf(os.path.exists(os.path.join(d, 'maildirsize')))
++
++    def testExistanceDeletion(self):
++        md = mail.maildir.Maildir( self.d )
++
++        # Root maildir existance checks 
++        self.assertRaises(mail.maildir.MaildirNotFoundError, md.delete )
++        self.assertRaises(mail.maildir.MaildirNotFoundError, md.isEmpty )
++        self.assertEqual(md.exists(), 0)
++ 
++        md.create()
++
++        self.assertEqual(md.exists(), 1)
++        self.assertRaises(mail.maildir.MaildirExistsError, 
++            md.create, may_exist=0)
++        md.create(may_exist=1)
++
++        # Maildir folder existance checks 
++        self.assertRaises(mail.maildir.MaildirFolderNotFoundError, 
++            md.deleteFolder, 'Folder' )
++        self.assertRaises(mail.maildir.MaildirFolderNotFoundError, 
++            md.isEmptyFolder, 'Folder' )
++        self.assertEqual(md.existsFolder('Folder'), 0)
++
++        md.createFolder('Folder')
++        self.assertEqual(md.existsFolder('Folder'), 1)
++        self.assertRaises(mail.maildir.MaildirFolderExistsError, 
++            md.createFolder, 'Folder', may_exist=0)
++        md.createFolder('Folder', may_exist=1)
++
++        # delete() methods should not delete non-empty folders by default 
++        open(os.path.join(self.d,'.Folder','new',
++             md._constructFilename()), 'w' ).close()
++        self.assertRaises(mail.maildir.MaildirFolderNotEmptyError,
++             md.deleteFolder, 'Folder')
++        self.assertRaises(mail.maildir.MaildirNotEmptyError, md.delete)
++
++        md.deleteFolder('Folder', must_empty=0)
++        md.createFolder('Folder', may_exist=0)
++        os.mkdir(os.path.join(self.d,'.Folder','other'))
++        self.assertRaises(mail.maildir.MaildirFolderNotEmptyError,
++             md.deleteFolder, 'Folder', rm_other=0)
++        md.deleteFolder('Folder', rm_other=1)
++
++        os.mkdir(os.path.join(self.d,'other'))
++        self.assertRaises(mail.maildir.MaildirNotEmptyError,
++             md.delete, rm_other=0)
++        os.rmdir(os.path.join(self.d,'other'))
++        md.createFolder('Folder', may_exist=0)
++        os.mkdir(os.path.join(self.d,'.Folder','other'))
++        self.assertRaises(mail.maildir.MaildirNotEmptyError,
++             md.delete, rm_other=0)
++        md.delete(rm_other=1)
++        self.assertEqual(md.exists(), 0)
++        self.assertEqual(os.path.exists(self.d), 0)
++
++    def testQuota(self):
++        md = mail.maildir.Maildir( self.d, '100S,10C' )
++        md.create()
++
++        #### Test _readMaildirSize() ####
++
++        # Create corrupt file (also checks if negative numbers are properly recognized)
++        fp = open(os.path.join(self.d,'maildirsize'), 'w')
++        fp.write('4349593S\n1000 1\n-100 -1\n')
++        fp.close()
++
++        self.assertRaises(mail.maildir.MaildirSizeFileError, md._readMaildirSize)
++
++        # Create a too large (==expired file) 
++        buffer = '4349593S\n1000 1\n'
++        for i in range(900):
++            buffer += '100 %d\n' % i
++
++        fp = open(os.path.join(self.d,'maildirsize'), 'w' )
++        fp.write(buffer)
++        fp.close()
++        
++        self.assertRaises(mail.maildir.MaildirSizeFileExpiredError, md._readMaildirSize)
++
++        # Create an invalid file
++        buffer = '4349593S\n1000 1'
++        for i in range(9):
++            buffer += '100 1\t'
++
++        fp = open(os.path.join(self.d,'maildirsize'), 'w' )
++        fp.write(buffer)
++        fp.close()
++
++        self.assertRaises(mail.maildir.MaildirSizeFileError, md._readMaildirSize)
++
++        # Create a file
++        buffer = '4349593S,10C\n1000 1\n'
++        for i in range(10):
++            buffer += '150 2\n'
++        for i in range(50):
++            buffer += '100 1\n'
++
++        fp = open(os.path.join(self.d,'maildirsize'), 'w' )
++        fp.write(buffer)
++        fp.close()
++
++        (msize,mcount,nlines,mtime,quota) = md._readMaildirSize()
++        self.assertEqual((msize, mcount, nlines,quota), (7500,71,61,'4349593S,10C'))
++
++        #### Test _parseQuota() ####
++
++        md.quota = '12516S,56254C'
++        self.assertEqual(md._parseQuota(), (12516,56254))
++        md.quota = '82308C,127836S'
++        self.assertEqual(md._parseQuota(), (127836,82308))
++
++        #### Test _parseFilename() and _constructFilename() ####
++
++        (name, size, flags ) = md._parseFilename( 
++            md._constructFilename(
++                ident='test',size=250,flags=['S','R','T']))
++        self.assertEqual((size,flags),(250,['S','R','T']))
++
++        (name, size, flags ) = md._parseFilename(
++            md._constructFilename(
++                ident='test',size=25) + ',SRT')
++        self.assertEqual((size,flags),(25,[]))
++
++        (name, size, flags ) = md._parseFilename(
++            md._constructFilename(
++                ident='test',size=999,flags=['S','R']))
++        self.assertEqual((size,flags), (999,['S','R']))
++
++        (name, size, flags ) = md._parseFilename(
++            md._constructFilename(
++                ident='test',flags=['S','R','T']))
++        self.assertEqual((size,flags), (None,['S','R','T']))
++
++        (name, size, flags ) = md._parseFilename(
++            md._constructFilename(
++                ident='test'))
++        self.assertEqual((size,flags), (None,[]))
++
++        self.assertEqual(md._parseFilename(
++            '32323.M728782P7237Q1.host,S=24:2,S'), 
++            ('32323.M728782P7237Q1.host', 24, ['S']))
++        self.assertEqual(md._parseFilename(
++            '12312.M712382P71237Q1.host,S=34'),
++            ('12312.M712382P71237Q1.host', 34, []))
++        self.assertEqual(md._parseFilename(
++            '11233.M23424P2323Q23.host'),
++            ('11233.M23424P2323Q23.host', None, []))
++
++        #### Test _countCurNew() ####
++
++        # Test for maildir
++        for i in range(0,5):
++            open(os.path.join(self.d,'new',
++                md._constructFilename(size=i*25)), 'w' ).close()
++        for i in range(0,5):
++            open(os.path.join(self.d,'new',
++                md._constructFilename(size=i*35)), 'w' ).close()         
++        (msize, mcount, maxtime) = md._countCurNew()
++        self.assertEqual((msize,mcount),(250+350,10))
++
++        # Test for folder
++        md.createFolder('Folder')
++        for i in range(0,5):
++            open(os.path.join(self.d,'.Folder','new',
++                md._constructFilename(size=i*25)), 'w' ).close()
++        for i in range(0,5):
++            open(os.path.join(self.d,'.Folder','new',
++                md._constructFilename(size=i*35)), 'w' ).close()
++        (msize, mcount, maxtime) = md._countCurNew('.Folder')
++        self.assertEqual((msize,mcount),(250+350,10))
++
++        # Test for filenames that do not specify sizes
++        md.createFolder('Idiots')
++        for i in range(0,5):
++            fp = open(os.path.join(self.d,'.Idiots','new',
++                md._constructFilename()), 'w' )
++            fp.write(string.zfill('',i*25))        
++            fp.close()
++        for i in range(0,5):
++            fp = open(os.path.join(self.d,'.Idiots','new',
++                md._constructFilename()), 'w' )
++            fp.write(string.zfill('',i*35))
++            fp.close()
++        (msize, mcount, maxtime) = md._countCurNew('.Idiots')
++        self.assertEqual((msize,mcount),(250+350,10))       
++ 
++        #### Test _updateMaildirSize() ####
++
++        md.quota='1413S,10C'
++        md._updateMaildirSize(600,10,recreate=1)
++        md._closeMaildirSizeFile()
++        (msize,mcount,nlines,mtime,quota) = md._readMaildirSize()
++        self.assertEqual((msize, mcount, nlines, quota), (600,10,1,'1413S,10C'))
++        
++        md._updateMaildirSize(235,6,recreate=0)
++        md._closeMaildirSizeFile()
++        (msize,mcount,nlines,mtime,quota) = md._readMaildirSize()
++        self.assertEqual((msize, mcount, nlines, quota), (835,16,2,'1413S,10C'))
++
++        for i in range(1,6):
++            md._updateMaildirSize(25,2,recreate=0)
++            (msize,mcount,nlines,mtime,quota) = md._readMaildirSize()
++            self.assertEqual((msize, mcount, nlines, quota), (835 + 25 * i,16 + 2 * i,2 + i,'1413S,10C'))
++
++        for i in range(1,6):
++            md._updateMaildirSize(-25,-2,recreate=0)
++            (msize,mcount,nlines,mtime,quota) = md._readMaildirSize()
++            self.assertEqual((msize, mcount, nlines, quota), (960 - 25 * i,26 - 2 * i,7 + i,'1413S,10C'))
++
++        md._updateMaildirSize(125,10,recreate=0)
++
++        #### Test _checkQuota() ####
++        md.quota = None
++        self.assertRaises(mail.maildir.MaildirQuotaExceededError, md._checkQuota, 50, 1, no_recount=1)
++
++        md.quota = '970S'
++        self.assertRaises(mail.maildir.MaildirQuotaExceededError, md._checkQuota, 50, 1, no_recount=1)
++        md._checkQuota(5,1,no_recount=1)
++        md.quota = '27C' 
++        self.assertRaises(mail.maildir.MaildirQuotaExceededError, md._checkQuota, 50, 4, no_recount=1)
++        md._checkQuota(5,1,no_recount=1)
++
++        md.quota = '32C'
++        md._closeMaildirSizeFile()
++        md._checkQuota(50,1,no_recount=0)
++        (msize,mcount,nlines,mtime,quota) = md._readMaildirSize()
++        self.assertEqual((msize, mcount, nlines, quota), (1800,30,1,'32C'))  
++       
++        for i in range(1,3):
++            msg  = md._constructFilename(size=i*25)
++            size = i*25 
++            open(os.path.join(self.d,'new', msg), 'w' ).close()
++        (msize,mcount) = md._recount()        
++        self.assertEqual((msize, mcount), (1875,32))
++        self.assertRaises(mail.maildir.MaildirQuotaExceededError, md._checkQuota, 50, 1, no_recount=1)
++
++        os.remove(os.path.join(self.d,'maildirsize'))
++        md.quota = None
++        self.assertRaises(mail.maildir.MaildirNoQuotaError, md._checkQuota, 50, 1)
++
++        # Test _setMessageAttributes
++        (msize,mcount) = md._recount()
++
++        (f,pt) = md._setMessageAttributes((msg,'new'),flags=['T'])
++        (ms,mc,nlines,mtime,quota) = md._readMaildirSize()
++        self.failUnlessEqual((ms,mc),(msize-size,mcount-1))
++
++        (f,pt) = md._setMessageAttributes((msg,'new'),flags=[])
++        (ms,mc,nlines,mtime,quota) = md._readMaildirSize()
++        self.failUnlessEqual((ms,mc),(msize,mcount))
++
++    def testPurge(self):
++        md = mail.maildir.Maildir( self.d )
++        md.create()
++
++        # Toss a message into the tmp directory
++        message = '623756.M12313P12123Q2.host'
++        open(os.path.join(self.d,'tmp',message),'w+').close()
++
++        # Test that isEmpty ignores in
++        self.assertEqual(md.isEmpty(), 1)
++
++        # Test purging files in the tmp dir
++        md.purgeTemp(max_age=1)
++        self.assertEqual(os.path.exists(os.path.join(self.d,'tmp',message)),1)
++ 
++        # Wait till it expires
++        time.sleep(2)
++        md.purgeTemp(max_age=1)
++        self.assertEqual(os.path.exists(os.path.join(self.d,'tmp',message)),0)
++
++        # Create a folder 
++        md.createFolder('Folder')
++ 
++        # Toss a few files in the cur directory
++        for i in range(1,11):
++            open(os.path.join(self.d,'.Folder', 'cur','623756.M12313P12123Q%d.host,S=%d' % (i,i)),'w+').close()
++        for i in range(1,11):
++            open(os.path.join(self.d,'.Folder', 'cur','624445.M21312P12123Q%d.host,S=%d:2,ST' % (i,i)),'w+').close()
++
++        (msize,mcount) = md._recount()
++        self.assertEqual( (msize,mcount), (55,10))
++      
++        # Test if files are moved to the trash folder if they should  
++        self.assertRaises(mail.maildir.MaildirFolderNotEmptyError, md.deleteFolder, 'Folder', rm_other=0, must_empty=1)
++        md.deleteFolder('Folder', must_empty=0, trash=1)
++        
++        for i in range(1,11):
++            self.assertEqual(os.path.exists(os.path.join(self.d,'.Trash', 'cur','623756.M12313P12123Q%d.host,S=%d' % (i,i))), 1)
++            self.assertEqual(os.path.exists(os.path.join(self.d,'.Folder', 'cur','623756.M12313P12123Q%d.host,S=%d' % (i,i))), 0)
++        for i in range(1,11):
++            self.assertEqual(os.path.exists(os.path.join(self.d,'.Trash', 'cur','624445.M21312P12123Q%d.host,S=%d:2,ST' % (i,i))), 0)
++            self.assertEqual(os.path.exists(os.path.join(self.d,'.Folder', 'cur','624445.M21312P12123Q%d.host,S=%d:2,ST' % (i,i))), 0)
++
++        (ms, mc, nl, mt, qt) = md._readMaildirSize()
++         
++        self.assertEqual((ms,mc), (0,0))
++
+     def testMailbox(self):
++        md = mail.maildir.Maildir( self.d )
++        md.create()
++
+         j = os.path.join
+-        n = mail.maildir._generateMaildirName
+-        msgs = [j(b, n()) for b in ('cur', 'new') for x in range(5)]
++        n = md._constructFilename
++        i = 1
++        msgs = []
++        for b in ('cur', 'new'):
++            for x in range(5):
++                msgs.append(j(b, n(size=i,flags=['S','R'])) )
++                i += 1
++        for b in ('cur', 'new'):
++            for x in range(5):
++                msgs.append(j(b, n(size=i)))
++                i += 1
++        for b in ('cur', 'new'):
++            for x in range(5):
++                msgs.append(j(b, n()))
+ 
+         # Toss a few files into the mailbox
+         i = 1
+@@ -236,7 +570,7 @@
+             i = i + 1
+ 
+         mb = mail.maildir.MaildirMailbox(self.d)
+-        self.assertEquals(mb.listMessages(), range(1, 11))
++        self.assertEquals(mb.listMessages(), range(1, 31))
+         self.assertEquals(mb.listMessages(1), 2)
+         self.assertEquals(mb.listMessages(5), 6)
+         
+@@ -250,16 +584,33 @@
+             d[u] = None
+         
+         p, f = os.path.split(msgs[5])
+-        
++
++        self.assertEquals(mb.listMessages(5), 6)
++        (msize,mcount) = md._recount()
+         mb.deleteMessage(5)
+         self.assertEquals(mb.listMessages(5), 0)
+         self.failUnless(os.path.exists(j(self.d, '.Trash', 'cur', f)))
+         self.failIf(os.path.exists(j(self.d, msgs[5])))
++
++        (ms,mc,nlines,mtime,quota) = md._readMaildirSize()
++        self.failUnlessEqual((ms,mc),(msize-6,mcount-1))
+         
+         mb.undeleteMessages()
+         self.assertEquals(mb.listMessages(5), 6)
+         self.failIf(os.path.exists(j(self.d, '.Trash', 'cur', f)))
+         self.failUnless(os.path.exists(j(self.d, msgs[5])))
++
++        (ms,mc,nlines,mtime,quota) = md._readMaildirSize()
++        self.failUnlessEqual((ms,mc),(msize,mcount))
++
++        (f,pt) = md._setMessageAttributes((f,os.path.split(p)[1]),flags=['F'])
++        mb.deleteMessage(5)
++        self.assertEquals(mb.listMessages(5), 0)
++        self.failUnless(os.path.exists(j(self.d, '.Trash', 'cur', f)))
++        self.failIf(os.path.exists(j(self.d,p,f)))
++
++        (ms,mc,nlines,mtime,quota) = md._readMaildirSize()
++        self.failUnlessEqual((ms,mc),(msize-6,mcount-1))
+ 
+ class MaildirDirdbmDomainTestCase(unittest.TestCase):
+     def setUp(self):

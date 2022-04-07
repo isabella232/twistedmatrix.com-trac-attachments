@@ -1,0 +1,92 @@
+--- threadedselectreactor_old.py	Wed Nov 30 19:03:57 2005
++++ threadedselectreactor.py	Wed Nov 30 17:49:17 2005
+@@ -100,7 +100,9 @@
+         threadable.init(1)
+         self.reads = {}
+         self.writes = {}
++        self.toBeRemoved = []
+         self.toThreadQueue = Queue()
++        self.toThreadSubQueue = Queue() # used to add/remove readers n' writers
+         self.toMainThread = Queue()
+         self.workerThread = None
+         self.mainWaker = None
+@@ -125,6 +127,10 @@
+     def _sendToThread(self, fn, *args):
+         #print >>sys.stderr, 'sendToThread', fn, args
+         self.toThreadQueue.put((fn, args))
++
++    def _sendToThreadSubQueue(self, fn, *args):
++        #print >>sys.stderr, 'sendToThreadSubQueue', fn, args
++        self.toThreadSubQueue.put((fn, args))
+     
+     def _preenDescriptorsInThread(self):
+         log.msg("Malformed file descriptor found.  Preening lists.")
+@@ -163,6 +169,14 @@
+         reads = self.reads
+         writes = self.writes
+         while 1:
++            # first add/remove readers and writers
++            try:
++                while 1:
++                    fn, args = self.toThreadSubQueue.get_nowait()
++                    fn(*args)
++            except Empty:
++                pass
++
+             try:
+                 r, w, ignored = _select(reads.keys(),
+                                         writes.keys(),
+@@ -295,6 +309,8 @@
+             pass
+ 
+     def _doReadOrWrite(self, selectable, method, dict):
++        if selectable in self.toBeRemoved:
++            return
+         try:
+             why = getattr(selectable, method)()
+             handfn = getattr(selectable, 'fileno', None)
+@@ -307,28 +323,40 @@
+             log.err()
+         if why:
+             self._disconnectSelectable(selectable, why, method == "doRead")
++
++    def _removeReader(self, reader):
++        dictRemove(self.reads, reader)
++        self.toBeRemoved.remove(reader)
++
++    def _removeWriter(self, writer):
++        dictRemove(self.writes, writer)
++        self.toBeRemoved.remove(writer)
+     
+     def addReader(self, reader):
+         """Add a FileDescriptor for notification of data available to read.
+         """
+-        self._sendToThread(self.reads.__setitem__, reader, 1)
++        self._sendToThreadSubQueue(self.reads.__setitem__, reader, 1)
+         self.wakeUp()
+ 
+     def addWriter(self, writer):
+         """Add a FileDescriptor for notification of data available to write.
+         """
+-        self._sendToThread(self.writes.__setitem__, writer, 1)
++        self._sendToThreadSubQueue(self.writes.__setitem__, writer, 1)
+         self.wakeUp()
+ 
+     def removeReader(self, reader):
+         """Remove a Selectable for notification of data available to read.
+         """
+-        self._sendToThread(dictRemove, self.reads, reader)
++        if reader not in self.toBeRemoved:
++            self.toBeRemoved.append(reader)
++            self._sendToThreadSubQueue(self._removeReader, reader)
+ 
+     def removeWriter(self, writer):
+         """Remove a Selectable for notification of data available to write.
+         """
+-        self._sendToThread(dictRemove, self.writes, writer)
++        if writer not in self.toBeRemoved:
++            self.toBeRemoved.append(writer)
++            self._sendToThreadSubQueue(self._removeWriter, writer)
+ 
+     def removeAll(self):
+         return self._removeAll(self.reads, self.writes)

@@ -1,0 +1,520 @@
+diff --git twisted/conch/manhole.py twisted/conch/manhole.py
+index dee6a02..848aa71 100644
+--- twisted/conch/manhole.py
++++ twisted/conch/manhole.py
+@@ -13,15 +13,26 @@ and reasonable handling of Deferreds.
+ @author: Jp Calderone
+ """
+ 
+-import code, sys, StringIO, tokenize
++import code, sys, StringIO, tokenize, string
+ 
+ from twisted.conch import recvline
+ 
+ from twisted.internet import defer
+ from twisted.python.htmlizer import TokenPrinter
+ 
++# conditional imports
++try:
++    from IPython.core import completer
++except ImportError:
++    COMPLETION_AVAILABLE = False
++else:
++    COMPLETION_AVAILABLE = True
++
++
++
+ class FileWrapper:
+-    """Minimal write-file-like object.
++    """
++    Minimal write-file-like object.
+ 
+     Writes are translated into addOutput calls on an object passed to
+     __init__.  Newlines are also converted from network to local style.
+@@ -42,8 +53,11 @@ class FileWrapper:
+     def writelines(self, lines):
+         self.write(''.join(lines))
+ 
++
++
+ class ManholeInterpreter(code.InteractiveInterpreter):
+-    """Interactive Interpreter with special output and Deferred support.
++    """
++    Interactive Interpreter with special output and Deferred support.
+ 
+     Aside from the features provided by L{code.InteractiveInterpreter}, this
+     class captures sys.stdout output and redirects it to the appropriate
+@@ -137,23 +151,37 @@ CTRL_BACKSLASH = '\x1c'
+ CTRL_L = '\x0c'
+ CTRL_A = '\x01'
+ CTRL_E = '\x05'
++TAB = b"\t"
+ 
+ class Manhole(recvline.HistoricRecvLine):
+-    """Mediator between a fancy line source and an interactive interpreter.
++    """
++    Mediator between a fancy line source and an interactive interpreter.
+ 
+     This accepts lines from its transport and passes them on to a
+     L{ManholeInterpreter}.  Control commands (^C, ^D, ^\) are also handled
+     with something approximating their normal terminal-mode behavior.  It
+     can optionally be constructed with a dict which will be used as the
+     local namespace for any code executed.
++
++    @ivar completion: A flag to indicate if tab-completion is enabled.
+     """
+ 
+     namespace = None
+ 
+-    def __init__(self, namespace=None):
++    def __init__(self, namespace=None, completion=None):
+         recvline.HistoricRecvLine.__init__(self)
+-        if namespace is not None:
+-            self.namespace = namespace.copy()
++        if namespace is None:
++            namespace = {}
++        self.namespace = namespace.copy()
++        if "__manhole__" not in self.namespace:
++            self.namespace["__manhole__"] = ManholeControl(self)
++        if completion is None:
++            completion = COMPLETION_AVAILABLE
++        if completion and not COMPLETION_AVAILABLE:
++            raise ImportError(
++                "Tab-completion in Manhole requires the IPython module.")
++        self.completion = completion
++
+ 
+     def connectionMade(self):
+         recvline.HistoricRecvLine.connectionMade(self)
+@@ -164,6 +192,7 @@ class Manhole(recvline.HistoricRecvLine):
+         self.keyHandlers[CTRL_A] = self.handle_HOME
+         self.keyHandlers[CTRL_E] = self.handle_END
+         self.keyHandlers[CTRL_BACKSLASH] = self.handle_QUIT
++        self.keyHandlers[TAB] = self.handle_TAB
+ 
+ 
+     def handle_INT(self):
+@@ -203,10 +232,59 @@ class Manhole(recvline.HistoricRecvLine):
+         self.terminal.loseConnection()
+ 
+ 
++    def handle_TAB(self):
++        """
++        If tab completion is available and enabled then perform some tab
++        completion.
++        """
++        if not self.completion:
++            recvline.HistoricRecvLine.handle_TAB(self)
++            return
++        # If we only have whitespace characters on this line we pass through
++        # the tab
++        if set(self.lineBuffer).issubset(string.whitespace):
++            recvline.HistoricRecvLine.handle_TAB(self)
++            return
++        cp = completer.Completer(self.namespace)
++        cp.limit_to__all__ = False
++
++        lineLeft, lineRight = self.currentLineBuffer()
++
++        # Extract all the matches
++        matches = []
++        n = 0
++        while True:
++            match = cp.complete(lineLeft, n)
++            if match is None:
++                break
++            n += 1
++            matches.append(match)
++
++        if not matches:
++            return
++
++        if len(matches) == 1:
++            # Found the match so replace the line. This is apparently how we
++            # replace a line
++            self.handle_HOME()
++            self.terminal.eraseToLineEnd()
++
++            self.lineBuffer = []
++            self._deliverBuffer(matches[0] + lineRight)
++        else:
++            # Must have more than one match, display them
++            matches.sort()
++            self.terminal.write("\n")
++            self.terminal.write("   ".join(matches))
++            self.terminal.write("\n\n")
++            self.drawInputLine()
++
++
+     def _needsNewline(self):
+         w = self.terminal.lastWrite
+         return not w.endswith('\n') and not w.endswith('\x1bE')
+ 
++
+     def addOutput(self, bytes, async=False):
+         if async:
+             self.terminal.eraseLine()
+@@ -338,3 +416,40 @@ class ColoredManhole(Manhole):
+             n = len(self.lineBuffer) - self.lineBufferIndex
+             if n:
+                 self.terminal.cursorBackward(n)
++
++
++
++class ManholeControl(object):
++    """
++    An instance of this class is available inside the manhole as C{__manhole__}
++    and allows the user to interact with the manhole itself.
++
++    @ivar completion: A flag which enables or disables tab-completion
++    """
++
++    @property
++    def completion(self):
++        """
++        Get or set the tab-completion option.
++
++        @return: L{True} if tab-completion is enabled.
++        """
++        return self._manhole.completion
++
++
++    @completion.setter
++    def completion(self, completion):
++        if completion and not COMPLETION_AVAILABLE:
++            raise ValueError(
++                "Tab-completion in Manhole requires the IPython module.")
++        self._manhole.completion = bool(completion)
++
++
++    def __init__(self, manhole):
++        """
++        @param manhole: A L{Manhole} instance.
++        """
++        self._manhole = manhole
++
++
++
+diff --git twisted/conch/test/test_manhole.py twisted/conch/test/test_manhole.py
+index 09dd52c..0689a11 100644
+--- twisted/conch/test/test_manhole.py
++++ twisted/conch/test/test_manhole.py
+@@ -66,6 +66,69 @@ class ManholeProtocolTests(unittest.TestCase):
+         self.assertFalse(interpreter.buffer)
+ 
+ 
++    def test_namespaceHasManholeControl(self):
++        """
++        A L{manhole.ManholeControl} is created and available as C{__manhole__}.
++        """
++        mh = manhole.Manhole()
++        self.assertTrue(isinstance(mh.namespace["__manhole__"], manhole.ManholeControl))
++
++
++    def test_manholeControlHasManholeReference(self):
++        """
++        The L{manhole.ManholeControl} instance has a reference to the
++        L{manhole.Manhole} which created it.
++        """
++        mh = manhole.Manhole()
++        self.assertIs(mh.namespace["__manhole__"]._manhole, mh)
++
++
++    def test_manholeControlNotOverridden(self):
++        """
++        If a C{__manhole__} is provided in the namespace it is not replaced
++        with a L{manhole.ManholeControl}.
++        """
++        thing = object()
++        namespace = dict(__manhole__=thing)
++        mh = manhole.Manhole(namespace)
++        self.assertEqual(mh.namespace["__manhole__"], thing)
++
++
++    def test_unavailableCompletion(self):
++        """
++        Instantiating L{Manhole} with C{completion=True} when IPython is not
++        available raises L{ImportError}.
++        """
++        self.patch(manhole, "COMPLETION_AVAILABLE", False)
++        self.assertRaises(ImportError, manhole.Manhole, completion=True)
++
++
++    def test_completionFlag(self):
++        """
++        The value provided for the C{completion} argument is idential to the
++        C{completion} attribute.
++        """
++        completion = object()
++        mh = manhole.Manhole(completion=completion)
++        self.assertIs(mh.completion, completion)
++
++
++    def test_setCompletionWhenUnavailable(self):
++        """
++        The value provided for the C{completion} argument is idential to the
++        """
++        self.patch(manhole, "COMPLETION_AVAILABLE", False)
++        mh = manhole.Manhole()
++        mc = mh.namespace["__manhole__"]
++        try:
++            # assertRaises does not work with assignments
++            mc.completion = True
++        except ValueError:
++            return
++        else:
++            self.fail("ValueError was not raised.")
++
++
+ 
+ class WriterTestCase(unittest.TestCase):
+     def testInteger(self):
+@@ -309,7 +372,7 @@ class ManholeLoopbackMixin:
+         CTRL-A can be used as HOME - returning cursor to beginning of
+         current line buffer.
+         """
+-        self._testwrite('rint "hello"' + '\x01' + 'p')
++        self._testwrite('rint "hello"' + manhole.CTRL_A + 'p')
+         d = self.recvlineClient.expect('print "hello"')
+         def cb(ignore):
+             self._assertBuffer(['>>> print "hello"'])
+@@ -321,13 +384,148 @@ class ManholeLoopbackMixin:
+         CTRL-E can be used as END - setting cursor to end of current
+         line buffer.
+         """
+-        self._testwrite('rint "hello' + '\x01' + 'p' + '\x05' + '"')
++        self._testwrite(
++            'rint "hello' + manhole.CTRL_A + 'p' + manhole.CTRL_E + '"')
+         d = self.recvlineClient.expect('print "hello"')
+         def cb(ignore):
+             self._assertBuffer(['>>> print "hello"'])
+         return d.addCallback(cb)
+ 
+ 
++    def test_tabAtStart(self):
++        """
++        Tab at the start of a line with completion enabled yields a literal tab
++        character represented as four spaces.
++        """
++        self._testwrite(b"__manhole__.completion = True\n")
++        self._testwrite(
++            manhole.TAB + b"print 'some bytes'")
++        d = self.recvlineClient.expect(b"    print 'some bytes'")
++        def cb(ignore):
++            self._assertBuffer([
++                b">>> __manhole__.completion = True",
++                b">>>     print 'some bytes'",
++            ])
++        return d.addCallback(cb)
++
++
++    def test_twoTabsAtStart(self):
++        """
++        Two tabs at the start of a line with completion enabled yields two
++        literal tab characters represented as four spaces.
++        """
++        self._testwrite(b"__manhole__.completion = True\n")
++        self._testwrite(
++            manhole.TAB + manhole.TAB + b"print 'some bytes'")
++        d = self.recvlineClient.expect(b"        print 'some bytes'")
++        def cb(ignore):
++            self._assertBuffer([
++                b">>> __manhole__.completion = True",
++                b">>>         print 'some bytes'",
++            ])
++        return d.addCallback(cb)
++
++
++    def test_whitespaceAtStart(self):
++        """
++        Whitespace at the start of a line with completion enabled yields tabs
++        when the tab key is pressed.
++        """
++        self._testwrite(b"__manhole__.completion = True\n")
++        self._testwrite(
++            b"  " + manhole.TAB + b"print 'some bytes'")
++        d = self.recvlineClient.expect(b"print 'some bytes'")
++        def cb(ignore):
++            self._assertBuffer([
++                b">>> __manhole__.completion = True",
++                b">>>     print 'some bytes'",
++            ])
++        return d.addCallback(cb)
++
++
++    def test_tabCompleteEnabled(self):
++        """
++        A tab-complete request will complete the current input when
++        tab-completion is enabled.
++        """
++        self._testwrite(b"__manhole__.completion = True\n")
++        self._testwrite(b"qwertyuiop = object()\n")
++        self._testwrite(
++            b"qwertyuio" + manhole.TAB + " # expect")
++        d = self.recvlineClient.expect(b" # expect")
++        def cb(ignore):
++            self._assertBuffer([
++                b">>> __manhole__.completion = True",
++                b">>> qwertyuiop = object()",
++                b">>> qwertyuiop # expect",
++            ])
++        return d.addCallback(cb)
++
++
++    def test_tabCompleteMultipleResults(self):
++        """
++        A tab-complete request will complete the current input when
++        tab-completion is enabled.
++        """
++        self._testwrite(b"__manhole__.completion = True\n")
++        self._testwrite(b"qwertyuiop = object()\n")
++        self._testwrite(b"qwertyuiom = object()\n")
++        self._testwrite(
++            b"qwertyuio" + manhole.TAB + " # expect")
++        d = self.recvlineClient.expect(b" # expect")
++        def cb(ignore):
++            self._assertBuffer([
++                b">>> __manhole__.completion = True",
++                b">>> qwertyuiop = object()",
++                b">>> qwertyuiom = object()",
++                b">>> qwertyuio",
++                b"qwertyuiom   qwertyuiop",
++                b"",
++                b">>> qwertyuio # expect",
++            ])
++        return d.addCallback(cb)
++
++
++    def test_tabCompleteDisabled(self):
++        """
++        A tab-complete request will not complete the current input when
++        tab-completion is enabled.
++        """
++        self._testwrite(b"__manhole__.completion = False\n")
++        self._testwrite(b"complete_me = object()\n")
++        self._testwrite(
++            b"compl" + manhole.TAB + " # expect")
++        d = self.recvlineClient.expect(b" # expect")
++        def cb(ignore):
++            self._assertBuffer([
++                b">>> __manhole__.completion = False",
++                b">>> complete_me = object()",
++                b">>> compl    # expect",
++            ])
++        return d.addCallback(cb)
++
++
++    def test_nothingToComplete(self):
++        """
++        A tab-complete request which fails will not change the current line.
++        """
++        self._testwrite(b"__manhole__.completion = True\n")
++        self._testwrite(b"try: del qwertyuiop\n")
++        self._testwrite(b"except NameError: pass\n\n")
++        self._testwrite(
++            b"qwertyuio" + manhole.TAB + " # expect")
++        d = self.recvlineClient.expect(b"# expect")
++        def cb(ignore):
++            self._assertBuffer([
++                b">>> __manhole__.completion = True",
++                b">>> try: del qwertyuiop",
++                b"... except NameError: pass",
++                b"... ",
++                b">>> qwertyuio # expect",
++            ])
++        return d.addCallback(cb)
++
++
+     def testDeferred(self):
+         self._testwrite(
+             "from twisted.internet import defer, reactor\n"
+@@ -370,3 +568,41 @@ class ManholeLoopbackStdio(_StdioMixin, unittest.TestCase, ManholeLoopbackMixin)
+         skip = "Terminal requirements missing, can't run manhole tests over stdio"
+     else:
+         serverProtocol = stdio.ConsoleManhole
++
++
++
++class ManholeControlTests(unittest.TestCase):
++    """
++    Tests for L{manhole.ManholeControl}.
++    """
++
++    def setUp(self):
++        self.manhole = manhole.Manhole()
++        self.mc = manhole.ManholeControl(self.manhole)
++
++
++    def test_storesManhole(self):
++        """
++        The C{manhole} argument passed to L{ManholeControl} is stored as
++        C{_manhole}.
++        """
++        self.assertIs(self.manhole, self.mc._manhole)
++
++
++    def test_getCompletion(self):
++        """
++        L{ManholeControl.completion} returns the value of the C{completion}
++        property of the manhole.
++        """
++        self.manhole.completion = object()
++        self.assertIs(self.mc.completion, self.manhole.completion)
++
++
++    def test_setCompletion(self):
++        """
++        L{ManholeControl.completion} sets the C{completion} property of the
++        manhole.
++        """
++        self.manhole.completion = False
++        self.mc.completion = True
++        self.assertTrue(self.manhole.completion)
+diff --git twisted/manhole/service.py twisted/manhole/service.py
+index c9d4679..b670ad2 100644
+--- twisted/manhole/service.py
++++ twisted/manhole/service.py
+@@ -17,13 +17,10 @@ from zope.interface import implements, Interface
+ # sibling imports
+ import explorer
+ 
+-# system imports
+-from cStringIO import StringIO
+-
+ import string
+ import sys
+ import traceback
+-import types
++
+ 
+ 
+ class FakeStdIO:
+@@ -67,6 +64,7 @@ class FakeStdIO:
+                 block_begin = i
+ 
+ 
++
+ class IManholeClient(Interface):
+     def console(list_of_messages):
+         """Takes a list of (type, message) pairs to display.
+@@ -82,16 +80,20 @@ class IManholeClient(Interface):
+             - \"exception\" -- a L{failure.Failure}
+         """
+ 
++
+     def receiveExplorer(xplorer):
+         """Receives an explorer.Explorer
+         """
+ 
++
+     def listCapabilities():
+         """List what manholey things I am capable of doing.
+ 
+         i.e. C{\"Explorer\"}, C{\"Failure\"}
+         """
+ 
++
++
+ def runInConsole(command, console, globalNS=None, localNS=None,
+                  filename=None, args=None, kw=None, unsafeTracebacks=False):
+     """Run this, directing all output to the specified console.

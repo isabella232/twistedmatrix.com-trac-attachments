@@ -1,0 +1,204 @@
+diff --git a/twisted/cred/test/test_cred.py b/twisted/cred/test/test_cred.py
+index e639d0d..110911d 100644
+--- a/twisted/cred/test/test_cred.py
++++ b/twisted/cred/test/test_cred.py
+@@ -16,6 +16,7 @@ from twisted.python.compat import nativeString, networkString
+ from twisted.python import components
+ from twisted.internet import defer
+ from twisted.cred import checkers, credentials, portal, error
++from twisted.test.proto_helpers import LogCapture
+ 
+ try:
+     from crypt import crypt
+@@ -213,7 +214,10 @@ class OnDiskDatabaseTests(unittest.TestCase):
+         """
+         self.db = checkers.FilePasswordDB('test_thisbetternoteverexist.db')
+ 
+-        self.failUnlessRaises(error.UnauthorizedLogin, self.db.getUser, 'user')
++        with LogCapture() as lc:
++            self.failUnlessRaises(error.UnauthorizedLogin, self.db.getUser, '')
++            self.assertIn('Unable to load credentials db: IOError', lc.asText)
++
+ 
+ 
+     def testUserLookup(self):
+diff --git a/twisted/internet/test/test_protocol.py b/twisted/internet/test/test_protocol.py
+index 1a4c5a7..c488e41 100644
+--- a/twisted/internet/test/test_protocol.py
++++ b/twisted/internet/test/test_protocol.py
+@@ -18,8 +18,9 @@ from twisted.internet.protocol import (
+     Protocol, ClientCreator, Factory, ProtocolToConsumerAdapter,
+     ConsumerToProtocolAdapter)
+ from twisted.trial.unittest import TestCase
+-from twisted.test.proto_helpers import MemoryReactorClock, StringTransport
+-from twisted.logger import LogLevel, globalLogPublisher
++from twisted.test.proto_helpers import (
++    MemoryReactorClock, StringTransport, LogCapture)
++from twisted.logger import LogLevel
+ 
+ 
+ 
+@@ -399,18 +400,14 @@ class FactoryTests(TestCase):
+         L{Factory.doStart} logs that it is starting a factory, followed by
+         the L{repr} of the L{Factory} instance that is being started.
+         """
+-        events = []
+-        globalLogPublisher.addObserver(events.append)
+-        self.addCleanup(
+-            lambda: globalLogPublisher.removeObserver(events.append))
+-
+         f = Factory()
+-        f.doStart()
+-
+-        self.assertIs(events[0]['factory'], f)
+-        self.assertEqual(events[0]['log_level'], LogLevel.info)
+-        self.assertEqual(events[0]['log_format'],
+-                         'Starting factory {factory!r}')
++        with LogCapture() as lc:
++            f.doStart()
++            self.assertIs(lc.asEvents[0]['factory'], f)
++            self.assertEqual(lc.asEvents[0]['log_level'], LogLevel.info)
++            self.assertIn(
++                'Starting factory <twisted.internet.protocol.Factory instance',
++                lc.asText)
+ 
+ 
+     def test_doStopLoggingStatement(self):
+@@ -418,21 +415,20 @@ class FactoryTests(TestCase):
+         L{Factory.doStop} logs that it is stopping a factory, followed by
+         the L{repr} of the L{Factory} instance that is being stopped.
+         """
+-        events = []
+-        globalLogPublisher.addObserver(events.append)
+-        self.addCleanup(
+-            lambda: globalLogPublisher.removeObserver(events.append))
+ 
+         class MyFactory(Factory):
+             numPorts = 1
+ 
+         f = MyFactory()
+-        f.doStop()
+ 
+-        self.assertIs(events[0]['factory'], f)
+-        self.assertEqual(events[0]['log_level'], LogLevel.info)
+-        self.assertEqual(events[0]['log_format'],
+-                         'Stopping factory {factory!r}')
++        with LogCapture() as lc:
++            f.doStop()
++            self.assertIs(lc.asEvents[0]['factory'], f)
++            self.assertEqual(lc.asEvents[0]['log_level'], LogLevel.info)
++            self.assertIn(
++                'Stopping factory '
++                '<twisted.internet.test.test_protocol.MyFactory instance',
++                lc.asText)
+ 
+ 
+ 
+diff --git a/twisted/test/proto_helpers.py b/twisted/test/proto_helpers.py
+index 3b0d27f..5bab462 100644
+--- a/twisted/test/proto_helpers.py
++++ b/twisted/test/proto_helpers.py
+@@ -9,13 +9,17 @@ Assorted functionality which is commonly useful when writing unit tests.
+ from __future__ import division, absolute_import
+ 
+ from socket import AF_INET, AF_INET6
+-from io import BytesIO
++from io import BytesIO, StringIO
+ 
+ from zope.interface import implementer, implementedBy
+ from zope.interface.verify import verifyClass
+ 
+ from twisted.python import failure
+ from twisted.python.compat import unicode
++from twisted.logger import (
++    FilteringLogObserver, ILogFilterPredicate, LogLevel, PredicateResult,
++    globalLogPublisher, textFileLogObserver
++)
+ from twisted.internet.interfaces import (
+     ITransport, IConsumer, IPushProducer, IConnector, IReactorTCP, IReactorSSL,
+     IReactorUNIX, IReactorSocket, IListeningPort, IReactorFDSet
+@@ -688,3 +692,84 @@ class RaisingMemoryReactor(object):
+         Fake L{reactor.connectUNIX}, that raises L{self._connectException}.
+         """
+         raise self._connectException
++
++
++
++@implementer(ILogFilterPredicate)
++class NamespaceFilterPredicate(object):
++    """
++    L{ILogFilterPredicate} that filters out events not matching configured
++    namespace.
++    """
++
++    def __init__(self, namespace):
++        self.namespace = namespace
++
++    def __call__(self, event):
++        namespace = event.get("log_namespace", None)
++
++        if namespace != self.namespace:
++            return PredicateResult.no
++
++        return PredicateResult.maybe
++
++
++
++class LogCapture(object):
++    """
++    A context manager that captures log events and makes them available in
++    plain text format or as raw events list.
++
++    Can be used like this:
++
++    with LogCapture() as lc:
++        [... code that logs events ...]
++
++        self.assertIn('logline text', lc.asText)
++        self.assertNotIn('Unable to format event', lc.asText)
++        selc.assertEqual(lc.asEvents[0]['log_level'], Loglevel.debug)
++
++    """
++
++    def __init__(self, namespace=None):
++        self.events = []
++        self.eventsObserver = lambda e: self.events.append(e)
++        self.handle = StringIO()
++        self.textObserver = textFileLogObserver(self.handle)
++
++        if namespace is not None:
++            predicate = NamespaceFilterPredicate(namespace)
++            self.eventsObserver = FilteringLogObserver(
++                self.eventsObserver, [predicate])
++            self.textObserver = FilteringLogObserver(
++                self.textObserver, [predicate])
++
++    def __enter__(self):
++        globalLogPublisher.addObserver(self.eventsObserver)
++        globalLogPublisher.addObserver(self.textObserver)
++        return self
++
++    def __exit__(self, type_, value_, tb_):
++        globalLogPublisher.removeObserver(self.eventsObserver)
++        globalLogPublisher.removeObserver(self.textObserver)
++
++    @property
++    def asText(self):
++        """
++        Get captured events as a string, the same a textFileLogObserver would
++        write to the output file
++
++        @return: the full log textual output
++        @rtype: L{str}
++        """
++        return self.handle.getvalue()
++
++    @property
++    def asEvents(self):
++        """
++        Get captured events as a list of event dicts.
++
++        @return: the list of captured events
++        @rtype: L{list}
++        """
++        return self.events[:]

@@ -1,0 +1,386 @@
+Index: twisted/words/test/test_jabberxmlstream.py
+===================================================================
+--- twisted/words/test/test_jabberxmlstream.py	(révision 30631)
++++ twisted/words/test/test_jabberxmlstream.py	(copie de travail)
+@@ -5,6 +5,8 @@
+ Tests for L{twisted.words.protocols.jabber.xmlstream}.
+ """
+ 
++import zlib
++
+ from twisted.trial import unittest
+ 
+ from zope.interface.verify import verifyObject
+@@ -20,6 +22,8 @@
+ 
+ 
+ NS_XMPP_TLS = 'urn:ietf:params:xml:ns:xmpp-tls'
++NS_XMPP_FEATURE_COMPRESS = "http://jabber.org/features/compress"
++NS_XMPP_COMPRESS = "http://jabber.org/protocol/compress"
+ 
+ 
+ 
+@@ -1302,3 +1306,151 @@
+         xs2 = self.factory.buildProtocol(None)
+         self.assertNotIdentical(xs1, xs2)
+         self.assertNotIdentical(xs1.authenticator, xs2.authenticator)
++
++
++
++class CompressedTransportTest(unittest.TestCase):
++    def setUp(self):
++        self.output = []
++        self.done = []
++
++        self.authenticator = xmlstream.Authenticator()
++        self.xmlstream = xmlstream.XmlStream(self.authenticator)
++        self.xmlstream.transport = proto_helpers.StringTransport()
++        self.xmlstream.connectionMade()
++        self.xmlstream.dataReceived("<stream:stream xmlns='jabber:client' "
++                        "xmlns:stream='http://etherx.jabber.org/streams' "
++                        "from='example.com' id='12345' version='1.0'>")
++        self.compressed = xmlstream.CompressedTransport(self.xmlstream)
++
++
++    def testMakeConnection(self):
++        """
++        Test wrapping the transport
++        """
++        self.xmlstream.connectionMade = lambda: self.done.append("connMade")
++        self.compressed.makeConnection(self.xmlstream.transport)
++        self.assertTrue(self.xmlstream.transport is self.compressed)
++        self.assertEquals(["connMade"], self.done)
++
++
++    def testWrite(self):
++        """
++        Test data compression
++        """
++        self.xmlstream.transport.write = self.done.append
++        self.compressed.makeConnection(self.xmlstream.transport)
++
++        data = "x" * 100
++        compressed_data = zlib.compress(data)
++        self.xmlstream.send(data)
++
++        self.assertTrue(len(self.done) > 0)
++        # there is a difference in content due to the compression methods
++        # used (stream vs. block) but the lengths can be checked
++        self.assertEquals(len(compressed_data), len(self.done[0]))
++
++
++    def testRead(self):
++        """
++        Test data decompression
++        """
++        self.xmlstream.dataReceived = self.done.append
++        self.compressed.makeConnection(self.xmlstream.transport)
++        data = "x" * 100
++        self.compressed.dataReceived(zlib.compress(data))
++        self.assertEquals([data], self.done)
++
++
++
++class CompressInitiatingInitializerTest(unittest.TestCase):
++    def setUp(self):
++        self.output = []
++
++        self.authenticator = xmlstream.Authenticator()
++        self.xmlstream = xmlstream.XmlStream(self.authenticator)
++        self.xmlstream.send = self.output.append
++        self.xmlstream.transport = proto_helpers.StringTransport()
++        feature = domish.Element((NS_XMPP_FEATURE_COMPRESS, 'compression'))
++        feature.addElement('method', None, content="zlib")
++        self.xmlstream.features = {(feature.uri, feature.name): feature}
++        self.xmlstream.connectionMade()
++        self.xmlstream.dataReceived("<stream:stream xmlns='jabber:client' "
++                        "xmlns:stream='http://etherx.jabber.org/streams' "
++                        "from='example.com' id='12345' version='1.0'>")
++
++        self.init = xmlstream.CompressInitiatingInitializer(self.xmlstream)
++
++
++    def testWantedSupported(self):
++        """
++        Test start when compression is wanted.
++        """
++        d = self.init.start()
++        def cb(result):
++            self.assertEquals(result, xmlstream.Reset)
++            self.assertTrue(isinstance(self.xmlstream.transport,
++                                       xmlstream.CompressedTransport))
++        d.addCallback(cb)
++        self.assertTrue(len(self.output) > 0)
++        compress = self.output[0]
++        self.assertEquals('compress', compress.name)
++        self.assertEquals(NS_XMPP_COMPRESS, compress.uri)
++        self.xmlstream.dataReceived("<compressed xmlns='%s'/>"
++                                    % NS_XMPP_COMPRESS)
++        return d
++
++
++    def testTLSAlreadyOn(self):
++        """
++        Test start when compression is wanted and the TLS already set up.
++        """
++        self.xmlstream.transport.TLS = True
++
++        d = self.init.start()
++        d.addCallback(self.assertEquals, None)
++        self.assertEquals([], self.output)
++
++        return d
++
++
++    def testNoMethod(self):
++        """
++        Test start when there is no allowed method
++        """
++        feature = domish.Element((NS_XMPP_FEATURE_COMPRESS, 'compression'))
++        self.xmlstream.features = {(feature.uri, feature.name): feature}
++
++        d = self.init.start()
++        d.addCallback(self.assertEqual, None)
++        self.assertEquals([], self.output)
++
++        return d
++
++
++    def testOtherMethod(self):
++        """
++        Test start when zlib is not an allowed method
++        """
++        feature = domish.Element((NS_XMPP_FEATURE_COMPRESS, 'compression'))
++        feature.addElement('method', None, content="lzma")
++        self.xmlstream.features = {(feature.uri, feature.name): feature}
++
++        d = self.init.start()
++        d.addCallback(self.assertEqual, None)
++        self.assertEquals([], self.output)
++
++        return d
++
++
++    def testFailed(self):
++        """
++        Test failed compression negotiation.
++        """
++        d = self.init.start()
++        self.assertFailure(d, xmlstream.CompressError)
++        self.xmlstream.dataReceived("<failure xmlns='%s'/>" % NS_XMPP_COMPRESS)
++        return d
++
++
++
+Index: twisted/words/test/test_jabberclient.py
+===================================================================
+--- twisted/words/test/test_jabberclient.py	(révision 30631)
++++ twisted/words/test/test_jabberclient.py	(copie de travail)
+@@ -401,14 +401,17 @@
+         self.assertEqual('secret', xs.authenticator.password)
+ 
+         # test list of initializers
+-        version, tls, sasl, bind, session = xs.initializers
++        version, tls, compress, sasl, bind, session = xs.initializers
+ 
+         self.assert_(isinstance(tls, xmlstream.TLSInitiatingInitializer))
++        self.assert_(isinstance(compress,
++                                xmlstream.CompressInitiatingInitializer))
+         self.assert_(isinstance(sasl, SASLInitiatingInitializer))
+         self.assert_(isinstance(bind, client.BindInitializer))
+         self.assert_(isinstance(session, client.SessionInitializer))
+ 
+         self.assertFalse(tls.required)
++        self.assertFalse(compress.required)
+         self.assertTrue(sasl.required)
+         self.assertFalse(bind.required)
+         self.assertFalse(session.required)
+Index: twisted/words/protocols/jabber/xmlstream.py
+===================================================================
+--- twisted/words/protocols/jabber/xmlstream.py	(révision 30631)
++++ twisted/words/protocols/jabber/xmlstream.py	(copie de travail)
+@@ -11,12 +11,15 @@
+ Stanzas.
+ """
+ 
++import zlib
++
+ from zope.interface import directlyProvides, implements
+ 
+ from twisted.internet import defer, protocol
+ from twisted.internet.error import ConnectionLost
+ from twisted.python import failure, log, randbytes
+ from twisted.python.hashlib import sha1
++from twisted.protocols.policies import ProtocolWrapper, WrappingFactory
+ from twisted.words.protocols.jabber import error, ijabber, jid
+ from twisted.words.xish import domish, xmlstream
+ from twisted.words.xish.xmlstream import STREAM_CONNECTED_EVENT
+@@ -36,6 +39,8 @@
+ 
+ NS_STREAMS = 'http://etherx.jabber.org/streams'
+ NS_XMPP_TLS = 'urn:ietf:params:xml:ns:xmpp-tls'
++NS_XMPP_FEATURE_COMPRESS = "http://jabber.org/features/compress"
++NS_XMPP_COMPRESS = "http://jabber.org/protocol/compress"
+ 
+ Reset = object()
+ 
+@@ -446,6 +451,127 @@
+ 
+ 
+ 
++class CompressedTransport(ProtocolWrapper):
++    """
++    Wraps a transport with zlib compression, to implement XEP-0138 (stream
++    compression). Used by L{CompressInitiatingInitializer}.
++    """
++
++    def __init__(self, wrappedProtocol):
++        ProtocolWrapper.__init__(self, WrappingFactory(None), wrappedProtocol)
++        self._compressor = zlib.compressobj()
++        self._decompressor = zlib.decompressobj()
++
++
++    def makeConnection(self, transport):
++        """
++        Connects the factory to us and us to the underlying transport.
++        """
++        ProtocolWrapper.makeConnection(self, transport)
++        transport.protocol = self
++
++
++    def write(self, data):
++        if not data:
++            return
++        compressed = self._compressor.compress(data)
++        compressed += self._compressor.flush(zlib.Z_SYNC_FLUSH)
++        self.transport.write(compressed)
++
++
++    def writeSequence(self, dataSequence):
++        if not dataSequence:
++            return
++        compressed = [ self._compressor.compress(data)
++                       for data in dataSequence ]
++        compressed.append(self._compressor.flush(zlib.Z_SYNC_FLUSH))
++        self.transport.writeSequence(compressed)
++
++
++    def dataReceived(self, data):
++        to_decompress = self._decompressor.unconsumed_tail + data
++        decompressed = self._decompressor.decompress(to_decompress)
++        self.wrappedProtocol.dataReceived(decompressed)
++
++
++    def connectionLost(self, reason):
++        self.dataReceived(self._decompressor.flush())
++        ProtocolWrapper.connectionLost(self, reason)
++
++
++
++class CompressError(Exception):
++    """
++    Exception concerning stream compression (XEP-0138).
++    """
++
++
++
++class CompressInitiatingInitializer(BaseFeatureInitiatingInitializer):
++    """
++    Compressed stream initializer for the initiating entity.
++
++    If it is included in the list of initializers for an XMPP stream, it must
++    be after the TLS initializer. The spec allows stream compression after
++    TLS if TLS negociation failed, or if it is not desired.
++
++    The only supported compression method at the moment is C{zlib}.
++
++    @cvar wanted: indicates if stream compression negotiation is wanted.
++    @type wanted: L{bool}
++    """
++
++    feature = (NS_XMPP_FEATURE_COMPRESS, 'compression')
++    wanted = True
++    _deferred = None
++
++    def onProceed(self, obj):
++        """
++        Proceed and wrap the transport in zlib compression
++        """
++        self.xmlstream.removeObserver('/failure', self.onFailure)
++        compressedTransport = CompressedTransport(self.xmlstream)
++        compressedTransport.makeConnection(self.xmlstream.transport)
++        self._deferred.callback(Reset)
++
++
++    def onFailure(self, obj):
++        self.xmlstream.removeObserver('/compressed', self.onProceed)
++        self._deferred.errback(CompressError())
++
++
++    def start(self):
++        """
++        Start compression negotiation.
++
++        This checks the TLS status and the proposed compression methods.
++        TLS and stream compression are mutually exclusive: XEP-0138 states
++        that compression may be offered if TLS failed.
++
++        If TLS is active or if no proposed compression method is supported,
++        the initialization silently succeeds, moving on to the next step.
++        """
++        if not self.wanted:
++            return defer.succeed(None)
++        if (hasattr(self.xmlstream.transport, "TLS") and
++                self.xmlstream.transport.TLS):
++            return defer.succeed(None)
++
++        allowed_methods = [ str(m) for m in
++                            self.xmlstream.features[self.feature].elements() ]
++        if "zlib" not in allowed_methods:
++            return defer.succeed(None)
++
++        self._deferred = defer.Deferred()
++        self.xmlstream.addOnetimeObserver("/compressed", self.onProceed)
++        self.xmlstream.addOnetimeObserver("/failure", self.onFailure)
++        element = domish.Element((NS_XMPP_COMPRESS, "compress"))
++        element.addElement("method", None, content="zlib")
++        self.xmlstream.send(element)
++        return self._deferred
++
++
++
+ class XmlStream(xmlstream.XmlStream):
+     """
+     XMPP XML Stream protocol handler.
+@@ -1131,6 +1257,8 @@
+            'STREAM_CONNECTED_EVENT', 'STREAM_END_EVENT', 'STREAM_ERROR_EVENT',
+            'STREAM_START_EVENT', 'StreamManager', 'TLSError', 'TLSFailed',
+            'TLSInitiatingInitializer', 'TLSNotSupported', 'TLSRequired',
+-           'TimeoutError', 'XMPPHandler', 'XMPPHandlerCollection', 'XmlStream',
+-           'XmlStreamFactory', 'XmlStreamServerFactory', 'hashPassword',
+-           'toResponse', 'upgradeWithIQResponseTracker']
++           'CompressedTransport', 'CompressInitiatingInitializer',
++           'CompressError', 'TimeoutError', 'XMPPHandler',
++           'XMPPHandlerCollection', 'XmlStream', 'XmlStreamFactory',
++           'XmlStreamServerFactory', 'hashPassword', 'toResponse',
++           'upgradeWithIQResponseTracker']
+Index: twisted/words/protocols/jabber/client.py
+===================================================================
+--- twisted/words/protocols/jabber/client.py	(révision 30631)
++++ twisted/words/protocols/jabber/client.py	(copie de travail)
+@@ -186,6 +186,7 @@
+         xmlstream.ConnectAuthenticator.associateWithStream(self, xs)
+ 
+         inits = [ (xmlstream.TLSInitiatingInitializer, False),
++                  (xmlstream.CompressInitiatingInitializer, False),
+                   (IQAuthInitializer, True),
+                 ]
+ 
+@@ -358,6 +359,7 @@
+ 
+         xs.initializers = [CheckVersionInitializer(xs)]
+         inits = [ (xmlstream.TLSInitiatingInitializer, False),
++                  (xmlstream.CompressInitiatingInitializer, False),
+                   (sasl.SASLInitiatingInitializer, True),
+                   (BindInitializer, False),
+                   (SessionInitializer, False),

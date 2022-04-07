@@ -1,0 +1,335 @@
+Index: static.py
+===================================================================
+--- static.py	(Revision 22798)
++++ static.py	(Arbeitskopie)
+@@ -286,7 +286,55 @@
+         """Return file size."""
+         return self.getsize()
+ 
++    def _handleRangeRequest(self, request, file):
++        """Performs (simple) Range-Header requests. Simple means, that only 
++        the first byte range is handled.
+ 
++        @param file: file handle for the corresponding ressource
++        @type file: file object
++        @raise SyntaxError: The given Byte-Ranges-Specifier was invalid
++        @return: content-length and the number of the byte to where to stop.
++        @rtype: C{int}, C{int}
++        """
++
++        size = self.getFileSize()
++        range = request.getHeader('range')
++        bytesrange = string.split(range, '=')
++        if not (bytesrange[0] == 'bytes'):
++            raise SyntaxError("unsupported Byte-Unit => ignoring range request")
++        start, stop = string.split(bytesrange[1], ',', 1)[0].split('-')
++        if not ((start is not None) or (stop is not None)):
++            raise SyntaxError("syntactically invalid Range-Header, ignore..")
++
++        try:
++            if start:
++                start = int(start)
++                if stop and (int(stop) < size):
++                    stop = int(stop) + 1
++                else:
++                    stop = size
++            else:
++                lastbytes = int(stop)
++                if size < lastbytes:
++                    lastbytes = size
++                start = size - lastbytes
++                stop = size
++        except ValueError, e:
++            raise SyntaxError("invalid byte ranges => ignoring range request")
++
++        file.seek(start)
++        content_length = stop - start
++        if content_length <= 0:
++            request.setResponseCode(http.REQUESTED_RANGE_NOT_SATISFIABLE)
++            content_length = size
++            request.method = 'HEAD' # no msg body will be transferred
++        else:
++            request.setResponseCode(http.PARTIAL_CONTENT)
++            request.setHeader('content-range', "bytes %s-%s/%s" % (str(start), str(stop-1), str(size)))
++
++        return content_length, stop
++
++
+     def render(self, request):
+         """You know what you doing."""
+         self.restat()
+@@ -303,11 +351,8 @@
+         if self.isdir():
+             return self.redirect(request)
+ 
+-        #for content-length
+-        fsize = size = self.getFileSize()
++        request.setHeader('accept-ranges','bytes')
+ 
+-#         request.setHeader('accept-ranges','bytes')
+-
+         if self.type:
+             request.setHeader('content-type', self.type)
+         if self.encoding:
+@@ -325,40 +370,23 @@
+         if request.setLastModified(self.getmtime()) is http.CACHED:
+             return ''
+ 
+-# Commented out because it's totally broken. --jknight 11/29/04
+-#         try:
+-#             range = request.getHeader('range')
+-# 
+-#             if range is not None:
+-#                 # This is a request for partial data...
+-#                 bytesrange = string.split(range, '=')
+-#                 assert bytesrange[0] == 'bytes',\
+-#                        "Syntactically invalid http range header!"
+-#                 start, end = string.split(bytesrange[1],'-')
+-#                 if start:
+-#                     f.seek(int(start))
+-#                 if end:
+-#                     end = int(end)
+-#                     size = end
+-#                 else:
+-#                     end = size
+-#                 request.setResponseCode(http.PARTIAL_CONTENT)
+-#                 request.setHeader('content-range',"bytes %s-%s/%s " % (
+-#                     str(start), str(end), str(size)))
+-#                 #content-length should be the actual size of the stuff we're
+-#                 #sending, not the full size of the on-server entity.
+-#                 fsize = end - int(start)
+-# 
+-#             request.setHeader('content-length', str(fsize))
+-#         except:
+-#             traceback.print_exc(file=log.logfile)
++        # set the stop byte, and content-length
++        content_length = stop = self.getFileSize()
++        
++        if request.getHeader('range') is not None:
++            try:
++                content_length, stop = self._handleRangeRequest(request, f)
++            except SyntaxError, e:
++                log.msg("Warning: " + str(e))
++                request.setResponseCode(http.OK)
++                content_length = stop = self.getFileSize()
+ 
+-        request.setHeader('content-length', str(fsize))
++        request.setHeader('content-length', str(content_length))
+         if request.method == 'HEAD':
+             return ''
+ 
+         # return data
+-        FileTransfer(f, size, request)
++        FileTransfer(f, stop, request)
+         # and make sure the connection doesn't get closed
+         return server.NOT_DONE_YET
+ 
+Index: test/test_web.py
+===================================================================
+--- test/test_web.py	(Revision 22798)
++++ test/test_web.py	(Arbeitskopie)
+@@ -15,8 +15,8 @@
+     uri='http://dummy/'
+     method = 'GET'
+ 
+-    def getHeader(self, h):
+-        return None
++    def getHeader(self, name):
++        return self.headers.get(name.lower(), None)
+ 
+     def registerProducer(self, prod,s):
+         self.go = 1
+@@ -36,6 +36,8 @@
+         self.protoSession = session or server.Session(0, self)
+         self.args = {}
+         self.outgoingHeaders = {}
++        self.headers = {}
++        self.responseCode = None
+ 
+     def setHeader(self, name, value):
+         """TODO: make this assert on write() if the header is content-length
+@@ -56,6 +58,7 @@
+         self.args[name] = [value]
+     def setResponseCode(self, code):
+         assert not self.written, "Response code cannot be set after data has been written: %s." % "@@@@".join(self.written)
++        self.responseCode = code
+     def setLastModified(self, when):
+         assert not self.written, "Last-Modified cannot be set after data has been written: %s." % "@@@@".join(self.written)
+     def setETag(self, tag):
+@@ -535,13 +538,6 @@
+     clientproto = 'HTTP/1.0'
+     sentLength = None
+ 
+-    def __init__(self, *a, **kw):
+-        DummyRequest.__init__(self, *a, **kw)
+-        self.headers = {}
+-
+-    def getHeader(self, h):
+-        return self.headers.get(h.lower(), None)
+-
+     def getClientIP(self):
+         return self.client
+ 
+Index: test/test_static.py
+===================================================================
+--- test/test_static.py	(Revision 22798)
++++ test/test_static.py	(Arbeitskopie)
+@@ -1,64 +1,108 @@
+-from twisted.trial import unittest
+ import os
+-from twisted.web import static
++import tempfile
+ 
+-class FakeRequest:
+-    method = 'GET'
++from twisted.trial import unittest
++from twisted.web import static, http
++from twisted.web.test.test_web import DummyRequest
+ 
+-    _headers = None
+-    _setHeaders = None
+-    _written = ''
+-
+-    def __init__(self):
+-        self._headers = {}
+-        self._setHeaders = {}
+-
+-    def getHeader(self, k):
+-        if self._headers is None:
+-            return None
+-        return self._headers.get(k)
+-
+-    def setHeader(self, k, v):
+-        self._setHeaders.setdefault(k, []).append(v)
+-
+-    def setLastModified(self, x):
+-        pass
+-    def registerProducer(self, producer, x):
+-        producer.resumeProducing()
+-    def unregisterProducer(self):
+-        pass
+-    def finish(self):
+-        pass
+-
+-    def write(self, data):
+-        self._written = self._written + data
+-
+ class Range(unittest.TestCase):
+-    todo = (unittest.FailTest, 'No range support yet.')
+ 
+     def setUp(self):
+-        self.tmpdir = self.mktemp()
+-        os.mkdir(self.tmpdir)
+-        name = os.path.join(self.tmpdir, 'junk')
+-        f = file(name, 'w')
+-        f.write(8000 * 'x')
+-        f.close()
+-        self.file = static.File(name)
+-        self.request = FakeRequest()
++        self.file = tempfile.NamedTemporaryFile()
++        self.payload = '\xf8u\xf3E\x8c7\xce\x00\x9e\xb6a0y0S\xf0\xef\xac\xb7\xbe\xb5\x17M\x1e\x136k{\x1e\xbe\x0c\x07\x07\t\xd0\xbckY\xf5I\x0b\xb8\x88oZ\x1d\x85b\x1a\xcdk\xf2\x1d&\xfd%\xdd\x82q/A\x10Y\x8b'
++        self.file.write(self.payload)
++        self.file.flush()
++        
++        self.resource = static.File(self.file.name)
++        self.resource.isLeaf = 1
++        self.request = DummyRequest([''])        
++        self.request.uri = self.file.name
++        self.file.seek(0)
+ 
++    def tearDown(self):
++        self.file.close()
++
+     def testBodyLength(self):
+-        self.request._headers['range'] = 'bytes=0-1999'
+-        self.file.render(self.request)
+-        self.assertEquals(len(self.request._written), 2000)
++        self.request.headers['range'] = 'bytes=0-43'
++        self.resource.render(self.request)
++        self.assertEquals(len(''.join(self.request.written)), 44)
+ 
++    def testBodyContent(self):
++        self.request.headers['range'] = 'bytes=3-43'
++        self.resource.render(self.request)
++        self.assertEquals(''.join(self.request.written), self.payload[3:44])
++
+     def testContentLength(self):
+         """Content-Length of a request is correct."""
+-        self.request._headers['range'] = 'bytes=0-1999'
+-        self.file.render(self.request)
+-        self.assertEquals(self.request._setHeaders['content-length'], ['2000'])
++        self.request.headers['range'] = 'bytes=0-43'
++        self.resource.render(self.request)
++        self.assertEquals(self.request.outgoingHeaders['content-length'], '44')
+ 
+     def testContentRange(self):
+         """Content-Range of a request is correct."""
+-        self.request._headers['range'] = 'bytes=0-1999'
+-        self.file.render(self.request)
+-        self.assertEquals(self.request._setHeaders.get('content-range'), ['bytes 0-1999/8000'])
++        self.request.headers['range'] = 'bytes=0-43'
++        self.resource.render(self.request)
++        self.assertEquals(self.request.outgoingHeaders['content-range'], 'bytes 0-43/64')
++
++    def testStatusCodePartialContent(self):
++        """Test if the correct status code 206 is submitted."""
++        self.request.headers['range'] = 'bytes=0-43'
++        self.resource.render(self.request)
++        self.assertEquals(self.request.responseCode, http.PARTIAL_CONTENT)
++
++    def testStatusCodeRequestedRangeNotSatisfiable(self):
++        """Test if the correct status code 416 is submitted."""
++        self.request.headers['range'] = 'bytes=20-13'
++        self.resource.render(self.request)
++        self.assertEquals(self.request.responseCode, http.REQUESTED_RANGE_NOT_SATISFIABLE)
++
++    def testFirstByteSupport(self):
++        """Test if all is correct handled if end-byte is omitted."""
++        self.request.headers['range'] = 'bytes=23-'
++        self.resource.render(self.request)
++        self.assertEquals(''.join(self.request.written), self.payload[23:])
++        self.assertEquals(len(''.join(self.request.written)), 41)
++        self.assertEquals(self.request.outgoingHeaders['content-range'], 'bytes 23-63/64')
++        self.assertEquals(self.request.outgoingHeaders['content-length'], '41')
++
++    def testLastByteSupport(self):
++        """Test if all is correct handled if start-byte is omitted."""
++        self.request.headers['range'] = 'bytes=-17'
++        self.resource.render(self.request)
++        self.assertEquals(''.join(self.request.written), self.payload[-17:])
++        self.assertEquals(len(''.join(self.request.written)), 17)
++        self.assertEquals(self.request.outgoingHeaders['content-range'], 'bytes 47-63/64')
++        self.assertEquals(self.request.outgoingHeaders['content-length'], '17')
++
++    def testInvalidByteRangeNoStartNoEnd(self):
++        """Test what happens when start and end is missing."""
++        self.request.headers['range'] = 'bytes=-'
++        self.resource.render(self.request)
++        self.assertEquals(self.request.responseCode, http.OK)
++        self.assertEquals(len(''.join(self.request.written)), 64)
++        self.assertEquals(''.join(self.request.written), self.payload)
++
++    def testInvalidByteRangeStartGreaterEnd(self):
++        """Test what happens if start byte is greate than end byte."""
++        self.request.headers['range'] = 'bytes=23-21'
++        self.resource.render(self.request)
++        self.assertEquals(self.request.responseCode, http.REQUESTED_RANGE_NOT_SATISFIABLE)
++        self.assertEquals(len(''.join(self.request.written)), 0)
++
++    def testMultipleRanges(self):
++        """Test the response if multiple ranges are given. As the RFC2616 
++        says, we only have to return just on range. See section 14.16 
++        paragraph starting with: "Unlike byte-ranges-specifier"."""
++        self.request.headers['range'] = 'bytes=23-43,17-28'
++        self.resource.render(self.request)
++        self.assertEquals(self.request.responseCode, http.PARTIAL_CONTENT)
++        self.assertEquals(len(''.join(self.request.written)), 21)
++        self.assertEquals(''.join(self.request.written), self.payload[23:44])
++
++    def testInvalidByteRangeContainingNaNs(self):
++        """Test whats happening if the byte range has NaN in it."""
++        self.request.headers['range'] = 'bytes=-abc#'
++        self.resource.render(self.request)
++        self.assertEquals(self.request.responseCode, http.OK)
++        self.assertEquals(len(''.join(self.request.written)), 64)
++        self.assertEquals(''.join(self.request.written), self.payload)

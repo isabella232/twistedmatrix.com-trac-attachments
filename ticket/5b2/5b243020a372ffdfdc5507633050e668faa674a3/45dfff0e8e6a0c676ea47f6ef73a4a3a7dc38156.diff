@@ -1,0 +1,994 @@
+Index: TwistedCore-2.5.0/twisted/enterprise/adbapi.py
+===================================================================
+--- TwistedCore-2.5.0/twisted/enterprise/adbapi.py	(revision 4949)
++++ TwistedCore-2.5.0/twisted/enterprise/adbapi.py	(working copy)
+@@ -7,6 +7,7 @@
+ An asynchronous mapping to U{DB-API 2.0<http://www.python.org/topics/database/DatabaseAPI-2.0.html>}.
+ """
+ 
++
+ from twisted.internet import defer, threads
+ from twisted.python import reflect, log
+ from twisted.enterprise.util import safe # backwards compat
+@@ -16,176 +17,88 @@
+     """This exception means that a db connection has been lost.
+     Client code may try again."""
+     pass
+-    
+-    
+-class Connection(object):
+-    """A wrapper for a DB-API connection instance.
+-    
+-    The wrapper passes almost everything to the wrapped connection and so has
+-    the same API. However, the Connection knows about its pool and also
+-    handle reconnecting should when the real connection dies.
+-    """
+-    
+-    def __init__(self, pool):
+-        self._pool = pool
+-        self._connection = None
+-        self.reconnect()
+-        
+-    def close(self):
+-        # The way adbapi works right now means that closing a connection is
+-        # a really bad thing  as it leaves a dead connection associated with
+-        # a thread in the thread pool.
+-        # Really, I think closing a pooled connection should return it to the
+-        # pool but that's handled by the runWithConnection method already so,
+-        # rather than upsetting anyone by raising an exception, let's ignore
+-        # the request
+-        pass
+-        
+-    def rollback(self):
+-        if not self._pool.reconnect:
+-            self._connection.rollback()
+-            return
+ 
+-        try:
+-            self._connection.rollback()
+-            curs = self._connection.cursor()
+-            curs.execute(self._pool.good_sql)
+-            curs.close()
+-            self._connection.commit()
+-            return
+-        except:
+-            pass
+ 
+-        self._pool.disconnect(self._connection)
+-
+-        if self._pool.noisy:
+-            log.msg('Connection lost.')
+-
+-        raise ConnectionLost()
+-
+-    def reconnect(self):
+-        if self._connection is not None:
+-            self._pool.disconnect(self._connection)
+-        self._connection = self._pool.connect()
+-        
+-    def __getattr__(self, name):
+-        return getattr(self._connection, name)
+-        
+-        
+-class Transaction:
+-    """A lightweight wrapper for a DB-API 'cursor' object.
+-
+-    Relays attribute access to the DB cursor. That is, you can call
+-    execute(), fetchall(), etc., and they will be called on the
+-    underlying DB-API cursor object. Attributes will also be
+-    retrieved from there.
+-    """
+-    _cursor = None
+-
+-    def __init__(self, pool, connection):
+-        self._pool = pool
+-        self._connection = connection
+-        self.reopen()
+-
+-    def close(self):
+-        _cursor = self._cursor
+-        self._cursor = None
+-        _cursor.close()
+-
+-    def reopen(self):
+-        if self._cursor is not None:
+-            self.close()
+-
+-        try:
+-            self._cursor = self._connection.cursor()
+-            return
+-        except:
+-            if not self._pool.reconnect:
+-                raise
+-
+-        if self._pool.noisy:
+-            log.msg('Connection lost, reconnecting')
+-
+-        self.reconnect()
+-        self._cursor = self._connection.cursor()
+-
+-    def reconnect(self):
+-        self._connection.reconnect()
+-        self._cursor = None
+-
+-    def __getattr__(self, name):
+-        return getattr(self._cursor, name)
+-
+-
+-class ConnectionPool:
++class ConnectionPool(object):
+     """I represent a pool of connections to a DB-API 2.0 compliant database.
+     """
+ 
+-    CP_ARGS = "min max name noisy openfun reconnect good_sql".split()
+-
+-    noisy = True # if true, generate informational log messages
+-    min = 3 # minimum number of connections in pool
+-    max = 5 # maximum number of connections in pool
+     name = None # Name to assign to thread pool for debugging
+-    openfun = None # A function to call on new connections
+-    reconnect = False # reconnect when connections fail
+-    good_sql = 'select 1' # a query which should always succeed
+-
+     running = False # true when the pool is operating
+ 
+-    def __init__(self, dbapiName, *connargs, **connkw):
++    def __init__(self, connfactory, *args, **kwargs):
+         """Create a new ConnectionPool.
+ 
+-        Any positional or keyword arguments other than those documented here
+-        are passed to the DB-API object when connecting. Use these arguments to
+-        pass database names, usernames, passwords, etc.
++	NOTE: The old style API will still work.  dbapiName is passed
++	instead of connfactory, and the following options are
++	supported: cp_openfun, cp_min, cp_max, cp_noisy, cp_reconnect,
++	cp_good_sql.
++	
+ 
+-        @param dbapiName: an import string to use to obtain a DB-API compatible
+-                          module (e.g. 'pyPgSQL.PgSQL')
++	@param connfactory: the ConnectionFactory instance that will
++	                    create Connections
+ 
+-        @param cp_min: the minimum number of connections in pool (default 3)
++        @param minconn: the minimum number of connections in pool (default 3)
+ 
+-        @param cp_max: the maximum number of connections in pool (default 5)
++        @param maxconn: the maximum number of connections in pool (default 5)
+ 
+-        @param cp_noisy: generate informational log messages during operation
+-                         (default False)
+-
+-        @param cp_openfun: a callback invoked after every connect() on the
+-                           underlying DB-API object. The callback is passed a
+-                           new DB-API connection object.  This callback can
+-                           setup per-connection state such as charset,
+-                           timezone, etc.
+-
+-        @param cp_reconnect: detect connections which have failed and reconnect
+-                             (default False). Failed connections may result in
+-                             ConnectionLost exceptions, which indicate the
+-                             query may need to be re-sent.
+-
+-        @param cp_good_sql: an sql query which should always succeed and change
+-                            no state (default 'select 1')
++        @param noisy: generate informational log messages during operation
++	              (default False)
+         """
++	
++	self.noisy = False
++	self.min = 3
++	self.max = 5
+ 
+-        self.dbapiName = dbapiName
+-        self.dbapi = reflect.namedModule(dbapiName)
++	if isinstance(connfactory, ConnectionFactory):
++	    # new style API
++	    self.connfactory = connfactory
+ 
+-        if getattr(self.dbapi, 'apilevel', None) != '2.0':
+-            log.msg('DB API module not DB API 2.0 compliant.')
++	    if 'minconn' in kwargs.keys():
++		self.min = kwargs['minconn']
++		del kwargs['minconn']
++	    if 'maxconn' in kwargs.keys():
++		self.max = kwargs['maxconn']
++		del kwargs['maxconn']
++	    if 'noisy' in kwargs.keys():
++		self.noisy = kwargs['noisy']
++		del kwargs['noisy']
+ 
+-        if getattr(self.dbapi, 'threadsafety', 0) < 1:
+-            log.msg('DB API module not sufficiently thread-safe.')
++	    if len(args) > 0:
++		raise TypeError, "ConnectionPool.__init__() takes at "\
++		    "most 1 argument (%d given)" % (len(args) + 1,)
++	    if len(kwargs.keys()) > 0:
++		raise TypeError, "ConnectionPool.__init__() got an "\
++		    "unexpected keyword argument '%s'" % (kwargs.keys()[0],)
++	else:
++	    # old style API
++	    dbapiName = connfactory
+ 
+-        self.connargs = connargs
+-        self.connkw = connkw
++	    # look for old style kwargs and redo them
++	    connargs = args
++	    kwconnargs = {}
++	    for arg in kwargs.keys():
++		if arg == 'cp_min':
++		    self.min = kwargs[arg]
++		elif arg == 'cp_max':
++		    self.max = kwargs[arg]
++		elif arg == 'cp_noisy':
++		    self.noisy = kwargs[arg]
++		elif arg == 'cp_reconnect':
++		    kwconnargs['adb_reconnect'] = kwargs[arg]
++		elif arg == 'cp_openfun':
++		    kwconnargs['adb_openfun'] = kwargs[arg]
++		elif arg == 'cp_good_sql':
++		    pass
++		else:
++		    kwconnargs[arg] = kwargs[arg]
++	    
++	    self.connfactory = GenericConnectionFactory(
++		dbapiName, *connargs, **kwconnargs)
+ 
+-        for arg in self.CP_ARGS:
+-            cp_arg = 'cp_%s' % arg
+-            if connkw.has_key(cp_arg):
+-                setattr(self, arg, connkw[cp_arg])
+-                del connkw[cp_arg]
++	self.min = min(self.min, self.max)
++	self.max = max(self.min, self.max)
+ 
+-        self.min = min(self.min, self.max)
+-        self.max = max(self.min, self.max)
+-
+         self.connections = {}  # all connections, hashed on thread id
+ 
+         # these are optional so import them here
+@@ -218,18 +131,34 @@
+             self.running = True
+             
+     def runWithConnection(self, func, *args, **kw):
++	"""Run an arbitrary function with a database connection from
++	the pool, and return its results.
++
++	NOTE: The function you pass in is not run in the main thread.
++	Also, any data manipulations are not guarunteed to happen
++	inside a transaction block.  If you need transactions, use
++	runInteraction or do them yourself explicitly (by executing
++	'BEGIN' and 'COMMIT' for instance).
++
++        @param func: a callable object whose first argument is
++            L{adbapi.Connection}. *args,**kw will be passed as
++            additional arguments.
++
++        @return: a Deferred which will fire the return value of
++            'interaction(Transaction(...))', or a Failure.
++	"""
+         return self._deferToThread(self._runWithConnection,
+                                    func, *args, **kw)
+ 
+     def _runWithConnection(self, func, *args, **kw):
+-        conn = Connection(self)
+-        try:
+-            result = func(conn, *args, **kw)
+-            conn.commit()
+-            return result
+-        except:
+-            conn.rollback()
+-            raise
++        conn = self.getConnection()
++	try:
++	    result = func(conn, *args, **kw)
++	    conn.commit()
++	except Exception, e:
++	    conn.rollback()
++	    raise
++	return result
+         
+     def runInteraction(self, interaction, *args, **kw):
+         """Interact with the database and return the result.
+@@ -267,17 +196,21 @@
+         of DB-API being used, but the first argument in *args be an SQL
+         statement. The result of a subsequent cursor.fetchall() will be
+         fired to the Deferred which is returned. If either the 'execute' or
+-        'fetchall' methods raise an exception, the transaction will be rolled
+-        back and a Failure returned.
++        'fetchall' methods raise an exception a Failure will be returned.
+ 
+         The  *args and **kw arguments will be passed to the DB-API cursor's
+         'execute' method.
+ 
++	NOTE: The query is not guarunteed to run inside a transaction
++	block.  This should not normally be a problem as this method
++	is intended for single queries.  If you need a transaction
++	block you will need to use runInteraction or handle it yourself.
++
+         @return: a Deferred which will fire the return value of a DB-API
+         cursor's 'fetchall' method, or a Failure.
+         """
+ 
+-        return self.runInteraction(self._runQuery, *args, **kw)
++        return self.runWithConnection(self._runQuery, *args, **kw)
+ 
+     def runOperation(self, *args, **kw):
+         """Execute an SQL query and return None.
+@@ -288,16 +221,22 @@
+         statement. This method will not attempt to fetch any results from the
+         query and is thus suitable for INSERT, DELETE, and other SQL statements
+         which do not return values. If the 'execute' method raises an
+-        exception, the transaction will be rolled back and a Failure returned.
++        exception, a Failure will be returned.
+ 
+         The args and kw arguments will be passed to the DB-API cursor's
+         'execute' method.
+ 
+-        return: a Deferred which will fire None or a Failure.
++	NOTE: The query is not guarunteed to run inside a transaction
++	block.  This should not normally be a problem as this method
++	is intended for single queries.  If you need a transaction
++	block you will need to use runInteraction or handle it yourself.
++
++        @return: a Deferred which will fire None or a Failure.
+         """
++	
++	kw['adb_operation'] = True
++        return self.runWithConnection(self._runQuery, *args, **kw)
+ 
+-        return self.runInteraction(self._runOperation, *args, **kw)
+-
+     def close(self):
+         """Close all pool connections and shutdown the pool."""
+ 
+@@ -320,8 +259,9 @@
+             self._close(conn)
+         self.connections.clear()
+ 
+-    def connect(self):
+-        """Return a database connection when one becomes available.
++    def getConnection(self):
++        """Return a database connection for the thread or create a new
++        one.
+ 
+         This method blocks and should be run in a thread from the internal
+         threadpool. Don't call this method directly from non-threaded code.
+@@ -335,12 +275,9 @@
+         conn = self.connections.get(tid)
+         if conn is None:
+             if self.noisy:
+-                log.msg('adbapi connecting: %s %s%s' % (self.dbapiName,
+-                                                        self.connargs or '',
+-                                                        self.connkw or ''))
+-            conn = self.dbapi.connect(*self.connargs, **self.connkw)
+-            if self.openfun != None:
+-                self.openfun(conn)
++                log.msg('adbapi connecting: %s' % (str(tid),))
++	    conn = self.connfactory.buildConnection()
++	    conn.reconnect()
+             self.connections[tid] = conn
+         return conn
+ 
+@@ -361,44 +298,47 @@
+ 
+     def _close(self, conn):
+         if self.noisy:
+-            log.msg('adbapi closing: %s' % (self.dbapiName,))
++            log.msg('adbapi closing: %s' % (str(self.threadID()),))
+         try:
+-            conn.close()
++            conn._connection.close()
+         except:
+             pass
+ 
+     def _runInteraction(self, interaction, *args, **kw):
+-        conn = Connection(self)
+-        trans = Transaction(self, conn)
++        conn = self.getConnection()
++        trans = conn.transaction()
+         try:
+             result = interaction(trans, *args, **kw)
+-            trans.close()
+-            conn.commit()
++            trans.commit()
+             return result
+         except:
+-            conn.rollback()
++            trans.rollback()
+             raise
+ 
+-    def _runQuery(self, trans, *args, **kw):
+-        trans.execute(*args, **kw)
+-        return trans.fetchall()
++    def _runQuery(self, conn, *args, **kw):
++	isOperation = False
++	if kw.has_key('adb_operation'):
++	    if kw['adb_operation']:
++		isOperation = True
++	    del kw['adb_operation']
++		
++	c = conn.cursor()
++	c.execute(*args, **kw)
++	if isOperation:
++	    return None
++	else:
++	    return c.fetchall()
+ 
+-    def _runOperation(self, trans, *args, **kw):
+-        trans.execute(*args, **kw)
+-
+     def __getstate__(self):
+-        return {'dbapiName': self.dbapiName,
+-                'min': self.min,
++        return {'connfactory': self.connfactory,
++		'min': self.min,
+                 'max': self.max,
+-                'noisy': self.noisy,
+-                'reconnect': self.reconnect,
+-                'good_sql': self.good_sql,
+-                'connargs': self.connargs,
+-                'connkw': self.connkw}
++                'noisy': self.noisy}
+ 
+     def __setstate__(self, state):
+         self.__dict__ = state
+-        self.__init__(self.dbapiName, *self.connargs, **self.connkw)
++        self.__init__(self.connfactory, minconn=self.min,
++		      maxconn=self.max, noisy=self.noisy)
+ 
+     def _deferToThread(self, f, *args, **kwargs):
+         """Internal function.
+@@ -412,4 +352,252 @@
+         return d
+ 
+ 
+-__all__ = ['Transaction', 'ConnectionPool']
++class Connection(object):
++    """A wrapper for a DB-API connection instance.
++    
++    The wrapper passes almost everything to the wrapped connection and so has
++    the same API. However, the Connection adds explicit transaction
++    handling with L{Transaction} objects.
++
++    NOTE: This class is not suitable for use directly, and is expected
++    to be subclassed.
++    """
++
++    def __init__(self, transactionClass):
++	self._connection = None
++	self._transactionClass = transactionClass
++
++    def reconnect(self):
++	raise NotImplemented()
++
++    def close(self):
++        # The way adbapi works right now means that closing a connection is
++        # a really bad thing  as it leaves a dead connection associated with
++        # a thread in the thread pool.
++        # Really, I think closing a pooled connection should return it to the
++        # pool but that's handled by the runWithConnection method already so,
++        # rather than upsetting anyone by raising an exception, let's ignore
++        # the request
++	pass
++
++    def setup(self):
++	"""Run when a connection is established."""
++	pass
++
++    def transaction(self):
++	"""Return a L{Transaction} object with a ready transaction."""
++	return self._transactionClass(self)
++
++    def __getattr__(self, name):
++	return getattr(self._connection, name)
++
++
++class Transaction(object):
++    """A lightweight wrapper for a transaction.
++
++    Relays attribute access to the DB cursor. That is, you can call
++    execute(), fetchall(), etc., and they will be called on the
++    underlying DB-API cursor object. Attributes will also be
++    retrieved from there.
++
++    Transactions blocks (if supported by the underlying DB-API) will
++    be started when the object is instantiated.
++    """
++
++    def __init__(self, connection):
++	self._connection = connection
++
++	# by default no transaction setup is needed for DB-API 2.0
++	self._cursor = self._connection.cursor()
++
++    def commit(self):
++	self._connection.commit()
++
++    def rollback(self):
++	self._connection.rollback()
++
++    def __getattr__(self, name):
++	return getattr(self._cursor, name)
++
++
++class ConnectionFactory(object):
++    """A factory for returning L{Connection} objects.
++
++    ConnectionFactories can control the L{Connection} and
++    L{Transaction} classes.
++    """
++
++    connectionClass = None
++    transactionClass = None
++
++    def __init__(self):
++	pass
++
++    def buildConnection(self):
++	return self.connectionClass(self.transactionClass)
++
++
++class GenericConnection(Connection):
++    """A generic DB-API 2.0 connection wrapper.
++
++    Most calls are passed along to the underly DB-API implementation.
++    """
++
++    def __init__(self, dbapiName, transactionClass, *args, **kwargs):
++	"""Instantiate a DB-API connection with a given module and
++	transactionClass.
++
++	Most of *args,**kwargs is passed to the underlying DB-API
++	connect function, but a few, prefixed with 'adb_' are used
++	directly by the wrapper.
++
++	@param dbapiName: the module name that implemented DB-API 2.0
++	
++	@param transactionClass: the L{Transaction} class to used by
++	                         this connection
++
++        @param adb_openfun: a callable object that is called with the
++	                    L{Connection} after a connection is
++	                    established.
++
++        @param adb_reconnect: a boolean which determins whether
++	                      reconnections will be attempted when
++	                      disconnects are detected.  Defaults to
++	                      True
++        """
++
++	Connection.__init__(self, transactionClass)
++
++	self.dbapiName = dbapiName
++	self.dbapi = reflect.namedModule(self.dbapiName)
++
++	self.openfun = None
++	if kwargs.has_key('adb_openfun'):
++	    self.openfun = kwargs['adb_openfun']
++	    del kwargs['adb_openfun']
++
++	self.do_reconnect = False
++	if kwargs.has_key('adb_reconnect'):
++	    self.do_reconnect = kwargs['adb_reconnect']
++	    del kwargs['adb_reconnect']
++
++	self.connargs = args
++	self.kwconnargs = kwargs
++    
++    def reconnect(self):
++	if self._connection is not None:
++	    try:
++		self._connection.close()
++	    except:
++		pass
++
++	self._connection = self.dbapi.connect(*self.connargs,
++					      **self.kwconnargs)
++	self.setup()
++	    
++    def setup(self):
++	if self.openfun:
++	    self.openfun(self)
++
++    def cursor(self, *args, **kwargs):
++	try: 
++	    return self._connection.cursor(*args, **kwargs)
++	except:
++	    if self.do_reconnect:
++		try:
++		    c = self._connection.cursor()
++		except:
++		    self.reconnect()
++		    return self._connection.cursor(*args, **kwargs)
++		
++	    raise
++
++class GenericConnectionFactory(ConnectionFactory):
++    """A L{ConnectionFactory} for creating generic DB-API 2.0
++    Connections and Transactions.
++
++    NOTE: For databases which support transactions, use of this
++    factory may not be very efficient in some cases.  Specifically,
++    DB-API 2.0 requires that the default behavior of implementations
++    create implicit transaction blocks.  This will create a lot of
++    overhead for many calls to pool.runQuery or pool.runOperation.
++    You can build a more efficient factory yourself if needed.
++    """
++
++    connectionClass = GenericConnection
++    transactionClass = Transaction
++
++    def __init__(self, dbapiName, *connargs, **kwconnargs):
++	"""Instantiate a GenericConnectionFactory.
++
++	*connargs,**kwconnargs will be passed to L{Connection} objects
++        on creation.
++
++	@param dbapiName: the name of the dbapi module to use
++	"""
++
++	self.dbapiName = dbapiName
++	self.connargs = connargs
++	self.kwconnargs = kwconnargs
++	
++    def buildConnection(self):
++	return self.connectionClass(self.dbapiName,
++				    self.transactionClass, 
++				    *self.connargs, **self.kwconnargs)
++
++
++class Psycopg2Connection(GenericConnection):
++    """A connection wrapper for an efficient Psycopg2 connection.
++
++    The connection will run in the autocommit isolation level.
++    """
++
++    def setup(self):
++	# set ourselves to autocommit isolation
++	self.set_isolation_level(0)
++
++	GenericConnection.setup(self)
++
++class Psycopg2Transaction(Transaction):
++    """A transaction wrapper for an efficient Psycopg2 connection.
++
++    Since the connection runs in autocommit isolation, we must take
++    care to explicitly start and end transactions.
++    """
++
++    def __init__(self, connection):
++	Transaction.__init__(self, connection)
++	
++	self._startTransaction()
++
++    def _startTransaction(self):
++	self._cursor.execute("BEGIN")
++
++    def commit(self):
++	self._cursor.execute("COMMIT")
++
++    def rollback(self):
++	self._cursor.execute("ROLLBACK")
++
++
++class Psycopg2ConnectionFactory(GenericConnectionFactory):
++    """A factory for more efficient Psycopg2 connections.
++
++    This factory will eliminate the overhead caused by the default
++    behavior of DB-API 2.0 implementations when the underlying
++    database supports transactions.  Specifically, transaction blocks
++    will not be implicitly started, but will be used when requested.
++    """
++
++    connectionClass = Psycopg2Connection
++    transactionClass = Psycopg2Transaction
++
++    def __init__(self, *connargs, **kwconnargs):
++	GenericConnectionFactory.__init__(self, 'psycopg2', *connargs,
++					  **kwconnargs)
++
++
++__all__ = ['ConnectionPool', 'Connection', 'Transaction',
++	   'ConnectionFactory', 'GenericConnectionFactory',
++	   'GenericConnection']
++
+Index: TwistedCore-2.5.0/twisted/test/test_adbapi.py
+===================================================================
+--- TwistedCore-2.5.0/twisted/test/test_adbapi.py	(revision 4949)
++++ TwistedCore-2.5.0/twisted/test/test_adbapi.py	(working copy)
+@@ -9,6 +9,7 @@
+ import os, stat, tempfile
+ 
+ from twisted.enterprise.adbapi import ConnectionPool, ConnectionLost
++from twisted.enterprise.adbapi import Psycopg2ConnectionFactory
+ from twisted.internet import reactor, defer, interfaces
+ from twisted.python import log
+ 
+@@ -18,6 +19,11 @@
+ )
+ """
+ 
++DEFAULT_DBNAME = 'twisted_test'
++DEFAULT_DBPORT = 5487
++DEFAULT_DBUSER = 'twisted_test'
++DEFAULT_DBPASS = 'twisted_test'
++
+ class ADBAPITestBase:
+     """Test the asynchronous DB-API code."""
+ 
+@@ -53,7 +59,7 @@
+             d.addCallback(self._testPool_1_2)
+             d.addCallback(self._testPool_1_3)
+             d.addCallback(self._testPool_1_4)
+-            d.addCallback(lambda res: log.flushErrors())
++            d.addCallback(lambda res: self.flushLoggedErrors())
+         d.addCallback(self._testPool_2)
+         d.addCallback(self._testPool_3)
+         d.addCallback(self._testPool_4)
+@@ -179,7 +185,7 @@
+ 
+     def checkConnect(self):
+         """Check the connect/disconnect synchronous calls."""
+-        conn = self.dbpool.connect()
++        conn = self.dbpool.getConnection()
+         self.checkOpenfunCalled(conn)
+         curs = conn.cursor()
+         curs.execute("insert into simple(x) values(1)")
+@@ -275,8 +281,12 @@
+         return d
+ 
+     def _testPool_2(self, res):
++	def _close(pool):
++	    conn = pool.getConnection()
++	    conn._connection.close()
++
+         # reach in and close the connection manually
+-        self.dbpool.connections.values()[0].close()
++	return self.dbpool._deferToThread(_close, self.dbpool)
+ 
+     def _testPool_3(self, res):
+         sql = "select count(1) from simple"
+@@ -312,9 +322,10 @@
+ 
+     TEST_PREFIX = None # used for creating new test cases
+ 
+-    DB_NAME = "twisted_test"
+-    DB_USER = 'twisted_test'
+-    DB_PASS = 'twisted_test'
++    DB_NAME = DEFAULT_DBNAME
++    DB_USER = DEFAULT_DBUSER
++    DB_PASS = DEFAULT_DBPASS
++    DB_PORT = DEFAULT_DBPORT
+ 
+     DB_DIR = None # directory for database storage
+ 
+@@ -323,7 +334,7 @@
+     can_rollback = True # rollback supported
+     test_failures = True # test bad sql?
+     escape_slashes = True # escape \ in sql?
+-    good_sql = ConnectionPool.good_sql
++    good_sql = 'SELECT 1'
+     early_reconnect = True # cursor() will fail on closed connection
+     can_clear = True # can try to clear out tables when starting
+     needs_dbdir = False # if a temporary directory is needed for the db
+@@ -365,40 +376,7 @@
+         to this database."""
+         raise NotImplementedError()
+ 
+-class GadflyConnector(DBTestConnector):
+-    TEST_PREFIX = 'Gadfly'
+ 
+-    nulls_ok = False
+-    can_rollback = False
+-    escape_slashes = False
+-    good_sql = 'select * from simple where 1=0'
+-    needs_dbdir = True
+-
+-    num_iterations = 1 # slow
+-
+-    def can_connect(self):
+-        try: import gadfly
+-        except: return False
+-        if not getattr(gadfly, 'connect', None):
+-            gadfly.connect = gadfly.gadfly
+-        return True
+-
+-    def startDB(self):
+-        import gadfly
+-        conn = gadfly.gadfly()
+-        conn.startup(self.DB_NAME, self.DB_DIR)
+-
+-        # gadfly seems to want us to create something to get the db going
+-        cursor = conn.cursor()
+-        cursor.execute("create table x (x integer)")
+-        conn.commit()
+-        conn.close()
+-
+-    def getPoolArgs(self):
+-        args = ('gadfly', self.DB_NAME, self.DB_DIR)
+-        kw = {'cp_max': 1}
+-        return args, kw
+-
+ class SQLiteConnector(DBTestConnector):
+     TEST_PREFIX = 'SQLite'
+ 
+@@ -430,7 +408,7 @@
+         except: return False
+         try:
+             conn = PgSQL.connect(database=self.DB_NAME, user=self.DB_USER,
+-                                 password=self.DB_PASS)
++                                 password=self.DB_PASS, port=self.DB_PORT)
+             conn.close()
+             return True
+         except:
+@@ -439,7 +417,8 @@
+     def getPoolArgs(self):
+         args = ('pyPgSQL.PgSQL',)
+         kw = {'database': self.DB_NAME, 'user': self.DB_USER,
+-              'password': self.DB_PASS, 'cp_min': 0}
++              'password': self.DB_PASS, 'port': self.DB_PORT,
++	      'cp_min': 0}
+         return args, kw
+ 
+ class PsycopgConnector(DBTestConnector):
+@@ -450,7 +429,8 @@
+         except: return False
+         try:
+             conn = psycopg.connect(database=self.DB_NAME, user=self.DB_USER,
+-                                   password=self.DB_PASS)
++                                   password=self.DB_PASS, 
++				   port=str(self.DB_PORT))
+             conn.close()
+             return True
+         except:
+@@ -459,9 +439,31 @@
+     def getPoolArgs(self):
+         args = ('psycopg',)
+         kw = {'database': self.DB_NAME, 'user': self.DB_USER,
+-              'password': self.DB_PASS, 'cp_min': 0}
++              'password': self.DB_PASS, 'port': str(self.DB_PORT),
++	      'cp_min': 0}
+         return args, kw
+ 
++class Psycopg2Connector(DBTestConnector):
++    TEST_PREFIX = 'Psycopg2'
++
++    def can_connect(self):
++        try: import psycopg2
++        except: return False
++        try:
++            conn = psycopg2.connect(database=self.DB_NAME, user=self.DB_USER,
++				    password=self.DB_PASS, port=self.DB_PORT)
++            conn.close()
++            return True
++        except:
++            return False
++
++    def getPoolArgs(self):
++        args = ('psycopg2',)
++        kw = {'database': self.DB_NAME, 'user': self.DB_USER,
++              'password': self.DB_PASS, 'port': self.DB_PORT,
++	      'cp_min': 0}
++        return args, kw
++
+ class MySQLConnector(DBTestConnector):
+     TEST_PREFIX = 'MySQL'
+ 
+@@ -528,6 +530,93 @@
+                                    password=self.DB_PASS)
+         conn.drop_database()
+ 
++
++class Psycopg2TestCase(unittest.TestCase):
++    """Test case for the more efficient psycopg2 connection factory,
++    connection, and transaction classes.
++
++    Since the more efficient psycopg2 engine runs in autocommit mode
++    and handles its own transactions explicitly, it needs to have some
++    basic testing done on this.
++    """
++    def setUp(self):
++        args = ('dbname=%s port=%d user=%s password=%s' %
++                (DEFAULT_DBNAME, DEFAULT_DBPORT,
++                 DEFAULT_DBUSER, DEFAULT_DBPASS),)
++        self.dbpool = ConnectionPool(
++            Psycopg2ConnectionFactory(*args))
++        self.dbpool.start()
++        return self.dbpool.runOperation(simple_table_schema)
++
++    def tearDown(self):
++        d =  self.dbpool.runOperation('DROP TABLE simple')
++        d.addCallback(lambda res: self.dbpool.close())
++        return d
++
++    def testPool(self):
++        d = defer.succeed(None)
++        d.addCallback(self._testTableExists)
++        d.addCallback(self._testOperationsGetCommitted)
++        d.addCallback(self._testInteractionsGetCommitted)
++        d.addCallback(self._testRollback)
++        return d
++
++    def _testTableExists(self, result):
++        d = self.dbpool.runQuery('SELECT * FROM simple')
++
++        def _check(rows):
++            self.failUnless(len(rows) == 0, 'Wrong number for rows')
++        d.addCallback(_check)
++        return d
++
++    def _testOperationsGetCommitted(self, result):
++        d = self.dbpool.runOperation('INSERT INTO simple (x) VALUES (1)')
++        d.addCallback(self._testOperationsGetCommitted_2)
++        return d
++
++    def _testOperationsGetCommitted_2(self, result):
++        d = self.dbpool.runQuery('SELECT * FROM simple')
++
++        def _check(rows):
++            self.failUnless(len(rows) == 1, 'Wrong number of rows')
++        d.addCallback(_check)
++        return d
++
++    def _testInteractionsGetCommitted(self, result):
++        def _interaction(trans):
++            trans.execute("INSERT INTO simple (x) VALUES (2)")
++            trans.execute("INSERT INTO simple (x) VALUES (3)")
++        d = self.dbpool.runInteraction(_interaction)
++        d.addCallback(self._testInteractionsGetCommitted_2)
++        return d
++
++    def _testInteractionsGetCommitted_2(self, result):
++        d = self.dbpool.runQuery('SELECT * FROM simple')
++
++        def _check(rows):
++            self.failUnless(len(rows) == 3, 'Wrong number of rows')
++        d.addCallback(_check)
++        return d
++
++    def _testRollback(self, result):
++        def _interaction(trans):
++            trans.execute('INSERT INTO simple (x) VALUES (4)')
++            trans.execute('INSERTxxx INTO simple (x) VALUES (5)')
++        d = self.dbpool.runInteraction(_interaction)
++        d.addCallbacks(lambda x: self.fail('no exception'),
++                       lambda x: None)
++        d.addCallback(self._testRollback_2)
++        return d
++
++    def _testRollback_2(self, result):
++        d = self.dbpool.runQuery('SELECT * FROM simple')
++
++        def _check(rows):
++            self.failUnless(len(rows) == 3, 'Wrong number of rows')
++        d.addCallback(_check)
++        return d
++
++
+ def makeSQLTests(base, suffix, globals):
+     """Make a test case for every db connector which can connect.
+ 
+@@ -536,7 +625,7 @@
+     @param suffix: A suffix used to create test case names. Prefixes
+                    are defined in the DBConnector subclasses.
+     """
+-    connectors = [GadflyConnector, SQLiteConnector, PyPgSQLConnector,
++    connectors = [SQLiteConnector, PyPgSQLConnector, Psycopg2Connector,
+                   PsycopgConnector, MySQLConnector, FirebirdConnector]
+     for connclass in connectors:
+         name = connclass.TEST_PREFIX + suffix
+@@ -544,10 +633,10 @@
+         klass = new.classobj(name, (connclass, base, unittest.TestCase), {})
+         globals[name] = klass
+ 
+-# GadflyADBAPITestCase SQLiteADBAPITestCase PyPgSQLADBAPITestCase
++# SQLiteADBAPITestCase PyPgSQLADBAPITestCase Psycopg2Connector
+ # PsycopgADBAPITestCase MySQLADBAPITestCase FirebirdADBAPITestCase
+ makeSQLTests(ADBAPITestBase, 'ADBAPITestCase', globals())
+ 
+-# GadflyReconnectTestCase SQLiteReconnectTestCase PyPgSQLReconnectTestCase
++# SQLiteReconnectTestCase PyPgSQLReconnectTestCase Psycopg2Connector
+ # PsycopgReconnectTestCase MySQLReconnectTestCase FirebirdReconnectTestCase
+ makeSQLTests(ReconnectTestBase, 'ReconnectTestCase', globals())

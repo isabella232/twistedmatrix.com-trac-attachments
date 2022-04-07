@@ -1,0 +1,663 @@
+Index: twisted/conch/test/test_cftp.py
+===================================================================
+--- twisted/conch/test/test_cftp.py	(revision 38158)
++++ twisted/conch/test/test_cftp.py	(working copy)
+@@ -8,14 +8,19 @@
+ 
+ import locale
+ import time, sys, os, operator, getpass, struct
++import posixpath
+ from StringIO import StringIO
+ 
+ from twisted.conch.test.test_ssh import Crypto, pyasn1
++from twisted.python.runtime import platform
+ 
+ _reason = None
+ if Crypto and pyasn1:
+     try:
+-        from twisted.conch import unix
++        if platform.isWindows():
++            from twisted.conch import windows as unix
++        else:
++            from twisted.conch import unix
+         from twisted.conch.scripts import cftp
+         from twisted.conch.test.test_filetransfer import FileTransferForTestAvatar
+     except ImportError as e:
+@@ -216,7 +221,13 @@
+         # which uses features not provided by our dumb Connection fake.
+         self.client.transport = StringTransport()
+ 
++        if platform.isWindows():
++            os.getuid = lambda: 0
+ 
++    def tearDown(self):
++        if platform.isWindows():
++            del os.getuid
++
+     def test_exec(self):
+         """
+         The I{exec} command runs its arguments locally in a child process
+@@ -227,7 +238,7 @@
+             sys.executable)
+ 
+         d = self.client._dispatchCommand("exec print 1 + 2")
+-        d.addCallback(self.assertEqual, "3\n")
++        d.addCallback(self.assertEqual, "3"+os.linesep)
+         return d
+ 
+ 
+@@ -240,7 +251,7 @@
+             getpass.getuser(), 'secret', os.getuid(), 1234, 'foo', 'bar', '')
+ 
+         d = self.client._dispatchCommand("exec echo hello")
+-        d.addCallback(self.assertEqual, "hello\n")
++        d.addCallback(self.assertEqual, "hello"+os.linesep)
+         return d
+ 
+ 
+@@ -248,12 +259,15 @@
+         """
+         The I{exec} command is run for lines which start with C{"!"}.
+         """
++        if platform.isWindows():
++            shell = os.environ['COMSPEC']
++        else:
++            shell = '/bin/sh'
+         self.database.addUser(
+-            getpass.getuser(), 'secret', os.getuid(), 1234, 'foo', 'bar',
+-            '/bin/sh')
++            getpass.getuser(), 'secret', os.getuid(), 1234, 'foo', 'bar', shell)
+ 
+         d = self.client._dispatchCommand("!echo hello")
+-        d.addCallback(self.assertEqual, "hello\n")
++        d.addCallback(self.assertEqual, "hello"+os.linesep)
+         return d
+ 
+ 
+@@ -267,10 +281,13 @@
+         @param height: the height in characters
+         @type height: C{int}
+         """
+-        import tty # local import to avoid win32 issues
++        try:
++            from tty import TIOCGWINSZ
++        except ImportError:
++            TIOCGWINSZ = 0x5413
+         class FakeFcntl(object):
+             def ioctl(self, fd, opt, mutate):
+-                if opt != tty.TIOCGWINSZ:
++                if opt != TIOCGWINSZ:
+                     self.fail("Only window-size queries supported.")
+                 return struct.pack("4H", height, width, 0, 0)
+         self.patch(cftp, "fcntl", FakeFcntl())
+@@ -404,7 +421,7 @@
+         """
+         self._expectingCommand = defer.Deferred()
+         self.clearBuffer()
+-        self.transport.write(command + '\n')
++        self.transport.write(command + os.linesep)
+         return self._expectingCommand
+ 
+     def runScript(self, commands):
+@@ -449,14 +466,15 @@
+ 
+ class CFTPClientTestBase(SFTPTestBase):
+     def setUp(self):
+-        f = open('dsa_test.pub','w')
++        f = open('dsa_test.pub','wb')
+         f.write(test_ssh.publicDSA_openssh)
+         f.close()
+-        f = open('dsa_test','w')
++        f = open('dsa_test','wb')
+         f.write(test_ssh.privateDSA_openssh)
+         f.close()
+-        os.chmod('dsa_test', 33152)
+-        f = open('kh_test','w')
++        if not platform.isWindows():
++            os.chmod('dsa_test', 33152)
++        f = open('kh_test','wb')
+         f.write('127.0.0.1 ' + test_ssh.publicRSA_openssh)
+         f.close()
+         return SFTPTestBase.setUp(self)
+@@ -544,6 +562,13 @@
+         """
+         return self.processProtocol.runScript(commands)
+ 
++    def getCwd(self):
++        cwd = os.getcwd()
++        if platform.isWindows():
++            cwd = os.path.splitdrive(cwd)[1]    # remove drive spec.
++            return cwd.replace('\\', '/')
++        return cwd
++
+     def testCdPwd(self):
+         """
+         Test that 'pwd' reports the current remote directory, that 'lpwd'
+@@ -552,7 +577,8 @@
+         remote directory.
+         """
+         # XXX - not actually a unit test, see docstring.
+-        homeDir = os.path.join(os.getcwd(), self.testDir)
++        cwd = self.getCwd()
++        homeDir = posixpath.join(cwd, self.testDir)
+         d = self.runScript('pwd', 'lpwd', 'cd testDirectory', 'cd ..', 'pwd')
+         d.addCallback(lambda xs: xs[:3] + xs[4:])
+         d.addCallback(self.assertEqual,
+@@ -566,9 +592,15 @@
+         """
+         def _check(results):
+             self.flushLoggedErrors()
+-            self.assertTrue(results[0].startswith('-rw-r--r--'))
++            if platform.isWindows():
++                self.assertTrue(results[0].startswith('-rw-rw-rw-'))
++            else:
++                self.assertTrue(results[0].startswith('-rw-r--r--'))
+             self.assertEqual(results[1], '')
+-            self.assertTrue(results[2].startswith('----------'), results[2])
++            if platform.isWindows():
++                self.assertTrue(results[2].startswith('-r--r--r--'), results[2])
++            else:
++                self.assertTrue(results[2].startswith('----------'), results[2])
+             self.assertEqual(results[3], '')
+ 
+         d = self.runScript('ls -l testfile1', 'chmod 0 testfile1',
+@@ -611,8 +643,8 @@
+         Assert that the files at C{name1} and C{name2} contain exactly the
+         same data.
+         """
+-        f1 = file(name1).read()
+-        f2 = file(name2).read()
++        f1 = file(name1, "rb").read()
++        f2 = file(name2, "rb").read()
+         self.assertEqual(f1, f2, msg)
+ 
+ 
+@@ -624,7 +656,7 @@
+         """
+         # XXX - not actually a unit test
+         expectedOutput = ("Transferred %s/%s/testfile1 to %s/test file2"
+-                          % (os.getcwd(), self.testDir, self.testDir))
++                          % (self.getCwd(), self.testDir, self.testDir))
+         def _checkGet(result):
+             self.assertTrue(result.endswith(expectedOutput))
+             self.assertFilesEqual(self.testDir + '/testfile1',
+@@ -661,19 +693,26 @@
+         successfully removed. Also check the output of the put command.
+         """
+         # XXX - not actually a unit test
+-        expectedOutput = ('Transferred %s/testfile1 to %s/%s/test"file2'
+-                          % (self.testDir, os.getcwd(), self.testDir))
++        if platform.isWindows():
++            testfile2 = 'testfile2'
++            escaped_testfile2 = 'testfile2'
++        else:
++            testfile2 = 'test"file2'
++            escaped_testfile2 = 'test\\"file2'
++
++        expectedOutput = ('Transferred %s/testfile1 to %s/%s/%s'
++                          % (self.testDir, self.getCwd(), self.testDir, testfile2))
+         def _checkPut(result):
+             self.assertFilesEqual(self.testDir + '/testfile1',
+-                                  self.testDir + '/test"file2')
++                                  self.testDir + '/'+testfile2)
+             self.failUnless(result.endswith(expectedOutput))
+-            return self.runCommand('rm "test\\"file2"')
++            return self.runCommand('rm "%s"' % escaped_testfile2)
+ 
+-        d = self.runCommand('put %s/testfile1 "test\\"file2"'
+-                            % (self.testDir,))
++        d = self.runCommand('put %s/testfile1 "%s"'
++                            % (self.testDir, escaped_testfile2))
+         d.addCallback(_checkPut)
+         d.addCallback(lambda _: self.failIf(
+-            os.path.exists(self.testDir + '/test"file2')))
++            os.path.exists(self.testDir + testfile2)))
+         return d
+ 
+ 
+@@ -683,10 +722,10 @@
+         file.
+         """
+         # XXX - not actually a unit test
+-        f = file(os.path.join(self.testDir, 'shorterFile'), 'w')
++        f = file(os.path.join(self.testDir, 'shorterFile'), 'wb')
+         f.write("a")
+         f.close()
+-        f = file(os.path.join(self.testDir, 'longerFile'), 'w')
++        f = file(os.path.join(self.testDir, 'longerFile'), 'wb')
+         f.write("bb")
+         f.close()
+         def _checkPut(result):
+@@ -706,10 +745,10 @@
+         """
+         # XXX - not actually a unit test
+         os.mkdir(os.path.join(self.testDir, 'dir'))
+-        f = file(os.path.join(self.testDir, 'dir', 'file'), 'w')
++        f = file(os.path.join(self.testDir, 'dir', 'file'), 'wb')
+         f.write("a")
+         f.close()
+-        f = file(os.path.join(self.testDir, 'file'), 'w')
++        f = file(os.path.join(self.testDir, 'file'), 'wb')
+         f.write("bb")
+         f.close()
+         def _checkPut(result):
+@@ -760,6 +799,8 @@
+         d.addCallback(_check)
+         d.addCallback(self.assertEqual, '')
+         return d
++    if platform.isWindows():
++        testLink.skip = "Windows sftp server doesn't support symbolic links."
+ 
+ 
+     def testRemoteDirectory(self):
+@@ -781,7 +822,7 @@
+     def test_existingRemoteDirectory(self):
+         """
+         Test that a C{mkdir} on an existing directory fails with the
+-        appropriate error, and doesn't log an useless error server side.
++        appropriate error, and doesn't log a useless error server side.
+         """
+         def _check(results):
+             self.assertEqual(results[0], '')
+@@ -971,3 +1012,4 @@
+     from twisted.python.procutils import which
+     if not which('sftp'):
+         TestOurServerSftpClient.skip = "no sftp command-line client available"
++
+Index: twisted/conch/test/test_checkers.py
+===================================================================
+--- twisted/conch/test/test_checkers.py	(revision 38158)
++++ twisted/conch/test/test_checkers.py	(working copy)
+@@ -175,7 +175,7 @@
+     """
+     Tests for L{SSHPublicKeyDatabase}.
+     """
+-    skip = euidSkip or dependencySkip
++    skip = dependencySkip
+ 
+     def setUp(self):
+         self.checker = checkers.SSHPublicKeyDatabase()
+@@ -253,6 +253,8 @@
+         self.assertEqual(self.mockos.seteuidCalls, [0, 1, 0, 2345])
+         self.assertEqual(self.mockos.setegidCalls, [2, 1234])
+ 
++    if euidSkip:
++        test_checkKeyAsRoot.skip = "Not supported on Windows"
+ 
+     def test_requestAvatarId(self):
+         """
+Index: twisted/conch/test/test_conch.py
+===================================================================
+--- twisted/conch/test/test_conch.py	(revision 38158)
++++ twisted/conch/test/test_conch.py	(working copy)
+@@ -526,9 +526,6 @@
+     """
+     Connection forwarding tests run against the Conch command line client.
+     """
+-    if runtime.platformType == 'win32':
+-        skip = "can't run cmdline client on win32"
+-
+     def execute(self, remoteCommand, process, sshArgs=''):
+         """
+         As for L{OpenSSHClientTestCase.execute}, except it runs the 'conch'
+@@ -550,3 +547,4 @@
+         env['PYTHONPATH'] = os.pathsep.join(sys.path)
+         reactor.spawnProcess(process, sys.executable, cmds, env=env)
+         return process.deferred
++
+Index: twisted/conch/test/test_filetransfer.py
+===================================================================
+--- twisted/conch/test/test_filetransfer.py	(revision 38158)
++++ twisted/conch/test/test_filetransfer.py	(working copy)
+@@ -10,14 +10,16 @@
+ import re
+ import struct
+ import sys
++import posixpath
+ 
+ from twisted.trial import unittest
+-try:
+-    from twisted.conch import unix
+-    unix # shut up pyflakes
+-except ImportError:
+-    unix = None
++from twisted.python.runtime import platform
+ 
++if platform.isWindows():
++    from twisted.conch.windows import SFTPServerForWindowsConchUser as SFTPServerForConchUser
++else:
++    from twisted.conch.unix import SFTPServerForUnixConchUser as SFTPServerForConchUser
++
+ from twisted.conch import avatar
+ from twisted.conch.ssh import common, connection, filetransfer, session
+ from twisted.internet import defer
+@@ -44,6 +46,12 @@
+         return r
+ 
+ 
++def posixGetCWD():
++    basepath = os.getcwd()
++    path = os.path.splitdrive(basepath)[1]    # remove drive spec.
++    return path.replace('\\','/')
++    
++
+ class FileTransferTestAvatar(TestAvatar):
+ 
+     def __init__(self, homeDir):
+@@ -51,7 +59,7 @@
+         self.homeDir = homeDir
+ 
+     def getHomeDir(self):
+-        return os.path.join(os.getcwd(), self.homeDir)
++        return posixpath.join(posixGetCWD(), self.homeDir)
+ 
+ 
+ class ConchSessionForTestAvatar:
+@@ -59,53 +67,44 @@
+     def __init__(self, avatar):
+         self.avatar = avatar
+ 
+-if unix:
+-    if not hasattr(unix, 'SFTPServerForUnixConchUser'):
+-        # unix should either be a fully working module, or None.  I'm not sure
+-        # how this happens, but on win32 it does.  Try to cope.  --spiv.
+-        import warnings
+-        warnings.warn(("twisted.conch.unix imported %r, "
+-                       "but doesn't define SFTPServerForUnixConchUser'")
+-                      % (unix,))
+-        unix = None
+-    else:
+-        class FileTransferForTestAvatar(unix.SFTPServerForUnixConchUser):
++class FileTransferForTestAvatar(SFTPServerForConchUser):
+ 
+-            def gotVersion(self, version, otherExt):
+-                return {'conchTest' : 'ext data'}
++    def gotVersion(self, version, otherExt):
++        return {'conchTest' : 'ext data'}
+ 
+-            def extendedRequest(self, extName, extData):
+-                if extName == 'testExtendedRequest':
+-                    return 'bar'
+-                raise NotImplementedError
++    def extendedRequest(self, extName, extData):
++        if extName == 'testExtendedRequest':
++            return 'bar'
++        raise NotImplementedError
+ 
+-        components.registerAdapter(FileTransferForTestAvatar,
+-                                   TestAvatar,
+-                                   filetransfer.ISFTPServer)
++components.registerAdapter(FileTransferForTestAvatar,
++                           TestAvatar,
++                           filetransfer.ISFTPServer)
+ 
++
+ class SFTPTestBase(unittest.TestCase):
+ 
+     def setUp(self):
+-        self.testDir = self.mktemp()
++        basepath = self.mktemp()
++        path = os.path.splitdrive(basepath)[1]    # remove drive spec.
++        self.testDir = path.replace('\\','/')+"/"
+         # Give the testDir another level so we can safely "cd .." from it in
+         # tests.
+-        self.testDir = os.path.join(self.testDir, 'extra')
+-        os.makedirs(os.path.join(self.testDir, 'testDirectory'))
++        self.testDir = posixpath.join(self.testDir, 'extra')
++        os.makedirs(posixpath.join(self.testDir, 'testDirectory'))
+ 
+-        f = file(os.path.join(self.testDir, 'testfile1'),'w')
++        f = file(posixpath.join(self.testDir, 'testfile1'),'wb')
+         f.write('a'*10+'b'*10)
+-        f.write(file('/dev/urandom').read(1024*64)) # random data
+-        os.chmod(os.path.join(self.testDir, 'testfile1'), 0644)
+-        file(os.path.join(self.testDir, 'testRemoveFile'), 'w').write('a')
+-        file(os.path.join(self.testDir, 'testRenameFile'), 'w').write('a')
+-        file(os.path.join(self.testDir, '.testHiddenFile'), 'w').write('a')
++        f.write(os.urandom(1024*64)) # random data
++        if not platform.isWindows():
++            os.chmod(os.path.join(self.testDir, 'testfile1'), 0644)
++        file(posixpath.join(self.testDir, 'testRemoveFile'), 'wb').write('a')
++        file(posixpath.join(self.testDir, 'testRenameFile'), 'wb').write('a')
++        file(posixpath.join(self.testDir, '.testHiddenFile'), 'wb').write('a')
+ 
+ 
+ class TestOurServerOurClient(SFTPTestBase):
+ 
+-    if not unix:
+-        skip = "can't run on non-posix computers"
+-
+     def setUp(self):
+         SFTPTestBase.setUp(self)
+ 
+@@ -438,18 +437,22 @@
+             d = self.client.readLink('testLink')
+             self._emptyBuffers()
+             d.addCallback(self.assertEqual,
+-                          os.path.join(os.getcwd(), self.testDir, 'testfile1'))
++                          posixpath.join(posixGetCWD(), self.testDir, 'testfile1'))
+             return d
+         def _realPath(_):
+             d = self.client.realPath('testLink')
+             self._emptyBuffers()
+             d.addCallback(self.assertEqual,
+-                          os.path.join(os.getcwd(), self.testDir, 'testfile1'))
++                          posixpath.join(posixGetCWD(), self.testDir, 'testfile1'))
+             return d
+         d.addCallback(_readLink)
+         d.addCallback(_realPath)
+         return d
+ 
++    if platform.isWindows():
++        testLinkSharesAttrs.skip = "Not supported on Windows"
++        testLinkPath.skip = "Not supported on Windows"
++
+     def testExtendedRequest(self):
+         d = self.client.extendedRequest('testExtendedRequest', 'foo')
+         self._emptyBuffers()
+@@ -470,9 +473,6 @@
+ 
+ class TestFileTransferClose(unittest.TestCase):
+ 
+-    if not unix:
+-        skip = "can't run on non-posix computers"
+-
+     def setUp(self):
+         self.avatar = TestAvatar()
+ 
+@@ -760,3 +760,30 @@
+         """
+         self.assertEqual(result[0], 'msg')
+         self.assertEqual(result[1], '')
++
++
++class TestFileTransferClientMakeConnection(SFTPTestBase): 
++    """ 
++    Test for L{filetransfer.FileTransferClient} makeConnection(). 
++    """ 
++
++    def setUp(self): 
++        SFTPTestBase.setUp(self) 
++        self.avatar = FileTransferTestAvatar(self.testDir) 
++        self.server = filetransfer.FileTransferServer(avatar=self.avatar) 
++        self.clientTransport = loopback.LoopbackRelay(self.server) 
++        extData = {"test_key":"test_value"} 
++        self.client = filetransfer.FileTransferClient(extData) 
++        self.assertEqual(self.client.extData, extData) 
++        self.serverTransport = loopback.LoopbackRelay(self.client) 
++ 
++    def tearDown(self): 
++        self.serverTransport.loseConnection() 
++        self.clientTransport.loseConnection() 
++        self.serverTransport.clearBuffer() 
++        self.clientTransport.clearBuffer() 
++ 
++    def test_makeConnection(self): 
++        self.client.makeConnection(self.clientTransport) 
++        self.server.makeConnection(self.serverTransport) 
++ 
+Index: twisted/conch/test/test_openssh_compat.py
+===================================================================
+--- twisted/conch/test/test_openssh_compat.py	(revision 38158)
++++ twisted/conch/test/test_openssh_compat.py	(working copy)
+@@ -26,9 +26,7 @@
+     """
+     Tests for L{OpenSSHFactory}.
+     """
+-    if getattr(os, "geteuid", None) is None:
+-        skip = "geteuid/seteuid not available"
+-    elif OpenSSHFactory is None:
++    if OpenSSHFactory is None:
+         skip = "Cannot run without PyCrypto or PyASN1"
+ 
+     def setUp(self):
+@@ -50,8 +48,9 @@
+             keydata.publicRSA_openssh)
+ 
+         self.mockos = MockOS()
+-        self.patch(os, "seteuid", self.mockos.seteuid)
+-        self.patch(os, "setegid", self.mockos.setegid)
++        if getattr(os, "geteuid", None) is not None:
++            self.patch(os, "seteuid", self.mockos.seteuid)
++            self.patch(os, "setegid", self.mockos.setegid)
+ 
+ 
+     def test_getPublicKeys(self):
+@@ -99,3 +98,7 @@
+         self.assertEqual(set(keyTypes), set(['ssh-rsa', 'ssh-dss']))
+         self.assertEqual(self.mockos.seteuidCalls, [0, os.geteuid()])
+         self.assertEqual(self.mockos.setegidCalls, [0, os.getegid()])
++
++    if getattr(os, "geteuid", None) is None:
++        test_getPrivateKeysAsRoot.skip = "Not supported on windows"
++
+Index: twisted/conch/test/test_recvline.py
+===================================================================
+--- twisted/conch/test/test_recvline.py	(revision 38158)
++++ twisted/conch/test/test_recvline.py	(working copy)
+@@ -17,6 +17,7 @@
+ from twisted.trial import unittest
+ from twisted.cred import portal
+ from twisted.test.proto_helpers import StringTransport
++from twisted.python.runtime import platform
+ 
+ class Arrows(unittest.TestCase):
+     def setUp(self):
+@@ -566,8 +567,9 @@
+         env["PYTHONPATH"] = os.pathsep.join(sys.path)
+ 
+         from twisted.internet import reactor
++        usePTY = not platform.isWindows()
+         clientTransport = reactor.spawnProcess(processClient, exe, args,
+-                                               env=env, usePTY=True)
++                                               env=env, usePTY=usePTY)
+ 
+         self.recvlineClient = self.testTerminal = testTerminal
+         self.processClient = processClient
+@@ -588,8 +590,12 @@
+             pass
+         def trap(failure):
+             failure.trap(error.ProcessTerminated)
+-            self.assertEqual(failure.value.exitCode, None)
+-            self.assertEqual(failure.value.status, 9)
++            if platform.isWindows():
++                self.assertEqual(failure.value.exitCode, 1)
++                self.assertEqual(failure.value.status, None)
++            else:
++                self.assertEqual(failure.value.exitCode, None)
++                self.assertEqual(failure.value.status, 9)
+         return self.testTerminal.onDisconnection.addErrback(trap)
+ 
+     def _testwrite(self, bytes):
+@@ -704,3 +710,4 @@
+ class HistoricRecvlineLoopbackStdio(_StdioMixin, unittest.TestCase, HistoricRecvlineLoopbackMixin):
+     if stdio is None:
+         skip = "Terminal requirements missing, can't run historic recvline tests over stdio"
++
+Index: twisted/conch/test/test_scripts.py
+===================================================================
+--- twisted/conch/test/test_scripts.py	(revision 38158)
++++ twisted/conch/test/test_scripts.py	(working copy)
+@@ -53,12 +53,12 @@
+ 
+     def test_conch(self):
+         self.scriptTest("conch/conch")
+-    test_conch.skip = ttySkip or skip
++    test_conch.skip = skip
+ 
+ 
+     def test_cftp(self):
+         self.scriptTest("conch/cftp")
+-    test_cftp.skip = ttySkip or skip
++    test_cftp.skip = skip
+ 
+ 
+     def test_ckeygen(self):
+Index: twisted/conch/test/test_tap.py
+===================================================================
+--- twisted/conch/test/test_tap.py	(revision 38158)
++++ twisted/conch/test/test_tap.py	(working copy)
+@@ -15,12 +15,7 @@
+ except ImportError:
+     pyasn1 = None
+ 
+-try:
+-    from twisted.conch import unix
+-except ImportError:
+-    unix = None
+-
+-if Crypto and pyasn1 and unix:
++if Crypto and pyasn1:
+     from twisted.conch import tap
+     from twisted.conch.openssh_compat.factory import OpenSSHFactory
+ 
+@@ -45,9 +40,6 @@
+     if not pyasn1:
+         skip = "Cannot run without PyASN1"
+ 
+-    if not unix:
+-        skip = "can't run on non-posix computers"
+-
+     usernamePassword = ('iamuser', 'thisispassword')
+ 
+     def setUp(self):
+Index: twisted/conch/test/test_userauth.py
+===================================================================
+--- twisted/conch/test/test_userauth.py	(revision 38158)
++++ twisted/conch/test/test_userauth.py	(working copy)
+@@ -281,7 +281,7 @@
+ 
+ 
+     if keys is None:
+-        skip = "cannot run w/o PyCrypto"
++        skip = "cannot run without PyCrypto and PyASN1"
+ 
+ 
+     def setUp(self):
+@@ -724,7 +724,7 @@
+ 
+ 
+     if keys is None:
+-        skip = "cannot run w/o PyCrypto"
++        skip = "cannot run without PyCrypto and PyASN1"
+ 
+ 
+     def setUp(self):
+@@ -998,7 +998,7 @@
+ 
+ 
+     if keys is None:
+-        skip = "cannot run w/o PyCrypto or PyASN1"
++        skip = "cannot run without PyCrypto and PyASN1"
+ 
+ 
+     class Factory:
+@@ -1065,7 +1065,7 @@
+ 
+ class ModuleInitializationTestCase(unittest.TestCase):
+     if keys is None:
+-        skip = "cannot run w/o PyCrypto or PyASN1"
++        skip = "cannot run without PyCrypto and PyASN1"
+ 
+ 
+     def test_messages(self):

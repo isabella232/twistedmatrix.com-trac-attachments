@@ -1,0 +1,125 @@
+Index: twisted/test/test_ftp.py
+===================================================================
+--- twisted/test/test_ftp.py	(revision 34577)
++++ twisted/test/test_ftp.py	(working copy)
+@@ -2588,7 +2588,53 @@
+         d = self.shell.access(('foo',))
+         return self.assertFailure(d, ftp.FileNotFoundError)
+ 
++    def test_accessNotAllowed(self):
++        """
++        access should fail on a resource for which we can't list its content.
++        """
++        path = 'foo'
++        self.createDirectory(path)
++        self.root.child(path).chmod(0000)
++        d = self.shell.access((path,))
+ 
++        def revert_permissions(result_or_failure):
++            """Folder permissions are reverted so that any clean function
++            will be allowed to remove the folder.
++            """
++            self.root.child(path).chmod(0700)
++            self.root.child(path).remove()
++            return result_or_failure
++
++        d.addBoth(revert_permissions)
++        return self.assertFailure(d, ftp.PermissionDeniedError)
++
++    if not os.name == 'posix':
++        test_accessNotAllowed.skip = "test_accessNotAllowed not supported"
++
++    def test_accessNoExecutePermissions(self):
++        """
++        access should fail on a resource for which we can't list its content.
++        """
++        path = 'foo'
++        self.createDirectory(path)
++        self.root.child(path).chmod(0600)
++        d = self.shell.access((path,))
++
++        def revert_permissions(result_or_failure):
++            """Folder permissions are reverted so that any cleanup will be
++            allowed to remove the folder.
++            """
++            self.root.child(path).chmod(0700)
++            self.root.child(path).remove()
++            return result_or_failure
++
++        d.addBoth(revert_permissions)
++        return self.assertFailure(d, ftp.PermissionDeniedError)
++
++    if not os.name == 'posix':
++        test_accessNoExecutePermissions.skip = (
++            "test_accessNoExecutePermissions not supported")
++
+     def test_openForReading(self):
+         """
+         Check that openForReading returns an object providing C{ftp.IReadFile}.
+Index: twisted/protocols/ftp.py
+===================================================================
+--- twisted/protocols/ftp.py	(revision 34577)
++++ twisted/protocols/ftp.py	(working copy)
+@@ -1672,24 +1672,52 @@
+         """
+         return defer.fail(PermissionDeniedError("STOR not allowed"))
+ 
++    def access(self, path):
++        """
++        See L{IFTPShell.access}.
+ 
+-    def access(self, path):
++        If path doesn't exists, it returns L{FileNotFoundError}.
++        On Unix systems, it checks path access by trying to change current
++        working directory.
++        On non-Unix systems, it checks path access by issuing a folder
++        listing command.
++        """
+         p = self._path(path)
+         if not p.exists():
+             # Again, win32 doesn't report a sane error after, so let's fail
+-            # early if we can
++            # early if we can.
+             return defer.fail(FileNotFoundError(path))
+-        # For now, just see if we can os.listdir() it
+-        try:
+-            p.listdir()
+-        except (IOError, OSError), e:
+-            return errnoToFailure(e.errno, path)
+-        except:
+-            return defer.fail()
+-        else:
++
++        def check_access_chdir():
++            '''Check access by changing working folder.'''
++            current_path = os.getcwd()
++            try:
++                os.chdir(p.path)
++            except (IOError, OSError), e:
++                return errnoToFailure(e.errno, path)
++            except:
++                return defer.fail()
++            finally:
++                os.chdir(current_path)
++
+             return defer.succeed(None)
+ 
++        def check_access_listdir():
++            '''Check access by listing folder.'''
++            try:
++                os.listdir(p.path)
++            except (IOError, OSError), e:
++                return errnoToFailure(e.errno, path)
++            except:
++                return defer.fail()
+ 
++            return defer.succeed(None)
++
++        if os.name == 'posix':
++            return check_access_chdir()
++        else:
++            return check_access_listdir()
++
+     def stat(self, path, keys=()):
+         p = self._path(path)
+         if p.isdir():

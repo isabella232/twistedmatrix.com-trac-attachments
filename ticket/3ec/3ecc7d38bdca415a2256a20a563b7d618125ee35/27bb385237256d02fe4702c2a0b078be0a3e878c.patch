@@ -1,0 +1,356 @@
+Index: twisted/test/test_paths.py
+===================================================================
+--- twisted/test/test_paths.py	(revision 33490)
++++ twisted/test/test_paths.py	(working copy)
+@@ -15,7 +15,9 @@
+ 
+ from twisted.trial import unittest
+ 
++from zope.interface.verify import verifyObject
+ 
++
+ class AbstractFilePathTestCase(unittest.TestCase):
+ 
+     f1content = "file 1"
+@@ -299,6 +301,14 @@
+         self.all = [x.replace(self.cmn, self.cmn + '.zip') for x in self.all]
+ 
+ 
++    def test_verifyObject(self):
++        """
++        ZipPaths implement IFilePath.
++        """
++
++        self.assertTrue(verifyObject(filepath.IFilePath, self.path))
++
++
+     def test_zipPathRepr(self):
+         """
+         Make sure that invoking ZipPath's repr prints the correct class name
+@@ -643,6 +653,15 @@
+     Test various L{FilePath} path manipulations.
+     """
+ 
++
++    def test_verifyObject(self):
++        """
++        FilePaths implement IFilePath.
++        """
++
++        self.assertTrue(verifyObject(filepath.IFilePath, self.path))
++
++
+     def test_chmod(self):
+         """
+         L{FilePath.chmod} modifies the permissions of
+Index: twisted/python/zippath.py
+===================================================================
+--- twisted/python/zippath.py	(revision 33490)
++++ twisted/python/zippath.py	(working copy)
+@@ -3,9 +3,7 @@
+ # See LICENSE for details.
+ 
+ """
+-This module contains partial re-implementations of FilePath, pending some
+-specification of formal interfaces it is a duck-typing attempt to emulate them
+-for certain restricted uses.
++This module contains implementations of IFilePath for zip files.
+ 
+ See the constructor for ZipArchive for use.
+ """
+@@ -27,8 +25,10 @@
+     _USE_ZIPFILE = False
+     from twisted.python.zipstream import ChunkingZipFile
+ 
+-from twisted.python.filepath import FilePath, _PathHelper
++from twisted.python.filepath import IFilePath, FilePath, AbstractFilePath
+ 
++from zope.interface import implements
++
+ # using FilePath here exclusively rather than os to make sure that we don't do
+ # anything OS-path-specific here.
+ 
+@@ -36,10 +36,15 @@
+                                 # path separator, regardless of platform.
+ 
+ 
+-class ZipPath(_PathHelper):
++class ZipPath(AbstractFilePath):
+     """
+     I represent a file or directory contained within a zip file.
+     """
++
++    implements(IFilePath)
++
++    sep = ZIP_PATH_SEP
++
+     def __init__(self, archive, pathInArchive):
+         """
+         Don't construct me directly.  Use ZipArchive.child().
+@@ -136,16 +141,26 @@
+         # less meaningful here.
+         return self.parent().path
+ 
+-    def open(self):
++    def open(self, mode="r"):
+         if _USE_ZIPFILE:
+-            return self.archive.zipfile.open(self.pathInArchive)
++            return self.archive.zipfile.open(self.pathInArchive, mode=mode)
+         else:
++            # XXX oh man, is this too much hax?
++            self.archive.zipfile.mode = mode
+             return self.archive.zipfile.readfile(self.pathInArchive)
+ 
+-    def restat(self):
++    def changed(self):
+         pass
+ 
++    def getsize(self):
++        """
++        Retrieve this file's size.
+ 
++        @return: file size, in bytes
++        """
++
++        return self.archive.zipfile.NameToInfo[self.pathInArchive].file_size
++
+     def getAccessTime(self):
+         """
+         Retrieve this file's last access-time.  This is the same as the last access
+Index: twisted/python/filepath.py
+===================================================================
+--- twisted/python/filepath.py	(revision 33490)
++++ twisted/python/filepath.py	(working copy)
+@@ -36,6 +36,8 @@
+ 
+ from twisted.python.util import FancyEqMixin
+ 
++from zope.interface import Interface, Attribute, implements
++
+ _CREATE_FLAGS = (os.O_EXCL |
+                  os.O_CREAT |
+                  os.O_RDWR |
+@@ -79,6 +81,131 @@
+ randomBytes = getattr(os, 'urandom', _stub_urandom)
+ armor = getattr(base64, 'urlsafe_b64encode', _stub_armor)
+ 
++class IFilePath(Interface):
++    """
++    File path object.
++
++    A file path represents a location for a file-like-object and can be
++    organized into a hierarchy; a file path can can children which are
++    themselves file paths.
++
++    A file path has a name which unique identifies it in the context of its
++    parent (if it has one); a file path can not have two children with the same
++    name.  This name is referred to as the file path's "base name".
++
++    A series of such names can be used to locate nested children of a file path;
++    such a series is referred to as the child's "path", relative to the parent.
++    In this case, each name in the path is referred to as a "path segment"; the
++    child's base name is the segment in the path.
++
++    When representing a file path as a string, a "path separator" is used to
++    delimit the path segments within the string.  For a file system path, that
++    would be C{os.sep}.
++
++    Note that the values of child names may be restricted.  For example, a file
++    system path will not allow the use of the path separator in a name, and
++    certain names (eg. C{"."} and C{".."}) may be reserved or have special
++    meanings.
++    """
++    sep = Attribute("The path separator to use in string representations")
++
++    def child(name):
++        """
++        Obtain a direct child of this file path.  The child may or may not
++        exist.
++
++        @param name: the name of a child of this path. C{name} must be a direct
++            child of this path and may not contain a path separator.
++        @return: the child of this path with the given C{name}.
++        @raise InsecurePath: if C{name} describes a file path that is not a
++            direct child of this file path.
++        """
++
++    def open(mode="r"):
++        """
++        Opens this file path with the given mode.
++        @return: a file-like-object.
++        @raise Exception: if this file path cannot be opened.
++        """
++
++    def changed():
++        """
++        Clear any cached information about the state of this path on disk.
++        """
++
++    def getsize():
++        """
++        @return: the size of the file at this file path in bytes.
++        @raise Exception: if the size cannot be obtained.
++        """
++
++    def getModificationTime():
++        """
++        Retrieve the time of last access from this file.
++
++        @return: a number of seconds from the epoch.
++        @rtype: float
++        """
++
++    def getStatusChangeTime():
++        """
++        Retrieve the time of the last status change for this file.
++
++        @return: a number of seconds from the epoch.
++        @rtype: float
++        """
++
++    def getAccessTime():
++        """
++        Retrieve the time that this file was last accessed.
++
++        @return: a number of seconds from the epoch.
++        @rtype: float
++        """
++
++    def exists():
++        """
++        @return: C{True} if the file at this file path exists, C{False}
++            otherwise.
++        """
++
++    def isdir():
++        """
++        @return: C{True} if the file at this file path is a directory, C{False}
++            otherwise.
++        """
++
++    def isfile():
++        """
++        @return: C{True} if the file at this file path is a regular file,
++            C{False} otherwise.
++        """
++
++    def children():
++        """
++        @return: a sequence of the children of the directory at this file path.
++        @raise Exception: if the file at this file path is not a directory.
++        """
++
++    def basename():
++        """
++        @return: the base name of this file path.
++        """
++
++    def parent():
++        """
++        A file path for the directory containing the file at this file path.
++        """
++
++    def sibling(name):
++        """
++        A file path for the directory containing the file at this file path.
++        @param name: the name of a sibling of this path. C{name} must be a direct
++            sibling of this path and may not contain a path separator.
++
++        @return: a sibling file path of this one.
++        """
++
+ class InsecurePath(Exception):
+     """
+     Error that is raised when the path provided to FilePath is invalid.
+@@ -136,10 +263,13 @@
+ 
+ 
+ 
+-class _PathHelper:
++class AbstractFilePath(object):
+     """
+-    Abstract helper class also used by ZipPath; implements certain utility
+-    methods.
++    Abstract implementation of an IFilePath; must be completed by a subclass.
++
++    This class primarily exists to provide common implementations of certain
++    methods in IFilePath. It is *not* a required parent class for IFilePath
++    implementations, just a useful starting point.
+     """
+ 
+     def getContent(self):
+@@ -433,7 +563,7 @@
+ 
+ 
+ 
+-class FilePath(_PathHelper):
++class FilePath(AbstractFilePath):
+     """
+     I am a path on the filesystem that only permits 'downwards' access.
+ 
+@@ -479,9 +609,13 @@
+     @type statinfo: C{int} or L{types.NoneType} or L{os.stat_result}
+     """
+ 
++    implements(IFilePath)
++
+     statinfo = None
+     path = None
+ 
++    sep = slash
++
+     def __init__(self, path, alwaysCreate=False):
+         """
+         Convert a path string to an absolute path if necessary and initialize
+@@ -517,7 +651,7 @@
+             # Catch paths like C:blah that don't have a slash
+             raise InsecurePath("%r contains a colon." % (path,))
+         norm = normpath(path)
+-        if slash in norm:
++        if self.sep in norm:
+             raise InsecurePath("%r contains one or more directory separators" % (path,))
+         newpath = abspath(joinpath(self.path, norm))
+         if not newpath.startswith(self.path):
+@@ -652,6 +786,9 @@
+         @param reraise: a boolean.  If true, re-raise exceptions from
+         L{os.stat}; otherwise, mark this path as not existing, and remove any
+         cached stat information.
++
++        @raise Exception: is C{reraise} is C{True} and an exception occurs while
++            reloading metadata.
+         """
+         try:
+             self.statinfo = stat(self.path)
+@@ -983,7 +1120,12 @@
+ 
+     def touch(self):
+         """
+-        Update the access and modified times of the L{FilePath}'s file.
++        Updates the access and last modification times of the file at this
++        file path to the current time. Also creates the file if it does not
++        already exist.
++
++        @raise Exception: if unable to create or modify the last modification
++            time of the file.
+         """
+         try:
+             self.open('a').close()
+@@ -996,8 +1138,7 @@
+         """
+         Removes the file or directory that is represented by self.  If
+         C{self.path} is a directory, recursively remove all its children
+-        before removing the directory.  If it's a file or link, just delete
+-        it.
++        before removing the directory. If it's a file or link, just delete it.
+         """
+         if self.isdir() and not self.islink():
+             for child in self.children():
+@@ -1023,7 +1164,7 @@
+         pattern.
+         """
+         import glob
+-        path = self.path[-1] == '/' and self.path + pattern or slash.join([self.path, pattern])
++        path = self.path[-1] == '/' and self.path + pattern or self.sep.join([self.path, pattern])
+         return map(self.clonePath, glob.glob(path))
+ 
+ 

@@ -1,0 +1,386 @@
+diff -ruN orig/TwistedSumo-2005-05-25/twisted/conch/checkers.py TwistedSumo-2005-05-25/twisted/conch/checkers.py
+--- orig/TwistedSumo-2005-05-25/twisted/conch/checkers.py	2005-05-25 12:07:16.000000000 +0300
++++ TwistedSumo-2005-05-25/twisted/conch/checkers.py	2005-06-12 20:25:49.000000000 +0300
+@@ -13,7 +13,7 @@
+     shadow = None
+ 
+ try:
+-    import pamauth
++    import twisted.cred.pamauth
+ except ImportError:
+     pamauth = None
+ 
+@@ -24,7 +24,7 @@
+ from twisted.cred.error import UnauthorizedLogin, UnhandledCredentials
+ from twisted.internet import defer
+ from twisted.python import components, failure, reflect, log
+-from credentials import ISSHPrivateKey, IPluggableAuthenticationModules
++from twisted.cred.credentials import ISSHPrivateKey, IPluggableAuthenticationModules
+ from zope import interface
+ 
+ def verifyCryptedPassword(crypted, pw):
+@@ -133,20 +133,6 @@
+ 
+ components.backwardsCompatImplements(SSHPublicKeyDatabase)
+ 
+-class PluggableAuthenticationModulesChecker:
+-    interface.implements(ICredentialsChecker)
+-    credentialInterfaces = IPluggableAuthenticationModules,
+-
+-    def requestAvatarId(self, credentials):
+-        if not pamauth:
+-            return defer.fail(UnauthorizedLogin())
+-        d = pamauth.pamAuthenticate('ssh', credentials.username,
+-                                       credentials.pamConversion)
+-        d.addCallback(lambda x: credentials.username)
+-        return d
+-
+-components.backwardsCompatImplements(PluggableAuthenticationModulesChecker)
+-
+ class SSHProtocolChecker:
+     interface.implements(ICredentialsChecker)
+ 
+diff -ruN orig/TwistedSumo-2005-05-25/twisted/conch/credentials.py TwistedSumo-2005-05-25/twisted/conch/credentials.py
+--- orig/TwistedSumo-2005-05-25/twisted/conch/credentials.py	2005-05-25 12:07:16.000000000 +0300
++++ TwistedSumo-2005-05-25/twisted/conch/credentials.py	1970-01-01 02:00:00.000000000 +0200
+@@ -1,55 +0,0 @@
+-from twisted.cred import credentials
+-from twisted.python import components
+-from zope import interface
+-
+-class ISSHPrivateKey(credentials.ICredentials):
+-    """I encapsulate an SSH public key to be checked against a users private
+-    key.
+-
+-    @ivar username: Duh?
+-
+-    @ivar blob: The public key blob as sent by the client.
+-
+-    @ivar sigData: The data the signature was made from.
+-
+-    @ivar signature: The signed data.  This is checked to verify that the user
+-                     owns the private key.
+-    
+-    """
+-
+-class SSHPrivateKey:
+-    interface.implements(ISSHPrivateKey)
+-    def __init__(self, username, blob, sigData, signature):
+-        self.username = username
+-        self.blob = blob
+-        self.sigData = sigData
+-        self.signature = signature
+-
+-components.backwardsCompatImplements(SSHPrivateKey)
+-
+-class IPluggableAuthenticationModules(credentials.ICredentials):
+-    """I encapsulate the authentication of a user via PAM (Pluggable
+-    Authentication Modules.  I use PyPAM (available from
+-    http://www.tummy.com/Software/PyPam/index.html).
+-
+-    @ivar username: The username for the user being logged in.
+-
+-    @ivar pamConversion: A function that is called with a list of tuples 
+-                         (message, messageType).  See the PAM documentation
+-                         for the meaning of messageType.  The function
+-                         returns a Deferred which will fire with a list
+-                         of (response, 0), one for each message.  The 0 is
+-                         currently unused, but is required by the PAM library.
+-    """
+-
+-class PluggableAuthenticationModules:
+-    interface.implements(IPluggableAuthenticationModules)
+-
+-    def __init__(self, username, pamConversion):
+-        self.username = username
+-        self.pamConversion = pamConversion
+-
+-components.backwardsCompatImplements(PluggableAuthenticationModules)
+-
+-IUsernamePassword = credentials.IUsernamePassword
+-UsernamePassword = credentials.UsernamePassword
+diff -ruN orig/TwistedSumo-2005-05-25/twisted/conch/pamauth.py TwistedSumo-2005-05-25/twisted/conch/pamauth.py
+--- orig/TwistedSumo-2005-05-25/twisted/conch/pamauth.py	2005-05-25 12:07:16.000000000 +0300
++++ TwistedSumo-2005-05-25/twisted/conch/pamauth.py	1970-01-01 02:00:00.000000000 +0200
+@@ -1,79 +0,0 @@
+-# Copyright (c) 2001-2004 Twisted Matrix Laboratories.
+-# See LICENSE for details.
+-
+-#
+-
+-"""Support for asynchronously authenticating using PAM.
+-"""
+-
+-from __future__ import nested_scopes
+-
+-import PAM
+-from twisted.internet import reactor
+-from twisted.internet import threads, defer
+-
+-import sys, time, getpass, threading, os
+-
+-def pamAuthenticateThread(service, user, conv):
+-    def _conv(p, items, foo):
+-        try:
+-            d = conv(items)
+-        except:
+-            import traceback
+-            traceback.print_exc()
+-            return
+-        ev = threading.Event()
+-        def cb(r):
+-            ev.r = (1, r)
+-            ev.set()
+-        def eb(e):
+-            ev.r = (0, e)
+-            ev.set()
+-        reactor.callFromThread(d.addCallbacks, cb, eb)
+-        ev.wait()
+-        done = ev.r
+-        if done[0]:
+-            return done[1]
+-        else:
+-            raise done[1].type, done[1].value
+-
+-    pam = PAM.pam()
+-    pam.start(service)
+-    pam.set_item(PAM.PAM_USER, user)
+-    pam.set_item(PAM.PAM_CONV, _conv)
+-    gid = os.getegid()
+-    uid = os.geteuid()
+-    os.setegid(0)
+-    os.seteuid(0)
+-    try:
+-        pam.authenticate() # these will raise
+-        pam.acct_mgmt()
+-    except:
+-        os.setegid(gid)
+-        os.seteuid(uid)
+-        raise
+-    else:
+-        os.setegid(gid)
+-        os.seteuid(uid)
+-        return 1
+-
+-def defConv(items):
+-    resp = []
+-    for i in range(len(items)):
+-        message, kind = items[i]
+-        if kind == 1: # password
+-            p = getpass.getpass(message)
+-            resp.append((p, 0))
+-        elif kind == 2: # text
+-            p = raw_input(message)
+-            resp.append((p, 0))
+-        elif kind in (3,4):
+-            print message
+-            resp.append(("", 0))
+-        else:
+-            return defer.fail('foo')
+-    d = defer.succeed(resp)
+-    return d
+-
+-def pamAuthenticate(service, user, conv):
+-    return threads.deferToThread(pamAuthenticateThread, service, user, conv)
+diff -ruN orig/TwistedSumo-2005-05-25/twisted/conch/ssh/userauth.py TwistedSumo-2005-05-25/twisted/conch/ssh/userauth.py
+--- orig/TwistedSumo-2005-05-25/twisted/conch/ssh/userauth.py	2005-05-25 12:07:16.000000000 +0300
++++ TwistedSumo-2005-05-25/twisted/conch/ssh/userauth.py	2005-06-12 20:21:05.000000000 +0300
+@@ -12,7 +12,8 @@
+ """
+ 
+ import struct
+-from twisted.conch import error, credentials, interfaces 
++from twisted.conch import error, interfaces
++from twisted.cred import credentials
+ from twisted.internet import defer, reactor
+ from twisted.python import failure, log
+ from common import NS, getNS, MP
+diff -ruN orig/TwistedSumo-2005-05-25/twisted/conch/tap.py TwistedSumo-2005-05-25/twisted/conch/tap.py
+--- orig/TwistedSumo-2005-05-25/twisted/conch/tap.py	2005-05-25 12:07:16.000000000 +0300
++++ TwistedSumo-2005-05-25/twisted/conch/tap.py	2005-06-12 20:26:12.000000000 +0300
+@@ -36,8 +36,8 @@
+     t.portal = portal.Portal(unix.UnixSSHRealm())
+     t.portal.registerChecker(checkers.UNIXPasswordDatabase())
+     t.portal.registerChecker(checkers.SSHPublicKeyDatabase())
+-    if checkers.pamauth:
+-        t.portal.registerChecker(checkers.PluggableAuthenticationModulesChecker())
++    if twisted.cred.pamauth:
++        t.portal.registerChecker(twisted.cred.checkers.PluggableAuthenticationModulesChecker())
+     t.dataRoot = config['data']
+     t.moduliRoot = config['moduli'] or config['data']
+     port = config['port']
+diff -ruN orig/TwistedSumo-2005-05-25/twisted/cred/checkers.py TwistedSumo-2005-05-25/twisted/cred/checkers.py
+--- orig/TwistedSumo-2005-05-25/twisted/cred/checkers.py	2005-05-25 12:07:16.000000000 +0300
++++ TwistedSumo-2005-05-25/twisted/cred/checkers.py	2005-06-12 20:28:28.000000000 +0300
+@@ -4,9 +4,9 @@
+ # See LICENSE for details.
+ 
+ 
+-from twisted.internet import defer
++from twisted.internet import reactor, threads, defer
+ from twisted.python import components, failure, log
+-from twisted.cred import error, credentials
++from twisted.cred import error, credentials, pamauth
+ from zope import interface
+ 
+ class ICredentialsChecker(components.Interface):
+@@ -204,6 +204,20 @@
+ 
+ components.backwardsCompatImplements(FilePasswordDB)
+ 
++class PluggableAuthenticationModulesChecker:
++    interface.implements(ICredentialsChecker)
++    credentialInterfaces = credentials.IPluggableAuthenticationModules,
++    
++    def requestAvatarId(self, credentials):
++        if not pamauth:
++            return defer.fail(UnauthorizedLogin())
++        d = pamauth.pamAuthenticate('ssh', credentials.username,
++                                    credentials.pamConversion)
++        d.addCallback(lambda x: credentials.username)
++        return d
++
++components.backwardsCompatImplements(PluggableAuthenticationModulesChecker)
++
+ # For backwards compatibility
+ # Allow access as the old name.
+ OnDiskUsernamePasswordDatabase = FilePasswordDB
+diff -ruN orig/TwistedSumo-2005-05-25/twisted/cred/credentials.py TwistedSumo-2005-05-25/twisted/cred/credentials.py
+--- orig/TwistedSumo-2005-05-25/twisted/cred/credentials.py	2005-05-25 12:07:16.000000000 +0300
++++ TwistedSumo-2005-05-25/twisted/cred/credentials.py	2005-06-12 20:10:28.000000000 +0300
+@@ -138,3 +138,52 @@
+     interface.implements(IAnonymous)
+ 
+ components.backwardsCompatImplements(Anonymous)
++
++class ISSHPrivateKey(ICredentials):
++    """I encapsulate an SSH public key to be checked against a users private
++    key.
++    
++    @ivar username: Duh?
++    
++    @ivar blob: The public key blob as sent by the client.
++    
++    @ivar sigData: The data the signature was made from.
++    
++    @ivar signature: The signed data.  This is checked to verify that the user
++    owns the private key.
++
++    """
++
++class SSHPrivateKey:
++    interface.implements(ISSHPrivateKey)
++    def __init__(self, username, blob, sigData, signature):
++        self.username = username
++        self.blob = blob
++        self.sigData = sigData
++        self.signature = signature
++        
++components.backwardsCompatImplements(SSHPrivateKey)
++
++class IPluggableAuthenticationModules(ICredentials):
++    """I encapsulate the authentication of a user via PAM (Pluggable
++    Authentication Modules.  I use PyPAM (available from
++    http://www.tummy.com/Software/PyPam/index.html).
++    
++    @ivar username: The username for the user being logged in.
++    
++    @ivar pamConversion: A function that is called with a list of tuples
++    (message, messageType).  See the PAM documentation
++    for the meaning of messageType.  The function
++    returns a Deferred which will fire with a list
++    of (response, 0), one for each message.  The 0 is
++    currently unused, but is required by the PAM library.
++    """
++
++class PluggableAuthenticationModules:
++    interface.implements(IPluggableAuthenticationModules)
++    
++    def __init__(self, username, pamConversion):
++        self.username = username
++        self.pamConversion = pamConversion
++        
++components.backwardsCompatImplements(PluggableAuthenticationModules)
+diff -ruN orig/TwistedSumo-2005-05-25/twisted/cred/pamauth.py TwistedSumo-2005-05-25/twisted/cred/pamauth.py
+--- orig/TwistedSumo-2005-05-25/twisted/cred/pamauth.py	1970-01-01 02:00:00.000000000 +0200
++++ TwistedSumo-2005-05-25/twisted/cred/pamauth.py	2005-06-12 20:39:44.000000000 +0300
+@@ -0,0 +1,79 @@
++# Copyright (c) 2001-2004 Twisted Matrix Laboratories.
++# See LICENSE for details.
++
++#
++
++"""Support for asynchronously authenticating using PAM.
++"""
++
++from __future__ import nested_scopes
++
++import PAM
++from twisted.internet import reactor
++from twisted.internet import threads, defer
++
++import sys, time, getpass, threading, os
++
++def pamAuthenticateThread(service, user, conv):
++    def _conv(p, items, foo):
++        try:
++            d = conv(items)
++        except:
++            import traceback
++            traceback.print_exc()
++            return
++        ev = threading.Event()
++        def cb(r):
++            ev.r = (1, r)
++            ev.set()
++        def eb(e):
++            ev.r = (0, e)
++            ev.set()
++        reactor.callFromThread(d.addCallbacks, cb, eb)
++        ev.wait()
++        done = ev.r
++        if done[0]:
++            return done[1]
++        else:
++            raise done[1].type, done[1].value
++
++    pam = PAM.pam()
++    pam.start(service)
++    pam.set_item(PAM.PAM_USER, user)
++    pam.set_item(PAM.PAM_CONV, _conv)
++    gid = os.getegid()
++    uid = os.geteuid()
++    os.setegid(0)
++    os.seteuid(0)
++    try:
++        pam.authenticate() # these will raise
++        pam.acct_mgmt()
++    except:
++        os.setegid(gid)
++        os.seteuid(uid)
++        raise
++    else:
++        os.setegid(gid)
++        os.seteuid(uid)
++        return 1
++
++def defConv(items):
++    resp = []
++    for i in range(len(items)):
++        message, kind = items[i]
++        if kind == 1: # password
++            p = getpass.getpass(message)
++            resp.append((p, 0))
++        elif kind == 2: # text
++            p = raw_input(message)
++            resp.append((p, 0))
++        elif kind in (3,4):
++            print message
++            resp.append(("", 0))
++        else:
++            return defer.fail('foo')
++    d = defer.succeed(resp)
++    return d
++
++def pamAuthenticate(service, user, conv):
++    return threads.deferToThread(pamAuthenticateThread, service, user, conv)

@@ -1,0 +1,97 @@
+diff --git twisted/internet/base.py twisted/internet/base.py
+index ce63c37..7a865eb 100644
+--- twisted/internet/base.py
++++ twisted/internet/base.py
+@@ -91,7 +91,10 @@ class DelayedCall:
+             self.cancelled = 1
+             if self.debug:
+                 self._str = str(self)
+-            del self.func, self.args, self.kw
++            self.func = None
++            self.args = None
++            self.kw = None
++
+ 
+     def reset(self, secondsFromNow):
+         """Reschedule this call for a different time
+diff --git twisted/internet/task.py twisted/internet/task.py
+index f1984f7..60d9d04 100644
+--- twisted/internet/task.py
++++ twisted/internet/task.py
+@@ -786,11 +786,16 @@ class Clock:
+         """
+         self.rightNow += amount
+         self._sortCalls()
+-        while self.calls and self.calls[0].getTime() <= self.seconds():
+-            call = self.calls.pop(0)
++        calls = self.calls
++        self.calls = []
++        while calls and calls[0].getTime() <= self.seconds():
++            call = calls.pop(0)
+             call.called = 1
+-            call.func(*call.args, **call.kw)
+-            self._sortCalls()
++            # See ticket #6867 : call.func needs to handle exceptions.
++            # An exception puts self.calls in an invalid state
++            if call.func: # Can be None after cancel()
++                call.func(*call.args, **call.kw)
++        self.calls.extend(calls)
+ 
+ 
+     def pump(self, timings):
+diff --git twisted/test/test_task.py twisted/test/test_task.py
+index e28ce92..b3429c9 100644
+--- twisted/test/test_task.py
++++ twisted/test/test_task.py
+@@ -90,6 +90,43 @@ class ClockTestCase(unittest.TestCase):
+         self.failIf(call.active())
+ 
+ 
++    def _advanceCallingCallLater(self, advanceBy):
++        """
++        Adds a C{callLater} for immediate execution and advances the clock
++        by C{advanceBy} seconds.
++
++        @type advanceBy: number
++        @param advanceBy: Seconds to advance by.
++
++        @rtype: C{int}
++        @return: Number of times C{f} is called.
++        """
++        i = [0]
++        def f():
++            if i[0] < 6:
++                c.callLater(0, f)
++            i[0] += 1
++        c = task.Clock()
++        f()
++        c.advance(advanceBy)
++        return i[0]
++
++
++    def testAdvanceCallLaterZero(self):
++        """
++        C{f} calling C{Clock.callLater(0, f)} does not create an infinite loop
++        """
++        self.assertEqual(self._advanceCallingCallLater(0), 2)
++
++
++    def testAdvanceCallLaterZeroAdvanceOne(self):
++        """
++        Same as testAdvanceCallLaterZero in practice.
++        This test is included because it catches a bug in original proposed fix.
++        """
++        self.assertEqual(self._advanceCallingCallLater(1), 2)
++
++
+     def testAdvanceCancel(self):
+         """
+         Test attemping to cancel the call in a callback.
+diff --git twisted/topfiles/5962.bugfix twisted/topfiles/5962.bugfix
+new file mode 100644
+index 0000000..1146864
+--- /dev/null
++++ twisted/topfiles/5962.bugfix
+@@ -0,0 +1,2 @@
++twisted.internet.task.advance now avoids running any callbacks which are added during its excecution, which prevents a possible infinite loop.
++

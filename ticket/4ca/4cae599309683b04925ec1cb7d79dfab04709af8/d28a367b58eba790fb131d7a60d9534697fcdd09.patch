@@ -1,0 +1,217 @@
+diff -ruN twisted.old/protocols/basic.py twisted/protocols/basic.py
+--- twisted.old/protocols/basic.py	2004-01-14 04:56:58.000000000 +0100
++++ twisted/protocols/basic.py	2004-10-04 20:01:12.000000000 +0200
+@@ -143,8 +143,8 @@
+         """
+         
+         lines  = (self._buffer+data).split(self.delimiter)
+-        self._buffer = lines[-1]
+-        for line in lines[:-1]:
++        self._buffer = lines.pop()
++        for line in lines:
+             if self.transport.disconnecting:
+                 # this is necessary because the transport may be told to lose
+                 # the connection by a line within a larger packet, and it is
+@@ -153,8 +153,7 @@
+                 return
+             if len(line) > self.MAX_LENGTH:
+                 return self.lineLengthExceeded(line)                
+-            else:
+-                self.lineReceived(line)
++            self.lineReceived(line)
+         if len(self._buffer) > self.MAX_LENGTH:
+             return self.lineLengthExceeded(self._buffer)                
+ 
+@@ -327,7 +326,7 @@
+         """
+         self.recvd = self.recvd + recd
+         while len(self.recvd) > 1:
+-            length = (ord(self.recvd[0]) * 256) + ord(self.recvd[1])
++            length ,= struct.unpack("!h",self.recvd[:2])
+             if len(self.recvd) < length+2:
+                 break
+             packet = self.recvd[2:length+2]
+diff -ruN twisted.old/protocols/ftp.py twisted/protocols/ftp.py
+--- twisted.old/protocols/ftp.py	2004-03-03 11:42:26.000000000 +0100
++++ twisted/protocols/ftp.py	2004-10-04 20:52:28.000000000 +0200
+@@ -931,9 +931,11 @@
+         """
+         #abcdef = re.sub('[^0-9, ]', '', line[4:])
+         abcdef = re.sub('[^0-9, ]', '', line)
+-        a, b, c, d, e, f = map(str.strip, abcdef.split(','))
+-        host = "%s.%s.%s.%s" % (a, b, c, d)
+-        port = (int(e)<<8) + int(f)
++        t = a, b, c, d, e, f = map(int, map(str.strip, abcdef.split(',')))
++        if False in map(lambda n: 0 <= n < 256, t):
++            raise ValueError, "out of range"
++        host = "%d.%d.%d.%d" % (a, b, c, d)
++        port = (e<<8) + f
+         return (host, port)
+ 
+     def ftp_PORT(self, params):
+@@ -1287,9 +1289,9 @@
+         @param rpath: path element to the right of the '/' in the result
+         @type rpath: string
+         """
+-        if lpath and lpath[-1] == os.sep:
++        while lpath and lpath[-1] == os.sep:
+             lpath = lpath[:-1]
+-        if rpath and rpath[0] == os.sep:
++        while rpath and rpath[0] == os.sep:
+             rpath = rpath[1:]
+         return "%s%s%s" % (lpath, os.sep, rpath)
+ 
+@@ -1588,9 +1590,11 @@
+     @returns: a 2-tuple of (host, port).
+     """
+     abcdef = re.sub('[^0-9, ]', '', line[4:])
+-    a, b, c, d, e, f = map(str.strip, abcdef.split(','))
+-    host = "%s.%s.%s.%s" % (a, b, c, d)
+-    port = (int(e)<<8) + int(f)
++    t = a, b, c, d, e, f = map(int, map(str.strip, abcdef.split(',')))
++    if False in map(lambda n: 0 <= n < 256, t):
++        raise ValueError, "out of range"
++    host = "%d.%d.%d.%d" % (a, b, c, d)
++    port = (e<<8) + f
+     return host, port
+ 
+ 
+@@ -1853,12 +1857,12 @@
+         host = self.transport.getHost()[1]
+         port = listener.getHost()[2]
+         numbers = string.split(host, '.') + [str(port >> 8), str(port % 256)]
+-        portCmd.text = 'PORT ' + string.join(numbers,',')
++        portCmd.text = 'PORT ' + ",".join(numbers)
+ 
+     def escapePath(self, path):
+         """Returns a FTP escaped path (replace newlines with nulls)"""
+         # Escape newline characters
+-        return string.replace(path, '\n', '\0')
++        return path.replace('\n', '\0')
+ 
+     def retrieveFile(self, path, protocol, offset=0):
+         """Retrieve a file from the given path
+diff -ruN twisted.old/protocols/http.py twisted/protocols/http.py
+--- twisted.old/protocols/http.py	2004-04-24 05:43:51.000000000 +0200
++++ twisted/protocols/http.py	2004-10-04 20:25:06.000000000 +0200
+@@ -280,6 +280,8 @@
+     """
+     prefix, rest = data.split('\r\n', 1)
+     length = int(prefix, 16)
++    if length < 0:
++        raise ValueError, "length needs to be >0"
+     if not rest[length:length+2] == '\r\n':
+         raise ValueError, "chunk must end with CRLF"
+     return rest[:length], rest[length+2:]
+@@ -348,6 +350,7 @@
+             self.handleStatus(version, status, message)
+             return
+         if line:
++            # XXX: What happens if there is no :?
+             key, val = line.split(':', 1)
+             val = val.lstrip()
+             self.handleHeader(key, val)
+@@ -361,7 +364,7 @@
+         self.handleResponseEnd()
+ 
+     def handleResponseEnd(self):
+-        if self.__buffer != None:
++        if self.__buffer is not None:
+             b = self.__buffer
+             self.__buffer = None
+             self.handleResponse(b)
+@@ -551,8 +554,6 @@
+             elif key == mfd:
+                 args.update(
+                     cgi.parse_multipart(self.content, pdict))
+-            else:
+-                pass
+ 
+         self.process()
+ 
+@@ -980,6 +981,8 @@
+         data = data.strip()
+         if header == 'content-length':
+             self.length = int(data)
++            if self.length < 0:
++                raise ValueError, "request length is negative"
+         reqHeaders = self.requests[-1].received_headers
+         reqHeaders[header] = data
+         if len(reqHeaders) > self.maxHeaders:
+@@ -1025,7 +1028,7 @@
+         """Check if the channel should close or not."""
+         connection = request.getHeader('connection')
+         if connection:
+-            tokens = map(lambda x: x.lower(), connection.split(' '))
++            tokens = map(str.lower, connection.split(' '))
+         else:
+             tokens = []
+ 
+@@ -1054,7 +1057,7 @@
+     def requestDone(self, request):
+         """Called by first request in queue when it is done."""
+         if request != self.requests[0]: raise TypeError
+-        del self.requests[0]
++        self.requests.pop(0)
+ 
+         if self.persistent:
+             # notify next request it can start writing
+diff -ruN twisted.old/protocols/ident.py twisted/protocols/ident.py
+--- twisted.old/protocols/ident.py	2003-12-31 21:51:07.000000000 +0100
++++ twisted/protocols/ident.py	2004-10-04 21:13:51.000000000 +0200
+@@ -83,7 +83,9 @@
+             self.invalidQuery()
+         else:
+             try:
+-                portOnServer, portOnClient = map(int, parts)
++                t = portOnServer, portOnClient = map(int, parts)
++                if False in map(lambda n: 0 < n <= 65536, t):
++                    raise ValueError
+             except ValueError:
+                 self.invalidQuery()
+             else:
+diff -ruN twisted.old/protocols/irc.py twisted/protocols/irc.py
+--- twisted.old/protocols/irc.py	2003-09-25 23:38:55.000000000 +0200
++++ twisted/protocols/irc.py	2004-10-04 21:11:55.000000000 +0200
+@@ -169,8 +169,7 @@
+         of LineReceiver to turn "line mode" on and off was not
+         required.)
+         """
+-        self.buffer = self.buffer + data
+-        lines = string.split(self.buffer, LF)
++        lines = string.split(self.buffer + data, LF)
+         # Put the (possibly empty) element after the last LF back in the
+         # buffer
+         self.buffer = lines.pop()
+@@ -183,7 +182,7 @@
+                 line = line[:-1]
+             prefix, command, params = parsemsg(line)
+             # mIRC is a big pile of doo-doo
+-            command = string.upper(command)
++            command = command.upper()
+             # DEBUG: log.msg( "%s %s %s" % (prefix, command, params))
+ 
+             self.handleCommand(command, prefix, params)
+diff -ruN twisted.old/protocols/pop3.py twisted/protocols/pop3.py
+--- twisted.old/protocols/pop3.py	2004-04-05 19:41:53.000000000 +0200
++++ twisted/protocols/pop3.py	2004-10-04 21:19:47.000000000 +0200
+@@ -58,9 +58,7 @@
+     def checkPassword(self, password):
+         seed = self.magic + password
+         my_digest = md5.new(seed).hexdigest()
+-        if my_digest == self.digest:
+-            return True
+-        return False
++        return my_digest == self.digest
+ ##
+ 
+ class _HeadersPlusNLines:
+@@ -82,7 +80,7 @@
+             df, sz = data.find('\r\n\r\n'), 4
+             if df == -1:
+                 df, sz = data.find('\n\n'), 2
+-            if df!=-1:
++            else:
+                 df += sz
+                 val = data[:df]
+                 data = data[df:]

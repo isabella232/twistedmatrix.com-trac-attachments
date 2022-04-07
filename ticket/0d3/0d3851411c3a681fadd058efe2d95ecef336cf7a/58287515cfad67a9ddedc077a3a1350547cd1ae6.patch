@@ -1,0 +1,172 @@
+diff --git twisted/python/syslog.py twisted/python/syslog.py
+index 7f8afad..b1f8ce0 100644
+--- twisted/python/syslog.py
++++ twisted/python/syslog.py
+@@ -10,12 +10,21 @@ You probably want to call L{startLogging}.
+ 
+ syslog = __import__('syslog')
+ 
++import logging
+ from twisted.python import log
+ 
+ # These defaults come from the Python syslog docs.
+ DEFAULT_OPTIONS = 0
+ DEFAULT_FACILITY = syslog.LOG_USER
+ 
++# Mappings from/to Python's syslog module
++_toSyslogLevelMapping = {
++    logging.DEBUG: syslog.LOG_DEBUG,
++    logging.INFO: syslog.LOG_INFO,
++    logging.WARN: syslog.LOG_WARNING,
++    logging.ERROR: syslog.LOG_ERR,
++    logging.CRITICAL: syslog.LOG_ALERT,
++}
+ 
+ 
+ class SyslogObserver:
+@@ -49,7 +58,6 @@ class SyslogObserver:
+         """
+         self.openlog(prefix, options, facility)
+ 
+-
+     def emit(self, eventDict):
+         """
+         Send a message event to the I{syslog}.
+@@ -71,10 +79,17 @@ class SyslogObserver:
+         # Figure out what syslog parameters we might need to use.
+         priority = syslog.LOG_INFO
+         facility = 0
+-        if eventDict['isError']:
+-            priority = syslog.LOG_ALERT
++
++        # Set priority by loglevel and eventually
++        #  override it if isError or syslogPriority is defined
+         if 'syslogPriority' in eventDict:
+             priority = int(eventDict['syslogPriority'])
++        elif 'logLevel' in eventDict:
++            priority = _toSyslogLevelMapping.get(
++                eventDict['logLevel'], syslog.LOG_INFO)
++        elif eventDict['isError']:
++            priority = syslog.LOG_ALERT
++
+         if 'syslogFacility' in eventDict:
+             facility = int(eventDict['syslogFacility'])
+ 
+@@ -93,7 +108,6 @@ class SyslogObserver:
+                         '[%s] %s' % (eventDict['system'], line))
+ 
+ 
+-
+ def startLogging(prefix='Twisted', options=DEFAULT_OPTIONS,
+                  facility=DEFAULT_FACILITY, setStdout=1):
+     """
+diff --git twisted/python/test/test_syslog.py twisted/python/test/test_syslog.py
+index 559c62f..3e8cbd8 100644
+--- twisted/python/test/test_syslog.py
++++ twisted/python/test/test_syslog.py
+@@ -4,6 +4,7 @@
+ from twisted.trial.unittest import TestCase
+ from twisted.python.failure import Failure
+ 
++import logging
+ try:
+     import syslog as stdsyslog
+ except ImportError:
+@@ -149,3 +150,90 @@ class SyslogObserverTests(TestCase):
+             self.events,
+             [(stdsyslog.LOG_INFO, '[-] hello,'),
+              (stdsyslog.LOG_INFO, '[-] \tworld')])
++
++
++    def assertPriorityMapping(self, expected, event):
++        """
++        Check that when emitted, event is translated into expected syslog level
++        """
++        m = {
++            'message': ('hello,\nworld\n\n',),
++            'isError': False,
++            'system': '-',
++        }
++        m.update(event)
++        self.observer.emit(m)
++        self.assertEqual(
++            self.events,
++            [(expected, '[-] hello,'),
++             (expected, '[-] \tworld')])
++
++
++    def test_emitLevelMissingLevelUseDefault(self):
++        """
++        On missing logLevel defaults to stdsyslog.LOG_INFO
++        """
++        expected, event = stdsyslog.LOG_INFO, {}
++        self.assertPriorityMapping(expected, event)
++
++
++    def test_emitLevelInvalidLevelUseDefault(self):
++        """
++        On invalid logLevel defaults to stdsyslog.LOG_INFO
++        """
++        expected, event = stdsyslog.LOG_INFO, {'logLevel': 'INVALID'}
++        self.assertPriorityMapping(expected, event)
++
++
++    def test_emitLevelWARN(self):
++        """
++        Logging levels are nicely mapped to syslog priorities
++        https://twistedmatrix.com/documents/14.0.0/core/howto/logging.html
++         """
++        expected, event = stdsyslog.LOG_WARNING, {'logLevel': logging.WARN}
++        self.assertPriorityMapping(expected, event)
++
++
++    def test_emitLevelERR(self):
++        """
++        Logging levels are nicely mapped to syslog priorities
++        https://twistedmatrix.com/documents/14.0.0/core/howto/logging.html
++         """
++        expected, event = stdsyslog.LOG_ERR, {'logLevel': logging.ERROR}
++        self.assertPriorityMapping(expected, event)
++
++
++    def test_emitLevelDEBUG(self):
++        """
++        Logging levels are nicely mapped to syslog priorities
++        https://twistedmatrix.com/documents/14.0.0/core/howto/logging.html
++         """
++        expected, event = stdsyslog.LOG_DEBUG, {'logLevel': logging.DEBUG}
++        self.assertPriorityMapping(expected, event)
++
++
++    def test_emitLevelIsError(self):
++        """
++        Messages with isError=True are mapped to LOG_ALERT
++        """
++        expected, event = stdsyslog.LOG_ALERT, {'isError': True}
++        self.assertPriorityMapping(expected, event)
++
++
++    def test_emitLevelOvverrideIsError(self):
++        """
++        Using logLevel ovverrides isError
++        """
++        expected, event = stdsyslog.LOG_INFO, {'isError': True,
++                                                'logLevel': logging.INFO}
++        self.assertPriorityMapping(expected, event)
++
++
++    def test_emitLevelPriorityOverridesLogLevel(self):
++        """
++        Using syslogPriority overrides logLevel
++        """
++        expected, event = stdsyslog.LOG_ALERT, {'isError': False,
++                                                 'logLevel': logging.INFO,
++                                                 'syslogPriority': stdsyslog.LOG_ALERT}
++        self.assertPriorityMapping(expected, event)
+diff --git twisted/topfiles/7549.feature twisted/topfiles/7549.feature
+new file mode 100644
+index 0000000..396fe4f
+--- /dev/null
++++ twisted/topfiles/7549.feature
+@@ -0,0 +1 @@
++twisted.python.syslog now maps logLevel to syslog priorities 

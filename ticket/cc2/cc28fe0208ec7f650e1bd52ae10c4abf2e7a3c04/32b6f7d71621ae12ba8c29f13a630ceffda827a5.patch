@@ -1,0 +1,1484 @@
+diff --git twisted/internet/defer.py twisted/internet/defer.py
+index f1f05a4..7a8e14a 100644
+--- twisted/internet/defer.py
++++ twisted/internet/defer.py
+@@ -1047,7 +1047,7 @@ def _inlineCallbacks(result, g, deferred):
+             # fell off the end, or "return" statement
+             deferred.callback(None)
+             return deferred
+-        except _DefGen_Return, e:
++        except _DefGen_Return as e:
+             # returnValue() was called; time to give a result to the original
+             # Deferred.  First though, let's try to identify the potentially
+             # confusing situation which results when returnValue() is
+diff --git twisted/persisted/sob.py twisted/persisted/sob.py
+index 2ba2e49..0fc2fcd 100644
+--- twisted/persisted/sob.py
++++ twisted/persisted/sob.py
+@@ -14,14 +14,12 @@ try:
+     import cPickle as pickle
+ except ImportError:
+     import pickle
+-try:
+-    import cStringIO as StringIO
+-except ImportError:
+-    import StringIO
++
+ from twisted.python import log, runtime
+ from twisted.python.hashlib import md5
+ from twisted.persisted import styles
+-from zope.interface import implements, Interface
++from twisted.python.compat import exec_, StringIO
++from zope.interface import implementer, Interface
+ 
+ # Note:
+ # These encrypt/decrypt functions only work for data formats
+@@ -58,10 +56,9 @@ class IPersistable(Interface):
+         """
+ 
+ 
++@implementer(IPersistable)
+ class Persistent:
+ 
+-    implements(IPersistable)
+-
+     style = "pickle"
+ 
+     def __init__(self, original, name):
+@@ -92,7 +89,7 @@ class Persistent:
+         if passphrase is None:
+             dumpFunc(self.original, f)
+         else:
+-            s = StringIO.StringIO()
++            s = StringIO()
+             dumpFunc(self.original, s)
+             f.write(_encrypt(passphrase, s.getvalue()))
+         f.close()
+@@ -164,7 +161,7 @@ def load(filename, style, passphrase=None):
+     else:
+         _load, mode = pickle.load, 'rb'
+     if passphrase:
+-        fp = StringIO.StringIO(_decrypt(passphrase,
++        fp = StringIO(_decrypt(passphrase,
+                                         open(filename, 'rb').read()))
+     else:
+         fp = open(filename, mode)
+@@ -205,9 +202,9 @@ def loadValueFromFile(filename, variable, passphrase=None):
+     if passphrase:
+         data = fileObj.read()
+         data = _decrypt(passphrase, data)
+-        exec data in d, d
++        exec_(data, d, d)
+     else:
+-        exec fileObj in d, d
++        exec_(fileObj, d, d)
+     value = d[variable]
+     return value
+ 
+diff --git twisted/persisted/styles.py twisted/persisted/styles.py
+index e3ca39b..9804617 100644
+--- twisted/persisted/styles.py
++++ twisted/persisted/styles.py
+@@ -10,20 +10,30 @@ Different styles of persisted objects.
+ 
+ # System Imports
+ import types
+-import copy_reg
+ import copy
+ import inspect
+ import sys
+ 
+ try:
+-    import cStringIO as StringIO
++    import copyreg as copy_reg # Python 3
+ except ImportError:
+-    import StringIO
++    import copy_reg
+ 
+ # Twisted Imports
+ from twisted.python import log
+ from twisted.python import reflect
+ 
++# cannot import from t.p.compat as this file expects a module
++try:
++    if sys.version_info[0] < 3:
++        import cStringIO as StringIO
++    else:
++        # FIXME-py3k: this isn't strictly correct, but makes the file importable
++        # under Python3 at least
++        import io as StringIO
++except ImportError:
++    import StringIO
++
+ oldModules = {}
+ 
+ ## First, let's register support for some stuff that really ought to
+diff --git twisted/plugin.py twisted/plugin.py
+index a4f8334..4ef2de5 100644
+--- twisted/plugin.py
++++ twisted/plugin.py
+@@ -179,7 +179,7 @@ def getCache(module):
+         if needsWrite:
+             try:
+                 dropinPath.setContent(pickle.dumps(dropinDotCache))
+-            except OSError, e:
++            except OSError as e:
+                 log.msg(
+                     format=(
+                         "Unable to write to plugin cache %(path)s: error "
+diff --git twisted/python/compat.py twisted/python/compat.py
+index 880a4b0..ba97be8 100644
+--- twisted/python/compat.py
++++ twisted/python/compat.py
+@@ -199,10 +199,55 @@ def execfile(filename, globals, locals=None):
+     code = compile(source, filename, "exec")
+     exec(code, globals, locals)
+ 
++if sys.version_info[0] == 3:
++    import builtins
++    exec_ = getattr(builtins, "exec")
++
++    def reraise(tp, value, tb=None):
++        """
++        Raises an exception, with a tracebook, in a way compatible with both
++        Python 2 and Python 3.
++
++        Copied from the "six" library.
++        """
++        if value.__traceback__ is not tb:
++            raise value.with_traceback(tb)
++        raise value
++else:
++    def exec_(code, globs=None, locs=None):
++        """
++        Execute code in a namespace.
++
++        Copied from the "six" library.
++        """
++        if globs is None:
++            frame = sys._getframe(1)
++            globs = frame.f_globals
++            if locs is None:
++                locs = frame.f_locals
++            del frame
++        elif locs is None:
++            locs = globs
++        exec("""exec code in globs, locs""")
++
++    exec_("""def reraise(tp, value, tb=None):
++        raise tp, value, tb""")
++
++try:
++    if sys.version_info[0] < 3:
++        from cStringIO import StringIO
++    else:
++        from io import StringIO
++except ImportError:
++    from StringIO import StringIO
++
+ 
+ __all__ = [
+     "execfile",
+     "frozenset",
+     "reduce",
+     "set",
++    "reraise",
++    "exec_",
++    "StringIO",
+     ]
+diff --git twisted/python/components.py twisted/python/components.py
+index 6fb1f2a..2341b35 100644
+--- twisted/python/components.py
++++ twisted/python/components.py
+@@ -307,7 +307,7 @@ class ReprableComponentized(Componentized):
+         Componentized.__init__(self)
+ 
+     def __repr__(self):
+-        from cStringIO import StringIO
++        from twisted.python.compat import StringIO
+         from pprint import pprint
+         sio = StringIO()
+         pprint(self._adapterCache, sio)
+diff --git twisted/python/constants.py twisted/python/constants.py
+index db708d6..5f34c05 100644
+--- twisted/python/constants.py
++++ twisted/python/constants.py
+@@ -15,7 +15,7 @@ from itertools import count
+ from operator import and_, or_, xor
+ 
+ _unspecified = object()
+-_constantOrder = count().next
++_constantOrder = count()
+ 
+ 
+ class _Constant(object):
+@@ -30,7 +30,7 @@ class _Constant(object):
+         to; only set once the constant is initialized by that subclass.
+     """
+     def __init__(self):
+-        self._index = _constantOrder()
++        self._index = next(_constantOrder)
+ 
+ 
+     def __get__(self, oself, cls):
+diff --git twisted/python/failure.py twisted/python/failure.py
+index ed03281..17d2f97 100644
+--- twisted/python/failure.py
++++ twisted/python/failure.py
+@@ -16,10 +16,10 @@ import sys
+ import linecache
+ import inspect
+ import opcode
+-from cStringIO import StringIO
+ from inspect import getmro
+ 
+ from twisted.python import reflect
++from twisted.python.compat import reraise, StringIO
+ 
+ count = 0
+ traceupLength = 4
+@@ -367,7 +367,7 @@ class Failure:
+         raise the original exception, preserving traceback
+         information if available.
+         """
+-        raise self.type, self.value, self.tb
++        reraise(self.type, self.value, self.tb)
+ 
+ 
+     def throwExceptionIntoGenerator(self, g):
+@@ -533,7 +533,9 @@ class Failure:
+             C{'verbose'}.
+         """
+         if file is None:
+-            file = log.logerr
++            # import here to resolve circular imports
++            from twisted.python.log import logerr
++            file = logerr
+         w = file.write
+ 
+         if detail == 'verbose' and not self.captureVars:
+@@ -623,7 +625,7 @@ DO_POST_MORTEM = True
+ 
+ def _debuginit(self, exc_value=None, exc_type=None, exc_tb=None,
+                captureVars=False,
+-               Failure__init__=Failure.__init__.im_func):
++               Failure__init__=Failure.__init__):
+     """
+     Initialize failure object, possibly spawning pdb.
+     """
+@@ -634,7 +636,7 @@ def _debuginit(self, exc_value=None, exc_type=None, exc_tb=None,
+                 strrepr = str(exc[1])
+             except:
+                 strrepr = "broken str"
+-            print "Jumping into debugger for post-mortem of exception '%s':" % (strrepr,)
++            print("Jumping into debugger for post-mortem of exception '%s':" % (strrepr,))
+             import pdb
+             pdb.post_mortem(exc[2])
+     Failure__init__(self, exc_value, exc_type, exc_tb, captureVars)
+@@ -644,7 +646,3 @@ def startDebugMode():
+     """Enable debug hooks for Failures."""
+     Failure.__init__ = _debuginit
+ 
+-
+-# Sibling imports - at the bottom and unqualified to avoid unresolvable
+-# circularity
+-import log
+diff --git twisted/python/filepath.py twisted/python/filepath.py
+index a4016d6..6647be0 100644
+--- twisted/python/filepath.py
++++ twisted/python/filepath.py
+@@ -36,7 +36,7 @@ from twisted.python.win32 import WindowsError
+ 
+ from twisted.python.util import FancyEqMixin
+ 
+-from zope.interface import Interface, Attribute, implements
++from zope.interface import Interface, Attribute, implementer
+ 
+ _CREATE_FLAGS = (os.O_EXCL |
+                  os.O_CREAT |
+@@ -314,7 +314,7 @@ class AbstractFilePath(object):
+         """
+         try:
+             subnames = self.listdir()
+-        except WindowsError, winErrObj:
++        except WindowsError as winErrObj:
+             # WindowsError is an OSError subclass, so if not for this clause
+             # the OSError clause below would be handling these.  Windows error
+             # codes aren't the same as POSIX error codes, so we need to handle
+@@ -344,7 +344,7 @@ class AbstractFilePath(object):
+                                 ERROR_DIRECTORY):
+                 raise
+             raise _WindowsUnlistableError(winErrObj)
+-        except OSError, ose:
++        except OSError as ose:
+             if ose.errno not in (errno.ENOENT, errno.ENOTDIR):
+                 # Other possible errors here, according to linux manpages:
+                 # EACCES, EMIFLE, ENFILE, ENOMEM.  None of these seem like the
+@@ -565,6 +565,7 @@ class Permissions(FancyEqMixin, object):
+ 
+ 
+ 
++@implementer(IFilePath)
+ class FilePath(AbstractFilePath):
+     """
+     I am a path on the filesystem that only permits 'downwards' access.
+@@ -611,8 +612,6 @@ class FilePath(AbstractFilePath):
+     @type statinfo: C{int} or L{types.NoneType} or L{os.stat_result}
+     """
+ 
+-    implements(IFilePath)
+-
+     statinfo = None
+     path = None
+ 
+@@ -1414,7 +1413,7 @@ class FilePath(AbstractFilePath):
+         """
+         try:
+             os.rename(self.path, destination.path)
+-        except OSError, ose:
++        except OSError as ose:
+             if ose.errno == errno.EXDEV:
+                 # man 2 rename, ubuntu linux 5.10 "breezy":
+ 
+diff --git twisted/python/finalize.py twisted/python/finalize.py
+index 8b99bf6..1378158 100644
+--- twisted/python/finalize.py
++++ twisted/python/finalize.py
+@@ -24,7 +24,7 @@ def register(inst):
+ 
+ if __name__ == '__main__':
+     def fin():
+-        print 'I am _so_ dead.'
++        print('I am _so_ dead.')
+ 
+     class Finalizeable:
+         """
+@@ -43,4 +43,4 @@ if __name__ == '__main__':
+     del f
+     import gc
+     gc.collect()
+-    print 'deled'
++    print('deled')
+diff --git twisted/python/formmethod.py twisted/python/formmethod.py
+index 4fb1c5f..8daf76b 100644
+--- twisted/python/formmethod.py
++++ twisted/python/formmethod.py
+@@ -59,7 +59,7 @@ class Argument:
+ 
+     def coerce(self, val):
+         """Convert the value to the correct format."""
+-        raise NotImplementedError, "implement in subclass"
++        raise NotImplementedError("implement in subclass")
+ 
+ 
+ class String(Argument):
+@@ -79,9 +79,9 @@ class String(Argument):
+     def coerce(self, val):
+         s = str(val)
+         if len(s) < self.min:
+-            raise InputError, "Value must be at least %s characters long" % self.min
++            raise InputError("Value must be at least %s characters long" % self.min)
+         if self.max != None and len(s) > self.max:
+-            raise InputError, "Value must be at most %s characters long" % self.max
++            raise InputError("Value must be at most %s characters long" % self.max)
+         return str(val)
+ 
+ 
+@@ -100,12 +100,12 @@ class VerifiedPassword(String):
+     
+     def coerce(self, vals):
+         if len(vals) != 2 or vals[0] != vals[1]:
+-            raise InputError, "Please enter the same password twice."
++            raise InputError("Please enter the same password twice.")
+         s = str(vals[0])
+         if len(s) < self.min:
+-            raise InputError, "Value must be at least %s characters long" % self.min
++            raise InputError("Value must be at least %s characters long" % self.min)
+         if self.max != None and len(s) > self.max:
+-            raise InputError, "Value must be at most %s characters long" % self.max
++            raise InputError("Value must be at most %s characters long" % self.max)
+         return s
+ 
+ 
+@@ -137,7 +137,7 @@ class Integer(Argument):
+         try:
+             return int(val)
+         except ValueError:
+-            raise InputError, "%s is not valid, please enter a whole number, e.g. 10" % val
++            raise InputError("%s is not valid, please enter a whole number, e.g. 10" % val)
+ 
+ 
+ class IntegerRange(Integer):
+@@ -154,9 +154,9 @@ class IntegerRange(Integer):
+         if self.allowNone and result == None:
+             return result
+         if result < self.min:
+-            raise InputError, "Value %s is too small, it should be at least %s" % (result, self.min)
++            raise InputError("Value %s is too small, it should be at least %s" % (result, self.min))
+         if result > self.max:
+-            raise InputError, "Value %s is too large, it should be at most %s" % (result, self.max)
++            raise InputError("Value %s is too large, it should be at most %s" % (result, self.max))
+         return result
+ 
+ 
+@@ -181,7 +181,7 @@ class Float(Argument):
+         try:
+             return float(val)
+         except ValueError:
+-            raise InputError, "Invalid float: %s" % val
++            raise InputError("Invalid float: %s" % val)
+ 
+ 
+ class Choice(Argument):
+@@ -267,7 +267,7 @@ class File(Argument):
+         elif file:
+             return file
+         else:
+-            raise InputError, "Invalid File"
++            raise InputError("Invalid File")
+ 
+ def positiveInt(x):
+     x = int(x)
+@@ -294,18 +294,18 @@ class Date(Argument):
+         try:
+             year, month, day = map(positiveInt, args)
+         except ValueError:
+-            raise InputError, "Invalid date"
++            raise InputError("Invalid date")
+         if (month, day) == (2, 29):
+             if not calendar.isleap(year):
+-                raise InputError, "%d was not a leap year" % year
++                raise InputError("%d was not a leap year" % year)
+             else:
+                 return year, month, day
+         try:
+             mdays = calendar.mdays[month]
+         except IndexError:
+-            raise InputError, "Invalid date"
++            raise InputError("Invalid date")
+         if day > mdays:
+-            raise InputError, "Invalid date"
++            raise InputError("Invalid date")
+         return year, month, day
+ 
+ 
+diff --git twisted/python/htmlizer.py twisted/python/htmlizer.py
+index c95fb00..1a0533c 100644
+--- twisted/python/htmlizer.py
++++ twisted/python/htmlizer.py
+@@ -7,7 +7,7 @@ HTML rendering of Python source.
+ """
+ 
+ import tokenize, cgi, keyword
+-import reflect
++from twisted.python import reflect
+ 
+ class TokenPrinter:
+ 
+@@ -17,10 +17,12 @@ class TokenPrinter:
+     def __init__(self, writer):
+         self.writer = writer
+ 
+-    def printtoken(self, type, token, (srow, scol), (erow, ecol), line):
++    def printtoken(self, type, token, s, e, line):
+         #print "printtoken(%r,%r,%r,(%r,%r),(%r,%r),%r), row=%r,col=%r" % (
+         #    self, type, token, srow,scol, erow,ecol, line,
+         #    self.currentLine, self.currentCol)
++        srow, scol = s
++        erow, ecol = e
+         if self.currentLine < srow:
+             self.writer('\n'*(srow-self.currentLine))
+             self.currentLine, self.currentCol = srow, 0
+diff --git twisted/python/lockfile.py twisted/python/lockfile.py
+index a044957..3c9f3bf 100644
+--- twisted/python/lockfile.py
++++ twisted/python/lockfile.py
+@@ -40,7 +40,7 @@ else:
+         def kill(pid, signal):
+             try:
+                 OpenProcess(0, 0, pid)
+-            except pywintypes.error, e:
++            except pywintypes.error as e:
+                 if e.args[0] == ERROR_ACCESS_DENIED:
+                     return
+                 elif e.args[0] == ERROR_INVALID_PARAMETER:
+@@ -70,7 +70,7 @@ else:
+     def readlink(filename):
+         try:
+             fObj = _open(os.path.join(filename,'symlink'), 'rb')
+-        except IOError, e:
++        except IOError as e:
+             if e.errno == errno.ENOENT or e.errno == errno.EIO:
+                 raise OSError(e.errno, None)
+             raise
+@@ -125,7 +125,7 @@ class FilesystemLock:
+         while True:
+             try:
+                 symlink(str(os.getpid()), self.name)
+-            except OSError, e:
++            except OSError as e:
+                 if _windows and e.errno in (errno.EACCES, errno.EIO):
+                     # The lock is in the middle of being deleted because we're
+                     # on Windows where lock removal isn't atomic.  Give up, we
+@@ -134,13 +134,13 @@ class FilesystemLock:
+                 if e.errno == errno.EEXIST:
+                     try:
+                         pid = readlink(self.name)
+-                    except OSError, e:
++                    except OSError as e:
+                         if e.errno == errno.ENOENT:
+                             # The lock has vanished, try to claim it in the
+                             # next iteration through the loop.
+                             continue
+                         raise
+-                    except IOError, e:
++                    except IOError as e:
+                         if _windows and e.errno == errno.EACCES:
+                             # The lock is in the middle of being
+                             # deleted because we're on Windows where
+@@ -152,13 +152,13 @@ class FilesystemLock:
+                     try:
+                         if kill is not None:
+                             kill(int(pid), 0)
+-                    except OSError, e:
++                    except OSError as e:
+                         if e.errno == errno.ESRCH:
+                             # The owner has vanished, try to claim it in the next
+                             # iteration through the loop.
+                             try:
+                                 rmlink(self.name)
+-                            except OSError, e:
++                            except OSError as e:
+                                 if e.errno == errno.ENOENT:
+                                     # Another process cleaned up the lock.
+                                     # Race them to acquire it in the next
+diff --git twisted/python/log.py twisted/python/log.py
+index d8342e3..e5c6f8b 100644
+--- twisted/python/log.py
++++ twisted/python/log.py
+@@ -613,9 +613,8 @@ class DefaultObserver:
+         removeObserver(self._emit)
+ 
+ 
+-# Some more sibling imports, at the bottom and unqualified to avoid
+-# unresolvable circularity
+-import threadable, failure
++# Some more sibling imports, at the bottom to avoid unresolvable circularity
++from twisted.python import threadable, failure
+ threadable.synchronize(LogPublisher)
+ 
+ 
+diff --git twisted/python/logfile.py twisted/python/logfile.py
+index f652271..f74bd3e 100644
+--- twisted/python/logfile.py
++++ twisted/python/logfile.py
+@@ -66,7 +66,7 @@ class BaseLogFile:
+         else:
+             if self.defaultMode is not None:
+                 # Set the lowest permissions
+-                oldUmask = os.umask(0777)
++                oldUmask = os.umask(0o777)
+                 try:
+                     self._file = file(self.path, "w+", 1)
+                 finally:
+@@ -178,7 +178,7 @@ class LogFile(BaseLogFile):
+         """
+         filename = "%s.%d" % (self.path, identifier)
+         if not os.path.exists(filename):
+-            raise ValueError, "no such logfile exists"
++            raise ValueError("no such logfile exists")
+         return LogReader(filename)
+ 
+     def write(self, data):
+@@ -266,7 +266,7 @@ class DailyLogFile(BaseLogFile):
+             return self.getCurrentLog()
+         filename = "%s.%s" % (self.path, self.suffix(identifier))
+         if not os.path.exists(filename):
+-            raise ValueError, "no such logfile exists"
++            raise ValueError("no such logfile exists")
+         return LogReader(filename)
+ 
+     def write(self, data):
+diff --git twisted/python/modules.py twisted/python/modules.py
+index 307970c..9b55be0 100644
+--- twisted/python/modules.py
++++ twisted/python/modules.py
+@@ -62,7 +62,7 @@ import sys
+ import zipimport
+ import inspect
+ import warnings
+-from zope.interface import Interface, implements
++from zope.interface import Interface, implementer
+ 
+ from twisted.python.components import registerAdapter
+ from twisted.python.filepath import FilePath, UnlistableError
+@@ -476,16 +476,16 @@ class IPathImportMapper(Interface):
+         L{ZipPath}, but more might be added later).
+         """
+ 
++@implementer(IPathImportMapper)
+ class _DefaultMapImpl:
+     """ Wrapper for the default importer, i.e. None.  """
+-    implements(IPathImportMapper)
+     def mapPath(self, fsPathString):
+         return FilePath(fsPathString)
+ _theDefaultMapper = _DefaultMapImpl()
+ 
++@implementer(IPathImportMapper)
+ class _ZipMapImpl:
+     """ IPathImportMapper implementation for zipimport.ZipImporter.  """
+-    implements(IPathImportMapper)
+     def __init__(self, importer):
+         self.importer = importer
+ 
+diff --git twisted/python/randbytes.py twisted/python/randbytes.py
+index 63ae2dc..dd07509 100644
+--- twisted/python/randbytes.py
++++ twisted/python/randbytes.py
+@@ -47,7 +47,7 @@ class RandomFactory(object):
+         """
+         try:
+             return os.urandom(nbytes)
+-        except (AttributeError, NotImplementedError), e:
++        except (AttributeError, NotImplementedError) as e:
+             raise SourceNotAvailable(e)
+ 
+ 
+diff --git twisted/python/reflect.py twisted/python/reflect.py
+index f529754..e11b20c 100644
+--- twisted/python/reflect.py
++++ twisted/python/reflect.py
+@@ -23,16 +23,11 @@ except ImportError:
+ 
+ RegexType = type(re.compile(""))
+ 
+-
+-try:
+-    from cStringIO import StringIO
+-except ImportError:
+-    from StringIO import StringIO
+-
+ from twisted.python.util import unsignedID
+ from twisted.python.deprecate import deprecated, deprecatedModuleAttribute
+ from twisted.python.deprecate import _fullyQualifiedName as fullyQualifiedName
+ from twisted.python.versions import Version
++from twisted.python.compat import reraise, StringIO
+ 
+ 
+ 
+@@ -446,7 +441,7 @@ def _importAndCheckStack(importName):
+                 execName = excTraceback.tb_frame.f_globals["__name__"]
+                 if (execName is None or # python 2.4+, post-cleanup
+                     execName == importName): # python 2.3, no cleanup
+-                    raise excType, excValue, excTraceback
++                    reraise(excType, excValue, excTraceback)
+                 excTraceback = excTraceback.tb_next
+             raise _NoModuleFound()
+     except:
+@@ -780,7 +775,7 @@ def objgrep(start, goal, eq=isLike, path='', paths=None, seen=None, showUnknowns
+                                    'member_descriptor', 'getset_descriptor')):
+         pass
+     elif showUnknowns:
+-        print 'unknown type', type(start), start
++        print('unknown type', type(start), start)
+     return paths
+ 
+ 
+diff --git twisted/python/release.py twisted/python/release.py
+index 2454792..14dd4f7 100644
+--- twisted/python/release.py
++++ twisted/python/release.py
+@@ -43,7 +43,7 @@ def sh(command, null=True, prompt=False):
+     ask before running it.  If the command returns something other
+     than 0, I'll raise C{CommandFailed(command)}.
+     """
+-    print "--$", command
++    print("--$", command)
+ 
+     if prompt:
+         if raw_input("run ?? ").startswith('n'):
+diff --git twisted/python/shortcut.py twisted/python/shortcut.py
+index 6d6546b..0020a93 100644
+--- twisted/python/shortcut.py
++++ twisted/python/shortcut.py
+@@ -72,5 +72,5 @@ class Shortcut:
+     def __getattr__( self, name ):
+         if name != "_base":
+             return getattr(self._base, name)
+-        raise AttributeError, "%s instance has no attribute %s" % \
+-                (self.__class__.__name__, name)
++        raise AttributeError("%s instance has no attribute %s" % \
++                (self.__class__.__name__, name))
+diff --git twisted/python/test/test_components.py twisted/python/test/test_components.py
+index c4c1b45..7809629 100644
+--- twisted/python/test/test_components.py
++++ twisted/python/test/test_components.py
+@@ -6,7 +6,7 @@
+ Test cases for Twisted component architecture.
+ """
+ 
+-from zope.interface import Interface, implements, Attribute
++from zope.interface import Interface, implementer, Attribute
+ from zope.interface.adapter import AdapterRegistry
+ 
+ from twisted.trial import unittest
+@@ -33,8 +33,8 @@ class IElapsed(Interface):
+         1!
+         """
+ 
++@implementer(IAdept)
+ class Adept(components.Adapter):
+-    implements(IAdept)
+     def __init__(self, orig):
+         self.original = orig
+         self.num = 0
+@@ -42,8 +42,8 @@ class Adept(components.Adapter):
+         self.num = self.num + 1
+         return self.num, self.original.inc()
+ 
++@implementer(IElapsed)
+ class Elapsed(components.Adapter):
+-    implements(IElapsed)
+     def elapsedFunc(self):
+         return 1
+ 
+@@ -62,12 +62,12 @@ class ITest3(Interface):
+     pass
+ class ITest4(Interface):
+     pass
++@implementer(ITest, ITest3, ITest4)
+ class Test(components.Adapter):
+-    implements(ITest, ITest3, ITest4)
+     def __init__(self, orig):
+         pass
++@implementer(ITest2)
+ class Test2:
+-    implements(ITest2)
+     temporaryAdapter = 1
+     def __init__(self, orig):
+         pass
+@@ -173,13 +173,13 @@ class AdapterTestCase(unittest.TestCase):
+ class IMeta(Interface):
+     pass
+ 
++@implementer(IMeta)
+ class MetaAdder(components.Adapter):
+-    implements(IMeta)
+     def add(self, num):
+         return self.original.num + num
+ 
++@implementer(IMeta)
+ class BackwardsAdder(components.Adapter):
+-    implements(IMeta)
+     def add(self, num):
+         return self.original.num - num
+ 
+@@ -199,8 +199,8 @@ class ComponentNumber(components.Componentized):
+         self.num = 0
+         components.Componentized.__init__(self)
+ 
++@implementer(IMeta)
+ class ComponentMeta(components.Adapter):
+-    implements(IMeta)
+     def __init__(self, original):
+         components.Adapter.__init__(self, original)
+         self.num = self.original.num
+@@ -223,8 +223,8 @@ class IAttrXX(Interface):
+     def xx():
+         pass
+ 
++@implementer(IAttrX)
+ class Xcellent:
+-    implements(IAttrX)
+     def x(self):
+         return 'x!'
+ 
+@@ -478,6 +478,7 @@ class IProxiedSubInterface(IProxiedInterface):
+ 
+ 
+ 
++@implementer(IProxiedInterface)
+ class Yayable(object):
+     """
+     A provider of L{IProxiedInterface} which increments a counter for
+@@ -485,7 +486,6 @@ class Yayable(object):
+ 
+     @ivar yays: The number of times C{yay} has been called.
+     """
+-    implements(IProxiedInterface)
+ 
+     def __init__(self):
+         self.yays = 0
+@@ -500,11 +500,11 @@ class Yayable(object):
+         return self.yays
+ 
+ 
++@implementer(IProxiedSubInterface)
+ class Booable(object):
+     """
+     An implementation of IProxiedSubInterface
+     """
+-    implements(IProxiedSubInterface)
+     yayed = False
+     booed = False
+     def yay(self):
+diff --git twisted/python/test/test_htmlizer.py twisted/python/test/test_htmlizer.py
+index 38e607a..3565d5a 100644
+--- twisted/python/test/test_htmlizer.py
++++ twisted/python/test/test_htmlizer.py
+@@ -5,10 +5,9 @@
+ Tests for L{twisted.python.htmlizer}.
+ """
+ 
+-from StringIO import StringIO
+-
+ from twisted.trial.unittest import TestCase
+ from twisted.python.htmlizer import filter
++from twisted.python.compat import StringIO
+ 
+ 
+ class FilterTests(TestCase):
+diff --git twisted/python/test/test_release.py twisted/python/test/test_release.py
+index 9ab4f22..ebe281a 100644
+--- twisted/python/test/test_release.py
++++ twisted/python/test/test_release.py
+@@ -12,7 +12,6 @@ only ever performed on Linux.
+ import warnings
+ import operator
+ import os, sys, signal
+-from StringIO import StringIO
+ import tarfile
+ from xml.dom import minidom as dom
+ 
+@@ -20,7 +19,7 @@ from datetime import date
+ 
+ from twisted.trial.unittest import TestCase
+ 
+-from twisted.python.compat import execfile, set
++from twisted.python.compat import execfile, set, StringIO
+ from twisted.python.procutils import which
+ from twisted.python import release
+ from twisted.python.filepath import FilePath
+diff --git twisted/python/test/test_sendmsg.py twisted/python/test/test_sendmsg.py
+index 48301f5..b4b7de5 100644
+--- twisted/python/test/test_sendmsg.py
++++ twisted/python/test/test_sendmsg.py
+@@ -337,7 +337,7 @@ class SendmsgTestCase(TestCase):
+         for i in range(1024):
+             try:
+                 send1msg(self.input.fileno(), "x" * 1024, MSG_DONTWAIT)
+-            except error, e:
++            except error as e:
+                 self.assertEqual(e.args[0], errno.EAGAIN)
+                 break
+         else:
+diff --git twisted/python/test/test_shellcomp.py twisted/python/test/test_shellcomp.py
+index 7f9cc83..ad7c012 100755
+--- twisted/python/test/test_shellcomp.py
++++ twisted/python/test/test_shellcomp.py
+@@ -6,12 +6,12 @@ Test cases for twisted.python._shellcomp
+ """
+ 
+ import sys
+-from cStringIO import StringIO
+ 
+ from twisted.trial import unittest
+ from twisted.python import _shellcomp, usage, reflect
+ from twisted.python.usage import Completions, Completer, CompleteFiles
+ from twisted.python.usage import CompleteList
++from twisted.python.compat import StringIO
+ 
+ 
+ 
+@@ -76,13 +76,13 @@ def test_genZshFunction(self, cmdName, optionsFQPN):
+     # dependencies (PyCrypto, etc) so we have to skip them.
+     try:
+         o = reflect.namedAny(optionsFQPN)()
+-    except Exception, e:
++    except Exception as e:
+         raise unittest.SkipTest("Couldn't import or instantiate "
+                                 "Options class: %s" % (e,))
+ 
+     try:
+         o.parseOptions(["", "--_shell-completion", "zsh:2"])
+-    except ImportError, e:
++    except ImportError as e:
+         # this can happen for commands which don't have all
+         # the necessary dependencies installed. skip test.
+         # skip
+@@ -103,7 +103,7 @@ def test_genZshFunction(self, cmdName, optionsFQPN):
+             try:
+                 o.parseOptions([cmd, "", "--_shell-completion",
+                                 "zsh:3"])
+-            except ImportError, e:
++            except ImportError as e:
+                 # this can happen for commands which don't have all
+                 # the necessary dependencies installed. skip test.
+                 raise unittest.SkipTest("ImportError calling parseOptions() "
+diff --git twisted/python/test/test_util.py twisted/python/test/test_util.py
+index 08c39d6..2ab78b6 100644
+--- twisted/python/test/test_util.py
++++ twisted/python/test/test_util.py
+@@ -41,7 +41,7 @@ class UtilTestCase(unittest.TestCase):
+         except ZeroDivisionError:
+             pass
+         else:
+-            raise unittest.FailTest, "util.raises didn't raise when it should have"
++            raise unittest.FailTest("util.raises didn't raise when it should have")
+ 
+     def testUninterruptably(self):
+         def f(a, b):
+@@ -816,7 +816,7 @@ class UnsignedIDTests(unittest.TestCase):
+         util.setIDFunction(fakeId)
+ 
+         self.assertEqual(util.unsignedID(foo), 17)
+-        self.assertEqual(util.unsignedID(bar), (sys.maxint + 1) * 2 - 73)
++        self.assertEqual(util.unsignedID(bar), (sys.maxsize + 1) * 2 - 73)
+ 
+ 
+     def test_defaultIDFunction(self):
+@@ -826,7 +826,7 @@ class UnsignedIDTests(unittest.TestCase):
+         obj = object()
+         idValue = id(obj)
+         if idValue < 0:
+-            idValue += (sys.maxint + 1) * 2
++            idValue += (sys.maxsize + 1) * 2
+ 
+         self.assertEqual(util.unsignedID(obj), idValue)
+ 
+diff --git twisted/python/test/test_versions.py twisted/python/test/test_versions.py
+index 79388cf..96a4aa0 100644
+--- twisted/python/test/test_versions.py
++++ twisted/python/test/test_versions.py
+@@ -2,11 +2,11 @@
+ # See LICENSE for details.
+ 
+ import sys
+-from cStringIO import StringIO
+ 
+ from twisted.python.versions import getVersionString, IncomparableVersions
+ from twisted.python.versions import Version, _inf
+ from twisted.python.filepath import FilePath
++from twisted.python.compat import StringIO
+ 
+ from twisted.trial import unittest
+ 
+diff --git twisted/python/test/test_zshcomp.py twisted/python/test/test_zshcomp.py
+index 13865b2..445fe21 100644
+--- twisted/python/test/test_zshcomp.py
++++ twisted/python/test/test_zshcomp.py
+@@ -6,10 +6,10 @@ Test cases for twisted.python.zshcomp
+ """
+ import os
+ import os.path
+-from cStringIO import StringIO
+ 
+ from twisted.trial import unittest
+ from twisted.python import zshcomp, usage
++from twisted.python.compat import StringIO
+ 
+ 
+ 
+diff --git twisted/python/threadpool.py twisted/python/threadpool.py
+index 1fa2ed5..669e817 100644
+--- twisted/python/threadpool.py
++++ twisted/python/threadpool.py
+@@ -9,7 +9,11 @@ In most cases you can just use C{reactor.callInThread} and friends
+ instead of creating a thread pool directly.
+ """
+ 
+-import Queue
++try:
++    import Queue as queue
++except ImportError: # Python 3
++    import queue
++
+ import threading
+ import copy
+ 
+@@ -47,7 +51,7 @@ class ThreadPool:
+         """
+         assert minthreads >= 0, 'minimum is negative'
+         assert minthreads <= maxthreads, 'minimum is greater than maximum'
+-        self.q = Queue.Queue(0)
++        self.q = queue.Queue(0)
+         self.min = minthreads
+         self.max = maxthreads
+         self.name = name
+diff --git twisted/python/urlpath.py twisted/python/urlpath.py
+index 1c15f09..ea7482a 100644
+--- twisted/python/urlpath.py
++++ twisted/python/urlpath.py
+@@ -4,7 +4,12 @@
+ 
+ #
+ 
+-import urlparse
++try:
++    # Python 3
++    from urllib import parse as urlparse
++except ImportError:
++    import urlparse
++
+ import urllib
+ 
+ class URLPath:
+diff --git twisted/python/usage.py twisted/python/usage.py
+index 9280ae2..d518882 100644
+--- twisted/python/usage.py
++++ twisted/python/usage.py
+@@ -52,7 +52,7 @@ class CoerceParameter(object):
+                              % (parameterName,))
+         try:
+             value = self.coerce(value)
+-        except ValueError, e:
++        except ValueError as e:
+             raise UsageError("Parameter type enforcement failed: %s" % (e,))
+ 
+         self.options.opts[parameterName] = value
+@@ -188,13 +188,13 @@ class Options(dict):
+         as dictionary keys.  This is an internal feature used to implement
+         the parser.  Do not rely on it in application code.
+         """
+-        return int(id(self) % sys.maxint)
++        return int(id(self) % sys.maxsize)
+ 
+     def opt_help(self):
+         """
+         Display this help and exit.
+         """
+-        print self.__str__()
++        print(self.__str__())
+         sys.exit(0)
+ 
+     def opt_version(self):
+@@ -202,7 +202,7 @@ class Options(dict):
+         Display Twisted version and exit.
+         """
+         from twisted import copyright
+-        print "Twisted version:", copyright.version
++        print("Twisted version:", copyright.version)
+         sys.exit(0)
+ 
+     #opt_h = opt_help # this conflicted with existing 'host' options.
+@@ -232,7 +232,7 @@ class Options(dict):
+         try:
+             opts, args = getopt.getopt(options,
+                                        self.shortOpt, self.longOpt)
+-        except getopt.error, e:
++        except getopt.error as e:
+             raise UsageError(str(e))
+ 
+         for opt, arg in opts:
+diff --git twisted/python/util.py twisted/python/util.py
+index 852043c..c682fdb 100644
+--- twisted/python/util.py
++++ twisted/python/util.py
+@@ -12,7 +12,6 @@ try:
+     from os import setgroups, getgroups
+ except ImportError:
+     setgroups = getgroups = None
+-from UserDict import UserDict
+ 
+ 
+ class InsensitiveDict:
+@@ -140,8 +139,8 @@ class InsensitiveDict:
+                 return 0
+         return len(self)==len(other)
+ 
+-class OrderedDict(UserDict):
+-    """A UserDict that preserves insert order whenever possible."""
++class OrderedDict(dict):
++    """A dict that preserves insert order whenever possible."""
+     def __init__(self, dict=None, **kwargs):
+         self._order = []
+         self.data = {}
+@@ -159,13 +158,13 @@ class OrderedDict(UserDict):
+     def __setitem__(self, key, value):
+         if not self.has_key(key):
+             self._order.append(key)
+-        UserDict.__setitem__(self, key, value)
++        dict.__setitem__(self, key, value)
+ 
+     def copy(self):
+         return self.__class__(self)
+ 
+     def __delitem__(self, key):
+-        UserDict.__delitem__(self, key)
++        dict.__delitem__(self, key)
+         self._order.remove(key)
+ 
+     def iteritems(self):
+@@ -230,7 +229,7 @@ def padTo(n, seq, default=None):
+     """
+ 
+     if len(seq) > n:
+-        raise ValueError, "%d elements is more than %d." % (len(seq), n)
++        raise ValueError("%d elements is more than %d." % (len(seq), n))
+ 
+     blank = [default] * n
+ 
+@@ -277,7 +276,7 @@ def _getpass(prompt):
+     import getpass
+     try:
+         return getpass.getpass(prompt)
+-    except IOError, e:
++    except IOError as e:
+         if e.errno == errno.EINTR:
+             raise KeyboardInterrupt
+         raise
+@@ -382,14 +381,14 @@ def spewer(frame, s, ignored):
+             k = reflect.qual(se.__class__)
+         else:
+             k = reflect.qual(type(se))
+-        print 'method %s of %s at %s' % (
++        print('method %s of %s at %s' % (
+             frame.f_code.co_name, k, id(se)
+-        )
++        ))
+     else:
+-        print 'function %s in %s, line %s' % (
++        print('function %s in %s, line %s' % (
+             frame.f_code.co_name,
+             frame.f_code.co_filename,
+-            frame.f_lineno)
++            frame.f_lineno))
+ 
+ 
+ def searchupwards(start, files=[], dirs=[]):
+@@ -535,7 +534,7 @@ class _IntervalDifferentialIterator:
+                     if i[2] > index:
+                         i[2] -= 1
+                 return
+-        raise ValueError, "Specified interval not in IntervalDifferential"
++        raise ValueError("Specified interval not in IntervalDifferential")
+ 
+ 
+ class FancyStrMixin:
+@@ -608,7 +607,7 @@ else:
+                     del l[-1]
+                 else:
+                     raise
+-            except OSError, e:
++            except OSError as e:
+                 if e.errno == errno.EINVAL and len(l) > 1:
+                     # This comes from the OS saying too many groups
+                     del l[-1]
+@@ -660,7 +659,7 @@ else:
+                     break # No more groups, ignore any more
+         try:
+             _setgroups_until_success(l)
+-        except OSError, e:
++        except OSError as e:
+             # We might be able to remove this code now that we
+             # don't try to setgid/setuid even when not asked to.
+             if e.errno == errno.EPERM:
+@@ -723,7 +722,7 @@ class SubclassableCStringIO(object):
+     __csio = None
+ 
+     def __init__(self, *a, **kw):
+-        from cStringIO import StringIO
++        from twisted.python.compat import StringIO
+         self.__csio = StringIO(*a, **kw)
+ 
+     def __iter__(self):
+@@ -774,7 +773,7 @@ def untilConcludes(f, *a, **kw):
+     while True:
+         try:
+             return f(*a, **kw)
+-        except (IOError, OSError), e:
++        except (IOError, OSError) as e:
+             if e.args[0] == errno.EINTR:
+                 continue
+             raise
+@@ -799,7 +798,8 @@ def setIDFunction(idFunction):
+ # A value about twice as large as any Python int, to which negative values
+ # from id() will be added, moving them into a range which should begin just
+ # above where positive values from id() leave off.
+-_HUGEINT = (sys.maxint + 1L) * 2L
++_HUGEINT = (sys.maxsize + 1) * 2
++
+ def unsignedID(obj):
+     """
+     Return the id of an object as an unsigned number so that its hex
+diff --git twisted/python/win32.py twisted/python/win32.py
+index ca04fc0..cd318ba 100644
+--- twisted/python/win32.py
++++ twisted/python/win32.py
+@@ -12,7 +12,6 @@ See also twisted.python.shortcut.
+ """
+ 
+ import re
+-import exceptions
+ import os
+ 
+ try:
+@@ -31,19 +30,16 @@ ERROR_DIRECTORY = 267
+ 
+ O_BINARY = getattr(os, "O_BINARY", 0)
+ 
+-def _determineWindowsError():
+-    """
+-    Determine which WindowsError name to export.
+-    """
+-    return getattr(exceptions, 'WindowsError', FakeWindowsError)
+-
+ class FakeWindowsError(OSError):
+     """
+     Stand-in for sometimes-builtin exception on platforms for which it
+     is missing.
+     """
+ 
+-WindowsError = _determineWindowsError()
++try:
++    WindowsError = WindowsError
++except NameError:
++    WindowsError = FakeWindowsError
+ 
+ # XXX fix this to use python's builtin _winreg?
+ 
+diff --git twisted/python/zippath.py twisted/python/zippath.py
+index a82f253..c29addd 100644
+--- twisted/python/zippath.py
++++ twisted/python/zippath.py
+@@ -27,7 +27,7 @@ else:
+ 
+ from twisted.python.filepath import IFilePath, FilePath, AbstractFilePath
+ 
+-from zope.interface import implements
++from zope.interface import implementer
+ 
+ # using FilePath here exclusively rather than os to make sure that we don't do
+ # anything OS-path-specific here.
+@@ -36,13 +36,12 @@ ZIP_PATH_SEP = '/'              # In zipfiles, "/" is universally used as the
+                                 # path separator, regardless of platform.
+ 
+ 
++@implementer(IFilePath)
+ class ZipPath(AbstractFilePath):
+     """
+     I represent a file or directory contained within a zip file.
+     """
+ 
+-    implements(IFilePath)
+-
+     sep = ZIP_PATH_SEP
+ 
+     def __init__(self, archive, pathInArchive):
+diff --git twisted/python/zshcomp.py twisted/python/zshcomp.py
+index 89389fe..dc17bd3 100644
+--- twisted/python/zshcomp.py
++++ twisted/python/zshcomp.py
+@@ -138,7 +138,12 @@ warnings.warn(
+     "zshcomp is deprecated as of Twisted 11.1. Shell tab-completion is now "
+     "handled by twisted.python.usage.", DeprecationWarning, stacklevel=2)
+ 
+-import itertools, sys, commands, os.path
++import itertools, sys, os.path
++
++try:
++    import commands as subprocess
++except ImportError: # Python 3
++    import subprocess
+ 
+ from twisted.python import reflect, util, usage
+ from twisted.application.service import IServiceMaker
+@@ -161,12 +166,12 @@ class MyOptions(usage.Options):
+ 
+     def postOptions(self):
+         if self['install'] and self['directory']:
+-            raise usage.UsageError, "Can't have --install and " \
+-                                    "--directory at the same time"
++            raise usage.UsageError("Can't have --install and " \
++                                    "--directory at the same time")
+         if not self['install'] and not self['directory']:
+-            raise usage.UsageError, "Not enough arguments"
++            raise usage.UsageError("Not enough arguments")
+         if self['directory'] and not os.path.isdir(self['directory']):
+-            raise usage.UsageError, "%s is not a directory" % self['directory']
++            raise usage.UsageError("%s is not a directory" % self['directory'])
+ 
+ 
+ 
+@@ -405,9 +410,9 @@ class ArgumentsGenerator:
+                            zsh_* variables
+         """
+         def err(name):
+-            raise ValueError, "Unknown option name \"%s\" found while\n" \
++            raise ValueError("Unknown option name \"%s\" found while\n" \
+                 "examining zsh_ attributes for the %s command" % (
+-                    name, self.cmd_name)
++                    name, self.cmd_name))
+ 
+         for name in itertools.chain(self.altArgDescr, self.actionDescr,
+         self.actions, self.multiUse):
+@@ -658,8 +663,8 @@ class ArgumentsGenerator:
+                 self.optFlags_d[longname] = [short, descr]
+                 self.optAll_d[longname] = [short, None, descr]
+             else:
+-                raise TypeError, '%r has wrong number ' \
+-                                 'of arguments' % (methodObj,)
++                raise TypeError('%r has wrong number ' \
++                                 'of arguments' % (methodObj,))
+ 
+ 
+ 
+@@ -700,7 +705,7 @@ def escape(str):
+     """
+     Shell escape the given string
+     """
+-    return commands.mkarg(str)[1:]
++    return subprocess.mkarg(str)[1:]
+ 
+ 
+ 
+@@ -711,7 +716,7 @@ def siteFunctionsPath():
+     """
+     try:
+         cmd = "zsh -f -c 'echo ${(M)fpath:#/*/site-functions}'"
+-        output = commands.getoutput(cmd)
++        output = subprocess.getoutput(cmd)
+         if os.path.isdir(output):
+             return output
+     except:
+@@ -783,7 +788,7 @@ def makeCompFunctionFiles(out_path, generateFor=generateFor,
+             else:
+                 b = Builder(cmd_name, o, f)
+                 b.write()
+-        except Exception, e:
++        except Exception as e:
+             skips.append( (cmd_name, e) )
+             continue
+     return skips
+@@ -799,9 +804,9 @@ def run():
+     options = MyOptions()
+     try:
+         options.parseOptions(sys.argv[1:])
+-    except usage.UsageError, e:
+-        print e
+-        print options.getUsage()
++    except usage.UsageError as e:
++        print(e)
++        print(options.getUsage())
+         sys.exit(2)
+ 
+     if options['install']:
+diff --git twisted/test/test_compat.py twisted/test/test_compat.py
+index ee8a7ba..8da2a56 100644
+--- twisted/test/test_compat.py
++++ twisted/test/test_compat.py
+@@ -6,12 +6,13 @@
+ Tests for L{twisted.python.compat}.
+ """
+ 
+-import os, tempfile, types, socket
++import os, sys, tempfile, types, socket
+ 
+ from twisted.trial import unittest
+ 
+ from twisted.python.filepath import FilePath
+-from twisted.python.compat import set, frozenset, reduce, execfile
++from twisted.python.compat import (set, frozenset, reduce, execfile, reraise,
++                                   exec_)
+ 
+ 
+ 
+@@ -202,6 +203,39 @@ class CompatTestCase(unittest.TestCase):
+ 
+ 
+ 
++class ExecCompatTestCase(unittest.TestCase):
++    """
++    Tests for the Python 3-friendls L{exec_} implementation.
++
++    These tests have been copied from the "six" library and adapted to the
++    Twisted testing framework.
++    """
++
++    def test_execSimple(self):
++        """
++        Test a simple exec statement.
++        """
++        l = []
++        exec_("l.append(1)")
++        self.assertEqual(l, [1])
++
++    def test_execComplex(self):
++        """
++        Test an exec statement when the local and global scopes are given.
++        """
++        ns = {}
++        exec_("x = 42", ns)
++        self.assertEqual(ns["x"], 42)
++
++        glob = {}
++        loc = {}
++        exec_("global y; y = 42; x = 12", glob, loc)
++        self.assertEqual(glob["y"], 42)
++        self.assertNotIn("x", glob)
++        self.assertEqual(loc["x"], 12)
++        self.assertNotIn("y", loc)
++
++
+ class ExecfileCompatTestCase(unittest.TestCase):
+     """
+     Tests for the Python 3-friendly L{execfile} implementation.
+@@ -250,3 +284,58 @@ class ExecfileCompatTestCase(unittest.TestCase):
+             globalNamespace = {"foo": None}
+             execfile(script.path, globalNamespace)
+             self.assertEqual("okay", globalNamespace["foo"])
++
++
++
++class reraiseTestCase(unittest.TestCase):
++    """
++    Tests for the Python 3-friendly raise function, reraise.
++
++    These tests have been copied from the "six" library and adapted to the
++    Twisted testing framework.
++    """
++    def get_next(self, tb):
++        """
++        Helper function to get the next entry from the traceback.
++        """
++        if sys.version_info[0] == 3:
++            return tb.tb_next.tb_next
++        else:
++            return tb.tb_next
++
++
++    def test_reraise(self):
++        """
++        Test reraise.
++        """
++        e = Exception("blah")
++
++        try:
++            raise e
++        except Exception:
++            tp, val, tb = sys.exc_info()
++
++        try:
++            reraise(tp, val, tb)
++        except Exception:
++            tp2, value2, tb2 = sys.exc_info()
++            self.assertIdentical(tp2, Exception)
++            self.assertIdentical(value2, e)
++            self.assertIdentical(tb, self.get_next(tb2))
++
++        try:
++            reraise(tp, val)
++        except Exception:
++            tp2, value2, tb2 = sys.exc_info()
++            self.assertIdentical(tp2, Exception)
++            self.assertIdentical(value2, e)
++            self.assertNotIdentical(tb2, tb)
++
++        try:
++            reraise(tp, val, tb2)
++        except Exception:
++            tp2, value2, tb3 = sys.exc_info()
++            self.assertIdentical(tp2, Exception)
++            self.assertIdentical(value2, e)
++            self.assertIdentical(self.get_next(tb3), tb2)
++

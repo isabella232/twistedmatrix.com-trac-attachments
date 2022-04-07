@@ -1,0 +1,245 @@
+Index: twisted/web/tap.py
+===================================================================
+--- twisted/web/tap.py	(revision 38074)
++++ twisted/web/tap.py	(working copy)
+@@ -6,13 +6,14 @@
+ """
+ 
+ import os
++import warnings
+ 
+ # Twisted Imports
+ from twisted.web import server, static, twcgi, script, demo, distrib, wsgi
+-from twisted.internet import interfaces, reactor
++from twisted.internet import interfaces, reactor, endpoints
+ from twisted.python import usage, reflect, threadpool
+ from twisted.spread import pb
+-from twisted.application import internet, service, strports
++from twisted.application import internet, service
+ 
+ 
+ class Options(usage.Options):
+@@ -21,12 +22,16 @@
+     """
+     synopsis = "[web options]"
+ 
+-    optParameters = [["port", "p", None, "strports description of the port to "
+-                      "start the server on."],
+-                     ["logfile", "l", None, "Path to web CLF (Combined Log Format) log file."],
+-                     ["https", None, None, "Port to listen on for Secure HTTP."],
+-                     ["certificate", "c", "server.pem", "SSL certificate to use for HTTPS. "],
+-                     ["privkey", "k", "server.pem", "SSL certificate to use for HTTPS."],
++    optParameters = [["logfile", "l", None, "Path to web CLF (Combined Log Format) log file."],
++                     ["https", None, None, "Port to listen on for Secure HTTP. "
++                      "DEPRECATED: use "
++                      "'--port ssl:port:privateKey=pkey.pem:certKey=cert.pem'"],
++                     ["certificate", "c", "server.pem", "SSL certificate to use for HTTPS. "
++                      "DEPRECATED: use "
++                      "'--port ssl:port:privateKey=pkey.pem:certKey=cert.pem'"],
++                     ["privkey", "k", "server.pem", "SSL certificate to use for HTTPS. "
++                      "DEPRECATED: use "
++                      "'--port ssl:port:privateKey=pkey.pem:certKey=cert.pem'"],
+                      ]
+ 
+     optFlags = [["personal", "",
+@@ -52,8 +57,31 @@
+         usage.Options.__init__(self)
+         self['indexes'] = []
+         self['root'] = None
++        self.endpoints = []
+ 
+ 
++    def addEndpoint(self, description, privateKey=None, certificate=None):
++        """
++        Add an endpoint according to the description
++        """
++        self.endpoints.append(
++            _toEndpoint(description, privateKey=privateKey, certificate=certificate))
++
++
++    def opt_port(self, description):
++        """
++        Add a specified endpoint. You can add multiple endpoints by specifying
++        multiple --port options. For backwards compatibility, a bare TCP port number
++        can be specified, but this is deprecated.
++        [TCP Example: tcp:port]
++        [SSL Example: ssl:port:privateKey=mycert.pem]
++        The default value is: '--port tcp:8080'
++        """
++        self.addEndpoint(description)
++
++    opt_p = opt_port
++
++
+     def opt_index(self, indexName):
+         """
+         Add the name of a file used to check for directory indexes.
+@@ -169,21 +197,45 @@
+         If no server port was supplied, select a default appropriate for the
+         other options supplied.
+         """
+-        if self['https']:
+-            try:
+-                from twisted.internet.ssl import DefaultOpenSSLContextFactory
+-            except ImportError:
+-                raise usage.UsageError("SSL support not installed")
+-        if self['port'] is None:
+-            if self['personal']:
++        if self['personal']:
++            if not self.endpoints:
+                 path = os.path.expanduser(
+                     os.path.join('~', distrib.UserDirectory.userSocketName))
+-                self['port'] = 'unix:' + path
+-            else:
+-                self['port'] = 'tcp:8080'
++                self.addEndpoint('unix:' + path)
++        else:
++            if not self.endpoints:
++                self.addEndpoint('tcp:8080')
++            if self['https']:
++                try:
++                    from twisted.internet.ssl import DefaultOpenSSLContextFactory
++                except ImportError:
++                    raise usage.UsageError("SSL support not installed")
++                self.addEndpoint(self['https'], privateKey=self['privkey'], certificate=self['certificate'])
+ 
+ 
+ 
++def _toEndpoint(description, privateKey=None, certificate=None):
++    """
++    Tries to guess whether a description is a bare TCP port or a endpoint.  If a
++    bare port is specified and a certificate file is present, returns an
++    SSL4ServerEndpoint and otherwise returns a TCP4ServerEndpoint.
++    """
++    try:
++        port = int(description)
++    except ValueError:
++        return endpoints.serverFromString(reactor, description)
++    warnings.warn(
++        "Specifying plain ports and/or a certificate is deprecated since "
++        "Twisted 11.0; use endpoint descriptions instead.",
++        category=DeprecationWarning, stacklevel=3)
++    if certificate:
++        from twisted.internet.ssl import DefaultOpenSSLContextFactory
++        ctx = DefaultOpenSSLContextFactory(privateKey, certificate)
++        return endpoints.SSL4ServerEndpoint(reactor, port, ctx)
++    return endpoints.TCP4ServerEndpoint(reactor, port)
++
++
++
+ def makePersonalServerFactory(site):
+     """
+     Create and return a factory which will respond to I{distrib} requests
+@@ -217,16 +269,12 @@
+     site.displayTracebacks = not config["notracebacks"]
+ 
+     if config['personal']:
+-        personal = strports.service(
+-            config['port'], makePersonalServerFactory(site))
+-        personal.setServiceParent(s)
++        siteFactory = makePersonalServerFactory(site)
+     else:
+-        if config['https']:
+-            from twisted.internet.ssl import DefaultOpenSSLContextFactory
+-            i = internet.SSLServer(int(config['https']), site,
+-                          DefaultOpenSSLContextFactory(config['privkey'],
+-                                                       config['certificate']))
+-            i.setServiceParent(s)
+-        strports.service(config['port'], site).setServiceParent(s)
++        siteFactory = site
++    for endpoint in config.endpoints:
++        svc = internet.StreamServerEndpointService(endpoint, siteFactory)
++        svc._raiseSynchronously = True
++        svc.setServiceParent(s)
+ 
+     return s
+Index: twisted/web/test/test_tap.py
+===================================================================
+--- twisted/web/test/test_tap.py	(revision 38074)
++++ twisted/web/test/test_tap.py	(working copy)
+@@ -10,10 +10,9 @@
+ from twisted.python.usage import UsageError
+ from twisted.python.filepath import FilePath
+ from twisted.internet.interfaces import IReactorUNIX
+-from twisted.internet import reactor
++from twisted.internet import reactor, endpoints, defer
+ from twisted.python.threadpool import ThreadPool
+ from twisted.trial.unittest import TestCase
+-from twisted.application import strports
+ 
+ from twisted.web.server import Site
+ from twisted.web.static import Data, File
+@@ -28,6 +27,16 @@
+ 
+ application = object()
+ 
++class SpyEndpoint(object):
++    """
++    SpyEndpoint remembers what factory it is told to listen with.
++    """
++    listeningWith = None
++    def listen(self, factory):
++        self.listeningWith = factory
++        return defer.succeed(None)
++
++
+ class ServiceTests(TestCase):
+     """
+     Tests for the service creation APIs in L{twisted.web.tap}.
+@@ -110,6 +119,34 @@
+         self.assertIdentical(serverFactory.root.site, site)
+ 
+ 
++    def test_dscMultipleEndpoints(self):
++        """
++        If one or more endpoints is included in the configuration passed to
++        L{makeService}, a service for starting a server is constructed
++        for each of them and attached to the returned service.
++        """
++        cleartext = SpyEndpoint()
++        secure = SpyEndpoint()
++        config = Options()
++        config.endpoints = [cleartext, secure]
++        service = makeService(config)
++        service.privilegedStartService()
++        service.startService()
++        self.addCleanup(service.stopService)
++        self.assertIsInstance(cleartext.listeningWith, Site)
++        self.assertIsInstance(secure.listeningWith, Site)
++
++
++    def test_dscBarePort(self):
++        """
++        For backwards compatibility, the I{--port} option supports the deprecated
++        bare port option like '--port 8080'.
++        """
++        options = Options()
++        options.parseOptions(['--port', '8080'])
++        self.assertEqual(options.endpoints[0]._port, 8080)
++
++
+     def test_personalServer(self):
+         """
+         The I{--personal} option to L{makeService} causes it to return a
+@@ -140,9 +177,7 @@
+         options.parseOptions(['--personal'])
+         path = os.path.expanduser(
+             os.path.join('~', UserDirectory.userSocketName))
+-        self.assertEqual(
+-            strports.parse(options['port'], None)[:2],
+-            ('UNIX', (path, None)))
++        self.assertEqual(options.endpoints[0]._address, path)
+ 
+     if not IReactorUNIX.providedBy(reactor):
+         test_defaultPersonalPath.skip = (
+@@ -156,9 +191,7 @@
+         """
+         options = Options()
+         options.parseOptions([])
+-        self.assertEqual(
+-            strports.parse(options['port'], None)[:2],
+-            ('TCP', (8080, None)))
++        self.assertEqual(options.endpoints[0]._port, 8080)
+ 
+ 
+     def test_wsgi(self):

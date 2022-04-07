@@ -1,0 +1,118 @@
+diff --git a/setup.cfg b/setup.cfg
+new file mode 100644
+index 0000000..9dbe235
+--- /dev/null
++++ b/setup.cfg
+@@ -0,0 +1,13 @@
++# Some RPM-based distributions configure RPM to automatically create .pyo files
++# when .py files are installed, but don't configure bdist_rpm to add .pyo files
++# to the list-of-files-to-be-installed. Since RPM will exit with an error if
++# files are installed that aren't in the list-of-files-to-be-installed, this
++# prevents bdist_rpm from working. This has been a problem for a very long time
++# (at least since Fedora 6, if not before), but is due to be fixed in Fedora
++# 11, with the same workaround we present here. For more details, see the
++# upstream Fedora bug:
++#
++#   https://bugzilla.redhat.com/show_bug.cgi?id=236535
++#
++[install]
++optimize = 1
+diff --git a/setup.py b/setup.py
+index 529fda5..860e713 100755
+--- a/setup.py
++++ b/setup.py
+@@ -44,7 +44,7 @@ def main(args):
+         sys.path.insert(0, '.')
+     from twisted import copyright
+     from twisted.python.dist import getDataFiles, getScripts, getPackages
+-    from twisted.python.dist import setup, _SDistTwisted
++    from twisted.python.dist import setup, _SDistTwisted, _BuildPyTwisted
+ 
+     # "" is included because core scripts are directly in bin/
+     projects = [''] + [x for x in os.listdir('bin')
+@@ -74,7 +74,10 @@ on event-based network programming and multiprotocol integration.
+             conditionalExtensions = getExtensions(),
+             scripts = scripts,
+             data_files=getDataFiles('twisted'),
+-            cmdclass = {'sdist': _SDistTwisted},
++            cmdclass = {
++                'sdist': _SDistTwisted,
++                'build_py': _BuildPyTwisted,
++                },
+             )
+ 
+     if 'setuptools' in sys.modules:
+diff --git a/twisted/python/dist.py b/twisted/python/dist.py
+index 6d91b52..9b89b78 100644
+--- a/twisted/python/dist.py
++++ b/twisted/python/dist.py
+@@ -6,9 +6,10 @@ Don't use this outside of Twisted.
+ Maintainer: Christopher Armstrong
+ """
+ 
++import sys
+ import os
+-from distutils.command import (build_scripts, install_data, build_ext,
+-                               sdist)
++from distutils.command import build_scripts, install_data, build_ext
++from distutils.command import sdist, build_py
+ from distutils.errors import CompileError
+ from distutils import core
+ from distutils.core import Extension
+@@ -377,3 +378,56 @@ class _SDistTwisted(sdist.sdist):
+         builder.buildTwistedFiles(version, basedir)
+ 
+         self.distribution.metadata.write_pkg_info(basedir)
++
++
++
++class _BuildPyTwisted(build_py.build_py):
++    """
++    Install Python source files, except the ones we don't want.
++    """
++
++    blacklist = {
++            (2, 5): [
++                "twisted/test/generator_failure_tests.py",
++            ],
++        }
++
++
++    def _check_file(self, filepath):
++        incompatible_versions = [v for v in self.blacklist.keys()
++                if v > sys.version_info]
++
++        for version in incompatible_versions:
++            for victim in self.blacklist[version]:
++                # Ignore plain Python files
++                if filepath.endswith(victim):
++                    print "Rejecting Python script %r" % (victim,)
++                    return False
++
++                # Ignore byte-compiled files
++                if filepath.endswith(victim + "c"):
++                    print "Rejecting compiled version of %r" % (victim,)
++                    return False
++
++                # Ignore optimized byte-compiled files
++                if filepath.endswith(victim + "o"):
++                    print "Rejecting optimized version of %r" % (victim,)
++                    return False
++
++        return True
++
++
++    def get_outputs(self, *args, **kwargs):
++        outfiles = build_py.build_py.get_outputs(self, *args, **kwargs)
++
++        filtered = [filepath for filepath in outfiles
++                if self._check_file(filepath)]
++
++        assert len(filtered) < len(outfiles)
++
++        return filtered
++
++
++    def build_module(self, module, module_file, package):
++        if self._check_file(module_file):
++            build_py.build_py.build_module(self, module, module_file, package)

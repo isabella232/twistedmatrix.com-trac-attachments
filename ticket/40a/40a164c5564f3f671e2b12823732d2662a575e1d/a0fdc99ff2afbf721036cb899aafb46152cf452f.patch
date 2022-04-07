@@ -1,0 +1,188 @@
+Index: twisted/web/test/requesthelper.py
+===================================================================
+--- twisted/web/test/requesthelper.py	(revision 42205)
++++ twisted/web/test/requesthelper.py	(working copy)
+@@ -14,7 +14,7 @@
+ from zope.interface import implementer
+ 
+ from twisted.internet.defer import Deferred
+-from twisted.internet.address import IPv4Address
++from twisted.internet.address import IPv4Address, UNIXAddress
+ from twisted.internet.interfaces import ISSLTransport
+ 
+ from twisted.web.http_headers import Headers
+@@ -53,6 +53,14 @@
+             self.disconnected = True
+ 
+ 
++    class UNIX(TCP):
++        def getPeer(self):
++            return UNIXAddress("testingPeer")
++
++        def getHost(self):
++            return UNIXAddress("testingHost")
++
++
+     @implementer(ISSLTransport)
+     class SSL(TCP):
+         pass
+Index: twisted/web/test/test_wsgi.py
+===================================================================
+--- twisted/web/test/test_wsgi.py	(revision 42205)
++++ twisted/web/test/test_wsgi.py	(working copy)
+@@ -393,6 +393,28 @@
+         return gatherResults([missing, present])
+ 
+ 
++    def test_serverNameIAddress(self):
++        """
++        The C{'SERVER_NAME'} key of the C{environ} C{dict} passed to the
++        application contains a reasonable value even when the underlying
++        transport's address is not a TCP address.
++        """
++        def makeChannel():
++            channel = DummyChannel()
++            channel.transport = DummyChannel.UNIX()
++            return channel
++        self.channelFactory = makeChannel
++
++        missing = self.render('GET', '1.1', [], [''])
++        missing.addCallback(self.environKeyEqual('SERVER_NAME', ''))
++
++        present = self.render(
++            'GET', '1.1', [], [''], None, [('host', 'example.org')])
++        present.addCallback(self.environKeyEqual('SERVER_NAME', 'example.org'))
++
++        return gatherResults([missing, present])
++
++
+     def test_serverPort(self):
+         """
+         The C{'SERVER_PORT'} key of the C{environ} C{dict} passed to the
+@@ -412,6 +434,29 @@
+         return d
+ 
+ 
++    def test_serverPortIAddress(self):
++        """
++        The C{'SERVER_PORT'} key of the C{environ} C{dict} passed to the
++        application contains a reasonable value even when the underlying
++        transport's address is not a TCP address.
++        """
++
++        def makeChannel():
++            channel = DummyChannel()
++            channel.transport = DummyChannel.UNIX()
++            return channel
++        self.channelFactory = makeChannel
++
++        missing = self.render('GET', '1.1', [], [''])
++        missing.addCallback(self.environKeyEqual('SERVER_PORT', b"80"))
++
++        present = self.render(
++            'GET', '1.1', [], [''], None, [('host', 'example.org:12384')])
++        present.addCallback(self.environKeyEqual('SERVER_PORT', b"12384"))
++
++        return gatherResults([missing, present])
++
++
+     def test_serverProtocol(self):
+         """
+         The C{'SERVER_PROTOCOL'} key of the C{environ} C{dict} passed to the
+Index: twisted/web/wsgi.py
+===================================================================
+--- twisted/web/wsgi.py	(revision 42205)
++++ twisted/web/wsgi.py	(working copy)
+@@ -16,7 +16,7 @@
+ from twisted.python.failure import Failure
+ from twisted.web.resource import IResource
+ from twisted.web.server import NOT_DONE_YET
+-from twisted.web.http import INTERNAL_SERVER_ERROR
++from twisted.web.http import INTERNAL_SERVER_ERROR, urlparse
+ 
+ 
+ class _ErrorStream:
+@@ -130,6 +130,20 @@
+ 
+ 
+ 
++def _splitNetloc(netloc):
++    """
++    Retrieve the host and port from a netloc.
++    """
++
++    hostAndPort = netloc.split(b":", 1)
++    if len(hostAndPort) == 2:
++        # Okay, done.
++        return tuple(hostAndPort)
++    else:
++        return netloc, None
++
++
++
+ class _WSGIResponse:
+     """
+     Helper for L{WSGIResource} which drives the WSGI application using a
+@@ -183,12 +197,41 @@
+         else:
+             pathInfo = ''
+ 
+-        parts = request.uri.split('?', 1)
+-        if len(parts) == 1:
+-            queryString = ''
+-        else:
+-            queryString = parts[1]
++        # Split the request URI and extract the query string, host, and port.
++        # Our first source of host information is from the request URI; if
++        # it's not there, then we check the transport and finally the Host
++        # header.
++        uriPieces = urlparse(request.uri)
+ 
++        # Query string is easy; it's always parsed correctly even from partial
++        # URIs.
++        queryString = uriPieces.query
++
++        # First, let's see what's in the request URI.
++        queryHost, queryPort = _splitNetloc(uriPieces.netloc)
++
++        if uriPieces.scheme and not queryPort:
++            # If we have a scheme, we can guess the port.
++            queryPort = b"443" if uriPieces.scheme == b"https" else b"80"
++
++        if not queryHost:
++            # Let's check the Host header!
++            hostHeader = request.getHeader("host")
++            if hostHeader:
++                queryHost, queryPort = _splitNetloc(hostHeader)
++
++        # Okay. *But*, if none of that worked, then it's time to look at the
++        # transport.
++        address = request.transport.getHost()
++        if not queryHost:
++            queryHost = getattr(address, "host", b"")
++        if not queryPort:
++            queryPort = bytes(getattr(address, "port", b""))
++            # And the port needs to be set at this point. We're giving up and
++            # using defaults here.
++            if not queryPort:
++                queryPort = b"443" if request.isSecure() else b"80"
++
+         self.environ = {
+             'REQUEST_METHOD': request.method,
+             'REMOTE_ADDR': request.getClientIP(),
+@@ -197,11 +240,11 @@
+             'QUERY_STRING': queryString,
+             'CONTENT_TYPE': request.getHeader('content-type') or '',
+             'CONTENT_LENGTH': request.getHeader('content-length') or '',
+-            'SERVER_NAME': request.getRequestHostname(),
+-            'SERVER_PORT': str(request.getHost().port),
+-            'SERVER_PROTOCOL': request.clientproto}
++            'SERVER_NAME': queryHost,
++            'SERVER_PORT': queryPort,
++            'SERVER_PROTOCOL': request.clientproto,
++        }
+ 
+-
+         # The application object is entirely in control of response headers;
+         # disable the default Content-Type value normally provided by
+         # twisted.web.server.Request.

@@ -1,0 +1,2766 @@
+Index: admin/run-python3-tests
+===================================================================
+--- admin/run-python3-tests	(revision 47351)
++++ admin/run-python3-tests	(working copy)
+@@ -1,4 +1,4 @@
+-#!/usr/bin/env python3.3
++#!/usr/bin/env python3
+ 
+ # Copyright (c) Twisted Matrix Laboratories.
+ # See LICENSE for details.
+Index: twisted/mail/imap4.py
+===================================================================
+--- twisted/mail/imap4.py	(revision 47351)
++++ twisted/mail/imap4.py	(working copy)
+@@ -15,7 +15,6 @@
+   Make APPEND recognize (again) non-existent mailboxes before accepting the literal
+ """
+ 
+-import rfc822
+ import base64
+ import binascii
+ import hmac
+@@ -26,16 +25,12 @@
+ import time
+ import random
+ import types
++from io import BytesIO
+ 
+-import email.Utils
++import email.utils
+ 
+-try:
+-    import cStringIO as StringIO
+-except:
+-    import StringIO
++from zope.interface import Interface, implementer
+ 
+-from zope.interface import implements, Interface
+-
+ from twisted.protocols import basic
+ from twisted.protocols import policies
+ from twisted.internet import defer
+@@ -299,7 +294,7 @@
+         if size > self._memoryFileLimit:
+             self.data = tempfile.TemporaryFile()
+         else:
+-            self.data = StringIO.StringIO()
++            self.data = BytesIO()
+ 
+     def write(self, data):
+         self.size -= len(data)
+@@ -460,7 +455,7 @@
+ # Some definitions (SP, CTL, DQUOTE) are also from the ABNF RFC -
+ # <https://tools.ietf.org/html/rfc2234>.
+ _SP = ' '
+-_CTL = ''.join(chr(ch) for ch in range(0x21) + range(0x80, 0x100))
++_CTL = ''.join(chr(ch) for ch in list(range(0x21)) + list(range(0x80, 0x100)))
+ 
+ # It is easier to define ATOM-CHAR in terms of what it does not match than in
+ # terms of what it does match.
+@@ -469,6 +464,7 @@
+ # This is all the bytes that match the ATOM-CHAR from the grammar in the RFC.
+ _atomChars = ''.join(chr(ch) for ch in range(0x100) if chr(ch) not in _nonAtomChars)
+ 
++@implementer(IMailboxListener)
+ class IMAP4Server(basic.LineReceiver, policies.TimeoutMixin):
+     """
+     Protocol implementation for an IMAP4rev1 server.
+@@ -479,7 +475,6 @@
+         - Selected
+         - Logout
+     """
+-    implements(IMailboxListener)
+ 
+     # Identifier for this server software
+     IDENT = 'Twisted IMAP4rev1 Ready'
+@@ -599,7 +594,7 @@
+         f = getattr(self, 'parse_' + self.parseState)
+         try:
+             f(line)
+-        except Exception, e:
++        except Exception as e:
+             self.sendUntaggedResponse('BAD Server error: ' + str(e))
+             log.err()
+ 
+@@ -621,11 +616,11 @@
+         cmd = cmd.upper()
+         try:
+             return self.dispatchCommand(tag, cmd, rest)
+-        except IllegalClientResponse, e:
++        except IllegalClientResponse as e:
+             self.sendBadResponse(tag, 'Illegal syntax: ' + str(e))
+-        except IllegalOperation, e:
++        except IllegalOperation as e:
+             self.sendNegativeResponse(tag, 'Illegal operation: ' + str(e))
+-        except IllegalMailboxEncoding, e:
++        except IllegalMailboxEncoding as e:
+             self.sendNegativeResponse(tag, 'Illegal mailbox name: ' + str(e))
+ 
+     def parse_pending(self, line):
+@@ -666,7 +661,8 @@
+         else:
+             handler(*args)
+ 
+-    def __cbDispatch(self, (arg, rest), tag, fn, args, parseargs, uid):
++    def __cbDispatch(self, result, tag, fn, args, parseargs, uid):
++        arg, rest = result
+         args.append(arg)
+         self.__doCommand(tag, fn, args, parseargs, rest, uid)
+ 
+@@ -809,7 +805,7 @@
+ 
+         try:
+             return (parseIdList(arg), rest)
+-        except IllegalIdentifierError, e:
++        except IllegalIdentifierError as e:
+             raise IllegalClientResponse("Bad message number " + str(e))
+ 
+     def arg_fetchatt(self, line):
+@@ -980,7 +976,7 @@
+     def _setupChallenge(self, chal, tag):
+         try:
+             challenge = chal.getChallenge()
+-        except Exception, e:
++        except Exception as e:
+             self.sendBadResponse(tag, 'Server error: ' + str(e))
+         else:
+             coded = base64.encodestring(challenge)[:-1]
+@@ -1006,7 +1002,8 @@
+                 (tag,), None, (tag,), None
+             )
+ 
+-    def __cbAuthResp(self, (iface, avatar, logout), tag):
++    def __cbAuthResp(self, result, tag):
++        iface, avatar, logout = result
+         assert iface is IAccount, "IAccount is the only supported interface"
+         self.account = avatar
+         self.state = 'auth'
+@@ -1076,7 +1073,8 @@
+             )
+         raise UnauthorizedLogin()
+ 
+-    def __cbLogin(self, (iface, avatar, logout), tag):
++    def __cbLogin(self, result, tag):
++        iface, avatar, logout = result
+         if iface is not IAccount:
+             self.sendBadResponse(tag, 'Server error: login returned unexpected value')
+             log.err("__cbLogin called with %r, IAccount expected" % (iface,))
+@@ -1182,7 +1180,7 @@
+         name = self._parseMbox(name)
+         try:
+             result = self.account.create(name)
+-        except MailboxException, c:
++        except MailboxException as c:
+             self.sendNegativeResponse(tag, str(c))
+         except:
+             self.sendBadResponse(tag, "Server error encountered while creating mailbox")
+@@ -1203,7 +1201,7 @@
+             return
+         try:
+             self.account.delete(name)
+-        except MailboxException, m:
++        except MailboxException as m:
+             self.sendNegativeResponse(tag, str(m))
+         except:
+             self.sendBadResponse(tag, "Server error encountered while deleting mailbox")
+@@ -1215,7 +1213,7 @@
+     select_DELETE = auth_DELETE
+ 
+     def do_RENAME(self, tag, oldname, newname):
+-        oldname, newname = [self._parseMbox(n) for n in oldname, newname]
++        oldname, newname = [self._parseMbox(n) for n in (oldname, newname)]
+         if oldname.lower() == 'inbox' or newname.lower() == 'inbox':
+             self.sendNegativeResponse(tag, 'You cannot rename the inbox, or rename another mailbox to inbox.')
+             return
+@@ -1223,7 +1221,7 @@
+             self.account.rename(oldname, newname)
+         except TypeError:
+             self.sendBadResponse(tag, 'Invalid command syntax')
+-        except MailboxException, m:
++        except MailboxException as m:
+             self.sendNegativeResponse(tag, str(m))
+         except:
+             self.sendBadResponse(tag, "Server error encountered while renaming mailbox")
+@@ -1238,7 +1236,7 @@
+         name = self._parseMbox(name)
+         try:
+             self.account.subscribe(name)
+-        except MailboxException, m:
++        except MailboxException as m:
+             self.sendNegativeResponse(tag, str(m))
+         except:
+             self.sendBadResponse(tag, "Server error encountered while subscribing to mailbox")
+@@ -1253,7 +1251,7 @@
+         name = self._parseMbox(name)
+         try:
+             self.account.unsubscribe(name)
+-        except MailboxException, m:
++        except MailboxException as m:
+             self.sendNegativeResponse(tag, str(m))
+         except:
+             self.sendBadResponse(tag, "Server error encountered while unsubscribing from mailbox")
+@@ -1630,7 +1628,7 @@
+ 
+     def search_BEFORE(self, query, id, msg):
+         date = parseTime(query.pop(0))
+-        return rfc822.parsedate(msg.getInternalDate()) < date
++        return email.utils.parsedate(msg.getInternalDate()) < date
+ 
+     def search_BODY(self, query, id, msg):
+         body = query.pop(0).lower()
+@@ -1668,7 +1666,7 @@
+     def search_NEW(self, query, id, msg):
+         return '\\Recent' in msg.getFlags() and '\\Seen' not in msg.getFlags()
+ 
+-    def search_NOT(self, query, id, msg, (lastSequenceId, lastMessageId)):
++    def search_NOT(self, query, id, msg, lastIds):
+         """
+         Returns C{True} if the message does not match the query.
+ 
+@@ -1681,13 +1679,13 @@
+         @type msg: Provider of L{imap4.IMessage}
+         @param msg: The message being checked.
+ 
+-        @type lastSequenceId: C{int}
+-        @param lastSequenceId: The highest sequence number of a message in the
++        @type lastIds: C{tuple}
++        @param lastIds: tuple of (lastSequenceId, lastMessageId) where
++            lastSequenceId is the highest sequence number of a message in the
++            mailbox and lastMessageId is The highest UID of a message in the
+             mailbox.
+-
+-        @type lastMessageId: C{int}
+-        @param lastMessageId: The highest UID of a message in the mailbox.
+         """
++        lastSequenceId, lastMessageId = lastIds
+         return not self._singleSearchStep(query, id, msg,
+                                           lastSequenceId, lastMessageId)
+ 
+@@ -1696,9 +1694,9 @@
+ 
+     def search_ON(self, query, id, msg):
+         date = parseTime(query.pop(0))
+-        return rfc822.parsedate(msg.getInternalDate()) == date
++        return email.utils.parsedate(msg.getInternalDate()) == date
+ 
+-    def search_OR(self, query, id, msg, (lastSequenceId, lastMessageId)):
++    def search_OR(self, query, id, msg, lastIds):
+         """
+         Returns C{True} if the message matches any of the first two query
+         items.
+@@ -1712,13 +1710,13 @@
+         @type msg: Provider of L{imap4.IMessage}
+         @param msg: The message being checked.
+ 
+-        @type lastSequenceId: C{int}
+-        @param lastSequenceId: The highest sequence number of a message in the
+-                               mailbox.
+-
+-        @type lastMessageId: C{int}
+-        @param lastMessageId: The highest UID of a message in the mailbox.
++        @type lastIds: C{tuple}
++        @param lastIds: tuple of (lastSequenceId, lastMessageId) where
++            lastSequenceId is the highest sequence number of a message in the
++            mailbox and lastMessageId is The highest UID of a message in the
++            mailbox.
+         """
++        lastSequenceId, lastMessageId = lastIds
+         a = self._singleSearchStep(query, id, msg,
+                                    lastSequenceId, lastMessageId)
+         b = self._singleSearchStep(query, id, msg,
+@@ -1746,7 +1744,7 @@
+         @type msg: Provider of L{imap4.IMessage}
+         """
+         date = msg.getHeaders(False, 'date').get('date', '')
+-        date = rfc822.parsedate(date)
++        date = email.utils.parsedate(date)
+         return date < parseTime(query.pop(0))
+ 
+     def search_SENTON(self, query, id, msg):
+@@ -1761,7 +1759,7 @@
+         @type msg: Provider of L{imap4.IMessage}
+         """
+         date = msg.getHeaders(False, 'date').get('date', '')
+-        date = rfc822.parsedate(date)
++        date = email.utils.parsedate(date)
+         return date[:3] == parseTime(query.pop(0))[:3]
+ 
+     def search_SENTSINCE(self, query, id, msg):
+@@ -1776,12 +1774,12 @@
+         @type msg: Provider of L{imap4.IMessage}
+         """
+         date = msg.getHeaders(False, 'date').get('date', '')
+-        date = rfc822.parsedate(date)
++        date = email.utils.parsedate(date)
+         return date > parseTime(query.pop(0))
+ 
+     def search_SINCE(self, query, id, msg):
+         date = parseTime(query.pop(0))
+-        return rfc822.parsedate(msg.getInternalDate()) > date
++        return email.utils.parsedate(msg.getInternalDate()) > date
+ 
+     def search_SMALLER(self, query, id, msg):
+         return int(query.pop(0)) > msg.getSize()
+@@ -1799,7 +1797,7 @@
+         to = msg.getHeaders(False, 'to').get('to', '')
+         return to.lower().find(query.pop(0).lower()) != -1
+ 
+-    def search_UID(self, query, id, msg, (lastSequenceId, lastMessageId)):
++    def search_UID(self, query, id, msg, lastIds):
+         """
+         Returns C{True} if the message UID is in the range defined by the
+         search query.
+@@ -1815,13 +1813,13 @@
+         @type msg: Provider of L{imap4.IMessage}
+         @param msg: The message being checked.
+ 
+-        @type lastSequenceId: C{int}
+-        @param lastSequenceId: The highest sequence number of a message in the
++        @type lastIds: C{tuple}
++        @param lastIds: tuple of (lastSequenceId, lastMessageId) where
++            lastSequenceId is the highest sequence number of a message in the
++            mailbox and lastMessageId is The highest UID of a message in the
+             mailbox.
+-
+-        @type lastMessageId: C{int}
+-        @param lastMessageId: The highest UID of a message in the mailbox.
+         """
++        lastSequenceId, lastMessageId = lastIds
+         c = query.pop(0)
+         m = parseIdList(c, lastMessageId)
+         return msg.getUID() in m
+@@ -1919,7 +1917,7 @@
+         if _w is None:
+             _w = self.transport.write
+         idate = msg.getInternalDate()
+-        ttup = rfc822.parsedate_tz(idate)
++        ttup = email.utils.parsedate_tz(idate)
+         if ttup is None:
+             log.msg("%d:%r: unpareseable internaldate: %r" % (id, msg, idate))
+             raise IMAP4Exception("Internal failure generating INTERNALDATE")
+@@ -2206,6 +2204,7 @@
+ 
+ TIMEOUT_ERROR = error.TimeoutError()
+ 
++@implementer(IMailboxListener)
+ class IMAP4Client(basic.LineReceiver, policies.TimeoutMixin):
+     """IMAP4 client protocol implementation
+ 
+@@ -2212,7 +2211,6 @@
+     @ivar state: A string representing the state the connection is currently
+     in.
+     """
+-    implements(IMailboxListener)
+ 
+     tags = None
+     waiting = None
+@@ -2396,7 +2394,7 @@
+         if octets > self._memoryFileLimit:
+             return tempfile.TemporaryFile()
+         else:
+-            return StringIO.StringIO()
++            return BytesIO()
+ 
+     def makeTag(self):
+         tag = '%0.4X' % self.tagID
+@@ -2544,7 +2542,8 @@
+         d.addCallback(self.__cbCapabilities)
+         return d
+ 
+-    def __cbCapabilities(self, (lines, tagline)):
++    def __cbCapabilities(self, result):
++        lines, tagline = result
+         caps = {}
+         for rest in lines:
+             for cap in rest[1:]:
+@@ -2577,7 +2576,8 @@
+         d.addCallback(self.__cbLogout)
+         return d
+ 
+-    def __cbLogout(self, (lines, tagline)):
++    def __cbLogout(self, result):
++        lines, tagline = result
+         self.transport.loseConnection()
+         # We don't particularly care what the server said
+         return None
+@@ -2596,7 +2596,8 @@
+         d.addCallback(self.__cbNoop)
+         return d
+ 
+-    def __cbNoop(self, (lines, tagline)):
++    def __cbNoop(self, result):
++        lines, tagline = result
+         # Conceivable, this is elidable.
+         # It is, afterall, a no-op.
+         return lines
+@@ -2810,7 +2811,8 @@
+         d.addCallback(self.__cbNamespace)
+         return d
+ 
+-    def __cbNamespace(self, (lines, last)):
++    def __cbNamespace(self, result):
++        lines, last = result
+         for parts in lines:
+             if len(parts) == 4 and parts[0] == 'NAMESPACE':
+                 return [e or [] for e in parts[1:]]
+@@ -2909,12 +2911,13 @@
+             raise IllegalServerResponse(phrase)
+ 
+ 
+-    def __cbSelect(self, (lines, tagline), rw):
++    def __cbSelect(self, result, rw):
+         """
+         Handle lines received in response to a SELECT or EXAMINE command.
+ 
+         See RFC 3501, section 6.3.1.
+         """
++        lines, tagline = result
+         # In the absence of specification, we are free to assume:
+         #   READ-WRITE access
+         datum = {'READ-WRITE': rw}
+@@ -3080,7 +3083,8 @@
+         d.addCallback(self.__cbList, 'LSUB')
+         return d
+ 
+-    def __cbList(self, (lines, last), command):
++    def __cbList(self, result, command):
++        lines, last = result
+         results = []
+         for parts in lines:
+             if len(parts) == 4 and parts[0] == command:
+@@ -3116,7 +3120,8 @@
+         d.addCallback(self.__cbStatus)
+         return d
+ 
+-    def __cbStatus(self, (lines, last)):
++    def __cbStatus(self, result):
++        lines, last = result
+         status = {}
+         for parts in lines:
+             if parts[0] == 'STATUS':
+@@ -3128,7 +3133,7 @@
+             if t:
+                 try:
+                     status[k] = t(status[k])
+-                except Exception, e:
++                except Exception as e:
+                     raise IllegalServerResponse('(%s %s): %s' % (k, status[k], str(e)))
+         return status
+ 
+@@ -3228,7 +3233,8 @@
+         return d
+ 
+ 
+-    def __cbExpunge(self, (lines, last)):
++    def __cbExpunge(self, result):
++        lines, last = result
+         ids = []
+         for parts in lines:
+             if len(parts) == 2 and parts[1] == 'EXPUNGE':
+@@ -3263,7 +3269,8 @@
+         return d
+ 
+ 
+-    def __cbSearch(self, (lines, end)):
++    def __cbSearch(self, result):
++        lines, end = result
+         ids = []
+         for parts in lines:
+             if len(parts) > 0 and parts[0] == 'SEARCH':
+@@ -3684,7 +3691,8 @@
+         return values
+ 
+ 
+-    def _cbFetch(self, (lines, last), requestedParts, structured):
++    def _cbFetch(self, result, requestedParts, structured):
++        lines, last = result
+         info = {}
+         for parts in lines:
+             if len(parts) == 3 and parts[1] == 'FETCH':
+@@ -4162,7 +4170,7 @@
+ def Or(*args):
+     """The disjunction of two or more queries"""
+     if len(args) < 2:
+-        raise IllegalQueryError, args
++        raise IllegalQueryError(args)
+     elif len(args) == 2:
+         return '(OR %s %s)' % args
+     else:
+@@ -4330,7 +4338,7 @@
+                 elif handleLiteral and c == '{':
+                     end = s.find('}', i)
+                     if end == -1:
+-                        raise ValueError, "Malformed literal"
++                        raise ValueError("Malformed literal")
+                     literalSize = int(s[i+1:end])
+                     contentStack[-1].append((s[end+3:end+3+literalSize],))
+                     i = end + 3 + literalSize
+@@ -4435,8 +4443,8 @@
+ 
+ 
+ 
++@implementer(IClientAuthentication)
+ class CramMD5ClientAuthenticator:
+-    implements(IClientAuthentication)
+ 
+     def __init__(self, user):
+         self.user = user
+@@ -4445,13 +4453,13 @@
+         return "CRAM-MD5"
+ 
+     def challengeResponse(self, secret, chal):
+-        response = hmac.HMAC(secret, chal).hexdigest()
+-        return '%s %s' % (self.user, response)
++        response = hmac.HMAC(secret, chal).hexdigest().encode('ascii')
++        return b' '.join([self.user, response])
+ 
+ 
+ 
++@implementer(IClientAuthentication)
+ class LOGINAuthenticator:
+-    implements(IClientAuthentication)
+ 
+     def __init__(self, user):
+         self.user = user
+@@ -4469,8 +4477,8 @@
+         # Respond to something like "Password:"
+         return secret
+ 
++@implementer(IClientAuthentication)
+ class PLAINAuthenticator:
+-    implements(IClientAuthentication)
+ 
+     def __init__(self, user):
+         self.user = user
+@@ -4689,8 +4697,8 @@
+         """
+ 
+ 
++@implementer(IAccount, INamespacePresenter)
+ class MemoryAccount(object):
+-    implements(IAccount, INamespacePresenter)
+ 
+     mailboxes = None
+     subscriptions = None
+@@ -4712,7 +4720,7 @@
+     def addMailbox(self, name, mbox = None):
+         name = name.upper()
+         if name in self.mailboxes:
+-            raise MailboxCollision, name
++            raise MailboxCollision(name)
+         if mbox is None:
+             mbox = self._emptyMailbox(name, self.allocateID())
+         self.mailboxes[name] = mbox
+@@ -4750,7 +4758,7 @@
+             # as part of their root.
+             for others in self.mailboxes.keys():
+                 if others != name and others.startswith(name):
+-                    raise MailboxException, "Hierarchically inferior mailboxes exist and \\Noselect is set"
++                    raise MailboxException("Hierarchically inferior mailboxes exist and \\Noselect is set")
+         mbox.destroy()
+ 
+         # iff there are no hierarchically inferior names, we will
+@@ -4762,7 +4770,7 @@
+         oldname = oldname.upper()
+         newname = newname.upper()
+         if oldname not in self.mailboxes:
+-            raise NoSuchMailbox, oldname
++            raise NoSuchMailbox(oldname)
+ 
+         inferiors = self._inferiorNames(oldname)
+         inferiors = [(o, o.replace(oldname, newname, 1)) for o in inferiors]
+@@ -4769,7 +4777,7 @@
+ 
+         for (old, new) in inferiors:
+             if new in self.mailboxes:
+-                raise MailboxCollision, new
++                raise MailboxCollision(new)
+ 
+         for (old, new) in inferiors:
+             self.mailboxes[new] = self.mailboxes[old]
+@@ -4793,7 +4801,7 @@
+     def unsubscribe(self, name):
+         name = name.upper()
+         if name not in self.subscriptions:
+-            raise MailboxException, "Not currently subscribed to " + name
++            raise MailboxException("Not currently subscribed to " + name)
+         self.subscriptions.remove(name)
+ 
+     def listMailboxes(self, ref, wildcard):
+@@ -4831,7 +4839,7 @@
+ def parseAddr(addr):
+     if addr is None:
+         return [(None, None, None),]
+-    addr = email.Utils.getaddresses([addr])
++    addr = email.utils.getaddresses([addr])
+     return [[fn or None, None] + address.split('@') for fn, address in addr]
+ 
+ def getEnvelope(msg):
+@@ -6116,7 +6124,7 @@
+     }
+     m = re.match('%(day)s-%(mon)s-%(year)s' % expr, s)
+     if not m:
+-        raise ValueError, "Cannot parse time string %r" % (s,)
++        raise ValueError("Cannot parse time string %r" % (s,))
+     d = m.groupdict()
+     try:
+         d['mon'] = 1 + (months.index(d['mon'].lower()) % 12)
+@@ -6123,7 +6131,7 @@
+         d['year'] = int(d['year'])
+         d['day'] = int(d['day'])
+     except ValueError:
+-        raise ValueError, "Cannot parse time string %r" % (s,)
++        raise ValueError("Cannot parse time string %r" % (s,))
+     else:
+         return time.struct_time(
+             (d['year'], d['mon'], d['day'], 0, 0, 0, -1, -1, -1)
+Index: twisted/mail/pop3.py
+===================================================================
+--- twisted/mail/pop3.py	(revision 47351)
++++ twisted/mail/pop3.py	(working copy)
+@@ -16,7 +16,7 @@
+ import warnings
+ from hashlib import md5
+ 
+-from zope.interface import implements, Interface
++from zope.interface import implementer, Interface
+ 
+ from twisted.mail import smtp
+ from twisted.protocols import basic
+@@ -31,6 +31,7 @@
+ ##
+ ## Authentication
+ ##
++@implementer(cred.credentials.IUsernamePassword)
+ class APOPCredentials:
+     """
+     Credentials for use in APOP authentication.
+@@ -39,7 +40,6 @@
+     @ivar username: See L{__init__}
+     @ivar digest: See L{__init__}
+     """
+-    implements(cred.credentials.IUsernamePassword)
+ 
+     def __init__(self, magic, username, digest):
+         """
+@@ -394,6 +394,7 @@
+ 
+ 
+ 
++@implementer(interfaces.IProducer)
+ class POP3(basic.LineOnlyReceiver, policies.TimeoutMixin):
+     """
+     A POP3 server protocol.
+@@ -449,7 +450,6 @@
+         <cred.credentials.IUsernameHashedPassword>} provider
+     @ivar _auth: Authorization credentials.
+     """
+-    implements(interfaces.IProducer)
+ 
+     magic = None
+     _userIs = None
+@@ -574,7 +574,7 @@
+         """
+         try:
+             return self.processCommand(*line.split(' '))
+-        except (ValueError, AttributeError, POP3Error, TypeError), e:
++        except (ValueError, AttributeError, POP3Error, TypeError) as e:
+             log.err()
+             self.failResponse('bad protocol or server: %s: %s' % (e.__class__.__name__, e))
+ 
+@@ -776,7 +776,7 @@
+         ).addErrback(self._ebUnexpected)
+ 
+ 
+-    def _cbMailbox(self, (interface, avatar, logout), user):
++    def _cbMailbox(self, result, user):
+         """
+         Complete successful authentication.
+ 
+@@ -783,19 +783,19 @@
+         Save the mailbox and logout function for the authenticated user and
+         send a successful response to the client.
+ 
+-        @type interface: C{zope.interface.Interface}
+-        @param interface: The interface supported by the avatar.
++        @type result: C{tuple}
++        @param result: tuple of (interface, avatar, logout) where:
++            - interface (C{zope.interface.Interface}) -- The interface
++              supported by the avatar.
++            - avatar (L{IMailbox}) -- The mailbox for the authenticated
++              user.
++            - logout (no-argument callable) -- The function to be invoked when
++              the session is terminated.
+ 
+-        @type avatar: L{IMailbox} provider
+-        @param avatar: The mailbox for the authenticated user.
+-
+-        @type logout: no-argument callable
+-        @param logout: The function to be invoked when the session is
+-            terminated.
+-
+         @type user: L{bytes}
+         @param user: The user being authenticated.
+         """
++        interface, avatar, logout = result
+         if interface is not IMailbox:
+             self.failResponse('Authentication failed')
+             log.err("_cbMailbox() called with an interface other than IMailbox")
+@@ -1498,11 +1498,11 @@
+ 
+ 
+ 
++@implementer(IMailbox)
+ class Mailbox:
+     """
+     A base class for mailboxes.
+     """
+-    implements(IMailbox)
+ 
+     def listMessages(self, i=None):
+         """
+Index: twisted/mail/pop3client.py
+===================================================================
+--- twisted/mail/pop3client.py	(revision 47351)
++++ twisted/mail/pop3client.py	(working copy)
+@@ -109,17 +109,16 @@
+         self.L = L
+ 
+ 
+-    def setitem(self, (item, value)):
++    def setitem(self, result):
+         """
+         Add the value at the specified position, padding out missing entries.
+ 
+-        @type item: L{int}
+-        @param item: The 0-based index in the list at which the value should
+-            be placed.
+-
+-        @type value: L{object}
+-        @param value: The value to put in the list.
++        @type result: L{tuple}
++        @param result: a tuple of (item, value) where item (L{int}) is the
++            The 0-based index in the list at which the value should
++            be placed and value (L{object}) is the value to put in the list.
+         """
++        item, value = result
+         diff = item - len(self.L) + 1
+         if diff > 0:
+             self.L.extend([None] * diff)
+Index: twisted/mail/protocols.py
+===================================================================
+--- twisted/mail/protocols.py	(revision 47351)
++++ twisted/mail/protocols.py	(working copy)
+@@ -21,10 +21,11 @@
+ 
+ from twisted.mail import relay
+ 
+-from zope.interface import implements
++from zope.interface import implementer
+ 
+ 
+ 
++@implementer(smtp.IMessageDelivery)
+ class DomainDeliveryBase:
+     """
+     A base class for message delivery using the domains of a mail service.
+@@ -37,7 +38,6 @@
+     @ivar protocolName: The protocol being used to deliver the mail.
+         Sub-classes should set this appropriately.
+     """
+-    implements(smtp.IMessageDelivery)
+ 
+     service = None
+     protocolName = None
+@@ -81,11 +81,9 @@
+         if helo[0]:
+             heloStr = " helo=%s" % (helo[0],)
+         from_ = "from %s ([%s]%s%s)" % (helo[0], helo[1], heloStr, authStr)
+-        by = "by %s with %s (%s)" % (
+-            self.host, self.protocolName, longversion
+-        )
+-        for_ = "for <%s>; %s" % (' '.join(map(str, recipients)), smtp.rfc822date())
+-        return "Received: %s\n\t%s\n\t%s" % (from_, by, for_)
++        by = "by %s with %s (%s)" % (self.host, self.protocolName, longversion)
++        for_ = "for <%s>; %s" % (' '.join(str(recp) for recp in recipients), smtp.rfc822date())
++        return ("Received: %s\n\t%s\n\t%s" % (from_, by, for_)).encode('utf-8')
+ 
+ 
+     def validateTo(self, user):
+Index: twisted/mail/smtp.py
+===================================================================
+--- twisted/mail/smtp.py	(revision 47351)
++++ twisted/mail/smtp.py	(working copy)
+@@ -6,13 +6,17 @@
+ Simple Mail Transfer Protocol implementation.
+ """
+ 
+-import time, re, base64, types, socket, os, random, rfc822
++import time, re, base64, socket, os, random, email
+ import binascii
+ import warnings
+-from email.base64MIME import encode as encode_base64
++from base64 import b64encode, b64decode
+ 
+-from zope.interface import implements, Interface
++from io import BytesIO
+ 
++from zope.interface import implementer, Interface
++
++from twisted.python.compat import iteritems, unicode, long, StringType
++from twisted.python.compat import _bytesChr
+ from twisted.copyright import longversion
+ from twisted.protocols import basic
+ from twisted.protocols import policies
+@@ -27,21 +31,17 @@
+ from twisted import cred
+ from twisted.python.runtime import platform
+ 
+-try:
+-    from cStringIO import StringIO
+-except ImportError:
+-    from StringIO import StringIO
+ 
+ # Cache the hostname (XXX Yes - this is broken)
+ if platform.isMacOSX():
+     # On OS X, getfqdn() is ridiculously slow - use the
+     # probably-identical-but-sometimes-not gethostname() there.
+-    DNSNAME = socket.gethostname()
++    DNSNAME = socket.gethostname().encode('utf-8')
+ else:
+-    DNSNAME = socket.getfqdn()
++    DNSNAME = socket.getfqdn().encode('utf-8')
+ 
+ # Used for fast success code lookup
+-SUCCESS = dict.fromkeys(xrange(200,300))
++SUCCESS = dict.fromkeys(range(200,300))
+ 
+ class IMessageDelivery(Interface):
+     def receivedHeader(helo, origin, recipients):
+@@ -257,7 +257,7 @@
+ 
+ class SMTPBadRcpt(SMTPAddressError):
+     def __init__(self, addr, code=550,
+-                 resp='Cannot receive for specified address'):
++                 resp=b'Cannot receive for specified address'):
+         SMTPAddressError.__init__(self, addr, code, resp)
+ 
+ class SMTPBadSender(SMTPAddressError):
+@@ -309,7 +309,11 @@
+         yield i
+         i += 1
+ 
+-def messageid(uniq=None, N=idGenerator().next):
++_idGeneratorInstance = idGenerator()
++def _nextId():
++    return next(_idGeneratorInstance)
++
++def messageid(uniq=None, N=_nextId):
+     """Return a globally unique random string in RFC 2822 Message-ID format
+ 
+     <datetime.pid.random@host.dom.ain>
+@@ -318,7 +322,7 @@
+     """
+     datetime = time.strftime('%Y%m%d%H%M%S', time.gmtime())
+     pid = os.getpid()
+-    rand = random.randrange(2**31L-1)
++    rand = random.randrange(2**31-1)
+     if uniq is None:
+         uniq = ''
+     else:
+@@ -334,7 +338,7 @@
+     if isinstance(addr, Address):
+         return '<%s>' % str(addr)
+ 
+-    res = rfc822.parseaddr(addr)
++    res = email.utils.parseaddr(addr)
+ 
+     if res == (None, None):
+         # It didn't parse, use it as-is
+@@ -349,6 +353,7 @@
+ 
+ # Character classes for parsing addresses
+ atom = r"[-A-Za-z0-9!\#$%&'*+/=?^_`{|}~]"
++atom_b = atom.encode('ascii')
+ 
+ class Address:
+     """Parse and hold an RFC 2821 address.
+@@ -376,12 +381,18 @@
+         if isinstance(addr, Address):
+             self.__dict__ = addr.__dict__.copy()
+             return
+-        elif not isinstance(addr, types.StringTypes):
+-            addr = str(addr)
++        # elif isinstance(addr, bytes):  # Hmm
++        #     addr = addr.decode('utf-8')
++        elif not isinstance(addr, str):
++            if isinstance(addr, bytes):
++                # Py3-only
++                addr = addr.decode('utf-8')
++            else:
++                addr = str(addr)
+         self.addrstr = addr
+ 
+         # Tokenize
+-        atl = filter(None,self.tstring.split(addr))
++        atl = list(filter(None,self.tstring.split(addr)))
+ 
+         local = []
+         domain = []
+@@ -389,7 +400,7 @@
+         while atl:
+             if atl[0] == '<':
+                 if atl[-1] != '>':
+-                    raise AddressError, "Unbalanced <>"
++                    raise AddressError("Unbalanced <>")
+                 atl = atl[1:-1]
+             elif atl[0] == '@':
+                 atl = atl[1:]
+@@ -399,15 +410,15 @@
+                         # remove it
+                         atl = atl[1:]
+                     if not atl:
+-                        raise AddressError, "Malformed source route"
++                        raise AddressError("Malformed source route")
+                     atl = atl[1:] # remove :
+                 elif domain:
+-                    raise AddressError, "Too many @"
++                    raise AddressError("Too many @")
+                 else:
+                     # Now in domain
+                     domain = ['']
+             elif len(atl[0]) == 1 and not self.atomre.match(atl[0]) and atl[0] !=  '.':
+-                raise AddressError, "Parse error at %r of %r" % (atl[0], (addr, atl))
++                raise AddressError("Parse error at %r of %r" % (atl[0], (addr, atl)))
+             else:
+                 if not domain:
+                     local.append(atl[0])
+@@ -536,12 +547,12 @@
+         self.deliveryFactory = deliveryFactory
+ 
+     def timeoutConnection(self):
+-        msg = '%s Timeout. Try talking faster next time!' % (self.host,)
++        msg = self.host + b' Timeout. Try talking faster next time!'
+         self.sendCode(421, msg)
+         self.transport.loseConnection()
+ 
+     def greeting(self):
+-        return '%s NO UCE NO UBE NO RELAY PROBES' % (self.host,)
++        return self.host + b' NO UCE NO UBE NO RELAY PROBES'
+ 
+     def connectionMade(self):
+         # Ensure user-code always gets something sane for _helo
+@@ -554,14 +565,14 @@
+         self.sendCode(220, self.greeting())
+         self.setTimeout(self.timeout)
+ 
+-    def sendCode(self, code, message=''):
++    def sendCode(self, code, message=b''):
+         "Send an SMTP code with a message."
+         lines = message.splitlines()
+         lastline = lines[-1:]
+         for line in lines[:-1]:
+-            self.sendLine('%3.3d-%s' % (code, line))
+-        self.sendLine('%3.3d %s' % (code,
+-                                    lastline and lastline[0] or ''))
++            self.sendLine(('%3.3d-' % code).encode('ascii') + line)
++        self.sendLine(('%3.3d ' % code).encode('ascii') + (
++                                    lastline and lastline[0] or b''))
+ 
+     def lineReceived(self, line):
+         self.resetTimeout()
+@@ -584,10 +595,10 @@
+             self.sendSyntaxError()
+ 
+     def sendSyntaxError(self):
+-        self.sendCode(500, 'Error: bad syntax')
++        self.sendCode(500, b'Error: bad syntax')
+ 
+     def lookupMethod(self, command):
+-        return getattr(self, 'do_' + command.upper(), None)
++        return getattr(self, 'do_' + command.upper().decode('ascii'), None)
+ 
+     def lineLengthExceeded(self, line):
+         if self.mode is DATA:
+@@ -595,10 +606,10 @@
+                 message.connectionLost()
+             self.mode = COMMAND
+             del self.__messages
+-        self.sendCode(500, 'Line too long')
++        self.sendCode(500, b'Line too long')
+ 
+     def do_UNKNOWN(self, rest):
+-        self.sendCode(500, 'Command not implemented')
++        self.sendCode(500, b'Command not implemented')
+ 
+     def do_HELO(self, rest):
+         peer = self.transport.getPeer()
+@@ -609,41 +620,41 @@
+         self._helo = (rest, host)
+         self._from = None
+         self._to = []
+-        self.sendCode(250, '%s Hello %s, nice to meet you' % (self.host, host))
++        self.sendCode(250, b''.join([self.host, b' Hello ', host.encode('utf-8'), b', nice to meet you']))
+ 
+     def do_QUIT(self, rest):
+-        self.sendCode(221, 'See you later')
++        self.sendCode(221, b'See you later')
+         self.transport.loseConnection()
+ 
+     # A string of quoted strings, backslash-escaped character or
+     # atom characters + '@.,:'
+-    qstring = r'("[^"]*"|\\.|' + atom + r'|[@.,:])+'
++    qstring = br'("[^"]*"|\\.|' + atom_b + br'|[@.,:])+'
+ 
+-    mail_re = re.compile(r'''\s*FROM:\s*(?P<path><> # Empty <>
+-                         |<''' + qstring + r'''> # <addr>
+-                         |''' + qstring + r''' # addr
++    mail_re = re.compile(br'''\s*FROM:\s*(?P<path><> # Empty <>
++                         |<''' + qstring + br'''> # <addr>
++                         |''' + qstring + br''' # addr
+                          )\s*(\s(?P<opts>.*))? # Optional WS + ESMTP options
+                          $''',re.I|re.X)
+-    rcpt_re = re.compile(r'\s*TO:\s*(?P<path><' + qstring + r'''> # <addr>
+-                         |''' + qstring + r''' # addr
++    rcpt_re = re.compile(br'\s*TO:\s*(?P<path><' + qstring + br'''> # <addr>
++                         |''' + qstring + br''' # addr
+                          )\s*(\s(?P<opts>.*))? # Optional WS + ESMTP options
+                          $''',re.I|re.X)
+ 
+     def do_MAIL(self, rest):
+         if self._from:
+-            self.sendCode(503,"Only one sender per message, please")
++            self.sendCode(503, b"Only one sender per message, please")
+             return
+         # Clear old recipient list
+         self._to = []
+         m = self.mail_re.match(rest)
+         if not m:
+-            self.sendCode(501, "Syntax error")
++            self.sendCode(501, b"Syntax error")
+             return
+ 
+         try:
+             addr = Address(m.group('path'), self.host)
+-        except AddressError, e:
+-            self.sendCode(553, str(e))
++        except AddressError as e:
++            self.sendCode(553, str(e).encode('utf-8'))
+             return
+ 
+         validated = defer.maybeDeferred(self.validateFrom, self._helo, addr)
+@@ -650,7 +661,7 @@
+         validated.addCallbacks(self._cbFromValidate, self._ebFromValidate)
+ 
+ 
+-    def _cbFromValidate(self, from_, code=250, msg='Sender address accepted'):
++    def _cbFromValidate(self, from_, code=250, msg=b'Sender address accepted'):
+         self._from = from_
+         self.sendCode(code, msg)
+ 
+@@ -657,9 +668,9 @@
+ 
+     def _ebFromValidate(self, failure):
+         if failure.check(SMTPBadSender):
+-            self.sendCode(failure.value.code,
+-                          'Cannot receive from specified address %s: %s'
+-                          % (quoteaddr(failure.value.addr), failure.value.resp))
++            self.sendCode(failure.value.code, b''.join([b'Cannot receive from specified address ',
++                                                        quoteaddr(failure.value.addr).encode('utf-8'),
++                                                        b': ', failure.value.resp.encode('utf-8')]))
+         elif failure.check(SMTPServerError):
+             self.sendCode(failure.value.code, failure.value.resp)
+         else:
+@@ -666,22 +677,22 @@
+             log.err(failure, "SMTP sender validation failure")
+             self.sendCode(
+                 451,
+-                'Requested action aborted: local error in processing')
++                b'Requested action aborted: local error in processing')
+ 
+ 
+     def do_RCPT(self, rest):
+         if not self._from:
+-            self.sendCode(503, "Must have sender before recipient")
++            self.sendCode(503, b"Must have sender before recipient")
+             return
+         m = self.rcpt_re.match(rest)
+         if not m:
+-            self.sendCode(501, "Syntax error")
++            self.sendCode(501, b"Syntax error")
+             return
+ 
+         try:
+             user = User(m.group('path'), self._helo, self, self._from)
+-        except AddressError, e:
+-            self.sendCode(553, str(e))
++        except AddressError as e:
++            self.sendCode(553, str(e).encode('utf-8'))
+             return
+ 
+         d = defer.maybeDeferred(self.validateTo, user)
+@@ -691,7 +702,7 @@
+             callbackArgs=(user,)
+         )
+ 
+-    def _cbToValidate(self, to, user=None, code=250, msg='Recipient address accepted'):
++    def _cbToValidate(self, to, user=None, code=250, msg=b'Recipient address accepted'):
+         if user is None:
+             user = to
+         self._to.append((user, to))
+@@ -704,7 +715,7 @@
+             log.err(failure)
+             self.sendCode(
+                 451,
+-                'Requested action aborted: local error in processing'
++                b'Requested action aborted: local error in processing'
+             )
+ 
+     def _disconnect(self, msgs):
+@@ -717,7 +728,7 @@
+ 
+     def do_DATA(self, rest):
+         if self._from is None or (not self._to):
+-            self.sendCode(503, 'Must have valid receiver and originator')
++            self.sendCode(503, b'Must have valid receiver and originator')
+             return
+         self.mode = DATA
+         helo, origin = self._helo, self._from
+@@ -735,14 +746,14 @@
+                 if rcvdhdr:
+                     msg.lineReceived(rcvdhdr)
+                 msgs.append(msg)
+-            except SMTPServerError, e:
+-                self.sendCode(e.code, e.resp)
++            except SMTPServerError as e:
++                self.sendCode(e.code, e.resp.encode('utf-8'))
+                 self.mode = COMMAND
+                 self._disconnect(msgs)
+                 return
+             except:
+                 log.err()
+-                self.sendCode(550, "Internal server error")
++                self.sendCode(550, b"Internal server error")
+                 self.mode = COMMAND
+                 self._disconnect(msgs)
+                 return
+@@ -749,7 +760,7 @@
+         self.__messages = msgs
+ 
+         self.__inheader = self.__inbody = 0
+-        self.sendCode(354, 'Continue')
++        self.sendCode(354, b'Continue')
+ 
+         if self.noisy:
+             fmt = 'Receiving message for delivery: from=%s to=%s'
+@@ -778,11 +789,11 @@
+     def do_RSET(self, rest):
+         self._from = None
+         self._to = []
+-        self.sendCode(250, 'I remember nothing.')
++        self.sendCode(250, b'I remember nothing.')
+ 
+     def dataLineReceived(self, line):
+-        if line[:1] == '.':
+-            if line == '.':
++        if line[:1] == b'.':
++            if line == b'.':
+                 self.mode = COMMAND
+                 if self.datafailed:
+                     self.sendCode(self.datafailed.code,
+@@ -793,8 +804,7 @@
+                     return
+                 defer.DeferredList([
+                     m.eomReceived() for m in self.__messages
+-                ], consumeErrors=True).addCallback(self._messageHandled
+-                                                   )
++                ], consumeErrors=True).addCallback(self._messageHandled)
+                 del self.__messages
+                 return
+             line = line[1:]
+@@ -807,11 +817,11 @@
+             # and the message body if the message comes in without any
+             # headers
+             if not self.__inheader and not self.__inbody:
+-                if ':' in line:
++                if b':' in line:
+                     self.__inheader = 1
+                 elif line:
+                     for message in self.__messages:
+-                        message.lineReceived('')
++                        message.lineReceived(b'')
+                     self.__inbody = 1
+ 
+             if not line:
+@@ -819,7 +829,7 @@
+ 
+             for message in self.__messages:
+                 message.lineReceived(line)
+-        except SMTPServerError, e:
++        except SMTPServerError as e:
+             self.datafailed = e
+             for message in self.__messages:
+                 message.connectionLost()
+@@ -832,19 +842,21 @@
+                 failures += 1
+                 log.err(result)
+         if failures:
+-            msg = 'Could not send e-mail'
++            msg = b'Could not send e-mail'
+             L = len(resultList)
+             if L > 1:
+-                msg += ' (%d failures out of %d recipients)' % (failures, L)
++                msg += (' (%d failures out of %d recipients)' % (failures, L)).encode('ascii')
+             self.sendCode(550, msg)
+         else:
+-            self.sendCode(250, 'Delivery in progress')
++            self.sendCode(250, b'Delivery in progress')
+ 
+ 
+-    def _cbAnonymousAuthentication(self, (iface, avatar, logout)):
++    def _cbAnonymousAuthentication(self, result):
+         """
+         Save the state resulting from a successful anonymous cred login.
+         """
++        iface, avatar, logout = result
++
+         if issubclass(iface, IMessageDeliveryFactory):
+             self.deliveryFactory = avatar
+             self.delivery = None
+@@ -957,7 +969,7 @@
+                                      longversion)
+         for_ = "for %s; %s" % (' '.join(map(str, recipients)),
+                                rfc822date())
+-        return "Received: %s\n\t%s\n\t%s" % (from_, by, for_)
++        return ("Received: %s\n\t%s\n\t%s" % (from_, by, for_)).encode('utf-8')
+ 
+ 
+ 
+@@ -1000,7 +1012,7 @@
+     timeout = None
+ 
+     def __init__(self, identity, logsize=10):
+-        self.identity = identity or ''
++        self.identity = identity or b''
+         self.toAddressesResult = []
+         self.successAddresses = []
+         self._from = None
+@@ -1011,7 +1023,7 @@
+     def sendLine(self, line):
+         # Log sendLine only if you are in debug mode for performance
+         if self.debug:
+-            self.log.append('>>> ' + line)
++            self.log.append('>>> ' + line.decode('utf-8'))
+ 
+         basic.LineReceiver.sendLine(self,line)
+ 
+@@ -1038,7 +1050,7 @@
+ 
+         # Log lineReceived only if you are in debug mode for performance
+         if self.debug:
+-            self.log.append('<<< ' + line)
++            self.log.append('<<< ' + line.decode('utf-8'))
+ 
+         why = None
+ 
+@@ -1049,20 +1061,20 @@
+             self.sendError(SMTPProtocolError(-1, "Invalid response from SMTP server: %s" % line, self.log.str()))
+             return
+ 
+-        if line[0] == '0':
++        if line[0] == b'0':
+             # Verbose informational message, ignore it
+             return
+ 
+         self.resp.append(line[4:])
+ 
+-        if line[3:4] == '-':
++        if line[3:4] == b'-':
+             # continuation
+             return
+ 
+         if self.code in self._expected:
+-            why = self._okresponse(self.code,'\n'.join(self.resp))
++            why = self._okresponse(self.code,b'\n'.join(self.resp))
+         else:
+-            why = self._failresponse(self.code,'\n'.join(self.resp))
++            why = self._failresponse(self.code,b'\n'.join(self.resp))
+ 
+         self.code = -1
+         self.resp = []
+@@ -1078,7 +1090,7 @@
+             self.smtpState_msgSent(code, resp)
+ 
+     def smtpState_helo(self, code, resp):
+-        self.sendLine('HELO ' + self.identity)
++        self.sendLine(b'HELO ' + self.identity)
+         self._expected = SUCCESS
+         self._okresponse = self.smtpState_from
+ 
+@@ -1086,7 +1098,7 @@
+         self._from = self.getMailFrom()
+         self._failresponse = self.smtpTransferFailed
+         if self._from is not None:
+-            self.sendLine('MAIL FROM:%s' % quoteaddr(self._from))
++            self.sendLine(b'MAIL FROM:' + quoteaddr(self._from).encode('utf-8'))
+             self._expected = [250]
+             self._okresponse = self.smtpState_to
+         else:
+@@ -1101,7 +1113,7 @@
+         self.toAddressesResult = []
+         self.successAddresses = []
+         self._okresponse = self.smtpState_toOrData
+-        self._expected = xrange(0,1000)
++        self._expected = range(0,1000)
+         self.lastAddress = None
+         return self.smtpState_toOrData(0, '')
+ 
+@@ -1111,16 +1123,16 @@
+             if code in SUCCESS:
+                 self.successAddresses.append(self.lastAddress)
+         try:
+-            self.lastAddress = self.toAddresses.next()
++            self.lastAddress = next(self.toAddresses)
+         except StopIteration:
+             if self.successAddresses:
+-                self.sendLine('DATA')
++                self.sendLine(b'DATA')
+                 self._expected = [ 354 ]
+                 self._okresponse = self.smtpState_data
+             else:
+                 return self.smtpState_msgSent(code,'No recipients accepted')
+         else:
+-            self.sendLine('RCPT TO:%s' % quoteaddr(self.lastAddress))
++            self.sendLine(b'RCPT TO:' + quoteaddr(self.lastAddress).encode('utf-8'))
+ 
+     def smtpState_data(self, code, resp):
+         s = basic.FileSender()
+@@ -1140,7 +1152,7 @@
+ 
+         self.toAddressesResult = []
+         self._from = None
+-        self.sendLine('RSET')
++        self.sendLine(b'RSET')
+         self._expected = SUCCESS
+         self._okresponse = self.smtpState_from
+ 
+@@ -1156,13 +1168,13 @@
+         being made sending the message body, the client will not time out.
+         """
+         self.resetTimeout()
+-        return chunk.replace('\n', '\r\n').replace('\r\n.', '\r\n..')
++        return chunk.replace(b'\n', b'\r\n').replace(b'\r\n.', b'\r\n..')
+ 
+     def finishedFileTransfer(self, lastsent):
+-        if lastsent != '\n':
+-            line = '\r\n.'
++        if lastsent != b'\n':
++            line = b'\r\n.'
+         else:
+-            line = '.'
++            line = b'.'
+         self.sendLine(line)
+ 
+     ##
+@@ -1216,9 +1228,9 @@
+         raise NotImplementedError
+ 
+     def _disconnectFromServer(self):
+-        self._expected = xrange(0, 1000)
++        self._expected = range(0, 1000)
+         self._okresponse = self.smtpState_disconnect
+-        self.sendLine('QUIT')
++        self.sendLine(b'QUIT')
+ 
+ 
+ 
+@@ -1317,12 +1329,12 @@
+         tmp = []
+ 
+         for a in self.authenticators:
+-            tmp.append(a.getName().upper())
++            tmp.append(a.getName().upper().encode('utf-8'))
+ 
+-        auth = b"[%s]" % b", ".join(tmp)
++        auth = b'[' + b', '.join(tmp) + b']'
+ 
+         self.sendError(AUTHRequiredError(502, b"Server does not support Client "
+-            b"Authentication schemes %s" % auth, self.log.str()))
++            b"Authentication schemes " + auth, self.log.str()))
+ 
+ 
+     def esmtpTLSRequired(self, code=-1, resp=None):
+@@ -1552,8 +1564,8 @@
+ 
+ 
+     def authenticate(self, code, resp, items):
+-        if self.secret and items.get('AUTH'):
+-            schemes = items['AUTH'].split()
++        if self.secret and items.get(b'AUTH'):
++            schemes = items[b'AUTH'].split()
+             tmpSchemes = {}
+ 
+             #XXX: May want to come up with a more efficient way to do this
+@@ -1561,7 +1573,7 @@
+                 tmpSchemes[s.upper()] = 1
+ 
+             for a in self.authenticators:
+-                auth = a.getName().upper()
++                auth = a.getName().upper().encode('utf-8')
+ 
+                 if auth in tmpSchemes:
+                     self._authinfo = a
+@@ -1571,10 +1583,9 @@
+                         self._okresponse = self.smtpState_from
+                         self._failresponse = self._esmtpState_plainAuth
+                         self._expected = [235]
+-                        challenge = encode_base64(
+-                            self._authinfo.challengeResponse(self.secret, 1),
+-                            eol=b"")
+-                        self.sendLine(b"AUTH %s %s" % (auth, challenge))
++                        challenge = b64encode(
++                            self._authinfo.challengeResponse(self.secret, 1))
++                        self.sendLine(b"AUTH " + b''.join([auth, challenge]))
+                     else:
+                         self._expected = [334]
+                         self._okresponse = self.esmtpState_challenge
+@@ -1595,8 +1606,8 @@
+         self._okresponse = self.smtpState_from
+         self._failresponse = self.esmtpAUTHDeclined
+         self._expected = [235]
+-        challenge = encode_base64(self._authinfo.challengeResponse(self.secret, 2), eol="")
+-        self.sendLine('AUTH PLAIN ' + challenge)
++        challenge = b64encode(self._authinfo.challengeResponse(self.secret, 2))
++        self.sendLine(b'AUTH PLAIN ' + challenge)
+ 
+ 
+     def esmtpState_challenge(self, code, resp):
+@@ -1607,9 +1618,9 @@
+         self._failresponse = self.esmtpAUTHDeclined
+         try:
+             challenge = base64.decodestring(challenge)
+-        except binascii.Error:
++        except (binascii.Error, TypeError):
+             # Illegal challenge, give up, then quit
+-            self.sendLine('*')
++            self.sendLine(b'*')
+             self._okresponse = self.esmtpAUTHMalformedChallenge
+             self._failresponse = self.esmtpAUTHMalformedChallenge
+         else:
+@@ -1616,7 +1627,7 @@
+             resp = auth.challengeResponse(self.secret, challenge)
+             self._expected = [235, 334]
+             self._okresponse = self.smtpState_maybeAuthenticated
+-            self.sendLine(encode_base64(resp, eol=""))
++            self.sendLine(b64encode(resp))
+ 
+ 
+     def smtpState_maybeAuthenticated(self, code, resp):
+@@ -1658,7 +1669,7 @@
+ 
+ 
+     def greeting(self):
+-        return SMTP.greeting(self) + ' ESMTP'
++        return SMTP.greeting(self) + b' ESMTP'
+ 
+ 
+     def extensions(self):
+@@ -1670,12 +1681,12 @@
+     def lookupMethod(self, command):
+         m = SMTP.lookupMethod(self, command)
+         if m is None:
+-            m = getattr(self, 'ext_' + command.upper(), None)
++            m = getattr(self, 'ext_' + command.upper().decode('ascii'), None)
+         return m
+ 
+     def listExtensions(self):
+         r = []
+-        for (c, v) in self.extensions().iteritems():
++        for (c, v) in iteritems(self.extensions()):
+             if v is not None:
+                 if v:
+                     # Intentionally omit extensions with empty argument lists
+@@ -1691,30 +1702,29 @@
+         self._to = []
+         self.sendCode(
+             250,
+-            '%s Hello %s, nice to meet you\n%s' % (
+-                self.host, peer,
+-                self.listExtensions(),
+-            )
++            b''.join([self.host, b' Hello ', peer.encode('utf-8'),
++                      b', nice to meet you\n',
++                      self.listExtensions().encode('ascii')])
+         )
+ 
+     def ext_STARTTLS(self, rest):
+         if self.startedTLS:
+-            self.sendCode(503, 'TLS already negotiated')
++            self.sendCode(503, b'TLS already negotiated')
+         elif self.ctx and self.canStartTLS:
+-            self.sendCode(220, 'Begin TLS negotiation now')
++            self.sendCode(220, b'Begin TLS negotiation now')
+             self.transport.startTLS(self.ctx)
+             self.startedTLS = True
+         else:
+-            self.sendCode(454, 'TLS not available')
++            self.sendCode(454, b'TLS not available')
+ 
+     def ext_AUTH(self, rest):
+         if self.authenticated:
+-            self.sendCode(503, 'Already authenticated')
++            self.sendCode(503, b'Already authenticated')
+             return
+         parts = rest.split(None, 1)
+-        chal = self.challengers.get(parts[0].upper(), lambda: None)()
++        chal = self.challengers.get(parts[0].upper().decode('ascii'), lambda: None)()
+         if not chal:
+-            self.sendCode(504, 'Unrecognized authentication type')
++            self.sendCode(504, b'Unrecognized authentication type')
+             return
+ 
+         self.mode = AUTH
+@@ -1747,12 +1757,12 @@
+         """
+         self.challenge = None
+         if reason.check(cred.error.UnauthorizedLogin):
+-            self.sendCode(535, 'Authentication failed')
++            self.sendCode(535, b'Authentication failed')
+         else:
+             log.err(reason, "SMTP authentication failure")
+             self.sendCode(
+                 451,
+-                'Requested action aborted: local error in processing')
++                b'Requested action aborted: local error in processing')
+ 
+ 
+     def state_AUTH(self, response):
+@@ -1765,26 +1775,28 @@
+         as per RFC 2554.
+         """
+         if self.portal is None:
+-            self.sendCode(454, 'Temporary authentication failure')
++            self.sendCode(454, b'Temporary authentication failure')
+             self.mode = COMMAND
+             return
+ 
+         if response is None:
+             challenge = self.challenger.getChallenge()
+-            encoded = challenge.encode('base64')
++            if isinstance(challenge, unicode):  # Hmm
++                challenge = challenge.encode('utf-8')
++            encoded = b64encode(challenge)
+             self.sendCode(334, encoded)
+             return
+ 
+-        if response == '*':
+-            self.sendCode(501, 'Authentication aborted')
++        if response == b'*':
++            self.sendCode(501, b'Authentication aborted')
+             self.challenger = None
+             self.mode = COMMAND
+             return
+ 
+         try:
+-            uncoded = response.decode('base64')
+-        except binascii.Error:
+-            self.sendCode(501, 'Syntax error in parameters or arguments')
++            uncoded = b64decode(response)
++        except (binascii.Error, TypeError):
++            self.sendCode(501, b'Syntax error in parameters or arguments')
+             self.challenger = None
+             self.mode = COMMAND
+             return
+@@ -1792,7 +1804,7 @@
+         self.challenger.setResponse(uncoded)
+         if self.challenger.moreChallenges():
+             challenge = self.challenger.getChallenge()
+-            coded = challenge.encode('base64')[:-1]
++            coded = b64encode(challenge.encode('utf-8'))  # Hmm
+             self.sendCode(334, coded)
+             return
+ 
+@@ -1801,7 +1813,7 @@
+             self.challenger, None,
+             IMessageDeliveryFactory, IMessageDelivery)
+         result.addCallback(self._cbAuthenticated)
+-        result.addCallback(lambda ign: self.sendCode(235, 'Authentication successful.'))
++        result.addCallback(lambda ign: self.sendCode(235, b'Authentication successful.'))
+         result.addErrback(self._ebAuthenticated)
+ 
+ 
+@@ -1904,7 +1916,7 @@
+         """
+         assert isinstance(retries, (int, long))
+ 
+-        if isinstance(toEmail, types.StringTypes):
++        if isinstance(toEmail, (StringType, bytes)):
+             toEmail = [toEmail]
+         self.fromEmail = Address(fromEmail)
+         self.nEmails = len(toEmail)
+@@ -1987,8 +1999,8 @@
+ 
+ 
+ 
++@implementer(IClientAuthentication)
+ class PLAINAuthenticator:
+-    implements(IClientAuthentication)
+ 
+     def __init__(self, user):
+         self.user = user
+@@ -2156,7 +2168,7 @@
+     """
+     if not hasattr(msg, 'read'):
+         # It's not a file
+-        msg = StringIO(str(msg))
++        msg = BytesIO(bytes(msg))
+ 
+     def cancel(d):
+         """
+@@ -2198,7 +2210,7 @@
+             r.append('+%02X' % o)
+         else:
+             r.append(chr(o))
+-    return (''.join(r), len(s))
++    return (''.join(r).encode('ascii'), len(s))
+ 
+ 
+ def xtext_decode(s, errors=None):
+@@ -2208,16 +2220,16 @@
+     r = []
+     i = 0
+     while i < len(s):
+-        if s[i] == '+':
++        if s[i:i+1] == b'+':
+             try:
+-                r.append(chr(int(s[i + 1:i + 3], 16)))
++                r.append(_bytesChr(int(s[i + 1:i + 3], 16)))
+             except ValueError:
+                 r.append(s[i:i + 3])
+             i += 3
+         else:
+-            r.append(s[i])
++            r.append(s[i:i+1])
+             i += 1
+-    return (''.join(r), len(s))
++    return (b''.join(r).decode('utf-8'), len(s))  # Hmm
+ 
+ class xtextStreamReader(codecs.StreamReader):
+     def decode(self, s, errors='strict'):
+Index: twisted/mail/test/test_smtp.py
+===================================================================
+--- twisted/mail/test/test_smtp.py	(revision 47351)
++++ twisted/mail/test/test_smtp.py	(working copy)
+@@ -6,7 +6,7 @@
+ """
+ import inspect
+ 
+-from zope.interface import implements, directlyProvides
++from zope.interface import implementer, directlyProvides
+ 
+ from twisted.python.util import LineLog
+ from twisted.trial import unittest, util
+@@ -38,18 +38,16 @@
+     sslSkip = None
+ 
+ import re
++from base64 import b64encode
++import codecs
++from io import BytesIO
+ 
+-try:
+-    from cStringIO import StringIO
+-except ImportError:
+-    from StringIO import StringIO
+-
+-
+ def spameater(*spam, **eggs):
+     return None
+ 
+ 
+ 
++@implementer(smtp.IMessage)
+ class BrokenMessage(object):
+     """
+     L{BrokenMessage} is an L{IMessage} which raises an unexpected exception
+@@ -56,7 +54,6 @@
+     from its C{eomReceived} method.  This is useful for creating a server which
+     can be used to test client retry behavior.
+     """
+-    implements(smtp.IMessage)
+ 
+     def __init__(self, user):
+         pass
+@@ -91,12 +88,12 @@
+ 
+     def lineReceived(self, line):
+         # Throw away the generated Received: header
+-        if not re.match('Received: From yyy.com \(\[.*\]\) by localhost;', line):
++        if not re.match(b'Received: From yyy.com \(\[.*\]\) by localhost;', line):
+             self.buffer.append(line)
+ 
+ 
+     def eomReceived(self):
+-        message = '\n'.join(self.buffer) + '\n'
++        message = b'\n'.join(self.buffer) + b'\n'
+         self.domain.messages[self.user.dest.local].append(message)
+         deferred = defer.Deferred()
+         deferred.callback("saved")
+@@ -124,13 +121,13 @@
+ 
+ class SMTPTests(unittest.TestCase):
+ 
+-    messages = [('foo@bar.com', ['foo@baz.com', 'qux@baz.com'], '''\
++    messages = [(b'foo@bar.com', [b'foo@baz.com', b'qux@baz.com'], b'''\
+ Subject: urgent\015
+ \015
+ Someone set up us the bomb!\015
+ ''')]
+ 
+-    mbox = {'foo': ['Subject: urgent\n\nSomeone set up us the bomb!\n']}
++    mbox = {'foo': [b'Subject: urgent\n\nSomeone set up us the bomb!\n']}
+ 
+     def setUp(self):
+         """
+@@ -150,15 +147,15 @@
+         protocol.factory = self.factory
+         protocol.receivedHeader = spameater
+         protocol.makeConnection(self.transport)
+-        protocol.lineReceived('HELO yyy.com')
++        protocol.lineReceived(b'HELO yyy.com')
+         for message in self.messages:
+-            protocol.lineReceived('MAIL FROM:<%s>' % message[0])
++            protocol.lineReceived(b''.join([b'MAIL FROM:<', message[0], b'>']))
+             for target in message[1]:
+-                protocol.lineReceived('RCPT TO:<%s>' % target)
+-            protocol.lineReceived('DATA')
++                protocol.lineReceived(b''.join([b'RCPT TO:<', target, b'>']))
++            protocol.lineReceived(b'DATA')
+             protocol.dataReceived(message[2])
+-            protocol.lineReceived('.')
+-        protocol.lineReceived('QUIT')
++            protocol.lineReceived(b'.')
++        protocol.lineReceived(b'QUIT')
+         if self.mbox != self.factory.domains['baz.com'].messages:
+             raise AssertionError(self.factory.domains['baz.com'].messages)
+         protocol.setTimeout(None)
+@@ -165,7 +162,7 @@
+ 
+     testMessages.suppress = [util.suppress(message='DomainSMTP', category=DeprecationWarning)]
+ 
+-mail = '''\
++mail = b'''\
+ Subject: hello
+ 
+ Goodbye
+@@ -175,7 +172,7 @@
+     def __init__(self, messageInfo=None):
+         if messageInfo is None:
+             messageInfo = (
+-                'moshez@foo.bar', ['moshez@foo.bar'], StringIO(mail))
++                'moshez@foo.bar', ['moshez@foo.bar'], BytesIO(mail))
+         self._sender = messageInfo[0]
+         self._recipient = messageInfo[1]
+         self._data = messageInfo[2]
+@@ -207,12 +204,12 @@
+ 
+ class MySMTPClient(MyClient, smtp.SMTPClient):
+     def __init__(self, messageInfo=None):
+-        smtp.SMTPClient.__init__(self, 'foo.baz')
++        smtp.SMTPClient.__init__(self, b'foo.baz')
+         MyClient.__init__(self, messageInfo)
+ 
+ class MyESMTPClient(MyClient, smtp.ESMTPClient):
+     def __init__(self, secret = '', contextFactory = None):
+-        smtp.ESMTPClient.__init__(self, secret, contextFactory, 'foo.baz')
++        smtp.ESMTPClient.__init__(self, secret, contextFactory, b'foo.baz')
+         MyClient.__init__(self)
+ 
+ class LoopbackMixin:
+@@ -242,8 +239,8 @@
+ class FakeSMTPServer(basic.LineReceiver):
+ 
+     clientData = [
+-        '220 hello', '250 nice to meet you',
+-        '250 great', '250 great', '354 go on, lad'
++        b'220 hello', b'250 nice to meet you',
++        b'250 great', b'250 great', b'354 go on, lad'
+     ]
+ 
+     def connectionMade(self):
+@@ -254,12 +251,12 @@
+ 
+     def lineReceived(self, line):
+         self.buffer.append(line)
+-        if line == "QUIT":
+-            self.transport.write("221 see ya around\r\n")
++        if line == b"QUIT":
++            self.transport.write(b"221 see ya around\r\n")
+             self.transport.loseConnection()
+-        elif line == ".":
+-            self.transport.write("250 gotcha\r\n")
+-        elif line == "RSET":
++        elif line == b".":
++            self.transport.write(b"250 gotcha\r\n")
++        elif line == b"RSET":
+             self.transport.loseConnection()
+ 
+         if self.clientData:
+@@ -280,7 +277,7 @@
+         client = MySMTPClient()
+         client.sendError = errors.append
+         client.makeConnection(StringTransport())
+-        client.lineReceived("220 hello")
++        client.lineReceived(b"220 hello")
+         client.timeoutConnection()
+         self.assertIsInstance(errors[0], smtp.SMTPTimeoutError)
+         self.assertTrue(errors[0].isFatal)
+@@ -292,9 +289,9 @@
+ 
+ 
+     expected_output = [
+-        'HELO foo.baz', 'MAIL FROM:<moshez@foo.bar>',
+-        'RCPT TO:<moshez@foo.bar>', 'DATA',
+-        'Subject: hello', '', 'Goodbye', '.', 'RSET'
++        b'HELO foo.baz', b'MAIL FROM:<moshez@foo.bar>',
++        b'RCPT TO:<moshez@foo.bar>', b'DATA',
++        b'Subject: hello', b'', b'Goodbye', b'.', b'RSET'
+     ]
+ 
+     def test_messages(self):
+@@ -317,15 +314,15 @@
+         connection, the C{sendError} callback is invoked.
+         """
+         client = MySMTPClient(
+-            ('alice@example.com', ['bob@example.com'], StringIO("foo")))
++            ('alice@example.com', ['bob@example.com'], BytesIO(b"foo")))
+         transport = StringTransport()
+         client.makeConnection(transport)
+         client.dataReceived(
+-            '220 Ok\r\n' # Greeting
+-            '250 Ok\r\n' # EHLO response
+-            '250 Ok\r\n' # MAIL FROM response
+-            '250 Ok\r\n' # RCPT TO response
+-            '354 Ok\r\n' # DATA response
++            b'220 Ok\r\n' # Greeting
++            b'250 Ok\r\n' # EHLO response
++            b'250 Ok\r\n' # MAIL FROM response
++            b'250 Ok\r\n' # RCPT TO response
++            b'354 Ok\r\n' # DATA response
+             )
+ 
+         # Sanity check - a pull producer should be registered now.
+@@ -349,7 +346,7 @@
+         transport = StringTransport()
+         client.makeConnection(transport)
+         client.sendError(smtp.SMTPClientError(123, "foo", isFatal=True))
+-        self.assertEqual(transport.value(), "")
++        self.assertEqual(transport.value(), b"")
+         self.assertTrue(transport.disconnecting)
+ 
+ 
+@@ -363,7 +360,7 @@
+         transport = StringTransport()
+         client.makeConnection(transport)
+         client.sendError(smtp.SMTPClientError(123, "foo", isFatal=False))
+-        self.assertEqual(transport.value(), "QUIT\r\n")
++        self.assertEqual(transport.value(), b"QUIT\r\n")
+         self.assertFalse(transport.disconnecting)
+ 
+ 
+@@ -377,7 +374,7 @@
+         transport = StringTransport()
+         client.makeConnection(transport)
+         client.sendError(Exception("foo"))
+-        self.assertEqual(transport.value(), "")
++        self.assertEqual(transport.value(), b"")
+         self.assertTrue(transport.disconnecting)
+ 
+ 
+@@ -393,7 +390,7 @@
+         self.buffer.append(line)
+ 
+     def eomReceived(self):
+-        message = '\n'.join(self.buffer) + '\n'
++        message = b'\n'.join(self.buffer) + b'\n'
+         helo, origin = self.users[0].helo[0], str(self.users[0].orig)
+         recipients = []
+         for user in self.users:
+@@ -433,8 +430,8 @@
+     serverClass = None
+     clientClass = None
+ 
+-    messages = [ ('foo.com', 'moshez@foo.com', ['moshez@bar.com'],
+-                  'moshez@foo.com', ['moshez@bar.com'], '''\
++    messages = [ (b'foo.com', b'moshez@foo.com', [b'moshez@bar.com'],
++                  'moshez@foo.com', ['moshez@bar.com'], b'''\
+ From: Moshe
+ To: Moshe
+ 
+@@ -441,15 +438,15 @@
+ Hi,
+ how are you?
+ '''),
+-                 ('foo.com', 'tttt@rrr.com', ['uuu@ooo', 'yyy@eee'],
+-                  'tttt@rrr.com', ['uuu@ooo', 'yyy@eee'], '''\
++                 (b'foo.com', b'tttt@rrr.com', [b'uuu@ooo', b'yyy@eee'],
++                  'tttt@rrr.com', ['uuu@ooo', 'yyy@eee'], b'''\
+ Subject: pass
+ 
+ ..rrrr..
+ '''),
+-                 ('foo.com', '@this,@is,@ignored:foo@bar.com',
+-                  ['@ignore,@this,@too:bar@foo.com'],
+-                  'foo@bar.com', ['bar@foo.com'], '''\
++                 (b'foo.com', b'@this,@is,@ignored:foo@bar.com',
++                  [b'@ignore,@this,@too:bar@foo.com'],
++                  'foo@bar.com', ['bar@foo.com'], b'''\
+ Subject: apa
+ To: foo
+ 
+@@ -460,19 +457,19 @@
+               ]
+ 
+     data = [
+-        ('', '220.*\r\n$', None, None),
+-        ('HELO foo.com\r\n', '250.*\r\n$', None, None),
+-        ('RSET\r\n', '250.*\r\n$', None, None),
++        (b'', b'220.*\r\n$', None, None),
++        (b'HELO foo.com\r\n', b'250.*\r\n$', None, None),
++        (b'RSET\r\n', b'250.*\r\n$', None, None),
+         ]
+     for helo_, from_, to_, realfrom, realto, msg in messages:
+-        data.append(('MAIL FROM:<%s>\r\n' % from_, '250.*\r\n',
++        data.append((b''.join([b'MAIL FROM:<', from_, b'>\r\n']), b'250.*\r\n',
+                      None, None))
+         for rcpt in to_:
+-            data.append(('RCPT TO:<%s>\r\n' % rcpt, '250.*\r\n',
++            data.append((b''.join([b'RCPT TO:<', rcpt, b'>\r\n']), b'250.*\r\n',
+                          None, None))
+ 
+-        data.append(('DATA\r\n','354.*\r\n',
+-                     msg, ('250.*\r\n',
++        data.append((b'DATA\r\n',b'354.*\r\n',
++                     msg, (b'250.*\r\n',
+                            (helo_, realfrom, realto, msg))))
+ 
+ 
+@@ -496,13 +493,13 @@
+             data = transport.value()
+             transport.clear()
+             if not re.match(expect, data):
+-                raise AssertionError, (send, expect, data)
+-            if data[:3] == '354':
++                raise AssertionError((send, expect, data))
++            if data[:3] == b'354':
+                 for line in msg.splitlines():
+-                    if line and line[0] == '.':
+-                        line = '.' + line
+-                    a.dataReceived(line + '\r\n')
+-                a.dataReceived('.\r\n')
++                    if line and line[:1] == b'.':
++                        line = b'.' + line
++                    a.dataReceived(line + b'\r\n')
++                a.dataReceived(b'.\r\n')
+                 # Special case for DATA. Now we want a 250, and then
+                 # we compare the messages
+                 data = transport.value()
+@@ -509,7 +506,7 @@
+                 transport.clear()
+                 resp, msgdata = msgexpect
+                 if not re.match(resp, data):
+-                    raise AssertionError, (resp, data)
++                    raise AssertionError((resp, data))
+                 for recip in msgdata[2]:
+                     expected = list(msgdata[:])
+                     expected[2] = [recip]
+@@ -530,11 +527,11 @@
+ 
+ 
+ 
++@implementer(cred.checkers.ICredentialsChecker)
+ class DummyChecker:
+-    implements(cred.checkers.ICredentialsChecker)
+ 
+     users = {
+-        'testuser': 'testpassword'
++        b'testuser': b'testpassword'
+     }
+ 
+     credentialInterfaces = (cred.credentials.IUsernamePassword,
+@@ -552,12 +549,12 @@
+ 
+ 
+ 
++@implementer(smtp.IMessageDelivery)
+ class SimpleDelivery(object):
+     """
+     L{SimpleDelivery} is a message delivery factory with no interesting
+     behavior.
+     """
+-    implements(smtp.IMessageDelivery)
+ 
+     def __init__(self, messageFactory):
+         self._messageFactory = messageFactory
+@@ -595,9 +592,9 @@
+ 
+         server = DummyESMTP({'CRAM-MD5': cred.credentials.CramMD5Credentials})
+         server.portal = p
+-        client = MyESMTPClient('testpassword')
++        client = MyESMTPClient(b'testpassword')
+ 
+-        cAuth = smtp.CramMD5ClientAuthenticator('testuser')
++        cAuth = smtp.CramMD5ClientAuthenticator(b'testuser')
+         client.registerAuthenticator(cAuth)
+ 
+         d = self.loopback(server, client)
+@@ -617,9 +614,9 @@
+ 
+         server = DummyESMTP({'LOGIN': imap4.LOGINCredentials})
+         server.portal = p
+-        client = MyESMTPClient('testpassword')
++        client = MyESMTPClient(b'testpassword')
+ 
+-        cAuth = smtp.LOGINAuthenticator('testuser')
++        cAuth = smtp.LOGINAuthenticator(b'testuser')
+         client.registerAuthenticator(cAuth)
+ 
+         d = self.loopback(server, client)
+@@ -641,8 +638,8 @@
+         server = DummyESMTP({'LOGIN': smtp.LOGINCredentials})
+         server.portal = p
+ 
+-        client = MyESMTPClient('testpassword')
+-        cAuth = smtp.LOGINAuthenticator('testuser')
++        client = MyESMTPClient(b'testpassword')
++        cAuth = smtp.LOGINAuthenticator(b'testuser')
+         client.registerAuthenticator(cAuth)
+ 
+         d = self.loopback(server, client)
+@@ -677,18 +674,18 @@
+ 
+     def testXtextEncoding(self):
+         cases = [
+-            ('Hello world', 'Hello+20world'),
+-            ('Hello+world', 'Hello+2Bworld'),
+-            ('\0\1\2\3\4\5', '+00+01+02+03+04+05'),
+-            ('e=mc2@example.com', 'e+3Dmc2@example.com')
++            ('Hello world', b'Hello+20world'),
++            ('Hello+world', b'Hello+2Bworld'),
++            ('\0\1\2\3\4\5', b'+00+01+02+03+04+05'),
++            ('e=mc2@example.com', b'e+3Dmc2@example.com')
+         ]
+ 
+         for (case, expected) in cases:
+             self.assertEqual(smtp.xtext_encode(case), (expected, len(case)))
+-            self.assertEqual(case.encode('xtext'), expected)
++            self.assertEqual(codecs.encode(case, 'xtext'), expected)
+             self.assertEqual(
+                 smtp.xtext_decode(expected), (case, len(expected)))
+-            self.assertEqual(expected.decode('xtext'), case)
++            self.assertEqual(codecs.decode(expected, 'xtext'), case)
+ 
+ 
+     def test_encodeWithErrors(self):
+@@ -710,13 +707,13 @@
+         """
+         Similar to L{test_encodeWithErrors}, but for C{str.decode}.
+         """
+-        bytes = 'Hello world'
++        bytes = b'Hello world'
+         self.assertEqual(
+             smtp.xtext_decode(bytes, 'strict'),
+-            (bytes.decode('xtext'), len(bytes)))
++            (codecs.decode(bytes, 'xtext'), len(bytes)))
+         self.assertEqual(
+-            bytes.decode('xtext', 'strict'),
+-            bytes.decode('xtext'))
++            codecs.decode(bytes, 'xtext', 'strict'),
++            codecs.decode(bytes, 'xtext'))
+ 
+ 
+ 
+@@ -766,8 +763,8 @@
+ 
+         out = transport.value().splitlines()
+         self.assertEqual(len(out), 2)
+-        self.assertTrue(out[0].startswith('220'))
+-        self.assertEqual(out[1], "500 Error: bad syntax")
++        self.assertTrue(out[0].startswith(b'220'))
++        self.assertEqual(out[1], b"500 Error: bad syntax")
+ 
+ 
+ 
+@@ -806,7 +803,7 @@
+         onDone = defer.Deferred()
+         clientFactory = smtp.SMTPSenderFactory(
+             'source@address', 'recipient@address',
+-            StringIO("Message body"), onDone,
++            BytesIO(b"Message body"), onDone,
+             retries=0, timeout=0.5)
+         return self._timeoutTest(onDone, clientFactory)
+ 
+@@ -820,7 +817,7 @@
+         clientFactory = smtp.ESMTPSenderFactory(
+             'username', 'password',
+             'source@address', 'recipient@address',
+-            StringIO("Message body"), onDone,
++            BytesIO(b"Message body"), onDone,
+             retries=0, timeout=0.5)
+         return self._timeoutTest(onDone, clientFactory)
+ 
+@@ -841,8 +838,8 @@
+             def read(self, max=None):
+                 if self._size:
+                     self._size -= 1
+-                    return 'x'
+-                return ''
++                    return b'x'
++                return b''
+ 
+         failed = []
+         onDone = defer.Deferred()
+@@ -850,7 +847,7 @@
+         clientFactory = smtp.SMTPSenderFactory(
+             'source@address', 'recipient@address',
+             SlowFile(1), onDone, retries=0, timeout=3)
+-        clientFactory.domain = "example.org"
++        clientFactory.domain = b"example.org"
+         clock = task.Clock()
+         client = clientFactory.buildProtocol(
+             address.IPv4Address('TCP', 'example.net', 25))
+@@ -859,11 +856,11 @@
+         client.makeConnection(transport)
+ 
+         client.dataReceived(
+-            "220 Ok\r\n" # Greet the client
+-            "250 Ok\r\n" # Respond to HELO
+-            "250 Ok\r\n" # Respond to MAIL FROM
+-            "250 Ok\r\n" # Respond to RCPT TO
+-            "354 Ok\r\n" # Respond to DATA
++            b"220 Ok\r\n" # Greet the client
++            b"250 Ok\r\n" # Respond to HELO
++            b"250 Ok\r\n" # Respond to MAIL FROM
++            b"250 Ok\r\n" # Respond to RCPT TO
++            b"354 Ok\r\n" # Respond to DATA
+             )
+ 
+         # Now the client is producing data to the server.  Any time
+@@ -889,21 +886,21 @@
+         # The file has been completely produced - the next resume producing
+         # finishes the upload, successfully.
+         transport.producer.resumeProducing()
+-        client.dataReceived("250 Ok\r\n")
++        client.dataReceived(b"250 Ok\r\n")
+         self.assertEqual(failed, [])
+ 
+         # Verify that the client actually did send the things expected.
+         self.assertEqual(
+             transport.value(),
+-            "HELO example.org\r\n"
+-            "MAIL FROM:<source@address>\r\n"
+-            "RCPT TO:<recipient@address>\r\n"
+-            "DATA\r\n"
+-            "x\r\n"
+-            ".\r\n"
++            b"HELO example.org\r\n"
++            b"MAIL FROM:<source@address>\r\n"
++            b"RCPT TO:<recipient@address>\r\n"
++            b"DATA\r\n"
++            b"x\r\n"
++            b".\r\n"
+             # This RSET is just an implementation detail.  It's nice, but this
+             # test doesn't really care about it.
+-            "RSET\r\n")
++            b"RSET\r\n")
+ 
+ 
+ 
+@@ -938,7 +935,7 @@
+         sentDeferred = defer.Deferred()
+         clientFactory = smtp.SMTPSenderFactory(
+             "source@address", "recipient@address",
+-            StringIO("message"), sentDeferred)
++            BytesIO(b"message"), sentDeferred)
+         connector = reactor.connectTCP("localhost", 25, clientFactory)
+         clientFactory.buildProtocol(None)
+         clientFactory.clientConnectionLost(connector,
+@@ -955,7 +952,7 @@
+         sentDeferred = defer.Deferred()
+         clientFactory = smtp.SMTPSenderFactory(
+             "source@address", "recipient@address",
+-            StringIO("message"), sentDeferred)
++            BytesIO(b"message"), sentDeferred)
+         connector = reactor.connectTCP("localhost", 25, clientFactory)
+         clientFactory.buildProtocol(None)
+         clientFactory.clientConnectionFailed(connector,
+@@ -975,7 +972,7 @@
+         tries to deliver the message again.
+         """
+         recipient = 'alice'
+-        message = "some message text"
++        message = b"some message text"
+         domain = DummyDomain([recipient])
+ 
+         class CleanSMTP(smtp.SMTP):
+@@ -1003,8 +1000,8 @@
+         sentDeferred = defer.Deferred()
+         clientFactory = smtp.SMTPSenderFactory(
+             "bob@example.org", recipient + "@example.com",
+-            StringIO(message), sentDeferred)
+-        clientFactory.domain = "example.org"
++            BytesIO(message), sentDeferred)
++        clientFactory.domain = b"example.org"
+         clientConnector = reactor.connectTCP(
+             serverHost.host, serverHost.port, clientFactory)
+         self.addCleanup(clientConnector.disconnect)
+@@ -1016,7 +1013,7 @@
+             """
+             self.assertEqual(
+                 domain.messages,
+-                {recipient: ["\n%s\n" % (message,)]})
++                {recipient: [b"\n" + message + b"\n"]})
+             # Flush the RuntimeError that BrokenMessage caused to be logged.
+             self.assertEqual(len(self.flushLoggedErrors(RuntimeError)), 1)
+         sentDeferred.addCallback(cbSent)
+@@ -1024,12 +1021,12 @@
+ 
+ 
+ 
++@implementer(IRealm)
+ class SingletonRealm(object):
+     """
+     Trivial realm implementation which is constructed with an interface and an
+     avatar and returns that avatar when asked for that interface.
+     """
+-    implements(IRealm)
+ 
+     def __init__(self, interface, avatar):
+         self.interface = interface
+@@ -1073,11 +1070,11 @@
+         greeting.
+         """
+         s = serverClass()
+-        s.host = "example.com"
++        s.host = b"example.com"
+         t = StringTransport()
+         s.makeConnection(t)
+         s.connectionLost(error.ConnectionDone())
+-        self.assertIn("example.com", t.value())
++        self.assertIn(b"example.com", t.value())
+ 
+ 
+     def testSMTPGreetingNotExtended(self):
+@@ -1090,7 +1087,7 @@
+         t = StringTransport()
+         s.makeConnection(t)
+         s.connectionLost(error.ConnectionDone())
+-        self.assertNotIn("ESMTP", t.value())
++        self.assertNotIn(b"ESMTP", t.value())
+ 
+ 
+     def testESMTPGreetingHost(self):
+@@ -1110,7 +1107,7 @@
+         t = StringTransport()
+         s.makeConnection(t)
+         s.connectionLost(error.ConnectionDone())
+-        self.assertIn("ESMTP", t.value())
++        self.assertIn(b"ESMTP", t.value())
+ 
+ 
+     def test_acceptSenderAddress(self):
+@@ -1133,11 +1130,11 @@
+         proto.makeConnection(trans)
+ 
+         # Deal with the necessary preliminaries
+-        proto.dataReceived('HELO example.com\r\n')
++        proto.dataReceived(b'HELO example.com\r\n')
+         trans.clear()
+ 
+         # Try to specify our sender address
+-        proto.dataReceived('MAIL FROM:<alice@example.com>\r\n')
++        proto.dataReceived(b'MAIL FROM:<alice@example.com>\r\n')
+ 
+         # Clean up the protocol before doing anything that might raise an
+         # exception.
+@@ -1146,7 +1143,7 @@
+         # Make sure that we received exactly the correct response
+         self.assertEqual(
+             trans.value(),
+-            '250 Sender address accepted\r\n')
++            b'250 Sender address accepted\r\n')
+ 
+ 
+     def test_deliveryRejectedSenderAddress(self):
+@@ -1170,11 +1167,11 @@
+         proto.makeConnection(trans)
+ 
+         # Deal with the necessary preliminaries
+-        proto.dataReceived('HELO example.com\r\n')
++        proto.dataReceived(b'HELO example.com\r\n')
+         trans.clear()
+ 
+         # Try to specify our sender address
+-        proto.dataReceived('MAIL FROM:<alice@example.com>\r\n')
++        proto.dataReceived(b'MAIL FROM:<alice@example.com>\r\n')
+ 
+         # Clean up the protocol before doing anything that might raise an
+         # exception.
+@@ -1183,8 +1180,8 @@
+         # Make sure that we received exactly the correct response
+         self.assertEqual(
+             trans.value(),
+-            '550 Cannot receive from specified address '
+-            '<alice@example.com>: Sender not acceptable\r\n')
++            b'550 Cannot receive from specified address '
++            b'<alice@example.com>: Sender not acceptable\r\n')
+ 
+ 
+     def test_portalRejectedSenderAddress(self):
+@@ -1193,11 +1190,11 @@
+         L{smtp.SMTP} instance's portal is responded to with the correct error
+         code.
+         """
++        @implementer(ICredentialsChecker)
+         class DisallowAnonymousAccess(object):
+             """
+             Checker for L{IAnonymous} which rejects authentication attempts.
+             """
+-            implements(ICredentialsChecker)
+ 
+             credentialInterfaces = (IAnonymous,)
+ 
+@@ -1212,11 +1209,11 @@
+         proto.makeConnection(trans)
+ 
+         # Deal with the necessary preliminaries
+-        proto.dataReceived('HELO example.com\r\n')
++        proto.dataReceived(b'HELO example.com\r\n')
+         trans.clear()
+ 
+         # Try to specify our sender address
+-        proto.dataReceived('MAIL FROM:<alice@example.com>\r\n')
++        proto.dataReceived(b'MAIL FROM:<alice@example.com>\r\n')
+ 
+         # Clean up the protocol before doing anything that might raise an
+         # exception.
+@@ -1225,8 +1222,8 @@
+         # Make sure that we received exactly the correct response
+         self.assertEqual(
+             trans.value(),
+-            '550 Cannot receive from specified address '
+-            '<alice@example.com>: Sender not acceptable\r\n')
++            b'550 Cannot receive from specified address '
++            b'<alice@example.com>: Sender not acceptable\r\n')
+ 
+ 
+     def test_portalRejectedAnonymousSender(self):
+@@ -1243,11 +1240,11 @@
+         proto.makeConnection(trans)
+ 
+         # Deal with the necessary preliminaries
+-        proto.dataReceived('HELO example.com\r\n')
++        proto.dataReceived(b'HELO example.com\r\n')
+         trans.clear()
+ 
+         # Try to specify our sender address
+-        proto.dataReceived('MAIL FROM:<alice@example.com>\r\n')
++        proto.dataReceived(b'MAIL FROM:<alice@example.com>\r\n')
+ 
+         # Clean up the protocol before doing anything that might raise an
+         # exception.
+@@ -1256,8 +1253,8 @@
+         # Make sure that we received exactly the correct response
+         self.assertEqual(
+             trans.value(),
+-            '550 Cannot receive from specified address '
+-            '<alice@example.com>: Unauthenticated senders not allowed\r\n')
++            b'550 Cannot receive from specified address '
++            b'<alice@example.com>: Unauthenticated senders not allowed\r\n')
+ 
+ 
+ 
+@@ -1277,7 +1274,7 @@
+             self.transport.value().splitlines())
+ 
+ 
+-    def assertServerAuthenticated(self, loginArgs, username="username", password="password"):
++    def assertServerAuthenticated(self, loginArgs, username=b"username", password=b"password"):
+         """
+         Assert that a login attempt has been made, that the credentials and
+         interfaces passed to it are correct, and that when the login request
+@@ -1296,7 +1293,7 @@
+         d.callback((smtp.IMessageDeliveryFactory, None, lambda: None))
+ 
+         self.assertEqual(
+-            ["235 Authentication successful."],
++            [b"235 Authentication successful."],
+             self.transport.value().splitlines())
+ 
+ 
+@@ -1306,7 +1303,7 @@
+         """
+         self.server = smtp.ESMTP({
+                 'LOGIN': imap4.LOGINCredentials})
+-        self.server.host = 'localhost'
++        self.server.host = b'localhost'
+         self.transport = StringTransport(
+             peerAddress=address.IPv4Address('TCP', '127.0.0.1', 12345))
+         self.server.makeConnection(self.transport)
+@@ -1333,14 +1330,14 @@
+         Test that AUTH is advertised to clients which issue an EHLO command.
+         """
+         self.transport.clear()
+-        self.server.dataReceived('EHLO\r\n')
++        self.server.dataReceived(b'EHLO\r\n')
+         responseLines = self.transport.value().splitlines()
+         self.assertEqual(
+             responseLines[0],
+-            "250-localhost Hello 127.0.0.1, nice to meet you")
++            b"250-localhost Hello 127.0.0.1, nice to meet you")
+         self.assertEqual(
+             responseLines[1],
+-            "250 AUTH LOGIN")
++            b"250 AUTH LOGIN")
+         self.assertEqual(len(responseLines), 2)
+ 
+ 
+@@ -1351,19 +1348,19 @@
+         loginArgs = []
+         self.server.portal = self.portalFactory(loginArgs)
+ 
+-        self.server.dataReceived('EHLO\r\n')
++        self.server.dataReceived(b'EHLO\r\n')
+         self.transport.clear()
+ 
+         self.assertServerResponse(
+-            'AUTH LOGIN\r\n',
+-            ["334 " + "User Name\0".encode('base64').strip()])
++            b'AUTH LOGIN\r\n',
++            [b"334 " + b64encode(b"User Name\0")])
+ 
+         self.assertServerResponse(
+-            'username'.encode('base64') + '\r\n',
+-            ["334 " + "Password\0".encode('base64').strip()])
++            b64encode(b'username') + b'\r\n',
++            [b"334 " + b64encode(b"Password\0")])
+ 
+         self.assertServerResponse(
+-            'password'.encode('base64').strip() + '\r\n',
++            b64encode(b'password') + b'\r\n',
+             [])
+ 
+         self.assertServerAuthenticated(loginArgs)
+@@ -1376,19 +1373,19 @@
+         loginArgs = []
+         self.server.portal = self.portalFactory(loginArgs)
+ 
+-        self.server.dataReceived('EHLO\r\n')
++        self.server.dataReceived(b'EHLO\r\n')
+         self.transport.clear()
+ 
+         self.assertServerResponse(
+-            'AUTH LOGIN\r\n',
+-            ["334 " + "User Name\0".encode('base64').strip()])
++            b'AUTH LOGIN\r\n',
++            [b"334 " + b64encode(b"User Name\0")])
+ 
+         self.assertServerResponse(
+-            'username'.encode('base64') + '\r\n',
+-            ["334 " + "Password\0".encode('base64').strip()])
++            b64encode(b'username') + b'\r\n',
++            [b"334 " + b64encode(b"Password\0")])
+ 
+-        self.assertServerResponse('\r\n', [])
+-        self.assertServerAuthenticated(loginArgs, password='')
++        self.assertServerResponse(b'\r\n', [])
++        self.assertServerAuthenticated(loginArgs, password=b'')
+ 
+ 
+     def test_plainAuthenticationInitialResponse(self):
+@@ -1399,15 +1396,15 @@
+         loginArgs = []
+         self.server.portal = self.portalFactory(loginArgs)
+ 
+-        self.server.dataReceived('EHLO\r\n')
++        self.server.dataReceived(b'EHLO\r\n')
+         self.transport.clear()
+ 
+         self.assertServerResponse(
+-            'AUTH LOGIN ' + "username".encode('base64').strip() + '\r\n',
+-            ["334 " + "Password\0".encode('base64').strip()])
++            b'AUTH LOGIN ' + b64encode(b"username") + b'\r\n',
++            [b"334 " + b64encode(b"Password\0")])
+ 
+         self.assertServerResponse(
+-            'password'.encode('base64').strip() + '\r\n',
++            b64encode(b'password') + b'\r\n',
+             [])
+ 
+         self.assertServerAuthenticated(loginArgs)
+@@ -1420,12 +1417,12 @@
+         loginArgs = []
+         self.server.portal = self.portalFactory(loginArgs)
+ 
+-        self.server.dataReceived('EHLO\r\n')
+-        self.server.dataReceived('AUTH LOGIN\r\n')
++        self.server.dataReceived(b'EHLO\r\n')
++        self.server.dataReceived(b'AUTH LOGIN\r\n')
+ 
+         self.assertServerResponse(
+-            '*\r\n',
+-            ['501 Authentication aborted'])
++            b'*\r\n',
++            [b'501 Authentication aborted'])
+ 
+ 
+     def test_invalidBase64EncodedResponse(self):
+@@ -1436,12 +1433,12 @@
+         loginArgs = []
+         self.server.portal = self.portalFactory(loginArgs)
+ 
+-        self.server.dataReceived('EHLO\r\n')
+-        self.server.dataReceived('AUTH LOGIN\r\n')
++        self.server.dataReceived(b'EHLO\r\n')
++        self.server.dataReceived(b'AUTH LOGIN\r\n')
+ 
+         self.assertServerResponse(
+-            'x\r\n',
+-            ['501 Syntax error in parameters or arguments'])
++            b'x\r\n',
++            [b'501 Syntax error in parameters or arguments'])
+ 
+         self.assertEqual(loginArgs, [])
+ 
+@@ -1454,10 +1451,10 @@
+         loginArgs = []
+         self.server.portal = self.portalFactory(loginArgs)
+ 
+-        self.server.dataReceived('EHLO\r\n')
++        self.server.dataReceived(b'EHLO\r\n')
+         self.assertServerResponse(
+-            'AUTH LOGIN x\r\n',
+-            ['501 Syntax error in parameters or arguments'])
++            b'AUTH LOGIN x\r\n',
++            [b'501 Syntax error in parameters or arguments'])
+ 
+         self.assertEqual(loginArgs, [])
+ 
+@@ -1472,14 +1469,14 @@
+         loginArgs = []
+         self.server.portal = self.portalFactory(loginArgs)
+ 
+-        self.server.dataReceived('EHLO\r\n')
++        self.server.dataReceived(b'EHLO\r\n')
+         self.transport.clear()
+ 
+         self.assertServerResponse(
+-            'AUTH LOGIN ' + 'username'.encode('base64').strip() + '\r\n',
+-            ['334 ' + 'Password\0'.encode('base64').strip()])
++            b'AUTH LOGIN ' + b64encode(b'username') + b'\r\n',
++            [b'334 ' + b64encode(b'Password\0')])
+         self.assertServerResponse(
+-            'password'.encode('base64').strip() + '\r\n',
++            b64encode(b'password') + b'\r\n',
+             [])
+ 
+         d, credentials, mind, interfaces = loginArgs.pop()
+@@ -1486,7 +1483,7 @@
+         d.errback(RuntimeError("Something wrong with the server"))
+ 
+         self.assertEqual(
+-            '451 Requested action aborted: local error in processing\r\n',
++            b'451 Requested action aborted: local error in processing\r\n',
+             self.transport.value())
+ 
+         self.assertEqual(len(self.flushLoggedErrors(RuntimeError)), 1)
+@@ -1548,7 +1545,7 @@
+ 
+         clientFactory = smtp.SMTPSenderFactory(
+             'source@address', 'recipient@address',
+-            StringIO("Message body"), onDone,
++            BytesIO(b"Message body"), onDone,
+             retries=0, timeout=0.5)
+ 
+         client = clientFactory.buildProtocol(
+@@ -1601,7 +1598,7 @@
+         self.clientProtocol.dataReceived(b"220 localhost\r\n")
+         transport.clear()
+         self.clientProtocol.dataReceived(b"500 not an esmtp server\r\n")
+-        self.assertEqual("QUIT\r\n", transport.value())
++        self.assertEqual(b"QUIT\r\n", transport.value())
+ 
+ 
+     def test_requireTLSFailsHELOFallback(self):
+@@ -1647,12 +1644,12 @@
+     if sslSkip is not None:
+         skip = sslSkip
+ 
+-    SERVER_GREETING = "220 localhost NO UCE NO UBE NO RELAY PROBES ESMTP\r\n"
+-    EHLO_RESPONSE = "250-localhost Hello 127.0.0.1, nice to meet you\r\n"
++    SERVER_GREETING = b"220 localhost NO UCE NO UBE NO RELAY PROBES ESMTP\r\n"
++    EHLO_RESPONSE = b"250-localhost Hello 127.0.0.1, nice to meet you\r\n"
+ 
+     def setUp(self):
+         self.clientProtocol = smtp.ESMTPClient(
+-            "testpassword", ClientTLSContext(), "testuser")
++            b"testpassword", ClientTLSContext(), b"testuser")
+         self.clientProtocol.requireTransportSecurity = True
+         self.clientProtocol.getMailFrom = lambda: "test@example.org"
+ 
+@@ -1715,11 +1712,11 @@
+         # Tell the client about the server's capabilities - including STARTTLS
+         self.clientProtocol.dataReceived(
+             self.EHLO_RESPONSE +
+-            "250-AUTH LOGIN\r\n"
+-            "250 STARTTLS\r\n")
++            b"250-AUTH LOGIN\r\n"
++            b"250 STARTTLS\r\n")
+ 
+         # The client should try to start TLS before sending the message.
+-        self.assertEqual("STARTTLS\r\n", transport.value())
++        self.assertEqual(b"STARTTLS\r\n", transport.value())
+ 
+ 
+     def test_requireTransportSecurityTLSOfferedOverSSL(self):
+@@ -1749,10 +1746,10 @@
+         # Tell the client about the server's capabilities - excluding STARTTLS
+         self.clientProtocol.dataReceived(
+             self.EHLO_RESPONSE +
+-            "250 AUTH LOGIN\r\n")
++            b"250 AUTH LOGIN\r\n")
+ 
+         # The client give up
+-        self.assertEqual("QUIT\r\n", transport.value())
++        self.assertEqual(b"QUIT\r\n", transport.value())
+ 
+ 
+     def test_esmtpClientTlsModeDeprecationGet(self):
+@@ -1838,7 +1835,7 @@
+         """
+         reactor = MemoryReactor()
+         smtp.sendmail("localhost", "source@address", "recipient@address",
+-                      "message", reactor=reactor, username="foo",
++                      b"message", reactor=reactor, username="foo",
+                       password="bar", requireTransportSecurity=True,
+                       requireAuthentication=True)
+         factory = reactor.tcpClients[0][2]
+@@ -1854,7 +1851,7 @@
+         if it is a file-like object.
+         """
+         reactor = MemoryReactor()
+-        messageFile = StringIO(b"File!")
++        messageFile = BytesIO(b"File!")
+ 
+         smtp.sendmail("localhost", "source@address", "recipient@address",
+                       messageFile, reactor=reactor)
+@@ -1869,11 +1866,11 @@
+         """
+         reactor = MemoryReactor()
+         smtp.sendmail("localhost", "source@address", "recipient@address",
+-                      "message", reactor=reactor)
++                      b"message", reactor=reactor)
+         factory = reactor.tcpClients[0][2]
+         messageFile = factory.file
+         messageFile.seek(0)
+-        self.assertEqual(messageFile.read(), "message")
++        self.assertEqual(messageFile.read(), b"message")
+ 
+ 
+     def test_senderDomainName(self):
+@@ -1883,7 +1880,7 @@
+         """
+         reactor = MemoryReactor()
+         smtp.sendmail("localhost", "source@address", "recipient@address",
+-                      "message", reactor=reactor, senderDomainName="foo")
++                      b"message", reactor=reactor, senderDomainName="foo")
+         factory = reactor.tcpClients[0][2]
+         self.assertEqual(factory.domain, "foo")
+ 
+@@ -1896,7 +1893,7 @@
+         """
+         reactor = MemoryReactor()
+         d = smtp.sendmail("localhost", "source@address", "recipient@address",
+-                          "message", reactor=reactor)
++                          b"message", reactor=reactor)
+         d.cancel()
+         self.assertEqual(reactor.connectors[0]._disconnected, True)
+         failure = self.failureResultOf(d)
+@@ -1912,7 +1909,7 @@
+         reactor = MemoryReactor()
+         transport = AbortableStringTransport()
+         d = smtp.sendmail("localhost", "source@address", "recipient@address",
+-                          "message", reactor=reactor)
++                          b"message", reactor=reactor)
+         factory = reactor.tcpClients[0][2]
+         p = factory.buildProtocol(None)
+         p.makeConnection(transport)
+Index: twisted/python/dist3.py
+===================================================================
+--- twisted/python/dist3.py	(revision 47351)
++++ twisted/python/dist3.py	(working copy)
+@@ -122,6 +122,7 @@
+     "twisted.logger._stdlib",
+     "twisted.logger._util",
+     "twisted.logger.test.__init__",
++    "twisted.mail.smtp",
+     "twisted.names.__init__",
+     "twisted.names._rfc1982",
+     "twisted.names.authority",
+@@ -326,6 +327,7 @@
+     "twisted.logger.test.test_observer",
+     "twisted.logger.test.test_stdlib",
+     "twisted.logger.test.test_util",
++    "twisted.mail.test.test_smtp",
+     "twisted.names.test.test_cache",
+     "twisted.names.test.test_client",
+     "twisted.names.test.test_common",
+@@ -528,6 +530,10 @@
+     # GzipEncoder and allowed methods functionality not ported, no doubt
+     # missing lots of test coverage:
+     "twisted.web.server",
++    # twisted.mail.imap4 is ported only enough to make twisted.mail.smtp work
++    "twisted.mail.imap4",
++    # only twisted.python.text.strFile
++    "twisted.python.text",
+ ]
+ 
+ modulesToInstall = modules + testModules + almostModules
+Index: twisted/python/text.py
+===================================================================
+--- twisted/python/text.py	(revision 47351)
++++ twisted/python/text.py	(working copy)
+@@ -7,7 +7,9 @@
+ Miscellany of text-munging functions.
+ """
+ 
++from twisted.python.compat import _PY3
+ 
++
+ def stringyString(object, indentation=''):
+     """
+     Expansive string formatting for sequence types.
+@@ -206,3 +208,9 @@
+         if buf.find(p) != -1:
+             return True
+ 
++
++if _PY3:
++    __notported__ = [name for name in globals() if name != 'strFile']
++    for name in __notported__:
++        del globals()[name]
++    del name, __notported__
+Index: twisted/python/util.py
+===================================================================
+--- twisted/python/util.py	(revision 47351)
++++ twisted/python/util.py	(working copy)
+@@ -950,7 +950,7 @@
+ 
+ 
+ if _PY3:
+-    __notported__ = ["SubclassableCStringIO", "LineLog", "makeStatBar"]
++    __notported__ = ["SubclassableCStringIO", "makeStatBar"]
+     for name in __all__[:]:
+         if name in __notported__:
+             __all__.remove(name)

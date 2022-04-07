@@ -1,0 +1,249 @@
+#!/usr/bin/env python
+
+
+from twisted.conch.ssh import transport, userauth, connection, channel, filetransfer
+from twisted.conch.ssh.common import NS
+from twisted.internet import defer, protocol, reactor
+from twisted.python import log
+import sys, os, getpass
+
+USER, PASS, HOST, CMD, SRC, DST, TAIL, VERBOSE, EXCODE = None, None, None, None, None, None, False, False, 1
+
+# The "Transport" is the crypto layer on top of port 22
+class Transport(transport.SSHClientTransport):
+    def verifyHostKey(self, hostKey, fingerprint):
+        # For info only
+        log.msg('host key fingerprint: %s' % fingerprint)
+        # FIXME: this is insecure
+        return defer.succeed(1)
+
+    def connectionSecure(self):
+        # Once we're secure (server key valid) we ask for userauth service
+        # on a new "connection" object
+        self.requestService(UserAuth(USER, Connection()))
+
+    def connectionLost(self, reason):
+        reactor.stop()
+
+class UserAuth(userauth.SSHUserAuthClient):
+    def getPassword(self):
+        # Ack! Globals!
+        return defer.succeed(PASS)
+    
+    def getPublicKey(self):
+        # returning None means always use username/password auth
+        return
+
+    def serviceStopped(self):
+        log.msg('UserAuth stopped')
+
+
+class Connection(connection.SSHConnection):
+    def serviceStarted(self):
+        # Once userauth has succeeded we ask for a channel on this
+        # connection
+        if 'scp' in CMD or CMD.startswith('/'):
+            log.msg('starting scp')
+            self.openChannel(ScpChannel(2**16, 2**15, self))
+        else:
+            log.msg('starting sftp')
+            self.openChannel(SftpChannel(2**16, 2**15, self))
+
+class XferChannelBase(channel.SSHChannel):
+    name = 'session'
+    
+    state = None
+    todo = 0
+    buf = ''
+    
+    def openFailed(self, reason):
+        log.err(reason)
+        
+    def channelOpen(self, data):
+        if data:
+            lines = data.split('\n')
+            for l in lines:
+                log.msg(l.replace('\t','    '))
+    
+        # We might be an SCP or SFTP requests
+        if 'scp' in CMD or CMD.startswith('/'):
+            kind = 'exec'
+        else:
+            kind = 'subsystem'
+        # Call our handler
+        d = self.conn.sendRequest(self, kind, NS(CMD), wantReply=1)
+        d.addCallbacks(self.channelOpened, log.err)
+        
+
+class SftpChannel(XferChannelBase):
+    def channelOpened(self, data):
+        log.msg("sftp channelOpened: %r" % (data,))
+        self.client = filetransfer.FileTransferClient()
+        self.client.makeConnection(self)
+        self.dataReceived = self.client.dataReceived
+        d = self.client.openFile(SRC, filetransfer.FXF_READ, {})
+        d.addCallbacks(self.fileOpened, log.err)
+
+    def fileOpened(self, rfile):
+        rfile.getAttrs().addCallbacks(self.fileStatted, log.err, (rfile,))
+
+    def fileStatted(self, attrs, rfile):
+        log.msg("file is %i bytes" % (attrs['size'],))
+        rfile.readChunk(0, 4096).addCallbacks(
+                self.did_read,
+                self.failed_read,
+                (rfile, 0, attrs['size']), {},  # did_read pos/keyword args
+                (rfile, 0), {}                  # failed_read pos/keyword args
+                )
+            
+    def did_read(self, data, f, pos, todo):
+        if VERBOSE:
+            log.msg("read %i bytes" % (len(data),))
+            
+        DST.write(data)
+        todo -= len(data)
+        pos += len(data)
+        if todo<=0:
+            if TAIL:
+                reactor.callLater(1, self.is_more, f, pos)
+                return
+            else:
+                return self.done(pos)
+        f.readChunk(pos, 4096).addCallbacks(self.did_read, log.err, (f, pos, todo))
+
+    def failed_read(self, failure, f, pos):
+        f.check(EOFError)
+        if TAIL:
+            reactor.callLater(1, self.is_more, f, pos)
+
+    def is_more(self, f, pos):
+        if VERBOSE:
+            log.msg('checking for more input')
+        f.getAttrs().addCallbacks(self.is_more2, log.err, (f, pos))
+
+    def is_more2(self, attrs, f, pos):
+        if attrs['size'] > pos:
+            # file has grown, start reading again
+            if VERBOSE:
+                log.msg('file has grown %i bytes' % (attrs['size']-pos,))
+            f.readChunk(pos, 4096).addCallbacks(self.did_read, log.err, (f, pos, attrs['size']-pos))
+        else:
+            # no more
+            reactor.callLater(1, self.is_more, f, pos)
+
+    def done(self, l):
+        log.msg("done %i bytes" % (l,))
+        global EXCODE
+        EXCODE = 0
+
+class ScpChannel(XferChannelBase):
+    def channelOpened(self, data):
+        # once the scp is exec'ed, start the SCP transfer
+        self.write('\0')
+        # we're a state machine
+        self.state = 'waiting'
+
+    def dataReceived(self, data):
+        #log.msg('dataReceived: %s %r' % (self.state, data))
+
+        # What we do with the data depends on where we are
+        if self.state=='waiting':
+            # we've started the transfer, and are expecting a C
+            # Coctalperms size filename\n
+
+            # might not get it all at once, buffer
+            self.buf += data
+            if not self.buf.endswith('\n'):
+                return
+            b = self.buf
+            self.buf = ''
+
+            # Must be a C
+            if not b.startswith('C'):
+                log.msg("expecting C command: %r" % (self.buf,))
+                self.loseConnection()
+                return
+
+            # Get the file info
+            p, l, n = b[1:-1].split(' ')
+            perms = int(p, 8)
+            self.todo = int(l)
+            log.msg("getting file %s mode %s len %i" % (n, oct(perms), self.todo))
+            
+            # Tell the far end to start sending the content
+            self.state = 'receiving'
+            self.write('\0')
+            
+        elif self.state=='receiving':
+            # we've started the file body
+            #log.msg('got %i bytes' % (len(data),))
+            
+            if len(data)>self.todo:
+                extra = data[self.todo:]
+                data = data[:self.todo]
+                if extra!='\0':
+                    log.msg("got %i more bytes than we expected, ignoring: %r" % (len(extra), extra))
+                
+            DST.write(data)
+            self.todo -= len(data)
+            
+            if self.todo<=0:
+                log.msg('scp done')
+                global EXCODE
+                EXCODE = 0
+                self.loseConnection()
+        else:
+            log.msg("dataReceived in unknown state: %r" % (self.state,))
+            self.loseConnection()
+
+
+if __name__=='__main__':
+
+    import optparse
+
+    p = optparse.OptionParser(usage='usage: %prog [options] [user[:pass]@]hostname:sourcefile destfile')
+    if 'ftp' in sys.argv[0]:
+        p.add_option('-C', '--scp', dest='sftp', help='force SCP instead of SFPP', action='store_false', default=True)
+    else:
+        p.add_option('-F', '--sftp', dest='sftp', help='use SFTP instead of SCP', action='store_true', default=False)
+    p.add_option('-v', '--verbose', dest='verbose', help='be verbose', action='store_true', default=False)
+    p.add_option('-f', '--follow', dest='follow', help='tail the file', action='store_true', default=False)
+
+    options, args = p.parse_args()
+    
+    SRC = args[0]
+    DST = args[1]
+    TAIL = options.follow
+
+    if '@' in SRC:
+        USER, SRC = SRC.split('@', 1)
+    else:
+        USER = os.environ['USERNAME']
+        
+    if not ':' in SRC:
+        usage(1)
+        
+    HOST, SRC = SRC.split(':', 1)
+            
+    if ':' in USER:
+        USER, PASS = USER.split(':', 1)
+    else:
+        PASS = getpass.getpass('password for %s@%s: ' % (USER, HOST))
+
+    if DST=='-':
+        DST = sys.stdout
+    else:
+        DST = open(DST, 'wb')
+
+    if options.sftp:
+        CMD = 'sftp'
+    else: 
+        CMD = 'scp -f %s' % (SRC,)
+
+    VERBOSE = options.verbose
+        
+    protocol.ClientCreator(reactor, Transport).connectTCP(HOST, 22)
+    log.startLogging(sys.stderr)
+    reactor.run()
+    sys.exit(EXCODE)
+

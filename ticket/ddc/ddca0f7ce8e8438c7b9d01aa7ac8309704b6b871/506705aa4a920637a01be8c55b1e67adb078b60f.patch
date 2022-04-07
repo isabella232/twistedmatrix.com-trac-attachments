@@ -1,0 +1,138 @@
+Index: twisted/python/filepath.py
+===================================================================
+--- twisted/python/filepath.py	(revision 23176)
++++ twisted/python/filepath.py	(working copy)
+@@ -11,6 +11,7 @@
+ import random
+ import sha
+ import base64
++import pwd, grp
+ 
+ from os.path import isabs, exists, normpath, abspath, splitext
+ from os.path import basename, dirname
+@@ -401,6 +402,30 @@
+             if reraise:
+                 raise
+ 
++    def chmod(self, mode):
++        """
++        Changes the permissions on self, if possible.  Propagates errors from
++        os.chmod up.
++        
++        @param mode: int representing the new permissions desired.  (same as
++        the command line chmod)
++        """
++        os.chmod(self.path, mode)
++
++    def chown(self, user, group):
++        """
++        Changes the ownership of self, if possible.  Propagates errors from
++        os.chown and pwd.getpwnam and grp.getgrnam up.
++
++        @param user: the uid or the username of the new owner
++        @param group: the gid or group name of the old owner
++        """
++        if type(user) == type(""):
++            user = pwd.getpwnam(user)[2]
++        if type(group) == type(""):
++            group = grp.getgrnam(group)[2]
++        os.chown(self.path, user, group)
++
+     def getsize(self):
+         st = self.statinfo
+         if not st:
+Index: twisted/test/test_paths.py
+===================================================================
+--- twisted/test/test_paths.py	(revision 23176)
++++ twisted/test/test_paths.py	(working copy)
+@@ -5,7 +5,7 @@
+ Test cases covering L{twisted.python.filepath} and L{twisted.python.zippath}.
+ """
+ 
+-import os, time, pickle, errno, zipfile
++import os, time, pickle, errno, zipfile, stat, pwd, grp
+ 
+ from twisted.python.win32 import WindowsError, ERROR_DIRECTORY
+ from twisted.python import filepath
+@@ -255,8 +255,81 @@
+         self.all = [x.replace(self.cmn, self.cmn+'.zip') for x in self.all]
+ 
+ 
++class Verification:
++    """
++    Class to mock some function and see if it was called
++    """
++    def __init__(self):
++        self.wasICalled = False
++        
++    def callMe(self, *args, **kwargs):
++        """
++        Function with which to mock another function
++        """
++        self.wasICalled = True
++        self.args = args
++        self.kwargs = kwargs
++
++
+ class FilePathTestCase(AbstractFilePathTestCase):
+ 
++    def test_chmod(self):
++        """
++        Make sure that calling os.chmod works
++        """
++        for mode in (0500, 0700):
++            self.path.child("sub1").chmod(mode)
++            self.assertEquals(
++                stat.S_IMODE(os.stat(self.path.child("sub1").path).st_mode), 
++                mode)
++
++    def test_chmod_mockup(self):
++        """
++        Make sure os.chmod is called via a mocked chmod function
++        """
++        v = Verification()
++        mp = self.patch(os, "chmod", v.callMe)
++        self.path.child("sub1").chmod(0770)
++        self.assertTrue(v.wasICalled)
++        self.assertEquals(v.args, (self.path.child("sub1").path, 0770))
++        mp.restore()
++        
++    def test_chown_mockup(self):
++        """
++        Since FilePath.chown simply passes arguments to os.chown, simply need
++        to make sure that os.chown is called.
++        """
++        v = Verification()
++        mp = self.patch(os, "chown", v.callMe)
++        self.path.child("sub1").chown(1000, 1000)
++        self.assertTrue(v.wasICalled)
++        self.assertEquals(v.args, (self.path.child("sub1").path, 1000, 1000))
++        mp.restore()
++
++    def test_chown_idresolve(self):
++        """
++        Make sure that FilePath.chown resolves user names correctly
++        """
++        v = Verification()
++        mp = self.patch(os, "chown", v.callMe)
++        uid, gid = os.getuid(), os.getgid()
++        uname, gname = pwd.getpwuid(uid)[0], grp.getgrgid(gid)[0]
++        self.path.child("sub1").chown(uname, gname)
++        self.assertEquals(v.args, (self.path.child("sub1").path, uid, gid))
++        self.assertRaises(KeyError, self.path.child("sub1").chown, 
++                          "Idonotexist", "Idonotexist")
++        mp.restore()
++
++    def test_chown(self):
++        """
++        Make sure that calling chown doesn't raise any errors.  There is
++        actually no way to test
++        """
++        self.path.child("sub1").chown(os.getuid(), os.getgid())
++
++    if getattr(os, "symlink", None) is None: #Windows
++        test_chown.skip = "No chown on Windows."
++
+     def test_getAndSet(self):
+         content = 'newcontent'
+         self.path.child('new').setContent(content)

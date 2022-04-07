@@ -1,0 +1,214 @@
+Index: twisted/trial/test/test_script.py
+===================================================================
+--- twisted/trial/test/test_script.py	(revision 22134)
++++ twisted/trial/test/test_script.py	(revision 22138)
+@@ -1,6 +1,7 @@
+ # Copyright (c) 2001-2007 Twisted Matrix Laboratories.
+ # See LICENSE for details.
+ 
++import gc
+ import StringIO, sys, sets, types
+ 
+ from twisted.trial import unittest, runner
+@@ -9,13 +10,64 @@
+ 
+ from twisted.trial.test.test_loader import testNames
+ 
++pyunit = __import__('unittest')
+ 
++
+ def sibpath(filename):
+     """For finding files in twisted/trial/test"""
+     return util.sibpath(__file__, filename)
+ 
+ 
+ 
++class ForceGarbageCollection(unittest.TestCase):
++    """
++    Tets for the --force-gc option.
++    """
++
++    def setUp(self):
++        self.config = trial.Options()
++        self.log = []
++        self.patch(gc, 'collect', self.collect)
++        self.test = pyunit.FunctionTestCase(self.simpleTest)
++
++
++    def simpleTest(self):
++        self.log.append('test')
++
++
++    def collect(self):
++        self.log.append('collect')
++
++
++    def makeRunner(self):
++        runner = trial._makeRunner(self.config)
++        runner.stream = StringIO.StringIO()
++        return runner
++
++
++    def test_forceGc(self):
++        """
++        Passing the --force-gc option to the trial script forces the garbage
++        collector to run before and after tests.
++        """
++        self.config['force-gc'] = True
++        self.config.postOptions()
++        runner = self.makeRunner()
++        runner.run(self.test)
++        self.assertEqual(self.log, ['collect', 'test', 'collect'])
++
++
++    def test_unforceGc(self):
++        """
++        By default, no garbage collection is forced.
++        """
++        self.config.postOptions()
++        runner = self.makeRunner()
++        runner.run(self.test)
++        self.assertEqual(self.log, ['test'])
++
++
++
+ class TestSuiteUsed(unittest.TestCase):
+     """
+     Check the category of tests suite used by the loader.
+Index: twisted/trial/test/test_reporter.py
+===================================================================
+--- twisted/trial/test/test_reporter.py	(revision 22134)
++++ twisted/trial/test/test_reporter.py	(revision 22138)
+@@ -741,6 +741,7 @@
+         self.assertEquals(
+             self.stream.getvalue().splitlines()[-1].strip(), "(successes=1)")
+ 
++
+     def test_summaryColoredFailure(self):
+         """
+         The summary in case of failure should have a good count of errors
+@@ -756,6 +757,23 @@
+             self.stream.getvalue().splitlines()[-1].strip(), "(errors=1)")
+ 
+ 
++    def test_getPrelude(self):
++        """
++        The tree needs to get the segments of the test ID that correspond
++        to the module and class that it belongs to.
++        """
++        self.assertEqual(
++            ['foo.bar', 'baz'],
++            self.result._getPreludeSegments('foo.bar.baz.qux'))
++        self.assertEqual(
++            ['foo', 'bar'],
++            self.result._getPreludeSegments('foo.bar.baz'))
++        self.assertEqual(
++            ['foo'],
++            self.result._getPreludeSegments('foo.bar'))
++        self.assertEqual([], self.result._getPreludeSegments('foo'))
++
++
+ class TestReporter(unittest.TestCase):
+     resultFactory = reporter.Reporter
+ 
+Index: twisted/trial/runner.py
+===================================================================
+--- twisted/trial/runner.py	(revision 22134)
++++ twisted/trial/runner.py	(revision 22138)
+@@ -727,7 +727,7 @@
+         self._logFileObserver = None
+         self._logFileObject = None
+         self._logWarnings = False
+-        self.forceGarbageCollection = forceGarbageCollection
++        self._forceGarbageCollection = forceGarbageCollection
+         if profile:
+             self.run = util.profiled(self.run, 'profile.data')
+ 
+@@ -769,7 +769,7 @@
+         """
+         result = self._makeResult()
+         test = unittest.decorate(test, ITestCase)
+-        if self.forceGarbageCollection:
++        if self._forceGarbageCollection:
+             test = unittest.decorate(
+                 test, unittest._ForceGarbageCollectionDecorator)
+         # decorate the suite with reactor cleanup and log starting
+Index: twisted/trial/unittest.py
+===================================================================
+--- twisted/trial/unittest.py	(revision 22134)
++++ twisted/trial/unittest.py	(revision 22138)
+@@ -1277,7 +1277,10 @@
+         """
+         Return the fully-qualified Python name of the doctest.
+         """
+-        return self.original.shortDescription()
++        testID = self.original.shortDescription()
++        if testID is not None:
++            return testID
++        return self.original.id()
+ 
+ 
+ 
+@@ -1290,12 +1293,12 @@
+     def run(self, result):
+         gc.collect()
+         TestDecorator.run(self, result)
+-        self.original._installObserver()
++        _logObserver._add()
+         gc.collect()
+-        for error in self.original._observer.getErrors():
++        for error in _logObserver.getErrors():
+             result.addError(self, error)
+-        self.original.flushLoggedErrors()
+-        self.original._removeObserver()
++        _logObserver.flushErrors()
++        _logObserver._remove()
+ 
+ 
+ components.registerAdapter(
+Index: twisted/trial/reporter.py
+===================================================================
+--- twisted/trial/reporter.py	(revision 22134)
++++ twisted/trial/reporter.py	(revision 22138)
+@@ -898,15 +898,29 @@
+         super(TreeReporter, self)._write(self.currentLine)
+ 
+ 
+-    def _testPrelude(self, test):
++    def _getPreludeSegments(self, testID):
+         """
++        Return a list of all non-leaf segments to display in the tree.
++
++        Normally this is the module and class name.
++        """
++        segments = testID.split('.')[:-1]
++        if len(segments) == 0:
++            return segments
++        segments = [
++            seg for seg in '.'.join(segments[:-1]), segments[-1]
++            if len(seg) > 0]
++        return segments
++
++
++    def _testPrelude(self, testID):
++        """
+         Write the name of the test to the stream, indenting it appropriately.
+ 
+         If the test is the first test in a new 'branch' of the tree, also
+         write all of the parents in that branch.
+         """
+-        segments = test.id().split('.')
+-        segments = ['.'.join(segments[:-2]), segments[-2]]
++        segments = self._getPreludeSegments(testID)
+         indentLevel = 0
+         for seg in segments:
+             if indentLevel < len(self._lastTest):
+@@ -934,7 +948,7 @@
+         Called when C{test} starts. Writes the tests name to the stream using
+         a tree format.
+         """
+-        self._testPrelude(test)
++        self._testPrelude(test.id())
+         self._write('%s%s ... ' % (self.indent * (len(self._lastTest)),
+                                    self.getDescription(test)))
+         super(TreeReporter, self).startTest(test)

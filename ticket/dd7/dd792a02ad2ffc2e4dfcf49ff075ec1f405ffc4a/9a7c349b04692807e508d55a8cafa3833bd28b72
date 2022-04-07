@@ -1,0 +1,211 @@
+Index: twisted/protocols/memcache.py
+===================================================================
+--- twisted/protocols/memcache.py	(revision 23235)
++++ twisted/protocols/memcache.py	(working copy)
+@@ -182,7 +182,10 @@
+             self._getBuffer = None
+             self._bufferLength = None
+             cmd = self._current[0]
+-            cmd.value = val
++            if cmd.command == "get_multi":
++                cmd.values[cmd.key] = val
++            else:
++                cmd.value = val
+             self.setLineMode(rem)
+ 
+ 
+@@ -190,7 +193,13 @@
+         """
+         Manage a success response to a set operation.
+         """
+-        self._current.popleft().success(True)
++        cmd = self._current[0]
++        if cmd.command == 'set_multi':
++            cmd.remaining -= 1
++            if cmd.remaining == 0:
++                self._current.popleft().success(True)
++        else:
++            self._current.popleft().success(True)
+ 
+ 
+     def cmd_NOT_STORED(self):
+@@ -210,6 +219,8 @@
+             cmd.success((cmd.flags, cmd.value))
+         elif cmd.command == "gets":
+             cmd.success((cmd.flags, cmd.cas, cmd.value))
++        elif cmd.command == "get_multi":
++            cmd.success((cmd.flags, cmd.values))
+         elif cmd.command == "stats":
+             cmd.success(cmd.values)
+ 
+@@ -226,7 +237,7 @@
+         Prepare the reading a value after a get.
+         """
+         cmd = self._current[0]
+-        if cmd.command == "get":
++        if cmd.command in ["get", "get_multi"]:
+             key, flags, length = line.split()
+             cas = ""
+         else:
+@@ -234,14 +245,19 @@
+         self._lenExpected = int(length)
+         self._getBuffer = []
+         self._bufferLength = 0
+-        if cmd.key != key:
++        if hasattr(cmd, 'keys'):
++            valid_keys = cmd.keys
++        else:
++            valid_keys = [cmd.key]
++        if key not in valid_keys:
+             raise RuntimeError("Unexpected commands answer.")
++        setattr(cmd, 'key', key)
+         cmd.flags = int(flags)
+         cmd.length = self._lenExpected
+         cmd.cas = cas
+         self.setRawMode()
++        
+ 
+-
+     def cmd_STAT(self, line):
+         """
+         Reception of one stat line.
+@@ -459,8 +475,29 @@
+         @rtype: L{Deferred}
+         """
+         return self._set("set", key, val, flags, expireTime, "")
++        
++        
++    def set_multi(self, keys, flags=0, expireTime=0):
++        """
++        Set the keys in C{keys}.
+ 
++        @param keys: the key dictionary to set.
++        @type key: C{dict}
+ 
++        @param flags: the flags to store with the key.
++        @type flags: C{int}
++
++        @param expireTime: if different from 0, the relative time in seconds
++            when the key will be deleted from the store.
++        @type expireTime: C{int}
++
++        @return: a deferred that will fire with C{True} if the operation has
++            succeeded.
++        @rtype: L{Deferred}
++        """
++        return self._set_multi(keys, flags, expireTime)
++
++
+     def checkAndSet(self, key, val, cas, flags=0, expireTime=0):
+         """
+         Change the content of C{key} only if the C{cas} value matches the
+@@ -513,6 +550,32 @@
+         cmdObj = Command(cmd, key=key, flags=flags, length=length)
+         self._current.append(cmdObj)
+         return cmdObj._deferred
++        
++        
++    def _set_multi(self, keys, flags, expireTime):
++        """
++        Internal wrapper for setting multiple values.
++        """
++        cmd = "set"
++        if not isinstance(keys, dict):
++            return fail(ClientError(
++                "Invalid type for keys: %s, expecting a dict" % (type(keys),)))
++        lines = []
++        for key, val in keys.items():
++            if len(key) > self.MAX_KEY_LENGTH:
++                return fail(ClientError("Key too long"))
++            if not isinstance(val, str):
++                return fail(ClientError(
++                    "Invalid type for value: %s, expecting a string" %
++                    (type(val),)))
++            length = len(val)
++            fullcmd = "%s %s %d %d %d\r\n%s" % (
++                cmd, key, flags, expireTime, length, val)
++            lines.append(fullcmd)
++        self.sendLine('\r\n'.join(lines))
++        cmdObj = Command("set_multi", keys=keys.keys(), flags=flags, length=length, remaining=len(keys))
++        self._current.append(cmdObj)
++        return cmdObj._deferred
+ 
+ 
+     def append(self, key, val):
+@@ -587,8 +650,32 @@
+         cmdObj = Command(cmd, key=key, value=None, flags=0, cas="")
+         self._current.append(cmdObj)
+         return cmdObj._deferred
++    
++    
++    def get_multi(self, keys):
++        """
++        Get the given C{keys}.
+ 
++        @param keys: The keys to retrieve.
++        @type key: C{list}
+ 
++        @return: A deferred that will fire with (flags, value).
++        @rtype: L{Deferred}
++        """
++        if not isinstance(keys, list):
++            return fail(ClientError(
++                "Invalid type for keys: %s, expecting a list" % (type(keys),)))
++        for key in keys:
++            if len(key) > self.MAX_KEY_LENGTH:
++                return fail(ClientError("Key too long"))
++        cmd = "get"
++        fullcmd = "%s %s" % (cmd, ' '.join(keys))
++        self.sendLine(fullcmd)
++        cmdObj = Command("get_multi", keys=keys, values={}, flags=0, cas="")
++        self._current.append(cmdObj)
++        return cmdObj._deferred
++
++
+     def stats(self):
+         """
+         Get some stats from the server. It will be available as a dict.
+Index: twisted/test/test_memcache.py
+===================================================================
+--- twisted/test/test_memcache.py	(revision 23235)
++++ twisted/test/test_memcache.py	(working copy)
+@@ -65,6 +65,18 @@
+         """
+         return self._test(self.proto.get("foo"), "get foo\r\n",
+             "VALUE foo 0 3\r\nbar\r\nEND\r\n", (0, "bar"))
++            
++            
++    def test_get_multi(self):
++        """
++        L{MemCacheProtocol.get_multi} should return a L{Deferred} which is
++        called back with a dictionary and the flag associated with the given 
++        key if the server returns a successful result.
++        """
++        return self._test(self.proto.get_multi(['foo', 'cow']), 
++            "get foo cow\r\n",
++            "VALUE foo 0 3\r\nbar\r\nVALUE cow 0 7\r\nchicken\r\nEND\r\n", 
++            (0, {'foo' : 'bar', 'cow' : 'chicken'}))
+ 
+ 
+     def test_emptyGet(self):
+@@ -83,8 +95,20 @@
+         """
+         return self._test(self.proto.set("foo", "bar"),
+             "set foo 0 0 3\r\nbar\r\n", "STORED\r\n", True)
++            
+ 
++    def test_set_multi(self):
++        """
++        L{MemCacheProtocol.set_multi} should return a L{Deferred} which is
++        called back with C{True} when the operation succeeds.
++        """
++        return self._test(self.proto.set_multi(
++            {'foo' : 'bar',
++             'cow' : 'chicken'}),
++            "set foo 0 0 3\r\nbar\r\nset cow 0 0 7\r\nchicken\r\n", 
++            "STORED\r\nSTORED\r\n", True)
+ 
++
+     def test_add(self):
+         """
+         L{MemCacheProtocol.add} should return a L{Deferred} which is

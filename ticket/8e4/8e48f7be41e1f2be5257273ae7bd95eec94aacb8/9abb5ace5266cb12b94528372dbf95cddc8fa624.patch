@@ -1,0 +1,131 @@
+diff --git a/twisted/conch/endpoints.py b/twisted/conch/endpoints.py
+index 353ef7f..c824992 100644
+--- a/twisted/conch/endpoints.py
++++ b/twisted/conch/endpoints.py
+@@ -364,6 +364,8 @@ class _CommandTransport(SSHClientTransport):
+ 
+     _hostKeyFailure = None
+ 
++    _userauth = None
++
+ 
+     def __init__(self, creator):
+         """
+@@ -426,30 +428,26 @@ class _CommandTransport(SSHClientTransport):
+ 
+         command = _ConnectionReady(self.connectionReady)
+ 
+-        userauth = _UserAuth(self.creator.username, command)
+-        userauth.password = self.creator.password
++        self._userauth = _UserAuth(self.creator.username, command)
++        self._userauth.password = self.creator.password
+         if self.creator.keys:
+-            userauth.keys = list(self.creator.keys)
++            self._userauth.keys = list(self.creator.keys)
+ 
+         if self.creator.agentEndpoint is not None:
+-            d = self._connectToAgent(userauth, self.creator.agentEndpoint)
++            d = self._connectToAgent(self.creator.agentEndpoint)
+         else:
+             d = succeed(None)
+ 
+         def maybeGotAgent(ignored):
+-            self.requestService(userauth)
++            self.requestService(self._userauth)
+         d.addBoth(maybeGotAgent)
+ 
+ 
+-    def _connectToAgent(self, userauth, endpoint):
++    def _connectToAgent(self, endpoint):
+         """
+         Set up a connection to the authentication agent and trigger its
+         initialization.
+ 
+-        @param userauth: The L{_UserAuth} instance which is in charge of the
+-            overall authentication process.
+-        @type userauth: L{_UserAuth}
+-
+         @param endpoint: An endpoint which can be used to connect to the
+             authentication agent.
+         @type endpoint: L{IStreamClientEndpoint} provider
+@@ -461,7 +459,7 @@ class _CommandTransport(SSHClientTransport):
+         factory.protocol = SSHAgentClient
+         d = endpoint.connect(factory)
+         def connected(agent):
+-            userauth.agent = agent
++            self._userauth.agent = agent
+             return agent.getPublicKeys()
+         d.addCallback(connected)
+         return d
+@@ -470,8 +468,13 @@ class _CommandTransport(SSHClientTransport):
+     def connectionLost(self, reason):
+         """
+         When the underlying connection to the SSH server is lost, if there were
+-        any connection setup errors, propagate them.
++        any connection setup errors, propagate them. Also, clean up the
++        connection to the ssh agent if one was created.
+         """
++        if self._userauth:
++            if self._userauth.agent:
++                self._userauth.agent.transport.loseConnection()
++
+         if self._state == b'RUNNING' or self.connectionReady is None:
+             return
+         if self._state == b'SECURING' and self._hostKeyFailure is not None:
+diff --git a/twisted/conch/test/test_endpoints.py b/twisted/conch/test/test_endpoints.py
+index 52c0b66..472d8dd 100644
+--- a/twisted/conch/test/test_endpoints.py
++++ b/twisted/conch/test/test_endpoints.py
+@@ -232,6 +232,10 @@ class SingleUseMemoryEndpoint(object):
+     @ivar pump: L{None} until a connection is attempted, then a L{IOPump}
+         instance associated with the protocol which is connected.
+     @type pump: L{IOPump}
++
++    @ivar client_transport: L{None} until a connection is attempted, then the
++        L{AbortableFakeTransport} that was created for the client.
++    @type client_transport: L{AbortableFakeTransport}
+     """
+     def __init__(self, server):
+         """
+@@ -240,6 +244,7 @@ class SingleUseMemoryEndpoint(object):
+         @type server: L{IProtocol} provider
+         """
+         self.pump = None
++        self.client_transport = None
+         self._server = server
+ 
+ 
+@@ -252,10 +257,12 @@ class SingleUseMemoryEndpoint(object):
+         except:
+             return fail()
+         else:
++            self.client_transport = AbortableFakeTransport(
++                protocol, isServer=False)
+             self.pump = connect(
+                 self._server, AbortableFakeTransport(
+                     self._server, isServer=True),
+-                protocol, AbortableFakeTransport(protocol, isServer=False))
++                protocol, self.client_transport)
+             return succeed(protocol)
+ 
+ 
+@@ -1137,6 +1144,19 @@ class NewConnectionTests(TestCase, SSHCommandClientEndpointTestsMixin):
+         protocol = self.successResultOf(connected)
+         self.assertIsNot(None, protocol.transport)
+ 
++        # Shut down the ssh connection between the client and the server.
++        protocol.transport.loseConnection()
++        pump.pump()
++        pump.pump()
++        self.assertTrue(client.transport.disconnecting)
++
++        # Report the disconnect back to the ssh protocol.
++        client.transport.reportDisconnect()
++        pump.pump()
++
++        # Verify that the transport connected to the agent is disconnected.
++        self.assertTrue(agentEndpoint.client_transport.disconnecting)
++
+ 
+     def test_loseConnection(self):
+         """

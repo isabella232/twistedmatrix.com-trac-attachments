@@ -1,0 +1,408 @@
+diff --git twisted/protocols/haproxy.py twisted/protocols/haproxy.py
+new file mode 100644
+index 0000000..653489f
+--- /dev/null
++++ twisted/protocols/haproxy.py
+@@ -0,0 +1,258 @@
++# -*- test-case-name: twisted.protocols.test.test_haproxy -*-
++
++# Copyright (c) Twisted Matrix Laboratories.
++# See LICENSE for details.
++
++"""
++Protocol mix-in that provides HAProxy PROXY protocol support.
++"""
++
++import contextlib
++import sys
++
++import twisted.internet.protocol
++import twisted.python.compat
++
++
++_PROXYSTR = b'PROXY'
++_UNKNOWN_PROTO = b'UNKNOWN'
++_ALLOWED_NET_PROTOS = (
++    b'TCP4',
++    b'TCP6',
++    _UNKNOWN_PROTO,
++)
++_NEWLINE = b'\r\n'
++
++
++class InvalidProxyHeader(Exception):
++    """
++    The provided PROXY protocol header is invalid.
++    """
++
++
++
++class InvalidNetworkProtocol(InvalidProxyHeader):
++    """
++    The network protocol was not one of TCP4 TCP6 or UNKNOWN.
++    """
++
++
++
++class MissingSourceData(InvalidProxyHeader):
++    """
++    The address or port are missing from the source data.
++    """
++
++
++
++class MissingDestinationData(InvalidProxyHeader):
++    """
++    The address or port are missing from the destination data.
++    """
++
++
++
++@contextlib.contextmanager
++def _convertValueError(excType):
++    """
++    Convert a L{ValueError} into a different error type.
++
++    This context manager is used to help account for cases where splitting the
++    bytestring results in not enough parts. These cases indicate invalid data
++    and need to have appropriate exception converted.
++
++    @param excType: The type of exception to which the L{ValueError} should
++        be converted.
++    @type excType: L{Exception}
++    """
++    try:
++
++        yield None
++
++    except ValueError:
++
++        twisted.python.compat.reraise(excType(), sys.exc_info()[-1])
++
++
++
++def parseProtocolHeader(line):
++    """
++    Parse a bytesting as a PROXY protocol header.
++
++    @param line: A bytesting that represents a valid HAProxy PROXY protocol
++        header line.
++
++    @type line: bytes
++
++    @return: A six-tuple containing the PROXY prefix, network protocol,
++        source address, source port, destination address, and
++        destination port in that order. This matches the order in which
++        these values are defined within the protocol. When the network protocol
++        is UNKNOWN the source and destination values will all be None as the
++        PROXY protocol requires parsers to ignore any values provided during
++        this scenario.
++
++    @raises InvalidProxyHeader: When no valid data can be extracted from the
++        given bytestring.
++
++    @raises InvalidNetworkProtocol: When no protocol can be parsed or is not
++        one of the allowed values.
++
++    @raises MissingSourceData: When the protocol is TCP* but no source data are
++        provided.
++
++    @raises MissingDestinationData: When the protocol is TCP* but no
++        destination data are provided.
++    """
++    proxyStr = None
++    networkProtocol = None
++    sourceAddr = None
++    sourcePort = None
++    destAddr = None
++    destPort = None
++
++    with _convertValueError(InvalidProxyHeader):
++
++        proxyStr, line = line.split(b' ', 1)
++
++    if proxyStr != _PROXYSTR:
++
++        raise InvalidProxyHeader()
++
++    with _convertValueError(InvalidNetworkProtocol):
++
++        networkProtocol, line = line.split(b' ', 1)
++
++    if networkProtocol not in _ALLOWED_NET_PROTOS:
++
++        raise InvalidNetworkProtocol()
++
++    if networkProtocol == _UNKNOWN_PROTO:
++
++        return (proxyStr, networkProtocol, None, None, None, None)
++
++    with _convertValueError(MissingSourceData):
++
++        sourceAddr, sourcePort, line = line.split(b' ', 2)
++
++    with _convertValueError(MissingDestinationData):
++
++        destAddr, destPort = line.split(b' ')
++
++    return (
++        proxyStr,
++        networkProtocol,
++        sourceAddr,
++        sourcePort,
++        destAddr,
++        destPort,
++    )
++
++
++
++class HAProxyProtocolMixin(object):
++
++    """
++    A Protocol class mix-in that provides HAProxy support.
++
++    The values driven from the PROXY header, such as networkProtocol, source,
++    and destination, are only available when proxyParsed is set to True. These
++    values have no meaning when proxyParsed is False.
++
++    Usage::
++
++        from twisted.words.protocols.jabber import xmlstream
++
++        class XmlStream(xmlstream.XmlStream, HAProxyProtocolMixin):
++
++            def __init__(self, *args, **kwargs):
++                HAProxyProtocolMixin.__init__(self)
++                xmlstream.XmlStream.__init__(self, *args, **kwargs)
++
++            def dataReceived(self, data):
++                if self.proxyParsed:
++
++                    return xmlstream.XmlStream.dataReceived(self, data)
++
++                HAProxyProtocolMixin.dataReceived(self, data)
++                # If the header was parsed, continue with the remaining bytes.
++                if self.proxyParsed and self.overflowBuffer:
++
++                    xmlstream.XmlStream.dataReceived(self, self.overflowBuffer)
++
++    @cvar haProxyNewline: The bytestring to use when searching for the newline
++        that identifies the end of a valid PROXY header.
++    @type haProxyNewline: bytes
++
++    @ivar proxyParsed: A boolean indicator for whether or not the mix-in has
++        parsed a valid PROXY header.
++    @type proxyParsed: bool
++    @ivar overflowBuffer: A bytestring that contains all bytes delivered to
++        the mix-in dataReceived method but were not part of the PROXY header.
++    @type overflowBuffer: bytes
++    @ivar networkProtocol: A bytestring that represents the network protocol
++        identified by the PROXY header. Ex: TCP6, TCP4, UNKNOWN
++    @type networkProtocol: bytes
++    @ivar source: A two-tuple containing the source IP address and port both
++        encoded as bytes.
++    @type source: tuple
++    @ivar destination: A two-tuple containing the destination IP address and
++        port both encoded as bytes.
++    @type destination: tuple
++    """
++
++    haProxyNewline = _NEWLINE
++
++    def __init__(self):
++        """
++        Set the fiddly bits for HAProxy protocol.
++        """
++        self.proxyParsed = False
++        self._headerBuffer = b''
++        self.overflowBuffer = b''
++
++        self.networkProtocol = None
++        self.source = (None, None)
++        self.destination = (None, None)
++
++
++    def dataReceived(self, data):
++        """
++        Parse and manage data related to the HAProxy protocol header.
++
++        @param data: Bytes read from the transport.
++        @type data: bytes
++        """
++        if self.proxyParsed:
++
++            self.overflowBuffer += data
++            return None
++
++        lines = (self._headerBuffer + data).split(self.haProxyNewline, 1)
++        self._headerBuffer = lines.pop(0)
++        if not lines:
++            return None
++
++        (
++        proxyStr,
++        networkProtocol,
++        sourceAddr,
++        sourcePort,
++        destAddr,
++        destPort,
++        ) = parseProtocolHeader(self._headerBuffer)
++        self.proxyParsed = True
++        self.networkProtocol = networkProtocol
++        self.source = (sourceAddr, sourcePort)
++        self.destination = (destAddr, destPort)
++        self.overflowBuffer = lines.pop()
++
++
++__all__ = (
++    'InvalidProxyHeader',
++    'InvalidNetworkProtocol',
++    'MissingSourceData',
++    'MissingDestinationData',
++    'parseProtocolHeader',
++    'HAProxyProtocolMixin',
++)
+diff --git twisted/protocols/test/test_haproxy.py twisted/protocols/test/test_haproxy.py
+new file mode 100644
+index 0000000..c229833
+--- /dev/null
++++ twisted/protocols/test/test_haproxy.py
+@@ -0,0 +1,131 @@
++# Copyright (c) Twisted Matrix Laboratories.
++# See LICENSE for details.
++
++"""
++Test cases for L{twisted.protocols.haproxy}.
++"""
++
++from twisted.trial import unittest
++from twisted.protocols import haproxy
++from twisted.internet import protocol
++
++
++class HAProxyProtocolMixinTests(unittest.TestCase):
++    """
++    Test L{haproxy.HAProxyProtocolMixin} parsing behaviour.
++    """
++
++    def setUp(self):
++        """Create a test fixture for the HAProxyProtocolMixin class."""
++        class WrittenToProtocol(protocol.Protocol):
++
++            def __init__(self, *args, **kwargs):
++                self.gotData = None
++
++            def dataReceived(self, data):
++                self.gotData = data
++
++        class ProxyProtocolMixinTest(
++                WrittenToProtocol,
++                haproxy.HAProxyProtocolMixin,
++        ):
++
++            def __init__(self, *args, **kwargs):
++                haproxy.HAProxyProtocolMixin.__init__(self)
++                WrittenToProtocol.__init__(self, *args, **kwargs)
++
++            def dataReceived(self, data):
++                if self.proxyParsed:
++
++                    return WrittenToProtocol.dataReceived(self, data)
++
++                haproxy.HAProxyProtocolMixin.dataReceived(self, data)
++                # If the header was parsed, continue with the remaining bytes.
++                if self.proxyParsed and self.overflowBuffer:
++
++                    WrittenToProtocol.dataReceived(self, self.overflowBuffer)
++
++        self.constructor = ProxyProtocolMixinTest
++
++
++    def test_missingPROXYHeaderValue(self):
++        """
++        Test that an exception is raised when the PROXY header is missing.
++        """
++        proto = self.constructor()
++        self.assertRaises(
++            haproxy.InvalidProxyHeader,
++            proto.dataReceived,
++            b'NOTPROXY \r\n',
++        )
++
++
++    def test_invalidNetworkProtocol(self):
++        """
++        Test that an exception is raised when the proto is not TCP or UNKNOWN.
++        """
++        proto = self.constructor()
++        self.assertRaises(
++            haproxy.InvalidNetworkProtocol,
++            proto.dataReceived,
++            b'PROXY WUTPROTO \r\n',
++        )
++
++
++    def test_missingSourceData(self):
++        """
++        Test that an exception is raised when the proto has no source data.
++        """
++        proto = self.constructor()
++        self.assertRaises(
++            haproxy.MissingSourceData,
++            proto.dataReceived,
++            b'PROXY TCP4 \r\n',
++        )
++
++
++    def test_missingDestData(self):
++        """
++        Test that an exception is raised when the proto has no destination.
++        """
++        proto = self.constructor()
++        self.assertRaises(
++            haproxy.MissingDestinationData,
++            proto.dataReceived,
++            b'PROXY TCP4 127.0.0.1 8080 \r\n',
++        )
++
++
++    def test_fullParsingSuccess(self):
++        """
++        Test that parsing is successful for a PROXY header.
++        """
++        proto = self.constructor()
++        proto.dataReceived(b'PROXY TCP4 127.0.0.1 8080 127.0.0.1 8888\r\n')
++        self.assertTrue(proto.proxyParsed)
++        self.assertEqual(proto.networkProtocol, b'TCP4')
++        self.assertEqual((b'127.0.0.1', b'8080'), proto.source)
++        self.assertEqual((b'127.0.0.1', b'8888'), proto.destination)
++
++
++    def test_wrapperCallsWrapped(self):
++        """
++        Test if the wrapper calls the wrapped Protocol after init.
++        """
++        proto = self.constructor()
++        proto.dataReceived(b'PROXY TCP4 127.0.0.1 8080 127.0.0.1 8888\r\n')
++        self.assertTrue(proto.proxyParsed)
++        proto.dataReceived(b'some data')
++        self.assertEqual(proto.gotData, b'some data')
++
++
++    def test_wrapperCallsWrappedOverflow(self):
++        """
++        Test if the wrapper calls the wrapped Protocol after init.
++        """
++        proto = self.constructor()
++        proto.dataReceived(
++            b'PROXY TCP4 127.0.0.1 8080 127.0.0.1 8888\r\nsome data'
++        )
++        self.assertTrue(proto.proxyParsed)
++        self.assertEqual(proto.gotData, b'some data')
+diff --git twisted/topfiles/8203.feature twisted/topfiles/8203.feature
+new file mode 100644
+index 0000000..5c63d02
+--- /dev/null
++++ twisted/topfiles/8203.feature
+@@ -0,0 +1 @@
++twisted.protocol.haproxy provides a Protocol mix-in that enables other Protocol implementations to parse and handle the data stream annotations injected by HAProxy.

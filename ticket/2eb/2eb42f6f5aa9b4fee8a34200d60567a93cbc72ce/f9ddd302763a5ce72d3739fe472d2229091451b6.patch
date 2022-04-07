@@ -1,0 +1,370 @@
+=== added file 'fake_inetd.py'
+--- fake_inetd.py	1970-01-01 00:00:00 +0000
++++ fake_inetd.py	2011-09-03 16:18:38 +0000
+@@ -0,0 +1,20 @@
++#!/usr/bin/env python
++
++if __name__ == '__main__':
++    import fake_inetd
++    raise SystemExit(fake_inetd.main())
++
++from select import select
++from socket import socket, SOL_SOCKET, SO_REUSEADDR
++from subprocess import Popen
++
++def main():
++    s = socket()
++    s.setsockopt(SOL_SOCKET, SO_REUSEADDR, 1)
++    s.bind(('127.0.0.1', 1080))
++    s.listen(0)
++    while True:
++        r, w, e = select([s], [], [])
++        if r:
++            p = Popen(['python', 'line_reflector.py'], stdin=s.fileno())
++            p.wait()
+
+=== added file 'inetd.conf'
+--- inetd.conf	1970-01-01 00:00:00 +0000
++++ inetd.conf	2011-09-03 16:26:42 +0000
+@@ -0,0 +1,1 @@
++1080 stream  tcp     wait  richard      /home/richard/Projects/Twisted/branches/port-from-fd-5248/line_reflector.py
+
+=== added file 'line_reflector.py'
+--- line_reflector.py	1970-01-01 00:00:00 +0000
++++ line_reflector.py	2011-09-03 16:08:40 +0000
+@@ -0,0 +1,34 @@
++#!/usr/bin/env python
++
++if __name__ == '__main__':
++    import line_reflector
++    raise SystemExit(line_reflector.main())
++
++"""
++
++"""
++
++from twisted.internet import reactor
++from twisted.internet.tcp import SharedPort
++from twisted.internet.protocol import ServerFactory
++from twisted.protocols.basic import LineReceiver
++
++
++class LineReflector(LineReceiver):
++    def lineReceived(self, line):
++        msg = 'LINE: %r' % (line,)
++        print msg
++        self.sendLine(msg)
++        if line == 'QUIT':
++            self.transport.loseConnection()
++        if line == 'SHUTDOWN':
++            reactor.stop()
++
++
++def main():
++    f = ServerFactory()
++    f.protocol = LineReflector
++    p = SharedPort(0, f, reactor=reactor)
++    p.startListening()
++
++    reactor.run()
+
+=== modified file 'twisted/internet/base.py'
+--- twisted/internet/base.py	2011-06-13 22:20:22 +0000
++++ twisted/internet/base.py	2011-09-03 15:39:36 +0000
+@@ -1082,10 +1082,18 @@
+     addressFamily = None
+     socketType = None
+ 
+-    def createInternetSocket(self):
+-        s = socket.socket(self.addressFamily, self.socketType)
++    def createInternetSocket(self, fd=None):
++        """
++        @param fd: Optional filedescriptor number of an existing socket fd.
++        """
++        if fd is None:
++            s = socket.socket(self.addressFamily, self.socketType)
++            fdesc._setCloseOnExec(s.fileno())
++        else:
++            s = socket.fromfd(fd, self.addressFamily, self.socketType)
++
+         s.setblocking(0)
+-        fdesc._setCloseOnExec(s.fileno())
++
+         return s
+ 
+ 
+
+=== modified file 'twisted/internet/tcp.py'
+--- twisted/internet/tcp.py	2011-04-03 16:40:56 +0000
++++ twisted/internet/tcp.py	2011-09-03 15:58:01 +0000
+@@ -489,8 +489,7 @@
+         return address.IPv4Address('TCP', *self.client)
+ 
+ 
+-
+-class Port(base.BasePort, _SocketCloser):
++class BaseTcpPort(base.BasePort):
+     """
+     A TCP server port, listening for connections.
+ 
+@@ -530,15 +529,6 @@
+     # value when we are actually listening.
+     _realPortNumber = None
+ 
+-    def __init__(self, port, factory, backlog=50, interface='', reactor=None):
+-        """Initialize with a numeric port to listen on.
+-        """
+-        base.BasePort.__init__(self, reactor=reactor)
+-        self.port = port
+-        self.factory = factory
+-        self.backlog = backlog
+-        self.interface = interface
+-
+     def __repr__(self):
+         if self._realPortNumber is not None:
+             return "<%s of %s on %s>" % (self.__class__, self.factory.__class__,
+@@ -546,12 +536,6 @@
+         else:
+             return "<%s of %s (not listening)>" % (self.__class__, self.factory.__class__)
+ 
+-    def createInternetSocket(self):
+-        s = base.BasePort.createInternetSocket(self)
+-        if platformType == "posix" and sys.platform != "cygwin":
+-            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+-        return s
+-
+ 
+     def startListening(self):
+         """Create and bind my socket, and begin listening on it.
+@@ -559,11 +543,7 @@
+         This is called on unserialization, and must be called after creating a
+         server to begin listening on the specified port.
+         """
+-        try:
+-            skt = self.createInternetSocket()
+-            skt.bind((self.interface, self.port))
+-        except socket.error, le:
+-            raise CannotListenError, (self.interface, self.port, le)
++        skt = self.createInternetSocket()
+ 
+         # Make sure that if we listened on port 0, we update that to
+         # reflect what the OS actually assigned us.
+@@ -658,6 +638,7 @@
+             # and return, so handling it here works just as well.
+             log.deferr()
+ 
++
+     def loseConnection(self, connDone=failure.Failure(main.CONNECTION_DONE)):
+         """
+         Stop accepting connections on this port.
+@@ -707,6 +688,7 @@
+         """
+         return reflect.qual(self.factory.__class__)
+ 
++
+     def getHost(self):
+         """Returns an IPv4Address.
+ 
+@@ -714,6 +696,89 @@
+         """
+         return address.IPv4Address('TCP', *self.socket.getsockname())
+ 
++
++class Port(BaseTcpPort, _SocketCloser):
++    """
++    A TCP server port, listening for connections.
++
++    When a connection is accepted, this will call a factory's buildProtocol
++    with the incoming address as an argument, according to the specification
++    described in L{twisted.internet.interfaces.IProtocolFactory}.
++
++    If you wish to change the sort of transport that will be used, the
++    C{transport} attribute will be called with the signature expected for
++    C{Server.__init__}, so it can be replaced.
++
++    @ivar deferred: a deferred created when L{stopListening} is called, and
++        that will fire when connection is lost. This is not to be used it
++        directly: prefer the deferred returned by L{stopListening} instead.
++    @type deferred: L{defer.Deferred}
++
++    @ivar disconnecting: flag indicating that the L{stopListening} method has
++        been called and that no connections should be accepted anymore.
++    @type disconnecting: C{bool}
++
++    @ivar connected: flag set once the listen has successfully been called on
++        the socket.
++    @type connected: C{bool}
++    """
++
++    def __init__(self, port, factory, backlog=50, interface='', reactor=None):
++        """Initialize with a numeric port to listen on.
++        """
++        BaseTcpPort.__init__(self, reactor=reactor)
++        self.port = port
++        self.factory = factory
++        self.backlog = backlog
++        self.interface = interface
++
++
++    def createInternetSocket(self):
++        try:
++            s = BaseTcpPort.createInternetSocket(self)
++            if platformType == "posix" and sys.platform != "cygwin":
++                s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
++            s.bind((self.interface, self.port))
++            return s
++        except socket.error, le:
++            raise CannotListenError, (self.interface, self.port, le)
++
++
++class SharedPort(BaseTcpPort):
++    """
++    A TCP server port for which a listening socket already exists. eg
++    a socket may have been setup by a parent process such as inetd or
++    systemd.
++
++    The socket will not be destroyed when this Port stops listening or
++    is destroyed.
++    """
++
++    def __init__(self, fd, factory, backlog=50, reactor=None):
++        """
++        Initialize with the file descriptor number of an existing
++        listening socket.
++        """
++        BaseTcpPort.__init__(self, reactor=reactor)
++        self.fd = fd
++        self.factory = factory
++        self.backlog = backlog
++
++
++    def createInternetSocket(self):
++        try:
++            s = BaseTcpPort.createInternetSocket(self, fd=self.fd)
++            if platformType == "posix" and sys.platform != "cygwin":
++                s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
++            return s
++        except socket.error, le:
++            raise CannotListenError, (self.interface, self.fd, le)
++
++
++    def _closeSocket(self):
++        pass
++
++
+ class Connector(base.BaseConnector):
+     def __init__(self, host, port, factory, timeout, bindAddress, reactor=None):
+         self.host = host
+
+=== modified file 'twisted/internet/test/test_unix.py'
+--- twisted/internet/test/test_unix.py	2011-07-14 18:05:14 +0000
++++ twisted/internet/test/test_unix.py	2011-09-03 14:41:08 +0000
+@@ -159,7 +159,7 @@
+         """
+         Get the expected connection lost message for a UNIX port
+         """
+-        return "(UNIX Port %s Closed)" % (repr(port.port),)
++        return "(UNIX Port %s Closed)" % (repr(port.fileName),)
+ 
+ 
+ 
+
+=== modified file 'twisted/internet/unix.py'
+--- twisted/internet/unix.py	2011-05-15 20:41:27 +0000
++++ twisted/internet/unix.py	2011-09-03 15:14:36 +0000
+@@ -67,7 +67,7 @@
+ 
+ 
+ 
+-class Port(_UNIXPort, tcp.Port):
++class Port(_UNIXPort, tcp.BaseTcpPort):
+     addressFamily = socket.AF_UNIX
+     socketType = socket.SOCK_STREAM
+ 
+@@ -75,14 +75,18 @@
+     lockFile = None
+ 
+     def __init__(self, fileName, factory, backlog=50, mode=0666, reactor=None, wantPID = 0):
+-        tcp.Port.__init__(self, fileName, factory, backlog, reactor=reactor)
++        tcp.BaseTcpPort.__init__(self, reactor=reactor)
++        self.fileName = fileName
++        self.factory = factory
++        self.backlog = backlog
++
+         self.mode = mode
+         self.wantPID = wantPID
+ 
+     def __repr__(self):
+         factoryName = reflect.qual(self.factory.__class__)
+         if hasattr(self, 'socket'):
+-            return '<%s on %r>' % (factoryName, self.port)
++            return '<%s on %r>' % (factoryName, self.fileName)
+         else:
+             return '<%s (not listening)>' % (factoryName,)
+ 
+@@ -96,11 +100,11 @@
+         This is called on unserialization, and must be called after creating a
+         server to begin listening on the specified port.
+         """
+-        log.msg("%s starting on %r" % (self.factory.__class__, repr(self.port)))
++        log.msg("%s starting on %r" % (self.factory.__class__, repr(self.fileName)))
+         if self.wantPID:
+-            self.lockFile = lockfile.FilesystemLock(self.port + ".lock")
++            self.lockFile = lockfile.FilesystemLock(self.fileName + ".lock")
+             if not self.lockFile.lock():
+-                raise CannotListenError, (None, self.port, "Cannot acquire lock")
++                raise CannotListenError, (None, self.fileName, "Cannot acquire lock")
+             else:
+                 if not self.lockFile.clean:
+                     try:
+@@ -109,21 +113,21 @@
+                         # If it fails, there's not much else we can
+                         # do.  The bind() below will fail with an
+                         # exception that actually propagates.
+-                        if stat.S_ISSOCK(os.stat(self.port).st_mode):
+-                            os.remove(self.port)
++                        if stat.S_ISSOCK(os.stat(self.fileName).st_mode):
++                            os.remove(self.fileName)
+                     except:
+                         pass
+ 
+         self.factory.doStart()
+         try:
+             skt = self.createInternetSocket()
+-            skt.bind(self.port)
++            skt.bind(self.fileName)
+         except socket.error, le:
+-            raise CannotListenError, (None, self.port, le)
++            raise CannotListenError, (None, self.fileName, le)
+         else:
+-            if _inFilesystemNamespace(self.port):
++            if _inFilesystemNamespace(self.fileName):
+                 # Make the socket readable and writable to the world.
+-                os.chmod(self.port, self.mode)
++                os.chmod(self.fileName, self.mode)
+             skt.listen(self.backlog)
+             self.connected = True
+             self.socket = skt
+@@ -136,15 +140,14 @@
+         """
+         Log message for closing socket
+         """
+-        log.msg('(UNIX Port %s Closed)' % (repr(self.port),))
+-
+-
+-    def connectionLost(self, reason):
+-        if _inFilesystemNamespace(self.port):
+-            os.unlink(self.port)
++        log.msg('(UNIX Port %s Closed)' % (repr(self.fileName),))
++
++
++    def _closeSocket(self):
++        if _inFilesystemNamespace(self.fileName):
++            os.unlink(self.fileName)
+         if self.lockFile is not None:
+             self.lockFile.unlock()
+-        tcp.Port.connectionLost(self, reason)
+ 
+ 
+ 
+

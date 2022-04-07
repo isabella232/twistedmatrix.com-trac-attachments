@@ -1,0 +1,141 @@
+Index: twisted/protocols/socks.py
+===================================================================
+--- twisted/protocols/socks.py	(revision 27295)
++++ twisted/protocols/socks.py	(working copy)
+@@ -1,4 +1,5 @@
+-# Copyright (c) 2001-2004 Twisted Matrix Laboratories.
++# -*- test-case-name: twisted.test.test_socks -*-
++# Copyright (c) 2001-2009 Twisted Matrix Laboratories.
+ # See LICENSE for details.
+ 
+ 
+@@ -64,38 +65,49 @@
+         self.buf=""
+         self.otherConn=None
+ 
+-    def dataReceived(self,data):
++    def dataReceived(self, data):
+         if self.otherConn:
+             self.otherConn.write(data)
+             return
+-        self.buf=self.buf+data
+-        if '\000' in self.buf[8:]:
+-            head,self.buf=self.buf[:8],self.buf[8:]
+-            try:
+-                version,code,port=struct.unpack("!BBH",head[:4])
+-            except struct.error:
+-                raise RuntimeError, "struct error with head='%s' and buf='%s'"%(repr(head),repr(self.buf))
+-            user,self.buf=string.split(self.buf,"\000",1)
+-            if head[4:7]=="\000\000\000": # domain is after
+-                server,self.buf=string.split(self.buf,'\000',1)
+-                #server=gethostbyname(server)
+-            else:
+-                server=socket.inet_ntoa(head[4:8])
+-            assert version==4, "Bad version code: %s"%version
+-            if not self.authorize(code,server,port,user):
+-                self.makeReply(91)
+-                return
+-            if code==1: # CONNECT
+-                d = self.connectClass(server, port, SOCKSv4Outgoing, self)
+-                d.addErrback(lambda result, self=self: self.makeReply(91))
+-            elif code==2: # BIND
+-                ip = socket.gethostbyname(server)
+-                d = self.listenClass(0, SOCKSv4IncomingFactory, self, ip)
+-                d.addCallback(lambda (h, p), self=self: self.makeReply(90, 0, p, h))
+-            else:
+-                raise RuntimeError, "Bad Connect Code: %s" % code
+-            assert self.buf=="","hmm, still stuff in buffer... %s" % repr(self.buf)
++        self.buf = self.buf + data
++        try:
++            idx1 = self.buf.index('\000', 8)
++            idx2 = None
++            if self.buf[4:7] == "\000\000\000":
++                # We are in the SOCKSv4A case. Find the last null that is
++                # terminating field 6 which contains the domain name of the
++                # host. That marks the end of a complete request packet.
++                idx2 = self.buf.index('\000', idx1 + 1)
++        except ValueError:
++            return
+ 
++        head, user = self.buf[:8], self.buf[8:idx1]
++        self.buf = self.buf[idx1 + 1:]
++        try:
++            version, code, port = struct.unpack("!BBH", head[:4])
++        except struct.error:
++            raise RuntimeError(
++                "struct error with head = '%s' and buf = '%s'" %
++                (repr(head), repr(self.buf)))
++        if idx2:
++            server, self.buf = string.split(self.buf, '\000', 1)
++        else:
++            server = socket.inet_ntoa(head[4:8])
++        assert version == 4, "Bad version code: %s" % version
++        if not self.authorize(code, server, port, user):
++            self.makeReply(91)
++            return
++        if code == 1: # CONNECT
++            d = self.connectClass(server, port, SOCKSv4Outgoing, self)
++            d.addErrback(lambda result, self = self: self.makeReply(91))
++        elif code == 2: # BIND
++            ip = socket.gethostbyname(server)
++            d = self.listenClass(0, SOCKSv4IncomingFactory, self, ip)
++            d.addCallback(lambda (h, p), self = self: self.makeReply(90, 0, p, h))
++        else:
++            raise RuntimeError, "Bad Connect Code: %s" % code
++        assert self.buf == "", "hmm, still stuff in buffer... %s" % repr(self.buf)
++
+     def connectionLost(self, reason):
+         if self.otherConn:
+             self.otherConn.transport.loseConnection()
+Index: twisted/test/test_socks.py
+===================================================================
+--- twisted/test/test_socks.py	(revision 27295)
++++ twisted/test/test_socks.py	(working copy)
+@@ -1,3 +1,7 @@
++# -*- test-case-name: twisted.test.test_socks -*-
++# Copyright (c) 2001-2009 Twisted Matrix Laboratories.
++# See LICENSE file for details.
++
+ """SOCKS unit tests."""
+ 
+ from twisted.trial import unittest
+@@ -129,6 +133,8 @@
+         # now close it from the client side
+         self.sock.connectionLost('fake reason')
+ 
++
++
+ class Bind(unittest.TestCase):
+     def setUp(self):
+         self.sock = SOCKSv4Driver()
+@@ -278,3 +284,30 @@
+                          struct.pack('!BBH', 0, 91, 0)
+                          + socket.inet_aton('0.0.0.0'))
+         self.assert_(self.sock.transport.stringTCPTransport_closing)
++
++
++    def test_SOCKSv4ASupport(self):
++        """
++        Test that L{SOCKSv4.dataReceived} can process SOCKSv4A packets. SOCKSv4A
++        packets from a client have a bogus IP in the IP field and an additional
++        field containing the hostname for the server to resolve.
++        """
++        self.sock.dataReceived(
++            struct.pack('!BBH', 4, 2, 34)
++            + struct.pack('!L', 1)
++            + 'fooBAR' + '\000')
++        sent = self.sock.transport.value()
++        self.sock.transport.clear()
++        # Wait until the rest of the packet is received.
++        self.assertEqual(sent, '')
++
++        # Cheat a little here and give an IP address instead of a hostname to
++        # avoid testing issues with gethostbyname.
++        self.sock.dataReceived('1.2.3.4' + '\000')
++        sent = self.sock.transport.value()
++        self.sock.transport.clear()
++        self.assertEqual(sent,
++                         struct.pack('!BBH', 0, 90, 1234)
++                         + socket.inet_aton('6.7.8.9'))
++
++        self.sock.connectionLost('fake reason')

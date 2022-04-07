@@ -1,0 +1,407 @@
+Index: twisted/web/http.py
+===================================================================
+--- twisted/web/http.py	(revision 46705)
++++ twisted/web/http.py	(working copy)
+@@ -562,6 +562,13 @@
+         which this request was received is closed and which is C{True} after
+         that.
+     @type _disconnected: C{bool}
++
++    @ivar _queuedHeaders: A C{tuple} of items that would normally be passed to
++        L{HTTPChannel.writeHeaders}. Used when the response is queued to store
++        the eventual headers.
++    @type _queuedHeaders: A C{tuple} of HTTP version (C{bytes}), status code
++        (C{int}), reason phrase (C{bytes}), and headers (C{list} of C{tuple}s
++        of C{(bytes, bytes)}.
+     """
+     producer = None
+     finished = 0
+@@ -580,6 +587,7 @@
+     content = None
+     _forceSSL = 0
+     _disconnected = False
++    _queuedHeaders = None
+ 
+     def __init__(self, channel, queued):
+         """
+@@ -598,7 +606,7 @@
+         if queued:
+             self.transport = StringTransport()
+         else:
+-            self.transport = self.channel.transport
++            self.transport = self.channel
+ 
+ 
+     def _cleanup(self):
+@@ -637,7 +645,10 @@
+ 
+         # set transport to real one and send any buffer data
+         data = self.transport.getvalue()
+-        self.transport = self.channel.transport
++        self.transport = self.channel
++        if self._queuedHeaders:
++            self.transport.writeHeaders(*self._queuedHeaders)
++            self._queuedHeaders = None
+         if data:
+             self.transport.write(data)
+ 
+@@ -727,8 +738,8 @@
+ 
+         # cache the client and server information, we'll need this later to be
+         # serialized and sent with the request so CGIs will work remotely
+-        self.client = self.channel.transport.getPeer()
+-        self.host = self.channel.transport.getHost()
++        self.client = self.channel.getPeer()
++        self.host = self.channel.getHost()
+ 
+         # Argument processing
+         args = self.args
+@@ -755,7 +766,7 @@
+                         self.args.update(cgiArgs)
+                 except:
+                     # It was a bad request.
+-                    _respondToBadRequestAndDisconnect(self.channel.transport)
++                    _respondToBadRequestAndDisconnect(self.channel)
+                     return
+             self.content.seek(0, 0)
+ 
+@@ -805,14 +816,14 @@
+             if streaming:
+                 producer.pauseProducing()
+         else:
+-            self.transport.registerProducer(producer, streaming)
++            self.channel.registerProducer(producer, streaming)
+ 
+     def unregisterProducer(self):
+         """
+         Unregister the producer.
+         """
+         if not self.queued:
+-            self.transport.unregisterProducer()
++            self.channel.unregisterProducer()
+         self.producer = None
+ 
+ 
+@@ -870,7 +881,7 @@
+ 
+         if not self.startedWriting:
+             # write headers
+-            self.write('')
++            self.write(b'')
+ 
+         if self.chunked:
+             # write last chunk and closing CRLF
+@@ -899,19 +910,18 @@
+         if not self.startedWriting:
+             self.startedWriting = 1
+             version = self.clientproto
+-            l = []
+-            l.append(
+-                version + b" " +
+-                intToBytes(self.code) + b" " +
+-                self.code_message + b"\r\n")
++            code = intToBytes(self.code)
++            reason = self.code_message
+ 
++            headers = []
++
+             # if we don't have a content length, we send data in
+             # chunked mode, so that we can support pipelining in
+             # persistent connections.
+             if ((version == b"HTTP/1.1") and
+                 (self.responseHeaders.getRawHeaders(b'content-length') is None) and
+                 self.method != b"HEAD" and self.code not in NO_BODY_CODES):
+-                l.append(b'Transfer-Encoding: chunked\r\n')
++                headers.append((b'Transfer-Encoding', 'chunked'))
+                 self.chunked = 1
+ 
+             if self.lastModified is not None:
+@@ -935,15 +945,16 @@
+                             category=DeprecationWarning, stacklevel=2)
+                         # Backward compatible cast for non-bytes values
+                         value = networkString('%s' % (value,))
+-                    l.extend([name, b": ", value, b"\r\n"])
++                    headers.append((name, value))
+ 
+             for cookie in self.cookies:
+-                l.append(networkString('Set-Cookie: %s\r\n' % (cookie,)))
++                headers.append((b'Set-Cookie', networkString(cookie)))
+ 
+-            l.append(b"\r\n")
++            if self.queued:
++                self._queuedHeaders = (version, code, reason, headers)
++            else:
++                self.channel.writeHeaders(version, code, reason, headers)
+ 
+-            self.transport.writeSequence(l)
+-
+             # if this is a "HEAD" request, we shouldn't return any data
+             if self.method == b"HEAD":
+                 self.write = lambda data: None
+@@ -1828,7 +1839,95 @@
+             request.connectionLost(reason)
+ 
+ 
++    def writeHeaders(self, version, code, reason, headers):
++        """
++        Called by C{Request} objects to write a complete set of HTTP headers to
++        a transport.
+ 
++        @param version: The HTTP version in use.
++        @type version: C{bytes}
++
++        @param code: The HTTP status code to write.
++        @type code: C{bytes}
++
++        @param reason: The HTTP reason phrase to write.
++        @type reason: C{bytes}
++
++        @param headers: The headers to write to the transport.
++        @type headers: L{twisted.web.http_headers.Headers}
++        """
++        response_line = version + b" " + code + b" " + reason + b"\r\n"
++        headerSequence = [response_line]
++        headerSequence.extend(
++            name + b': ' + value + b"\r\n" for name, value in headers
++        )
++        headerSequence.append("\r\n")
++        self.transport.writeSequence(headerSequence)
++
++
++    def registerProducer(self, producer, streaming):
++        """
++        @see L{IConsumer.registerProducer}
++        """
++        return self.transport.registerProducer(producer, streaming)
++
++
++    def unregisterProducer(self):
++        """
++        @see L{IConsumer.unregisterProducer}
++        """
++        return self.transport.unregisterProducer()
++
++
++    def write(self, data):
++        """
++        Called by C{Request} objects to write response data.
++
++        @param data: The data chunk to write to the stream.
++        @type data: C{bytes}
++        """
++        self.transport.write(data)
++
++
++    def writeSequence(self, iovec):
++        """
++        Write a list of strings to the HTTP response.
++
++        @param iovec: A list of byte strings to write to the stream.
++        @type data: C{list} of C{bytes}
++        """
++        self.transport.writeSequence(iovec)
++
++
++    def getPeer(self):
++        """
++        Get the remote address of this connection.
++
++        @return: An L{IAddress} provider.
++        """
++        return self.transport.getPeer()
++
++
++    def getHost(self):
++        """
++        Get the local address of this connection.
++
++        @return: An L{IAddress} provider.
++        """
++        return self.transport.getHost()
++
++    def loseConnection(self):
++        """
++        Closes the connection. Will write any data that is pending to be sent
++        on the network, but if this response has not yet been written to the
++        network will not write anything.
++        """
++        # TODO: Does this need to be smarter, particularly about queued
++        # responses?
++        return self.transport.loseConnection()
++
++
++
+ def _respondToBadRequestAndDisconnect(transport):
+     """
+     This is a quick and dirty way of responding to bad requests.
+Index: twisted/web/test/requesthelper.py
+===================================================================
+--- twisted/web/test/requesthelper.py	(revision 46705)
++++ twisted/web/test/requesthelper.py	(working copy)
+@@ -52,6 +52,9 @@
+         def registerProducer(self, producer, streaming):
+             self.producers.append((producer, streaming))
+ 
++        def unregisterProducer(self):
++            pass
++
+         def loseConnection(self):
+             self.disconnected = True
+ 
+@@ -70,7 +73,54 @@
+         pass
+ 
+ 
++    def writeHeaders(self, version, code, reason, headers):
++        response_line = version + b" " + code + b" " + reason + b"\r\n"
++        headerSequence = [response_line]
++        headerSequence.extend(
++            name + b': ' + value + b"\r\n" for name, value in headers
++        )
++        headerSequence.append("\r\n")
++        self.transport.writeSequence(headerSequence)
+ 
++
++    def getPeer(self):
++        return self.transport.getPeer()
++
++
++    def getHost(self):
++        return self.transport.getHost()
++
++
++    def registerProducer(self, producer, streaming):
++        self.transport.registerProducer(producer, streaming)
++
++
++    def unregisterProducer(self):
++        self.transport.unregisterProducer()
++
++
++    def write(self, data):
++        self.transport.write(data)
++
++
++    def writeSequence(self, iovec):
++        self.transport.writeSequence(iovec)
++
++
++    def loseConnection(self):
++        self.transport.loseConnection()
++
++
++    def endRequest(self):
++        pass
++
++
++    @property
++    def producers(self):
++        return self.transport.producers
++
++
++
+ class DummyRequest(object):
+     """
+     Represents a dummy or fake request.
+Index: twisted/web/test/test_http.py
+===================================================================
+--- twisted/web/test/test_http.py	(revision 46705)
++++ twisted/web/test/test_http.py	(working copy)
+@@ -235,6 +235,7 @@
+         self.assertEqual(response, expectedResponse)
+ 
+ 
++
+ class HTTPLoopbackTests(unittest.TestCase):
+ 
+     expectedHeaders = {b'request': b'/foo/bar',
+@@ -1556,8 +1557,10 @@
+         For an HTTP 1.0 request, L{http.Request.write} sends an HTTP 1.0
+         Response-Line and whatever response headers are set.
+         """
+-        req = http.Request(DummyChannel(), False)
++        channel = DummyChannel()
+         trans = StringTransport()
++        channel.transport = trans
++        req = http.Request(channel, False)
+ 
+         req.transport = trans
+ 
+@@ -1578,8 +1581,10 @@
+         L{http.Request.write} casts non-bytes header value to bytes
+         transparently.
+         """
+-        req = http.Request(DummyChannel(), False)
++        channel = DummyChannel()
+         trans = StringTransport()
++        channel.transport = trans
++        req = http.Request(channel, False)
+ 
+         req.transport = trans
+ 
+@@ -1610,8 +1615,10 @@
+         Response-Line, whatever response headers are set, and uses chunked
+         encoding for the response body.
+         """
+-        req = http.Request(DummyChannel(), False)
++        channel = DummyChannel()
+         trans = StringTransport()
++        channel.transport = trans
++        req = http.Request(channel, False)
+ 
+         req.transport = trans
+ 
+@@ -1635,8 +1642,10 @@
+         L{http.Request.write} sends an HTTP Response-Line, whatever response
+         headers are set, and a last-modified header with that time.
+         """
+-        req = http.Request(DummyChannel(), False)
++        channel = DummyChannel()
+         trans = StringTransport()
++        channel.transport = trans
++        req = http.Request(channel, False)
+ 
+         req.transport = trans
+ 
+Index: twisted/web/test/test_proxy.py
+===================================================================
+--- twisted/web/test/test_proxy.py	(revision 46705)
++++ twisted/web/test/test_proxy.py	(working copy)
+@@ -123,7 +123,15 @@
+         self.lostReason = reason
+ 
+ 
++    def getPeer(self):
++        return self.transport.getPeer()
+ 
++
++    def getHost(self):
++        return self.transport.getHost()
++
++
++
+ class ProxyClientTests(TestCase):
+     """
+     Tests for L{ProxyClient}.
+Index: twisted/web/test/test_web.py
+===================================================================
+--- twisted/web/test/test_web.py	(revision 46705)
++++ twisted/web/test/test_web.py	(working copy)
+@@ -817,7 +817,7 @@
+         resource = HeadlessResource()
+         req = self._getReq(resource)
+         req.requestReceived(b"HEAD", b"/newrender", b"HTTP/1.0")
+-        headers, body = req.transport.getvalue().split(b'\r\n\r\n')
++        body = req.transport.getvalue()
+         self.assertEqual(req.code, 200)
+         self.assertEqual(body, b'')
+ 
+@@ -838,7 +838,7 @@
+ 
+         request.requestReceived(b"GET", b"/newrender", b"HTTP/1.0")
+ 
+-        headers, body = request.transport.getvalue().split(b'\r\n\r\n')
++        body = request.transport.getvalue()
+         self.assertEqual(request.code, 500)
+         expected = [
+             '',

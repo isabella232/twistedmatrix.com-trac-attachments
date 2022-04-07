@@ -1,0 +1,105 @@
+=== modified file 'twisted/names/tap.py'
+--- twisted/names/tap.py	2012-03-18 14:44:22 +0000
++++ twisted/names/tap.py	2012-09-16 12:28:40 +0000
+@@ -8,6 +8,7 @@
+ 
+ import os, traceback
+ 
++from twisted.internet.base import ThreadedResolver
+ from twisted.python import usage
+ from twisted.names import dns
+ from twisted.application import internet, service
+@@ -15,19 +16,25 @@
+ from twisted.names import server
+ from twisted.names import authority
+ from twisted.names import secondary
++from twisted.names import root
+ 
+ class Options(usage.Options):
+     optParameters = [
+         ["interface", "i", "",   "The interface to which to bind"],
+         ["port",      "p", "53", "The port on which to listen"],
+         ["resolv-conf", None, None,
+-            "Override location of resolv.conf (implies --recursive)"],
++            "Override location of resolv.conf (implies --stubresolver)"],
+         ["hosts-file", None, None, "Perform lookups with a hosts file"],
+     ]
+ 
+     optFlags = [
+         ["cache",       "c", "Enable record caching"],
+         ["recursive",   "r", "Perform recursive lookups"],
++        ["stubresolver",   "", ("Forward recursive queries to the system's "
++                                "default recursive DNS server IPs "
++                                "or if --resolv-conf is given, "
++                                "to the recursive DNS servers "
++                                "defined in that file.")],
+         ["verbose",     "v", "Log verbosely"],
+     ]
+ 
+@@ -86,7 +93,7 @@
+ 
+     def postOptions(self):
+         if self['resolv-conf']:
+-            self['recursive'] = True
++            self['stubresolver'] = True
+ 
+         self.svcs = []
+         self.zones = []
+@@ -123,22 +130,26 @@
+     @return: Two-item tuple of a list of cache resovers and a list of client
+         resolvers
+     """
+-    from twisted.names import client, cache, hosts
++    from twisted.internet import reactor
++    from twisted.names import cache, client, hosts
+ 
+-    ca, cl = [], []
++    caches, clients = [], []
+     if config['cache']:
+-        ca.append(cache.CacheResolver(verbose=config['verbose']))
++        caches.append(cache.CacheResolver(verbose=config['verbose']))
+     if config['hosts-file']:
+-        cl.append(hosts.Resolver(file=config['hosts-file']))
++        clients.append(hosts.Resolver(file=config['hosts-file']))
++    if config['stubresolver']:
++        clients.append(client.createResolver(resolvconf=config['resolv-conf']))
+     if config['recursive']:
+-        cl.append(client.createResolver(resolvconf=config['resolv-conf']))
+-    return ca, cl
++        clients.append(root.bootstrap(ThreadedResolver(reactor)))
++    return caches, clients
+ 
+ 
+ def makeService(config):
+-    ca, cl = _buildResolvers(config)
++    caches, clients = _buildResolvers(config)
+ 
+-    f = server.DNSServerFactory(config.zones, ca, cl, config['verbose'])
++    f = server.DNSServerFactory(
++        config.zones, caches, clients, config['verbose'])
+     p = dns.DNSDatagramProtocol(f)
+     f.noisy = 0
+     ret = service.MultiService()
+
+=== modified file 'twisted/names/test/test_tap.py'
+--- twisted/names/test/test_tap.py	2012-03-18 14:44:22 +0000
++++ twisted/names/test/test_tap.py	2012-09-16 12:43:44 +0000
+@@ -78,14 +78,14 @@
+         self.assertEqual(secondary._port, 5354)
+ 
+ 
+-    def test_recursiveConfiguration(self):
++    def test_stubResolverConfiguration(self):
+         """
+-        Recursive DNS lookups, if enabled, should be a last-resort option.
++        Stub resolver behaviour, if enabled, should be a last-resort option.
+         Any other lookup method (cache, local lookup, etc.) should take
+         precedence over recursive lookups
+         """
+         options = Options()
+-        options.parseOptions(['--hosts-file', 'hosts.txt', '--recursive'])
++        options.parseOptions(['--hosts-file', 'hosts.txt', '--stubresolver'])
+         ca, cl = _buildResolvers(options)
+ 
+         # Extra cleanup, necessary on POSIX because client.Resolver doesn't know
+

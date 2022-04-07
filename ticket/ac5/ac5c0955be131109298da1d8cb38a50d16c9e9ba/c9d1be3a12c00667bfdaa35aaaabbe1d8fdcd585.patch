@@ -1,0 +1,187 @@
+Index: plugin.py
+===================================================================
+--- plugin.py	(revision 18619)
++++ plugin.py	(working copy)
+@@ -23,7 +23,7 @@
+ from twisted.python.components import getAdapterFactory
+ from twisted.python.reflect import namedAny
+ from twisted.python import log
+-
++from twisted.python.filepath import FilePath, DirNotFound
+ try:
+     from os import stat_float_times
+     from os.path import getmtime as _getmtime
+@@ -117,10 +117,6 @@
+         is missing.
+         """
+ 
+-# http://msdn.microsoft.com/library/default.asp?url=/library/en-us/debug/base/system_error_codes.asp
+-ERROR_PATH_NOT_FOUND = 3
+-ERROR_INVALID_NAME = 123
+-
+ def getCache(module):
+     topcache = {}
+     for p in module.__path__:
+@@ -133,31 +129,24 @@
+             cache = {}
+             lastCached = 0
+             dirtyCache = True
++        
++        fp = FilePath(p)
++        
+         try:
+-            dropinNames = os.listdir(p)
+-        except WindowsError, e:
+-            if e.errno == ERROR_PATH_NOT_FOUND:
+-                continue
+-            elif e.errno == ERROR_INVALID_NAME:
+-                log.msg("Invalid path %r in search path for %s" % (p, module.__name__))
+-                continue
+-            else:
+-                raise
+-        except OSError, ose:
+-            if ose.errno not in (errno.ENOENT, errno.ENOTDIR):
+-                raise
+-            else:
+-                continue
+-        else:
+-            pys = {}
+-            for dropinName in dropinNames:
+-                moduleName, moduleExt = os.path.splitext(dropinName)
+-                if moduleName != '__init__' and moduleExt in _exts:
+-                    pyFile = os.path.join(p, dropinName)
+-                    try:
+-                        pys[moduleName] = getmtime(pyFile)
+-                    except:
+-                        log.err()
++            dropinNames = fp.saneListdir()
++        except DirNotFound:
++            continue
++        
++        
++        pys = {}
++        for dropinName in dropinNames:
++            moduleName, moduleExt = os.path.splitext(dropinName)
++            if moduleName != '__init__' and moduleExt in _exts:
++                pyFile = os.path.join(p, dropinName)
++                try:
++                    pys[moduleName] = getmtime(pyFile)
++                except:
++                    log.err()
+ 
+         for moduleName, lastChanged in pys.iteritems():
+             if lastChanged >= lastCached or moduleName not in cache:
+@@ -200,6 +189,7 @@
+ 
+     return topcache
+ 
++
+ import twisted.plugins
+ def getPlugins(interface, package=twisted.plugins):
+     """Retrieve all plugins implementing the given interface beneath the given module.
+Index: python/filepath.py
+===================================================================
+--- python/filepath.py	(revision 18619)
++++ python/filepath.py	(working copy)
+@@ -38,6 +38,16 @@
+     def armor(s):
+         return s.encode('hex')
+ 
++
++
++class DirNotFound(Exception):
++    def __init__(self, reason, path):
++         self.path = path
++         self.reason = reason
++    def __str__(self):
++         return repr("Directory Not Found " + self.path + " " +self.reason )
++
++
+ class InsecurePath(Exception):
+     pass
+ 
+@@ -56,7 +66,7 @@
+         return self.open().read()
+ 
+     def children(self):
+-        return map(self.child, self.listdir())
++        return map(self.child, self.saneListdir())
+ 
+     def walk(self):
+         """
+@@ -129,7 +139,7 @@
+ 
+     statinfo = None
+     path = None
+-
++  
+     def __init__(self, path, alwaysCreate=False):
+         self.path = abspath(path)
+         self.alwaysCreate = alwaysCreate
+@@ -196,7 +206,7 @@
+                 return self
+             if ext == '*':
+                 basedot = basename(p)+'.'
+-                for fn in listdir(dirname(p)):
++                for fn in saneListdir(dirname(p)):
+                     if fn.startswith(basedot):
+                         return self.clonePath(joinpath(dirname(p), fn))
+             p2 = p + ext
+@@ -287,6 +297,36 @@
+     def isabs(self):
+         return isabs(self.path)
+ 
++    # http://msdn.microsoft.com/library/default.asp?url=/library/en-us/debug/base/system_error_codes.asp
++    ERROR_FILE_NOT_FOUND = 2 
++    ERROR_PATH_NOT_FOUND = 3
++    ERROR_INVALID_NAME = 123   
++    def saneListdir(self):
++        """ behaves like os.listdir except several exceptions are
++        intercepted, and an empty list is returned instead of the 
++        raising the exception """
++        
++        
++        retVal = []
++        
++        try:
++            retVal = os.listdir(self.path)
++        except WindowsError, e:
++            if e.errno in (self.ERROR_FILE_NOT_FOUND, self.ERROR_PATH_NOT_FOUND):
++                raise DirNotFound(self.path, "Path Does not Exist")
++            elif e.errno == self.ERROR_INVALID_NAME:
++                raise DirNotFound(self.path, "Invalid Path Name")
++                log.msg("Invalid path %r in search path for %s" % (p, module.__name__))
++            else:
++                raise
++        except OSError, ose:
++            if ose.errno not in (errno.ENOENT, errno.ENOTDIR):
++                raise
++            else:
++                raise DirNotFound(self.path, "ENOENT | ENOTDIR error code")
++        
++        return retVal    
++
+     def listdir(self):
+         return listdir(self.path)
+ 
+Index: test/test_plugin.py
+===================================================================
+--- test/test_plugin.py	(revision 18619)
++++ test/test_plugin.py	(working copy)
+@@ -114,6 +114,16 @@
+             names.remove(p.__name__)
+             p.test()
+ 
++    def testPythonDirNotFound(self):
++        """ test that t.p.DirNotFound is thrown when directory is not found """
++        p="zzzThisDirDoesNotExist"
++      
++        from twisted.python.filepath import FilePath, DirNotFound
++        fp = FilePath(p)
++        
++        self.assertRaises(DirNotFound, fp.saneListdir)
++        
++
+     def testPlugins(self):
+         self._testWithCacheness(self._testPlugins)
+ 

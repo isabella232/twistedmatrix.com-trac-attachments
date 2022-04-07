@@ -1,0 +1,229 @@
+=== modified file 'twisted/scripts/trial.py'
+--- twisted/scripts/trial.py	2010-09-10 12:17:31 +0000
++++ twisted/scripts/trial.py	2011-03-26 18:56:59 +0000
+@@ -13,7 +13,7 @@
+ from twisted import plugin
+ from twisted.python.util import spewer
+ from twisted.python.compat import set
+-from twisted.trial import runner, itrial, reporter
++from twisted.trial import runner, itrial, reporter, util
+ 
+ 
+ # Yea, this is stupid.  Leave it for for command-line compatibility for a
+@@ -124,7 +124,10 @@
+          'Path to use as working directory for tests.'],
+         ['reporter', None, 'verbose',
+          'The reporter to use for this test run.  See --help-reporters for '
+-         'more info.']]
++         'more info.'],
++        ['timeout', 't', util.DEFAULT_TIMEOUT_DURATION,
++         'The default timeout in seconds. You can use the value 0 for no '
++         'timeout but this may cause your tests to hang.', float]]
+ 
+     zsh_actions = {"tbformat":"(plain emacs cgitb)",
+                    "reporter":_zshReporterAction}
+@@ -302,6 +305,8 @@
+         print 'Running tests shuffled with seed %d\n' % config['random']
+     if not config['until-failure']:
+         loader.suiteFactory = runner.DestructiveTestSuite
++    if config['timeout']:
++        loader.suiteFactory.defaultTimeout = config['timeout']
+     return loader
+ 
+ 
+
+=== modified file 'twisted/trial/runner.py'
+--- twisted/trial/runner.py	2010-07-16 12:45:42 +0000
++++ twisted/trial/runner.py	2011-03-26 18:50:32 +0000
+@@ -135,6 +135,7 @@
+             if result.shouldStop:
+                 break
+             test = self._tests.pop(0)
++            self.suggestTimeout(test)
+             test(result)
+         return result
+ 
+
+=== modified file 'twisted/trial/test/test_deferred.py'
+--- twisted/trial/test/test_deferred.py	2007-10-28 15:09:23 +0000
++++ twisted/trial/test/test_deferred.py	2011-03-26 19:53:21 +0000
+@@ -85,6 +85,9 @@
+         self.failUnless(result.errors[0][1].check(defer.TimeoutError))
+ 
+ 
++    test_setUp.skip = ("I don't think this test is relevant as an "
++                       "outcome of #2675. No?")
++
+ class TestTester(unittest.TestCase):
+     def getTest(self, name):
+         raise NotImplementedError("must override me")
+
+=== modified file 'twisted/trial/test/test_runner.py'
+--- twisted/trial/test/test_runner.py	2010-07-16 12:45:42 +0000
++++ twisted/trial/test/test_runner.py	2011-03-26 19:46:52 +0000
+@@ -487,6 +487,26 @@
+         self.assertEqual(['runcall'], debugger._calls)
+ 
+ 
++    def test_defaultTimeout(self):
++        self.parseOptions(['--timeout', '25', 'twisted.trial.test.sample'])
++        my_runner = self.getRunner()
++        suite = trial._getSuite(self.config)
++        tests = []
++        # gather references to any unittest.TestCase in the suite
++        for destrsuite in suite._tests[0]._tests:
++            tests.extend([ t for t in destrsuite._tests
++                           if isinstance(t, unittest.TestCase) ])
++        first_test = tests[0]
++        first_test.timeout = 1
++        second_test = tests[1]
++        second_test.timeout = 'orange'
++        tests = tests[2:]
++        result = my_runner.run(suite)
++        self.assertEquals(first_test.timeout, 1)
++        self.assertEquals(second_test.timeout, 'orange')
++        for test in tests:
++            self.assertEquals(test.timeout, 25)
++        self.flushWarnings()
+ 
+ class RemoveSafelyTests(unittest.TestCase):
+     """
+
+=== modified file 'twisted/trial/test/test_script.py'
+--- twisted/trial/test/test_script.py	2010-09-10 12:17:31 +0000
++++ twisted/trial/test/test_script.py	2011-03-26 19:26:07 +0000
+@@ -414,3 +414,20 @@
+         options = trial.Options()
+         options.parseOptions(["--coverage"])
+         self.assertEquals(sys.gettrace(), options.tracer.globaltrace)
++
++
++class DefaultTimeoutTests(unittest.TestCase):
++    """
++    Test for C{--timeout} argument.
++    """
++
++    def test_defaultTimeoutSetOnSuiteFactory(self):
++        """
++        Test C{--timeout} argument results in defaultTimeout being set
++        on the loaded C{suiteFactory}.
++        """
++        options = trial.Options()
++        options.parseOptions(["--timeout", "20"])
++        loader = trial._getLoader(options)
++        self.assertEquals(loader.suiteFactory.defaultTimeout, 20)
++
+
+=== modified file 'twisted/trial/test/test_warning.py'
+--- twisted/trial/test/test_warning.py	2009-01-16 13:05:44 +0000
++++ twisted/trial/test/test_warning.py	2011-03-26 19:12:53 +0000
+@@ -176,6 +176,7 @@
+         originalWarnings = warnings.filters[:]
+         try:
+             warnings.simplefilter('error')
++            case.suggestTimeout(0.1)
+             case.run(result)
+             self.assertEqual(len(result.errors), 1)
+             self.assertIdentical(result.errors[0][0], case)
+@@ -200,6 +201,7 @@
+         originalWarnings = warnings.filters[:]
+         try:
+             warnings.simplefilter('error')
++            case.suggestTimeout(0.1)
+             case.run(result)
+             self.assertEqual(result.errors, [])
+         finally:
+
+=== modified file 'twisted/trial/unittest.py'
+--- twisted/trial/unittest.py	2009-12-25 00:22:15 +0000
++++ twisted/trial/unittest.py	2011-03-26 19:11:01 +0000
+@@ -726,13 +726,15 @@
+                     result.addExpectedFailure(self, f, todo)
+                 else:
+                     result.addError(self, f)
+-        onTimeout = utils.suppressWarnings(
+-            onTimeout, util.suppress(category=DeprecationWarning))
+         method = getattr(self, methodName)
+         d = defer.maybeDeferred(utils.runWithWarningsSuppressed,
+                                 self.getSuppress(), method)
+-        call = reactor.callLater(timeout, onTimeout, d)
+-        d.addBoth(lambda x : call.active() and call.cancel() or x)
++        # If a timeout is not explicitly given we let the test hang
++        if timeout is not None:
++            onTimeout = utils.suppressWarnings(
++                onTimeout, util.suppress(category=DeprecationWarning))
++            call = reactor.callLater(timeout, onTimeout, d)
++            d.addBoth(lambda x : call.active() and call.cancel() or x)
+         return d
+ 
+     def shortDescription(self):
+@@ -1150,12 +1152,12 @@
+         """
+         Returns the timeout value set on this test. Checks on the instance
+         first, then the class, then the module, then packages. As soon as it
+-        finds something with a C{timeout} attribute, returns that. Returns
+-        L{util.DEFAULT_TIMEOUT_DURATION} if it cannot find anything. See
+-        L{TestCase} docstring for more details.
++        finds something with a C{timeout} attribute, returns that. If it
++        cannot find any value for timeout, then C{None} is returned which may
++        result in a test hang. A default timeout may be set on via the
++        L{suggestTimeout} method. See L{TestCase} docstring for more details.
+         """
+-        timeout =  util.acquireAttribute(self._parents, 'timeout',
+-                                         util.DEFAULT_TIMEOUT_DURATION)
++        timeout =  util.acquireAttribute(self._parents, 'timeout', None)
+         try:
+             return float(timeout)
+         except (ValueError, TypeError):
+@@ -1165,7 +1167,19 @@
+             # both do this.
+             warnings.warn("'timeout' attribute needs to be a number.",
+                           category=DeprecationWarning)
+-            return util.DEFAULT_TIMEOUT_DURATION
++
++    def suggestTimeout(self, timeout):
++        """
++        Suggest the timeout for this L{TestCase}. If C{timeout} is C{None}
++        this method is a noop. Also, if the current C{TestCase} already
++        supplies a non-C{None} timeout value, this method is a noop. Otherwise
++        the given C{timeout} will be set on this instance.
++        """
++        if timeout is None:
++            return
++        test_timeout = util.acquireAttribute(self._parents, 'timeout', None)
++        if test_timeout is None:
++            self.timeout = timeout
+ 
+     def getSuppress(self):
+         """
+@@ -1369,10 +1383,13 @@
+ class TestSuite(pyunit.TestSuite):
+     """
+     Extend the standard library's C{TestSuite} with support for the visitor
+-    pattern and a consistently overrideable C{run} method.
++    pattern and a consistently overrideable C{run} method. This also supplies
++    C{defaultTimeout} which can be applied to instances of
++    L{twisted.trial.unittest.TestCase}.
+     """
+ 
+     visit = suiteVisit
++    defaultTimeout = None
+ 
+     def __call__(self, result):
+         return self.run(result)
+@@ -1387,9 +1404,14 @@
+         for test in self._tests:
+             if result.shouldStop:
+                 break
++            self.suggestTimeout(test)
+             test(result)
+         return result
+ 
++    def suggestTimeout(self, test):
++        if isinstance(test, TestCase):
++            test.suggestTimeout(self.defaultTimeout)
++
+ 
+ 
+ class TestDecorator(components.proxyForInterface(itrial.ITestCase,
+

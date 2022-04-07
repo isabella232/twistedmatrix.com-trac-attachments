@@ -1,0 +1,382 @@
+Index: twisted/test/test_digestauth.py
+===================================================================
+--- twisted/test/test_digestauth.py	(revision 33621)
++++ twisted/test/test_digestauth.py	(working copy)
+@@ -26,20 +26,13 @@
+     def __init__(self, *args, **kwargs):
+         super(FakeDigestCredentialFactory, self).__init__(*args, **kwargs)
+         self.privateKey = "0"
++        self.fakeTime = 0
+ 
+-
+-    def _generateNonce(self):
+-        """
+-        Generate a static nonce
+-        """
+-        return '178288758716122392881254770685'
+-
+-
+     def _getTime(self):
+         """
+         Return a stable time
+         """
+-        return 0
++        return self.fakeTime
+ 
+ 
+ 
+@@ -355,38 +348,6 @@
+         self.assertFalse(creds.checkPassword(self.password + 'wrong'))
+ 
+ 
+-    def test_multiResponse(self):
+-        """
+-        L{DigestCredentialFactory.decode} handles multiple responses to a
+-        single challenge.
+-        """
+-        challenge = self.credentialFactory.getChallenge(self.clientAddress.host)
+-
+-        nc = "00000001"
+-        clientResponse = self.formatResponse(
+-            nonce=challenge['nonce'],
+-            response=self.getDigestResponse(challenge, nc),
+-            nc=nc,
+-            opaque=challenge['opaque'])
+-
+-        creds = self.credentialFactory.decode(clientResponse, self.method,
+-                                              self.clientAddress.host)
+-        self.assertTrue(creds.checkPassword(self.password))
+-        self.assertFalse(creds.checkPassword(self.password + 'wrong'))
+-
+-        nc = "00000002"
+-        clientResponse = self.formatResponse(
+-            nonce=challenge['nonce'],
+-            response=self.getDigestResponse(challenge, nc),
+-            nc=nc,
+-            opaque=challenge['opaque'])
+-
+-        creds = self.credentialFactory.decode(clientResponse, self.method,
+-                                              self.clientAddress.host)
+-        self.assertTrue(creds.checkPassword(self.password))
+-        self.assertFalse(creds.checkPassword(self.password + 'wrong'))
+-
+-
+     def test_failsWithDifferentMethod(self):
+         """
+         L{DigestCredentialFactory.decode} returns an L{IUsernameHashedPassword}
+@@ -669,3 +630,189 @@
+         opaque = self.credentialFactory._generateOpaque(
+             "long nonce " * 10, None)
+         self.assertNotIn('\n', opaque)
++
++
++    def test_reusedNonce(self):
++        """
++        L{DigestCredentialFactory.decode} raises L{LoginFailed} when the given
++        same nonce twice
++        """
++        credentialFactory = FakeDigestCredentialFactory(self.algorithm,
++                                                        self.realm)
++        challenge = credentialFactory.getChallenge(self.clientAddress.host)
++
++        key = '%s,%s,%s' % (challenge['nonce'],
++                            self.clientAddress.host,
++                            '0')
++        digest = md5(key + credentialFactory.privateKey).hexdigest()
++        ekey = b64encode(key)
++
++        nonceOpaque = '%s-%s' % (digest, ekey.strip('\n'))
++        
++        self.assertEqual(credentialFactory._verifyNonce(
++                challenge['nonce']),
++            True)
++
++        self.assertRaises(
++            LoginFailed,
++            credentialFactory._verifyNonce,
++            challenge['nonce'])
++
++
++    def test_nonceTimeoutCleanup(self):
++        """
++        L{DigestCredentialFactory._nonceCleanup} cleans up old nonces
++        to prevent memory exhaustion. The nonces cannot facilitate replay
++        attacks as the original request is timestamped.
++        """
++        credentialFactory = FakeDigestCredentialFactory(self.algorithm,
++                                                        self.realm)
++
++        challenge = credentialFactory.getChallenge(self.clientAddress.host)
++
++        # First verify a nonce, this adds it to known nonces
++        self.assertEqual(credentialFactory._verifyNonce(
++                challenge['nonce']),
++            True)
++
++        # Turn the clock forward
++        credentialFactory.fakeTime = 10000
++
++        # Cleanup old nonces
++        credentialFactory._nonceCleanup()
++
++        # The nonce tracking mechanisms must now be empty as the only item
++        # tracked was cleaned up.
++        self.assertEqual(len(credentialFactory._nonces), 0)
++        self.assertEqual(len(credentialFactory._nonceCleanupTracker), 0)
++
++        # Turn clock back again, the same nonce must now work again
++        # as it is no longer known
++        self.assertEqual(credentialFactory._verifyNonce(
++                challenge['nonce']),
++            True)
++
++    def test_nonceCounter(self):
++        """
++        L{DigestCredentialFactory._verifyNonce} keeps track of nonce counter
++        and allows reuse if the nonces are in order
++        """
++        credentialFactory = FakeDigestCredentialFactory(self.algorithm,
++                                                        self.realm)
++
++        challenge = credentialFactory.getChallenge(self.clientAddress.host)
++
++        self.assertEqual(credentialFactory._verifyNonce(
++                challenge['nonce'],
++                '00000001'),
++            True)
++
++        self.assertEqual(credentialFactory._verifyNonce(
++                challenge['nonce'],
++                '00000002'),
++            True)
++
++    def test_nonceCounterWrongInitValue(self):
++        """
++        L{DigestCredentialFactory._verifyNonce} keeps track of nonce counter
++        and allows reuse if the nonces are in order
++        """
++        credentialFactory = FakeDigestCredentialFactory(self.algorithm,
++                                                        self.realm)
++
++        challenge = credentialFactory.getChallenge(self.clientAddress.host)
++
++        self.assertRaises(
++            LoginFailed,
++            credentialFactory._verifyNonce,
++            challenge['nonce'], '00000002')
++
++    def test_nonceCounterOutOfOrder(self):
++        """
++        FIXME
++        """
++        credentialFactory = FakeDigestCredentialFactory(self.algorithm,
++                                                        self.realm)
++
++        challenge = credentialFactory.getChallenge(self.clientAddress.host)
++
++        self.assertEqual(credentialFactory._verifyNonce(
++                challenge['nonce'],
++                '00000001'),
++            True)
++
++        self.assertRaises(
++            LoginFailed,
++            credentialFactory._verifyNonce,
++            challenge['nonce'], '00000003')
++
++        self.assertEqual(credentialFactory._verifyNonce(
++                challenge['nonce'],
++                '00000002'),
++            True)
++
++    def test_withQopWithoutCnonceOrNc(self):
++        """
++        L{DigestCredentialFactory.decode} must fail when provided with qop but
++        without cnonce or nc.
++        """
++        # Test for nc
++        challenge = self.credentialFactory.getChallenge(self.clientAddress.host)
++
++        nc = None
++        clientResponse = self.formatResponse(
++            nonce=challenge['nonce'],
++            response=self.getDigestResponse(challenge, nc),
++            nc=nc,
++            opaque=challenge['opaque'])
++        self.assertRaises(LoginFailed, self.credentialFactory.decode,
++            clientResponse, self.method, self.clientAddress.host)
++
++        # Test for cnonce
++        challenge = self.credentialFactory.getChallenge(self.clientAddress.host)
++
++        nc = "00000001"
++        clientResponse = self.formatResponse(
++            nonce=challenge['nonce'],
++            response=self.getDigestResponse(challenge, nc),
++            cnonce=None,
++            opaque=challenge['opaque'])
++        self.assertRaises(LoginFailed, self.credentialFactory.decode,
++            clientResponse, self.method, self.clientAddress.host)
++
++    def test_withoutQopWithCnonceAndNc(self):
++        """
++        L{DigestCredentialFactory.decode} must fail when not provided with qop but
++        with cnonce or nc.
++        """
++        challenge = self.credentialFactory.getChallenge(self.clientAddress.host)
++
++        nc = "00000001"
++        clientResponse = self.formatResponse(
++            nonce=challenge['nonce'],
++            response=self.getDigestResponse(challenge, nc),
++            nc=nc,
++            qop=None,
++            opaque=challenge['opaque'])
++        self.assertRaises(LoginFailed, self.credentialFactory.decode,
++            clientResponse, self.method, self.clientAddress.host)
++
++    def test_withoutQop(self):
++        """
++        L{DigestCredentialFactory.decode} must work when no qop is provided to be backward
++        compatible.
++        """
++        challenge = self.credentialFactory.getChallenge(self.clientAddress.host)
++
++        nc = None
++        clientResponse = self.formatResponse(
++            nonce=challenge['nonce'],
++            response=self.getDigestResponse(challenge, nc),
++            nc=nc,
++            cnonce=None,
++            qop=None,
++            opaque=challenge['opaque'])
++        creds = self.credentialFactory.decode(
++            clientResponse, self.method, self.clientAddress.host)
++        self.assertTrue(creds.checkPassword(self.password))
++        self.assertFalse(creds.checkPassword(self.password + 'wrong'))
+\ No newline at end of file
+Index: twisted/cred/credentials.py
+===================================================================
+--- twisted/cred/credentials.py	(revision 33621)
++++ twisted/cred/credentials.py	(working copy)
+@@ -6,7 +6,8 @@
+ 
+ from zope.interface import implements, Interface
+ 
+-import hmac, time, random
++import hmac, time, random, struct
++from collections import deque
+ from twisted.python.hashlib import md5
+ from twisted.python.randbytes import secureRandom
+ from twisted.cred._digest import calcResponse, calcHA1, calcHA2
+@@ -187,6 +188,14 @@
+     @type authenticationRealm: C{str}
+     @param authenticationRealm: case sensitive string that specifies the realm
+         portion of the challenge
++
++    @type _nonces: C{dict}
++    @param _nonces: a collection of all previously used nonce, each key contains
++        a tuple as follows: (nonce_last_use, none_counter)
++
++    @type _nonceCleanupTracker: C{deque}
++    @param _nonceCleanupTracker: a queue of all currently known nonces, used to
++        cycle over in an orderly fashion to remove old nonces
+     """
+ 
+     CHALLENGE_LIFETIME_SECS = 15 * 60    # 15 minutes
+@@ -197,6 +206,8 @@
+         self.algorithm = algorithm
+         self.authenticationRealm = authenticationRealm
+         self.privateKey = secureRandom(12)
++        self._nonces = {}
++        self._nonceCleanupTracker = deque()
+ 
+ 
+     def getChallenge(self, address):
+@@ -313,6 +324,70 @@
+         return True
+ 
+ 
++    def _verifyNonce(self, nonce, nc=None):
++        """
++        Given the nonce and a nonce counter from the request, verify that
++        the request is not a replay of an already handled request.
++        
++        This implementation accepts unknown nonces even though the nonces
++        are handed out by the server.
++        A specific method to handle nonces in relation to this is not mentioned
++        in rfc2617, but the method used here is also used elsewhere, e.g.
++        https://tools.ietf.org/html/draft-ietf-oauth-v2-http-mac-01
++
++        @param nonce: The nonce value from the Digest response
++        @param nc: The nonce count value from the Digest response
++        
++        @return: C{True} if the nonce does not present as a replay.
++
++        @raise error.LoginFailed: if C{nonce} is already used, not provided
++            by us or counter is not valid.
++        """
++
++        self._nonceCleanup()
++
++        if nc is not None:
++            nc, = struct.unpack('!I', nc.decode('hex'))
++
++        if nonce in self._nonces:
++            if nc is None: # no counter, then this nonce cannot be reused
++                raise error.LoginFailed('Invalid response, nonce already used')
++
++            _, last_nc = self._nonces[nonce]
++
++            if nc - last_nc != 1:
++                raise error.LoginFailed('Invalid response, nc counts wrong')
++
++        elif nc is not None and nc != 1:
++            raise error.LoginFailed('Invalid Response, nc must start at 1')
++
++        self._nonces[nonce] = (self._getTime(), nc)
++        self._nonceCleanupTracker.append(nonce)
++
++        return True
++
++
++    def _nonceCleanup(self, checkCount=10):
++        """
++        Given a number of nonces to check, cycles C{checkCount} known nonces in a
++        lru fashion. Checks age, deletes nonces too old to be used in a replay
++        attack and adds any other nonce back into the verification queue.
++
++        This method is used to be reasonably sure old nonces does not consume
++        memory indefinitely while taking performance into consideration.
++
++        @param checkCount: Number of nonces to verify
++        """
++
++        for _ in range(min(len(self._nonceCleanupTracker), checkCount)):
++            nonce = self._nonceCleanupTracker.popleft()
++            last_use, _ = self._nonces[nonce]
++            if self._getTime() - last_use > self.CHALLENGE_LIFETIME_SECS:
++                del self._nonces[nonce]
++            else:
++                self._nonceCleanupTracker.append(nonce)
++
++
+     def decode(self, response, method, host):
+         """
+         Decode the given response and attempt to generate a
+@@ -355,8 +430,14 @@
+         if 'nonce' not in auth:
+             raise error.LoginFailed('Invalid response, no nonce given.')
+ 
++        for k in ['cnonce', 'nc']: # these MUST/MUST NOT be part of the request if
++                                   # qop is/is not part of the request
++            if (k in auth) != ('qop' in auth):
++                raise error.LoginFailed('Invalid Response, qop mismatch with other parts')
++
+         # Now verify the nonce/opaque values for this client
+-        if self._verifyOpaque(auth.get('opaque'), auth.get('nonce'), host):
++        if self._verifyOpaque(auth.get('opaque'), auth.get('nonce'), host) and \
++           self._verifyNonce(auth.get('nonce'), auth.get('nc', None)):
+             return DigestedCredentials(username,
+                                        method,
+                                        self.authenticationRealm,

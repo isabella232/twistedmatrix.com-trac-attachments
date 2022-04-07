@@ -1,0 +1,92 @@
+Index: twisted/internet/test/test_udp.py
+===================================================================
+--- twisted/internet/test/test_udp.py	(revision 33095)
++++ twisted/internet/test/test_udp.py	(working copy)
+@@ -191,4 +191,87 @@
+         self.runReactor(reactor)
+ 
+ 
++    def test_packetSizeOverflow(self):
++        """
++        Received datagram size overflow notifications are discarded by datagram
++        transports.
++        """
++        reactor = self.buildReactor()
++        RECEIVER_SIZE = 8 * 1024
++        SENDER_SIZE = 16 * 1024
++
++        class Receiver(DatagramProtocol):
++
++            received = ""
++
++            def datagramReceived(self, datagram, address):
++                self.received = datagram
++                self.transport.write("r" * len(datagram), address)
++                self.transport.stopListening()
++
++        class Sender(DatagramProtocol):
++
++            received = ""
++
++            def __init__(self, address):
++                self.address = address
++
++            def startProtocol(self):
++                self.transport.write("s" * SENDER_SIZE, self.address)
++                # Two reactor iterations are needed on Windows before the
++                # datagrams from Sender will be delivered to Receiver again.
++                # It looks like the reason for this behavior is that Receiver's
++                # recvfrom drops all pending datagrams when it fails with
++                # WSAEMSGSIZE (or maybe just all datagrams from the sender of
++                # the oversized datagram, I didn't check).
++                reactor.callLater(0, reactor.callLater, 0, self.sendMore)
++
++            def sendMore(self):
++                self.transport.write("s" * RECEIVER_SIZE, self.address)
++
++            def datagramReceived(self, datagram, address):
++                self.received = datagram
++                d = maybeDeferred(self.transport.stopListening)
++                d.addCallback(lambda ignored: reactor.stop())
++
++        receiver = Receiver()
++        port = reactor.listenUDP(0, receiver, maxPacketSize=RECEIVER_SIZE)
++        sender = Sender(("127.0.0.1", port.getHost().port))
++        reactor.callWhenRunning(reactor.listenUDP, 0, sender,
++                                maxPacketSize=SENDER_SIZE)
++        self.runReactor(reactor)
++
++        self.assertEqual(receiver.received, "s" * RECEIVER_SIZE)
++        self.assertEqual(sender.received, "r" * RECEIVER_SIZE)
++
++
++    def test_undeliverableConnectionlessDatagram(self):
++        """
++        Notifications that datagram could not be delivered are discarded by
++        not connected datagram transports.
++        """
++        reactor = self.buildReactor()
++
++        class Sender(DatagramProtocol):
++
++            received = ""
++
++            def startProtocol(self):
++                notListeningAddress = findFreePort(type=SOCK_DGRAM)
++                listeningAddress = ("127.0.0.1", self.transport.getHost().port)
++                self.transport.write("spam", notListeningAddress)
++                self.transport.write("sanity check", listeningAddress)
++
++            def datagramReceived(self, datagram, address):
++                self.received = datagram
++                d = maybeDeferred(self.transport.stopListening)
++                d.addBoth(lambda ignored: reactor.stop())
++
++        sender = Sender()
++        reactor.callWhenRunning(reactor.listenUDP, 0, sender)
++        self.runReactor(reactor)
++        self.assertEqual(sender.received, "sanity check")
++
++
++
+ globals().update(UDPServerTestsBuilder.makeTestCaseClasses())

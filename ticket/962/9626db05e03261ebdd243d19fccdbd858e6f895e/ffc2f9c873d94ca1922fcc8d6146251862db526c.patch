@@ -1,0 +1,103 @@
+Index: twisted/web/http.py
+===================================================================
+--- twisted/web/http.py	(revision 46710)
++++ twisted/web/http.py	(working copy)
+@@ -1950,6 +1950,89 @@
+ 
+ 
+ 
++class GenericHTTPChannel(object):
++    """
++    A proxy object that wraps one of the HTTP protocol objects, and switches
++    between them depending on TLS negotiated protocol.
++
++    @ivar _negotiatedProtocol: The protocol negotiated with ALPN or NPN, if
++        any.
++    @type _negotiatedProtocol: Either a bytestring containing the ALPN token
++        for the negotiated protocol, or C{None} if no protocol has yet been
++        negotiated.
++
++    @ivar _obj: The object conforming to the HTTPChannel protocol that is
++        backing this object. By default this is a L{HTTPChannel}, but if a
++        HTTP protocol upgrade takes place this may be a different channel
++        object.
++    @type _obj: L{HTTPChannel}
++
++    @ivar _queuedActions: A list of attribute sets and deletions that have been
++        applied to the proxy target. This is used before negotiation occurs to
++        ensure that if a new proxy target is used, the steps can be re-applied
++        to the new proxy object.
++    @type _queuedActions: C{list} of C{tuple} of C{(callable, arguments)}
++    """
++    def __init__(self):
++        object.__setattr__(self, '_negotiatedProtocol', None)
++        object.__setattr__(self, '_obj', HTTPChannel())
++        object.__setattr__(self, '_queuedActions', [])
++
++        self._obj.requestFactory = Request
++
++
++    def dataReceived(self, data):
++        """
++        A override of dataReceived that checks what protocol we're using.
++        """
++        if self._negotiatedProtocol is None:
++            try:
++                negotiatedProtocol = self.transport.negotiatedProtocol
++            except AttributeError:
++                # Plaintext HTTP, always HTTP/1.1
++                negotiatedProtocol = b'http/1.1'
++
++            if negotiatedProtocol is None:
++                negotiatedProtocol = b'http/1.1'
++
++            if negotiatedProtocol == b'h2' and H2_ENABLED:
++                transport = self._obj.transport
++                object.__setattr__(self, '_obj', H2Connection())
++                self._apply_queued_actions()
++                self._obj.makeConnection(transport)
++
++            object.__setattr__(
++                self, '_negotiatedProtocol', negotiatedProtocol
++            )
++            object.__setattr__(self, '_queuedActions', None)
++
++        return self._obj.dataReceived(data)
++
++
++    def _apply_queued_actions(self):
++        for action in self._queuedActions:
++            action[0](self._obj, *action[1:])
++
++
++    def __getattr__(self, attr):
++        return getattr(self._obj, attr)
++
++
++    def __setattr__(self, attr, value):
++        if self._negotiatedProtocol is None:
++            self._queuedActions.append((setattr, attr, value))
++
++        return setattr(self._obj, attr, value)
++
++
++    def __delattr__(self, attr):
++        if self._negotiatedProtocol is None:
++            self._queuedActions.append((delattr, attr))
++
++        return delattr(self._obj, attr)
++
++
++
+ class HTTPFactory(protocol.ServerFactory):
+     """
+     Factory for HTTP server.
+@@ -1973,7 +2056,7 @@
+         timestamps.
+     """
+ 
+-    protocol = HTTPChannel
++    protocol = GenericHTTPChannel
+ 
+     logPath = None
+ 

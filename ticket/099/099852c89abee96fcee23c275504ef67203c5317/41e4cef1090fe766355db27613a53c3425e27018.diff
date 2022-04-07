@@ -1,0 +1,138 @@
+Index: twisted/words/test/test_irc.py
+===================================================================
+--- twisted/words/test/test_irc.py	(revision 24481)
++++ twisted/words/test/test_irc.py	(working copy)
+@@ -550,7 +550,7 @@
+         self.assertEquals([], irc.split(''))
+ 
+ 
+-class ClientTests(TestCase):
++class ClientTests(unittest.TestCase):
+     """
+     Tests for the protocol-level behavior of IRCClient methods intended to
+     be called by application code.
+@@ -566,7 +566,7 @@
+         self.failIf(self.transport.getvalue())
+ 
+ 
+-    def test_register(self):
++    def testRegister(self):
+         """
+         Verify that the L{IRCClient.register} method sends a a USER command
+         with the correct arguments.
+@@ -585,7 +585,7 @@
+         self.assertEqual(self.transport.getvalue().split('\r\n'), expected)
+ 
+ 
+-    def test_registerWithPassword(self):
++    def testRegisterWithPassword(self):
+         """
+         Verify that if the C{password} attribute of L{IRCClient} is not
+         C{None}, the C{register} method also authenticates using it.
+@@ -603,3 +603,37 @@
+                 username, hostname, servername, self.protocol.realname),
+             '']
+         self.assertEqual(self.transport.getvalue().split('\r\n'), expected)
++
++    
++    def testRegisterWithTakenNick(self):
++        """
++        Verify that the client repeats the C{setNick} method with a
++        new value when presented with an ERR_NICKNAMEINUSE while
++        inside the C{register} method.
++        """
++        self.protocol._registered = False
++        username = 'testuser'
++        hostname = 'testhost'
++        servername = 'testserver'
++        self.protocol.realname = 'testname'
++        self.protocol.password = 'testpass'
++        self.protocol.register(username, hostname, servername)
++        self.protocol.irc_ERR_NICKNAMEINUSE('prefix', ['param'])
++        lastLine = self.transport.getvalue().split('\r\n')[-2]
++        self.assertEqual(lastLine[:4], 'NICK')
++        self.assertNotEqual(lastLine, 'NICK %s' % (username,))
++
++    def testNickChange(self):
++        """
++        Verify that, when a NICK command is sent after signon,
++        C{IRCClient.nickname} is set to the new nickname I{after} the
++        server sends acknowledgement.
++        """
++        oldnick = 'foo'
++        newnick = 'bar'
++        self.protocol.register(oldnick)
++        self.protocol.irc_RPL_WELCOME('prefix', ['param'])
++        self.protocol.setNick(newnick)
++        self.assertEqual(self.protocol.nickname, oldnick)
++        self.protocol.irc_NICK('%s!quux@qux' % (oldnick,), [newnick])
++        self.assertEqual(self.protocol.nickname, newnick)
+Index: twisted/words/protocols/irc.py
+===================================================================
+--- twisted/words/protocols/irc.py	(revision 24481)
++++ twisted/words/protocols/irc.py	(working copy)
+@@ -561,6 +561,9 @@
+     lineRate = None
+     _queue = None
+     _queueEmptying = None
++    
++    _registered = False
++    _attemptedNick=''
+ 
+     delimiter = '\n' # '\r\n' will also work (see dataReceived)
+ 
+@@ -1006,6 +1009,9 @@
+         """
+         if self.password is not None:
+             self.sendLine("PASS %s" % self.password)
++        # The following is perfectly acceptable here since this only
++        # happens during signup when there is no previous nick.
++        self.nickname = nickname
+         self.setNick(nickname)
+         if self.username is None:
+             self.username = nickname
+@@ -1018,7 +1024,7 @@
+         @type nickname: C{str}
+         @param nickname: The nickname to change to.
+         """
+-        self.nickname = nickname
++        self._attemptedNick = nickname
+         self.sendLine("NICK %s" % nickname)
+ 
+     def quit(self, message = ''):
+@@ -1116,10 +1122,25 @@
+ 
+     def irc_ERR_NICKNAMEINUSE(self, prefix, params):
+         """
+-        Called when we try to register an invalid nickname.
++        Called when we try to register or change to an invalid nickname.
++
++        If we are in the process of registering, call self.setNick()
++        again with a hopefully sufficiently modified argument.
+         """
+-        self.register(self.nickname+'_')
++        if not self._registered:
++            self.setNick(self._attemptedNick+'_')
+ 
++    def irc_ERR_ERRONEUSNICKNAME(self, prefix, params):
++        """
++        Called when we try to register or change to an illegal nickname.
++
++        The server should send this reply when the nickname contains any
++        disallowed characters.  The bot will stall, waiting for
++        RPL_WELCOME, if we don't handle this during sign-on.
++        """
++        if not self._registered:
++            self.setNick('defaultnick')
++
+     def irc_ERR_PASSWDMISMATCH(self, prefix, params):
+         """
+         Called when the login was incorrect.
+@@ -1130,6 +1151,7 @@
+         """
+         Called when we have received the welcome from the server.
+         """
++        self._registered = True
+         self.signedOn()
+ 
+     def irc_JOIN(self, prefix, params):

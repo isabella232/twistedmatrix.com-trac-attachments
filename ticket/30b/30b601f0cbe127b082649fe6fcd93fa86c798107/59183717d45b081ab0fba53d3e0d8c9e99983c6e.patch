@@ -1,0 +1,579 @@
+Index: twisted/web/http.py
+===================================================================
+--- twisted/web/http.py	(revision 24691)
++++ twisted/web/http.py	(working copy)
+@@ -192,7 +192,10 @@
+ 
+ 
+ def parse_qs(qs, keep_blank_values=0, strict_parsing=0, unquote=unquote):
+-    """like cgi.parse_qs, only with custom unquote function"""
++    """
++    like cgi.parse_qs, only with custom unquote function
++    """
++    
+     d = {}
+     items = [s2 for s1 in qs.split("&") for s2 in s1.split(";")]
+     for item in items:
+@@ -212,7 +215,9 @@
+     return d
+ 
+ def datetimeToString(msSinceEpoch=None):
+-    """Convert seconds since epoch to HTTP datetime string."""
++    """
++    Convert seconds since epoch to HTTP datetime string.
++    """
+     if msSinceEpoch == None:
+         msSinceEpoch = time.time()
+     year, month, day, hh, mm, ss, wd, y, z = time.gmtime(msSinceEpoch)
+@@ -223,7 +228,9 @@
+     return s
+ 
+ def datetimeToLogString(msSinceEpoch=None):
+-    """Convert seconds since epoch to log datetime string."""
++    """
++    Convert seconds since epoch to log datetime string.
++    """
+     if msSinceEpoch == None:
+         msSinceEpoch = time.time()
+     year, month, day, hh, mm, ss, wd, y, z = time.gmtime(msSinceEpoch)
+@@ -260,7 +267,9 @@
+         _resetLogDateTimeID.cancel()
+ 
+ def timegm(year, month, day, hour, minute, second):
+-    """Convert time tuple in GMT to seconds since epoch, GMT"""
++    """
++    Convert time tuple in GMT to seconds since epoch, GMT
++    """
+     EPOCH = 1970
+     assert year >= EPOCH
+     assert 1 <= month <= 12
+@@ -276,7 +285,9 @@
+     return seconds
+ 
+ def stringToDatetime(dateString):
+-    """Convert an HTTP date string (one of three formats) to seconds since epoch."""
++    """
++    Convert an HTTP date string (one of three formats) to seconds since epoch.
++    """
+     parts = dateString.split()
+ 
+     if not parts[0][0:3].lower() in weekdayname_lower:
+@@ -326,14 +337,17 @@
+     return int(timegm(year, month, day, hour, min, sec))
+ 
+ def toChunk(data):
+-    """Convert string to a chunk.
++    """
++    Convert string to a chunk.
+ 
+-    @returns: a tuple of strings representing the chunked encoding of data"""
++    @returns: a tuple of strings representing the chunked encoding of data
++    """
+     return ("%x\r\n" % len(data), data, "\r\n")
+ 
+ def fromChunk(data):
+-    """Convert chunk to string.
+-
++    """
++    Convert chunk to string.
++    
+     @returns: tuple (result, remaining), may raise ValueError.
+     """
+     prefix, rest = data.split('\r\n', 1)
+@@ -346,7 +360,8 @@
+ 
+ 
+ def parseContentRange(header):
+-    """Parse a content-range header into (start, end, realLength).
++    """
++    Parse a content-range header into (start, end, realLength).
+ 
+     realLength might be None if real length is not known ('*').
+     """
+@@ -375,53 +390,154 @@
+         return getattr(self.__dict__['s'], attr)
+ 
+ 
++PARSE_PREFIX = 1 # HTTP client is currently waiting for a chunked prefix
++PREPARE_NEXT = 2 # Just finished processing a chunk, prepare for the next one
++FINISH_CHUNK = 3 # Just received 0 length chunk, this response is finished
++FINISHED_CHUNK = 4  # The response has finished and the data has been 
++                    # handled. Used if connection is lost mid-response
++HTTP1_0 = 'HTTP/1.0' # Version string for HTTP 1.0
++HTTP1_1 = 'HTTP/1.1' # Version string for HTTP 1.1
++
++FIRST_LINE = 1 # HTTP Parser is waiting for the first line "GET /path HTTP/1.1"
++HEADERS = 2 # After the first, every line is an header until an empty one.
++BODY = 3 # Everything that comes from now on is part of the body.
++
+ class HTTPClient(basic.LineReceiver):
+-    """A client for HTTP 1.0
++    """A client for HTTP 1.0 and 1.1
+ 
+     Notes:
+     You probably want to send a 'Host' header with the name of
+     the site you're connecting to, in order to not break name
+     based virtual hosting.
++
++    @ivar version: a string that represents the http version that the
++    client should use.
++    @type version: L{str} with values 'HTTP/1.0' (default) or 'HTTP/1.1'
++
++    @ivar chunked: indicates the current chunked state of the of the
++    client. Can be L{False} when the connection is not chunked, or
++    be one of L{PARSE_PREFIX}, L{PREPARE_NEXT}, L{FINISH_CHUNK}.
++
++    @ivar state: represents the current state of the HTTP Parser for
++    the client. Can be L{FIRST_LINE}, L{HEADERS}, L{BODY}.
++
++    @ivar length: when not in chunked mode it represents the remaining
++    length of the response body. When in chunked mode it represents the
++    remaining length of the current chunk. Otherwise if neither
++    Content-Length nor Transfer-Encoding: chunked are provided it's
++    L{None}.
++
++    @ivar persistent: Currently does nothing, it's an anticipation
++    for future support of persistent connections.
+     """
++    version = HTTP1_0
+     length = None
+-    firstLine = 1
+-    __buffer = None
++    chunked = False
++    state = FIRST_LINE
++    persistent = False
++    _willChunk = False # will we read response chunked?
++    _headers = None # sent headers
++    __buffer = None # response buffer
+ 
+     def sendCommand(self, command, path):
+-        self.transport.write('%s %s HTTP/1.0\r\n' % (command, path))
++        self.transport.write('%s %s %s\r\n' % (
++            command, path, self.version
++        ))
+ 
+     def sendHeader(self, name, value):
+         self.transport.write('%s: %s\r\n' % (name, value))
++        if self._headers is None:
++            self._headers = {}
++        self._headers[name.lower()] = value
+ 
+     def endHeaders(self):
++        if not self.persistent and self.version == HTTP1_1:
++            if not 'connection' in self._headers:
++                self.sendHeader("Connection", "close")
+         self.transport.write('\r\n')
+ 
+     def lineReceived(self, line):
+-        if self.firstLine:
+-            self.firstLine = 0
+-            l = line.split(None, 2)
+-            version = l[0]
+-            status = l[1]
+-            try:
+-                message = l[2]
+-            except IndexError:
+-                # sometimes there is no message
+-                message = ""
+-            self.handleStatus(version, status, message)
++        if self.state == FIRST_LINE:            
++            self._firstLine(line)
++            self.state = HEADERS
+             return
+-        if line:
+-            key, val = line.split(':', 1)
+-            val = val.lstrip()
+-            self.handleHeader(key, val)
+-            if key.lower() == 'content-length':
+-                self.length = int(val)
+-        else:
+-            self.__buffer = StringIO()
+-            self.handleEndHeaders()
+-            self.setRawMode()
++        elif self.state == HEADERS:
++            if line:
++                key, val = line.split(':', 1)
++                val = val.lstrip()
++                self.handleHeader(key, val)
++                if key.lower() == 'content-length':
++                    self.length = int(val)
++                elif key.lower() == 'transfer-encoding' and \
++                     val.lower() == 'chunked' and \
++                     self.version == HTTP1_1:
++                        self._willChunk = True
++            else:
++                self.state = BODY
++                self.__buffer = StringIO()
++                self.handleEndHeaders()
++                if self._willChunk:
++                    self.chunked = PARSE_PREFIX
++                    self._willChunk = False
++                if self.chunked:
++                    return
++                if self.length == 0:
++                    self.handleResponseEnd()
++                self.setRawMode()
++            return
++        elif self.state == BODY:
++            if self.chunked:
++                if self.chunked == PARSE_PREFIX:
++                    # First we get a line like "chunk-size [';' chunk-extension]"
++                    # (where chunk extension is just random crap as far as we're concerned)
++                    # RFC says to ignore any extensions you don't recognize -- that's all of them.
++                    chunksize = line.split(';', 1)[0]
++                    try:
++                        self.length = int(chunksize, 16)
++                    except ValueError:
++                        self.transport.loseConnection()
++                    if self.length < 0:
++                        self.transport.loseConnection()
++                    if self.length == 0:
++                        # We're done, parse the trailers line
++                        self.chunked = FINISH_CHUNK
++                    else:
++                        # Read self.length bytes of raw data
++                        self.setRawMode()
++                elif self.chunked == PREPARE_NEXT:
++                    if line != "":
++                        self.transport.loseConnection()
++                    self.chunked = PARSE_PREFIX
++                elif self.chunked == FINISH_CHUNK:
++                    if line == '':
++                        self.chunked == FINISHED_CHUNK
++                        self.handleResponseEnd()
+ 
++    def _firstLine(self, line):
++        l = line.split(None, 2)
++        version = l[0]
++        # Remove HTTP/ from version
++        status = l[1]
++        try:
++            message = l[2]
++        except IndexError:
++            # sometimes there is no message
++            message = ""
++        self.handleStatus(version, status, message)
++
+     def connectionLost(self, reason):
+-        self.handleResponseEnd()
++        if not self.chunked:
++            # http://www.w3.org/Protocols/rfc2616/rfc2616-sec3.html
++            # The chunked encoding is ended by any chunk whose size is
++            # zero, followed by the trailer, which is terminated by an
++            # empty line.
++            self.handleResponseEnd()
++        elif self.chunked != FINISHED_CHUNK:
++            # We got cut off before the data could finish so just handle 
++            # the response that we got. Should this throw an exception but 
++            # include the current buffer? Not sure which is the best way 
++            # to handle this edge case.
++            self.handleResponseEnd()
+ 
+     def handleResponseEnd(self):
+         if self.__buffer is not None:
+@@ -444,27 +560,45 @@
+         @type status: C{str}
+         @param message: e.g. 'OK'
+         """
+-        
++  
+     def handleHeader(self, key, val):
+         """
+         Called every time a header is received.
++        
++        @param key: Header name, e.g. `connection`
++        @type key: C{str}
++        @param val: Header value, e.g. `close`
++        @type val: C{str}
+         """
+ 
+     def handleEndHeaders(self):
+         """
+         Called when all headers have been received.
+         """
+-    
++
+     def rawDataReceived(self, data):
+-        if self.length is not None:
+-            data, rest = data[:self.length], data[self.length:]
+-            self.length -= len(data)
++        """
++        Handle incoming content.
++        """
++        
++        datalen = len(data)
++        if self.length is None:
++            self.handleResponsePart(data)
++            return
++        if datalen < self.length:
++            self.handleResponsePart(data)
++            self.length = self.length - datalen
+         else:
+-            rest = ''
+-        self.handleResponsePart(data)
+-        if self.length == 0:
+-            self.handleResponseEnd()
+-            self.setLineMode(rest)
++            self.handleResponsePart(data[:self.length])
++            extraneous = data[self.length:]
++            self.length = 0
++            if not self.chunked:
++                self.handleResponseEnd()
++            else:
++                # NOTE: in chunked mode, self.length is the size of the current chunk,
++                # so we still have more to read.
++                self.chunked = 2 # Read next chunksize
++            self.setLineMode(extraneous)
+ 
+ 
+ # response codes that must have empty bodies
+Index: twisted/web/test/test_http.py
+===================================================================
+--- twisted/web/test/test_http.py	(revision 24691)
++++ twisted/web/test/test_http.py	(working copy)
+@@ -28,9 +28,14 @@
+             time2 = http.stringToDatetime(timestr)
+             self.assertEquals(time, time2)
+ 
+-
+-class DummyHTTPHandler(http.Request):
+-
++class DummyHTTPRequest(http.Request):
++    """
++    Dummy C{Request} for HTTP/1.0
++    
++    A C{Request} that makes a simple http request using the 
++    content-length header to determine content size.
++    """
++    
+     def process(self):
+         self.content.seek(0, 0)
+         data = self.content.read()
+@@ -44,16 +49,50 @@
+         self.write(request)
+         self.finish()
+ 
++class DummyHTTP11Request(http.Request):
++    """
++    Dummy C{Request} for HTTP/1.1
++    
++    A C{Request} that makes a simple http request without
++    specifying the content length.
++    """
++    
++    clientproto = "HTTP/1.1"
+ 
++    def process(self):
++        self.content.seek(0, 0)
++        data = self.content.read()
++        request = "'''"+data+"'''"
++        self.setResponseCode(200)
++        self.setHeader("Request", self.uri)
++        self.setHeader("Command", self.method)
++        self.setHeader("Version", self.clientproto)
++        self.write(request)
++        self.finish()
++
+ class LoopbackHTTPClient(http.HTTPClient):
++    """
++    HTTP/1.0 loopback C{HTTPClient} used for protocol testing.
++    """
++    
++    def connectionMade(self):
++        self.sendCommand("GET", "/foo/bar")
++        self.sendHeader("Content-Length", 10)
++        self.endHeaders()
++        self.transport.write("0123456789")
+ 
++class LoopbackHTTP11Client(http.HTTPClient):
++    """
++    HTTP/1.1 loopback C{HTTPClient} used for protocol testing.
++    """
++    
++    version = 'HTTP/1.1'
+     def connectionMade(self):
+         self.sendCommand("GET", "/foo/bar")
+         self.sendHeader("Content-Length", 10)
+         self.endHeaders()
+         self.transport.write("0123456789")
+ 
+-
+ class ResponseTestMixin(object):
+     """
+     A mixin that provides a simple means of comparing an actual response string
+@@ -106,7 +145,7 @@
+         """
+         b = StringIOWithoutClosing()
+         a = http.HTTPChannel()
+-        a.requestFactory = DummyHTTPHandler
++        a.requestFactory = DummyHTTPRequest
+         a.makeConnection(protocol.FileWrapper(b))
+         # one byte at a time, to stress it.
+         for byte in self.requests:
+@@ -193,7 +232,15 @@
+ 
+ 
+ class HTTPLoopbackTestCase(unittest.TestCase):
+-
++    """
++    HTTP/1.0 request/response loop test.
++    
++    Test to make sure proper I{version}, I{status}, I{headers},
++    and I{response} are received from the server.
++    """
++    
++    Client = LoopbackHTTPClient
++    Request = DummyHTTPRequest
+     expectedHeaders = {'request' : '/foo/bar',
+                        'command' : 'GET',
+                        'version' : 'HTTP/1.0',
+@@ -204,35 +251,51 @@
+     gotEndHeaders = 0
+ 
+     def _handleStatus(self, version, status, message):
++        """
++        Test that the proper status code and version were returned
++        """
+         self.gotStatus = 1
+         self.assertEquals(version, "HTTP/1.0")
+         self.assertEquals(status, "200")
+ 
+     def _handleResponse(self, data):
++        """
++        Test that handleResponse is called only once
++        """
+         self.gotResponse = 1
+         self.assertEquals(data, "'''\n10\n0123456789'''\n")
+ 
+     def _handleHeader(self, key, value):
++        """
++        Test that each header is correctly parsed
++        """
+         self.numHeaders = self.numHeaders + 1
+         self.assertEquals(self.expectedHeaders[string.lower(key)], value)
+ 
+     def _handleEndHeaders(self):
++        """
++        Test that every single header is correctly received
++        """
+         self.gotEndHeaders = 1
+         self.assertEquals(self.numHeaders, 4)
+ 
+-    def testLoopback(self):
++    def testRequestResponseLoop(self):
+         server = http.HTTPChannel()
+-        server.requestFactory = DummyHTTPHandler
+-        client = LoopbackHTTPClient()
++        server.requestFactory = self.Request
++        client = self.Client()
+         client.handleResponse = self._handleResponse
+         client.handleHeader = self._handleHeader
+         client.handleEndHeaders = self._handleEndHeaders
+         client.handleStatus = self._handleStatus
+         d = loopback.loopbackAsync(server, client)
+-        d.addCallback(self._cbTestLoopback)
++        d.addCallback(self._cbTestRequestResponseLoop)
+         return d
+ 
+-    def _cbTestLoopback(self, ignored):
++    def _cbTestRequestResponseLoop(self, ignored):
++        """
++        Test that every method was correctly called and has set the
++        expected values.
++        """
+         if not (self.gotStatus and self.gotResponse and self.gotEndHeaders):
+             raise RuntimeError(
+                 "didn't got all callbacks %s"
+@@ -242,8 +305,70 @@
+         del self.gotStatus
+         del self.numHeaders
+ 
++class HTTP11LoopbackTestCase(HTTPLoopbackTestCase):
++    """
++    HTTP/1.1 request/response loop test.
++    
++    Test to make sure proper I{version}, I{status}, I{headers},
++    and I{response} are received from the server.
++    """
++    
++    Client = LoopbackHTTP11Client
++    Request = DummyHTTP11Request
++    expectedHeaders = {'request' : '/foo/bar',
++                       'command' : 'GET',
++                       'version' : 'HTTP/1.1',
++                       'transfer-encoding': 'chunked',
++                       'connection': 'close'}
+ 
++    def _handleStatus(self, version, status, message):
++        """
++        Test that the proper status code and version were returned
++        """
++        self.gotStatus = 1
++        self.assertEquals(version, "HTTP/1.1")
++        self.assertEquals(status, "200")
+ 
++    def _handleEndHeaders(self):
++        """
++        Test that every single header is correctly received
++        """
++        self.gotEndHeaders = 1
++        self.assertEquals(self.numHeaders, 5)
++        self.assertEquals(self.expectedHeaders, {})
++
++    def _handleHeader(self, key, value):
++        """
++        Test that each header is correctly parsed
++        """
++        self.numHeaders = self.numHeaders + 1
++        self.assertEquals(self.expectedHeaders[string.lower(key)], value)
++        self.expectedHeaders.pop(key.lower())
++
++    def _handleResponse(self, data):
++        """
++        Test that handleResponse is called only once
++        """
++        self.gotResponse += 1
++        self.assertEquals(self.gotResponse, 1)
++        self.assertEquals(data, "'''0123456789'''")
++
++    def _cbTestRequestResponseLoop(self, ignored):
++        """
++        Test that every method was correctly called and has set the
++        expected values.
++        """
++        self.assertEquals(self.gotResponse, 1)
++        if not (self.gotStatus and self.gotResponse and self.gotEndHeaders):
++            raise RuntimeError(
++                "didn't got all callbacks %s"
++                % [self.gotStatus, self.gotResponse, self.gotEndHeaders])
++        del self.gotEndHeaders
++        del self.gotResponse
++        del self.gotStatus
++        del self.numHeaders
++
++
+ def _prequest(**headers):
+     """
+     Make a request with the given request headers for the persistence tests.
+@@ -276,8 +401,11 @@
+                 self.assertEquals(req.responseHeaders.getRawHeaders(header, None), resultHeaders[header])
+ 
+ 
++
+ class ChunkingTestCase(unittest.TestCase):
+-
++    """
++    Tests for chunked response parsing.
++    """
+     strings = ["abcv", "", "fdfsd423", "Ffasfas\r\n",
+                "523523\n\rfsdf", "4234"]
+ 
+@@ -299,8 +427,6 @@
+                 pass
+         self.assertEquals(result, self.strings)
+ 
+-
+-
+ class ParsingTestCase(unittest.TestCase):
+     """
+     Tests for protocol parsing in L{HTTPChannel}.

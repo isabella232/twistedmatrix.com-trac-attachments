@@ -1,0 +1,190 @@
+Index: names/authority.py
+===================================================================
+--- names/authority.py	(revision 1)
++++ names/authority.py	(working copy)
+@@ -82,7 +82,10 @@
+         additional = []
+         default_ttl = max(self.soa[1].minimum, self.soa[1].expire)
+ 
+-        domain_records = self.records.get(name.lower())
++        #a record in self.records has a trailing dot if it was created with one, but is never
++        #queried with a trailing dot. So, if the get fails with no trailing dot, try it with 
++        #a trailing dot.  (You could do a better job, and trim the trailing dot, but that's hard.)
++        domain_records = self.records.get(name.lower(), self.records.get(name.lower() + '.'))
+ 
+         if domain_records:
+             for record in domain_records:
+@@ -208,9 +211,8 @@
+ 
+     def stripComments(self, lines):
+         return [
+-            a.find(';') == -1 and a or a[:a.find(';')] for a in [
+-                b.strip() for b in lines
+-            ]
++            #leading whitespace is significant - don't strip it!
++            a.find(';') == -1 and a or a[:a.find(';')] for a in lines
+         ]
+ 
+ 
+@@ -233,7 +235,13 @@
+         lines = L
+         L = []
+         for line in lines:
+-            L.append(line.split())
++            if not line:
++                continue
++            
++            if line[0] in [' ', '\t']:
++                L.append([''] + line.split())
++            else:
++                L.append(line.split())
+         return filter(None, L)
+ 
+ 
+@@ -242,6 +250,7 @@
+         ORIGIN = self.origin
+ 
+         self.records = {}
++        self.previousDomain = None
+ 
+         for (line, index) in zip(lines, range(len(lines))):
+             if line[0] == '$TTL':
+@@ -275,7 +284,7 @@
+             r.ttl = ttl
+             self.records.setdefault(domain.lower(), []).append(r)
+ 
+-            print 'Adding IN Record', domain, ttl, r
++            #print 'Adding IN Record', domain, ttl, r
+             if type == 'SOA':
+                 self.soa = (domain, r)
+         else:
+@@ -283,51 +292,51 @@
+ 
+ 
+     #
+-    # This file ends here.  Read no further.
++    # parse a bind format line.
+     #
+     def parseRecordLine(self, origin, ttl, line):
+-        MARKERS = dns.QUERY_CLASSES.values() + dns.QUERY_TYPES.values()
+         cls = 'IN'
+-        owner = origin
+-
++        
+         if line[0] == '@':
+-            line = line[1:]
+             owner = origin
+-#            print 'default owner'
+-        elif not line[0].isdigit() and line[0] not in MARKERS:
++        elif line[0]:
+             owner = line[0]
+-            line = line[1:]
+-#            print 'owner is ', owner
++        else:
++            owner = self.previousDomain
+ 
+-        if line[0].isdigit() or line[0] in MARKERS:
++        #if the line starts with whitespace, it's not a name
++        if not line[0]:
+             domain = owner
+             owner = origin
+-#            print 'woops, owner is ', owner, ' domain is ', domain
++            line = line[1:]
+         else:
+             domain = line[0]
+             line = line[1:]
+-#            print 'domain is ', domain
+-
++        
++        if line[0].isdigit():
++            ttl = int(line[0])
++            line = line[1:]
++            
+         if line[0] in dns.QUERY_CLASSES.values():
+             cls = line[0]
+             line = line[1:]
+-#            print 'cls is ', cls
+-            if line[0].isdigit():
+-                ttl = int(line[0])
+-                line = line[1:]
+-#                print 'ttl is ', ttl
+-        elif line[0].isdigit():
+-            ttl = int(line[0])
++            
++        if line[0] in dns.QUERY_TYPES.values():
++            type = line[0]
+             line = line[1:]
+-#            print 'ttl is ', ttl
+-            if line[0] in dns.QUERY_CLASSES.values():
+-                cls = line[0]
+-                line = line[1:]
+-#                print 'cls is ', cls
+-
+-        type = line[0]
+-#        print 'type is ', type
+-        rdata = line[1:]
+-#        print 'rdata is ', rdata
+-
++        
++        if type == dns.QUERY_TYPES[dns.RRSIG] and len(line) > 9:
++            line[8] = ''.join(line[8:])
++            line = line[0:9]
++        elif type == dns.QUERY_TYPES[dns.DS] and len(line) > 4:
++            line[3] = ''.join(line[3:])
++            line = line[0:3]
++        elif type == dns.QUERY_TYPES[dns.DNSKEY] and len(line) > 4:
++            line[3] = ''.join(line[3:])
++            line = line[0:3]
++            
++        rdata = line
++        
+         self.addRecord(owner, ttl, type, domain, cls, rdata)
++        
++        self.previousDomain = domain
+Index: names/client.py
+===================================================================
+--- names/client.py	(revision 16)
++++ names/client.py	(working copy)
+@@ -246,8 +246,16 @@
+         for (d, q, t) in self.pending:
+             self.queryTCP(q, t).chainDeferred(d)
+         del self.pending[:]
++        
++    def connectionLost(self, protocol):
++        """
++        Called on UDP protocol when a DNS UDP query times out and is retried
++        on the TCP protocol. 30 seconds after the TCP query completes, this
++        method is called on the UDP protocol.
++        """
++        self.connections.remove(protocol)
++        del protocol
+ 
+-
+     def messageReceived(self, message, protocol, address = None):
+         log.msg("Unexpected message (%d) received from %r" % (message.id, address))
+ 
+Index: names/secondary.py
+===================================================================
+--- names/secondary.py	(revision 1)
++++ names/secondary.py	(working copy)
+@@ -59,8 +59,18 @@
+         if self.transferring:
+             return
+         self.transfering = True
+-        return client.Resolver(servers=[(self.primary, dns.PORT)]
+-            ).lookupZone(self.domain
++        
++        #allow for using a primary that is not serving DNS on port 53
++        #pick up the port from the primary address in ip:port format
++        primary = self.primary
++        port = dns.PORT
++        parts = self.primary.split(':')
++        if len(parts) == 2:
++            primary = parts[0]
++            port = int(parts[1])
++            
++        return client.Resolver(servers=[(primary, port)]
++            ).lookupZone(self.domain, timeout=600
+             ).addCallback(self._cbZone
+             ).addErrback(self._ebZone
+             )

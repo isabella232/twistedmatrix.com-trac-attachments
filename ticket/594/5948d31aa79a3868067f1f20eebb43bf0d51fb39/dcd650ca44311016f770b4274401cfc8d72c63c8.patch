@@ -1,0 +1,147 @@
+diff --git a/twisted/names/dns.py b/twisted/names/dns.py
+index 5e42a52..ea09e5b 100644
+--- a/twisted/names/dns.py
++++ b/twisted/names/dns.py
+@@ -29,7 +29,7 @@ __all__ = [
+     'Record_DNAME', 'Record_HINFO', 'Record_MB', 'Record_MD', 'Record_MF',
+     'Record_MG', 'Record_MINFO', 'Record_MR', 'Record_MX', 'Record_NAPTR',
+     'Record_NS', 'Record_NULL', 'Record_PTR', 'Record_RP', 'Record_SOA',
+-    'Record_SPF', 'Record_SRV', 'Record_TXT', 'Record_WKS',
++    'Record_SPF', 'Record_SRV', 'Record_TXT', 'Record_WKS', 'Record_UNKNOWN',
+ 
+     'QUERY_CLASSES', 'QUERY_TYPES', 'REV_CLASSES', 'REV_TYPES', 'EXT_QUERIES',
+ 
+@@ -483,7 +483,7 @@ class RRHeader(tputil.FancyEqMixin):
+         @type payload: An object implementing C{IEncodable}
+         @param payload: A Query Type specific data object.
+         """
+-        assert (payload is None) or (payload.TYPE == type)
++        assert (payload is None) or isinstance(payload, Record_UNKNOWN) or (payload.TYPE == type)
+ 
+         self.name = Name(name)
+         self.type = type
+@@ -1469,6 +1469,37 @@ class Record_TXT(tputil.FancyEqMixin, tputil.FancyStrMixin):
+     def __hash__(self):
+         return hash(tuple(self.data))
+ 
++# This is a fallback record
++class Record_UNKNOWN:
++    """
++    Encapsulate the wire data for unkown record types so that they can
++    pass through the system unchanged.
++
++    @type data: C{str}
++    @ivar data: Wire data which makes up this record.
++    
++    @type ttl: C{int}
++    @ivar ttl: The maximum number of seconds which this record should be cached.
++
++    @since: 11.1
++    """
++    implements(IEncodable, IRecord)
++
++    def __init__(self, data='', ttl=None):
++        self.data = data
++        self.ttl = str2time(ttl)
++
++    def encode(self, strio, compDict=None):
++        strio.write(self.data)
++
++    def decode(self, strio, length=None):
++        if length is None:
++            raise Exception('must know length for unknown record types')
++        self.data = readPrecisely(strio, length)
++
++    def __cmp__(self, other):
++        if isinstance(other, Record_UNKNOWN) and other.data == self.data:
++            return 0
+ 
+ 
+ class Record_SPF(Record_TXT):
+@@ -1612,6 +1643,8 @@ class Message:
+     # this).
+     _recordTypes = {}
+     for name in globals():
++        if name == 'Record_UNKNOWN':
++            continue
+         if name.startswith('Record_'):
+             _recordTypes[globals()[name].TYPE] = globals()[name]
+ 
+@@ -1631,7 +1664,7 @@ class Message:
+             can be found for the given type.
+         @rtype: L{types.ClassType}
+         """
+-        return self._recordTypes.get(type, None)
++        return self._recordTypes.get(type, Record_UNKNOWN)
+ 
+ 
+     def toStr(self):
+diff --git a/twisted/names/test/test_dns.py b/twisted/names/test/test_dns.py
+index 30714ef..1a28d3d 100644
+--- a/twisted/names/test/test_dns.py
++++ b/twisted/names/test/test_dns.py
+@@ -75,6 +75,55 @@ class NameTests(unittest.TestCase):
+             {"example.com": 0x17, "foo.example.com": expected},
+             compression)
+ 
++    def testUnknown(self):
++        wire = str(
++            '\x01\x00' # Message ID
++            '\x00' # answer bit, opCode nibble, auth bit, trunc bit, recursive bit
++            '\x00' # recursion bit, empty bit, empty bit, empty bit, response code nibble
++            '\x00\x01' # number of queries
++            '\x00\x01' # number of answers
++            '\x00\x00' # number of authorities
++            '\x00\x01' # number of additionals
++
++            # query
++            '\x03foo\x03bar\x00'    # foo.bar
++            '\xde\xad'              # type=0xdead
++            '\xbe\xef'              # cls=0xbeef
++
++            # 1st answer
++            '\xc0\x0c'              # foo.bae - compressed
++            '\xde\xad'              # type=0xdead
++            '\xbe\xef'              # cls=0xbeef
++            '\x00\x00\x01\x01'      # ttl=257
++            '\x00\x08somedata'      # some payload data
++
++            # 1st additional
++            '\x03baz\x03ban\x00'    # baz.ban
++            '\x00\x01'              # type=A
++            '\x00\x01'              # cls=IN
++            '\x00\x00\x01\x01'      # ttl=257
++            '\x00\x04'              # len=4
++            '\x01\x02\x03\x04'      # 1.2.3.4
++
++            )
++
++        msg = dns.Message()
++        msg.fromStr(wire)
++
++        self.assertEquals(msg.queries, [
++            dns.Query('foo.bar', type=0xdead, cls=0xbeef),
++            ])
++        self.assertEquals(msg.answers, [
++            dns.RRHeader('foo.bar', type=0xdead, cls=0xbeef, ttl=257, payload=dns.Record_UNKNOWN('somedata')),
++            ])
++        self.assertEquals(msg.additional, [
++            dns.RRHeader('baz.ban', type=dns.A, cls=dns.IN, ttl=257, payload=dns.Record_A('1.2.3.4', ttl=257)),
++            ])
++
++        enc = msg.toStr()
++
++        self.assertEquals(enc, wire)
++
+ 
+     def test_decodeWithCompression(self):
+         """
+@@ -312,7 +361,7 @@ class MessageTestCase(unittest.TestCase):
+         # 65280 is the first value in the range reserved for private
+         # use, so it shouldn't ever conflict with an officially
+         # allocated value.
+-        self.assertIdentical(dns.Message().lookupRecordType(65280), None)
++        self.assertIdentical(dns.Message().lookupRecordType(65280), dns.Record_UNKNOWN)
+ 
+ 
+ 

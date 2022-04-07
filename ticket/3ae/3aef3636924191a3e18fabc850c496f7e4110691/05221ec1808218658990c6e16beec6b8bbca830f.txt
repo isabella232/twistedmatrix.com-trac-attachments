@@ -1,0 +1,122 @@
+Index: twisted/internet/tcp.py
+===================================================================
+--- twisted/internet/tcp.py	(revision 12473)
++++ twisted/internet/tcp.py	(working copy)
+@@ -100,9 +100,8 @@
+             self.readBlockedOnWrite = 1
+             self.startWriting()
+             return
+-        except SSL.Error:
+-            log.err()
+-            return main.CONNECTION_LOST
++        except SSL.Error, e:
++            return e
+ 
+     def loseConnection(self):
+         Connection.loseConnection(self)
+@@ -139,9 +138,8 @@
+                 return 0
+             else:
+                 return main.CONNECTION_LOST
+-        except SSL.Error:
+-            log.err()
+-            return main.CONNECTION_LOST
++        except SSL.Error, e:
++            return e
+ 
+     def _closeSocket(self):
+         try:
+@@ -163,9 +161,8 @@
+         try:
+             done = self.socket.shutdown()
+             self.sslShutdown = 1
+-        except SSL.Error:
+-            log.err()
+-            return main.CONNECTION_LOST
++        except SSL.Error, e:
++            return e
+         if done:
+             return main.CONNECTION_DONE
+         else:
+Index: twisted/test/test_ssl.py
+===================================================================
+--- twisted/test/test_ssl.py	(revision 12473)
++++ twisted/test/test_ssl.py	(working copy)
+@@ -94,7 +94,6 @@
+ 
+ class ImmediatelyDisconnectingProtocol(protocol.Protocol):
+     def connectionMade(self):
+-        # Twisted's SSL support is terribly broken.
+         self.transport.loseConnection()
+ 
+     def connectionLost(self, reason):
+@@ -107,7 +106,7 @@
+         reactor.callLater(0.1, self.transport.loseConnection)
+ 
+     def connectionLost(self, reason):
+-        self.factory.connectionDisconnected.callback(None)
++        self.factory.connectionDisconnected.callback(reason)
+ 
+ 
+ def generateCertificateObjects(organization, organizationalUnit):
+@@ -313,10 +312,8 @@
+         self.assertEquals(client.buffer, ["+OK <some crap>\r\n"])
+ 
+ 
+-class ImmediateDisconnectTestCase(unittest.TestCase, ContextGeneratingMixin):
++class ConnectionLostTestCase(unittest.TestCase, ContextGeneratingMixin):
+ 
+-    todo = "Logged SSL.Error - [('SSL routines', 'SSL23_READ', 'ssl handshake failure')]"
+-
+     def testImmediateDisconnect(self):
+         org = "twisted.test.test_ssl"
+         self.setupServerAndClient(
+@@ -338,7 +335,48 @@
+         
+         return clientProtocolFactory.connectionDisconnected.addCallback(
+             lambda ignoredResult: self.serverPort.stopListening())
++    
++    def testFailedVerify(self):
++        org = "twisted.test.test_ssl"
++        self.setupServerAndClient(
++            (org, org + ", client"), {},
++            (org, org + ", server"), {})
+ 
++        def verify(*a):
++            return False
++        self.clientCtxFactory.getContext().set_verify(SSL.VERIFY_PEER, verify)
++        
++        serverConnLost = defer.Deferred()
++        serverProtocol = protocol.Protocol()
++        serverProtocol.connectionLost = serverConnLost.callback
++        serverProtocolFactory = protocol.ServerFactory()
++        serverProtocolFactory.protocol = lambda: serverProtocol
++        self.serverPort = serverPort = reactor.listenSSL(0,
++            serverProtocolFactory, self.serverCtxFactory)
++        
++        clientConnLost = defer.Deferred()
++        clientProtocol = protocol.Protocol()
++        clientProtocol.connectionLost = clientConnLost.callback
++        clientProtocolFactory = protocol.ClientFactory()
++        clientProtocolFactory.protocol = lambda: clientProtocol
++        clientConnector = reactor.connectSSL('127.0.0.1',
++            serverPort.getHost().port, clientProtocolFactory, self.clientCtxFactory)
++        
++        dl = defer.DeferredList([serverConnLost, clientConnLost], consumeErrors=True)
++        return dl.addCallback(self._cbLostConns)
++    
++    def _cbLostConns(self, results):
++        (sSuccess, sResult), (cSuccess, cResult) = results
++        
++        self.failIf(sSuccess)
++        self.failIf(cSuccess)
++        
++        sResult.trap(SSL.Error)
++        cResult.trap(SSL.Error)
++
++        return self.serverPort.stopListening()
++
++
+ if SSL is None:
+     for tCase in [StolenTCPTestCase, TLSTestCase, SpammyTLSTestCase, 
+                   BufferingTestCase, ImmediateDisconnectTestCase]:

@@ -1,0 +1,205 @@
+Index: twisted/web2/test/test_client.py
+===================================================================
+--- twisted/web2/test/test_client.py	(revision 19132)
++++ twisted/web2/test/test_client.py	(working copy)
+@@ -77,8 +77,9 @@
+         self.assertEquals(cxn.server.done, True, 'Connection not closed.')
+         
+     def assertHeaders(self, resp, expectedHeaders):
+-        for header in resp.headers.getAllRawHeaders():
+-            self.assertIn(header, expectedHeaders)
++        headers = list(resp.headers.getAllRawHeaders())
++        headers.sort()
++        self.assertEquals(headers, expectedHeaders)
+ 
+ 
+ class TestHTTPClient(ClientTests):
+@@ -91,9 +92,9 @@
+ 
+         def gotResp(resp):
+             self.assertEquals(resp.code, 200)
+-
+-            self.assertHeaders(resp, (('Content-Length', ['10']),))
+-
++            self.assertHeaders(resp, [])
++            self.assertEquals(resp.stream.length, 10)
++            
+             return defer.maybeDeferred(resp.stream.read).addCallback(gotData)
+                 
+         d = cxn.client.submitRequest(req).addCallback(gotResp)
+@@ -118,7 +119,8 @@
+ 
+         def gotResp(resp):
+             self.assertEquals(resp.code, 200)
+-            self.assertHeaders(resp, (('Content-Length', ['10']),))
++            self.assertHeaders(resp, [])
++            self.assertEquals(resp.stream.length, 10)
+ 
+             self.writeToClient(cxn, '1234567890')
+ 
+@@ -144,9 +146,9 @@
+ 
+         def gotResp(resp):
+             self.assertEquals(resp.code, 200)
++            self.assertHeaders(resp, [])
++            self.assertEquals(resp.stream.length, 0)
+ 
+-            self.assertHeaders(resp, (('Content-Length', ['0']),))
+-
+         d = cxn.client.submitRequest(req, closeAfter=False).addCallback(gotResp)
+ 
+         self.assertRaises(AssertionError,
+@@ -163,15 +165,12 @@
+ 
+     def test_userHeaders(self):
+         cxn = self.connect(inputTimeOut=None)
+-        req = http.ClientRequest('GET', '/',
+-                                 {'Accept-Language': {'en': 1.0}}, None)
+ 
+         def gotResp(resp):
+             self.assertEquals(resp.code, 200)
++            self.assertEquals(resp.stream.length, 0)
++            self.assertHeaders(resp, [('X-Foobar', ['Yes'])])
+ 
+-            self.assertHeaders(resp, (('Content-Length', ['0']),
+-                                      ('Connection', ['Keep-Alive'])))
+-
+             headers = http_headers.Headers(
+                 headers={'Accept-Language': {'en': 1.0}},
+                 rawHeaders={'X-My-Other-Header': ['socks']})
+@@ -194,6 +193,9 @@
+ 
+             return d
+ 
++        req = http.ClientRequest('GET', '/',
++                                 {'Accept-Language': {'en': 1.0}}, None)
++
+         d = cxn.client.submitRequest(req, closeAfter=False).addCallback(gotResp)
+ 
+         self.assertReceived(cxn, 'GET / HTTP/1.1',
+@@ -202,7 +204,7 @@
+ 
+         self.writeLines(cxn, ('HTTP/1.1 200 OK',
+                               'Content-Length: 0',
+-                              'Connection: Keep-Alive',
++                              'X-Foobar: Yes',
+                               '\r\n'))
+ 
+         return d.addCallback(lambda _: self.assertDone(cxn))
+@@ -214,6 +216,8 @@
+ 
+         def gotResp(resp):
+             self.assertEquals(resp.code, 202)
++            self.assertEquals(resp.stream.length, 0)
++            self.assertHeaders(resp, [])
+             
+         d = cxn.client.submitRequest(req).addCallback(gotResp)
+ 
+@@ -239,7 +243,9 @@
+ 
+         def gotResp(resp):
+             self.assertEquals(resp.code, 200)
+-            
++            self.assertEquals(resp.stream.length, 0)
++            self.assertHeaders(resp, [])
++
+             return defer.maybeDeferred(resp.stream.read).addCallback(gotData)
+ 
+         d = cxn.client.submitRequest(req).addCallback(gotResp)
+@@ -249,11 +255,52 @@
+ 
+         self.writeLines(cxn, ('HTTP/1.1 200 OK',
+                               'Connection: close',
++                              'Content-Length: 5',
+                               '',
+                               'Pants')) # bad server
+ 
+         return d.addCallback(lambda _: self.assertDone(cxn))
+ 
++    def test_sentHeadPipelined(self):
++        cxn = self.connect(inputTimeOut=None)
++
++        req = http.ClientRequest('HEAD', '/', None, None)
++
++        didIt = [0]
++
++        def gotData(data):
++            self.assertEquals(data, None)
++            
++        def gotResp(resp):
++            self.assertEquals(resp.code, 200)
++            self.assertEquals(resp.stream.length, 0)
++            self.assertHeaders(resp, [])
++
++            return defer.maybeDeferred(resp.stream.read).addCallback(gotData)
++
++        def submitRequest(second):
++            if didIt[0]:
++                return
++            didIt[0] = second
++
++            cxn.server.data = ''
++            
++            d = cxn.client.submitRequest(req, closeAfter=second).addCallback(gotResp)
++
++            self.assertReceived(cxn, 'HEAD / HTTP/1.1',
++                                ['Connection: '+ (second and 'close' or 'Keep-Alive')])
++            
++            self.writeLines(cxn, ('HTTP/1.1 200 OK',
++                                  'Connection: '+ (second and 'close' or 'Keep-Alive'),
++                                    'Content-Length: 5',
++                                  '\r\n'))
++            
++            return d.addCallback(lambda _: submitRequest(1))
++        
++        d = submitRequest(0)
++    
++        return d.addCallback(lambda _: self.assertDone(cxn))
++
+     def test_chunkedUpload(self):
+         cxn = self.connect(inputTimeOut=None)
+ 
+@@ -287,7 +334,9 @@
+ 
+         def gotResp(resp):
+             self.assertEquals(resp.code, 200)
+-            
++            self.assertEquals(resp.stream.length, None)
++            self.assertHeaders(resp, [])
++
+             self.failIf(('Connection', ['close']) in resp.headers.getAllRawHeaders())
+             
+         d = cxn.client.submitRequest(req).addCallback(gotResp)
+Index: twisted/web2/channel/http.py
+===================================================================
+--- twisted/web2/channel/http.py	(revision 19132)
++++ twisted/web2/channel/http.py	(working copy)
+@@ -279,10 +279,11 @@
+                 #  the request method was HEAD.
+                 # If the request was HEAD, self.length has been set to 0 by
+                 # HTTPClientRequest.submit)
+-                if self.code in http.NO_BODY_CODES:
+-                    self.length = 0
+-                else:
+-                    self.length = connHeaders.getHeader('content-length', self.length)
++                if self.length is None:
++                    if self.code in http.NO_BODY_CODES:
++                        self.length = 0
++                    else:
++                        self.length = connHeaders.getHeader('content-length', self.length)
+                     
+                 # If it's an indeterminate stream without transfer encoding, it must be
+                 # the last request.
+Index: twisted/web2/client/http.py
+===================================================================
+--- twisted/web2/client/http.py	(revision 19132)
++++ twisted/web2/client/http.py	(working copy)
+@@ -164,7 +164,7 @@
+ 
+     ## FIXME: Actually creates Response, function is badly named!
+     def createRequest(self):
+-        self.stream = stream_mod.ProducerStream()
++        self.stream = stream_mod.ProducerStream(self.length)
+         self.response = http.Response(self.code, self.inHeaders, self.stream)
+         self.stream.registerProducer(self, True)
+         

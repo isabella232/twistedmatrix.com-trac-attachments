@@ -1,0 +1,250 @@
+diff --git a/twisted/web/http.py b/twisted/web/http.py
+index 4024b0f..c92108a 100644
+--- a/twisted/web/http.py
++++ b/twisted/web/http.py
+@@ -1593,9 +1593,16 @@ class HTTPChannel(basic.LineReceiver, policies.TimeoutMixin):
+     @ivar _transferDecoder: C{None} or an instance of
+         L{_ChunkedTransferDecoder} if the request body uses the I{chunked}
+         Transfer-Encoding.
++    @ivar maxHeaders: Maximum number of headers allowed per request.
++    @ivar totalHeadersSize: Maximum bytes for request line plus all headers
++        from the request.
++
++    Maximum length for initial request line and each header is defined
++    by L{basic.LineReceiver.MAX_LENGTH}.
+     """
+ 
+-    maxHeaders = 500 # max number of headers allowed per request
++    maxHeaders = 500
++    totalHeadersSize = 16384
+ 
+     length = 0
+     persistent = 1
+@@ -1608,6 +1615,7 @@ class HTTPChannel(basic.LineReceiver, policies.TimeoutMixin):
+ 
+     _savedTimeOut = None
+     _receivedHeaderCount = 0
++    _receivedHeaderSize = 0
+ 
+     def __init__(self):
+         # the request queue
+@@ -1618,9 +1626,20 @@ class HTTPChannel(basic.LineReceiver, policies.TimeoutMixin):
+     def connectionMade(self):
+         self.setTimeout(self.timeOut)
+ 
++
+     def lineReceived(self, line):
++        """
++        Called for each line from request until the end of headers when
++        it enters binary mode.
++        """
+         self.resetTimeout()
+ 
++        self._receivedHeaderSize += len(line)
++        if (self._receivedHeaderSize > self.totalHeadersSize):
++            self.transport.write(b"HTTP/1.1 400 Bad Request\r\n\r\n")
++            self.transport.loseConnection()
++            return
++
+         if self.__first_line:
+             # if this connection is not persistent, drop any data which
+             # the client (illegally) sent after the last request.
+@@ -1719,6 +1738,7 @@ class HTTPChannel(basic.LineReceiver, policies.TimeoutMixin):
+         # reset ALL state variables, so we don't interfere with next request
+         self.length = 0
+         self._receivedHeaderCount = 0
++        self._receivedHeaderSize = 0
+         self.__first_line = 1
+         self._transferDecoder = None
+         del self._command, self._path, self._version
+diff --git a/twisted/web/test/test_http.py b/twisted/web/test/test_http.py
+index 5a0a853..370682f 100644
+--- a/twisted/web/test/test_http.py
++++ b/twisted/web/test/test_http.py
+@@ -660,23 +660,42 @@ class ParsingTestCase(unittest.TestCase):
+         self.didRequest = False
+ 
+ 
+-    def runRequest(self, httpRequest, requestClass, success=1):
++    def runRequest(
++            self, httpRequest, requestFactory=None, channel=None,
++            success=False):
++        """
++        Execute a request having content in `httpRequest`.
++
++        `channel` is the instance processing the request.
++
++        When defined `requestFactory` is used for the channel.
++
++        It will check `self.didRequest` for `success` value.
++
++        Returns the channel used for processing the request.
++        """
++        if not channel:
++            channel = http.HTTPChannel()
++
++        if requestFactory:
++            channel.requestFactory = requestFactory
++
+         httpRequest = httpRequest.replace(b"\n", b"\r\n")
+-        b = StringTransport()
+-        a = http.HTTPChannel()
+-        a.requestFactory = requestClass
+-        a.makeConnection(b)
++        transport = StringTransport()
++
++        channel.makeConnection(transport)
+         # one byte at a time, to stress it.
+         for byte in iterbytes(httpRequest):
+-            if a.transport.disconnecting:
++            if channel.transport.disconnecting:
+                 break
+-            a.dataReceived(byte)
+-        a.connectionLost(IOError("all done"))
++            channel.dataReceived(byte)
++        channel.connectionLost(IOError("all done"))
++
+         if success:
+             self.assertTrue(self.didRequest)
+         else:
+             self.assertFalse(self.didRequest)
+-        return a
++        return channel
+ 
+ 
+     def test_basicAuth(self):
+@@ -803,6 +822,81 @@ class ParsingTestCase(unittest.TestCase):
+             b'\r\n')
+ 
+ 
++    def test_headersTooBigInitialCommand(self):
++        """
++        Enforces a limit of C{HTTPChannel.totalHeadersSize}
++        on the size of headers received per request starting from initial
++        command line.
++        """
++        channel = http.HTTPChannel()
++        channel.totalHeadersSize = 10
++        httpRequest = b'GET /path/longer/than/10 HTTP/1.1\n'
++
++        channel = self.runRequest(httpRequest=httpRequest, channel=channel)
++
++        self.assertEqual(
++            channel.transport.value(),
++            b"HTTP/1.1 400 Bad Request\r\n\r\n")
++
++
++    def test_headersTooBigOtherHeaders(self):
++        """
++        Enforces a limit of C{HTTPChannel.totalHeadersSize}
++        on the size of headers received per request counting first line
++        and total headers.
++        """
++        channel = http.HTTPChannel()
++        channel.totalHeadersSize = 40
++        httpRequest = (
++            b'GET /less/than/40 HTTP/1.1\n'
++            b'Some-Header: less-than-40\n'
++            )
++
++        channel = self.runRequest(httpRequest=httpRequest, channel=channel)
++
++        self.assertEqual(
++            channel.transport.value(),
++            b"HTTP/1.1 400 Bad Request\r\n\r\n")
++
++
++    def test_headersTooBigPerRequest(self):
++        """
++        Enforces total size of headers per individual request and counter
++        is reset at the end of each request.
++        """
++        class SimpleRequest(http.Request):
++            def process(self):
++                self.finish()
++        channel = http.HTTPChannel()
++        channel.totalHeadersSize = 60
++        channel.requestFactory = SimpleRequest
++        httpRequest = (
++            b'GET / HTTP/1.1\n'
++            b'Some-Header: total-less-than-60\n'
++            b'\n'
++            b'GET / HTTP/1.1\n'
++            b'Some-Header: less-than-60\n'
++            b'\n'
++            )
++
++        channel = self.runRequest(
++            httpRequest=httpRequest, channel=channel)
++
++        self.assertEqual(
++            channel.transport.value(),
++            b'HTTP/1.1 200 OK\r\n'
++            b'Transfer-Encoding: chunked\r\n'
++            b'\r\n'
++            b'0\r\n'
++            b'\r\n'
++            b'HTTP/1.1 200 OK\r\n'
++            b'Transfer-Encoding: chunked\r\n'
++            b'\r\n'
++            b'0\r\n'
++            b'\r\n'
++            )
++
++
+     def testCookies(self):
+         """
+         Test cookies parsing and reading.
+@@ -821,7 +915,7 @@ Cookie: rabbit="eat carrot"; ninja=secret; spam="hey 1=1!"
+                 testcase.didRequest = True
+                 self.finish()
+ 
+-        self.runRequest(httpRequest, MyRequest)
++        self.runRequest(httpRequest, MyRequest, success=True)
+ 
+         self.assertEqual(
+             cookies, {
+@@ -848,7 +942,7 @@ GET /?key=value&multiple=two+words&multiple=more%20words&empty= HTTP/1.0
+                 testcase.didRequest = True
+                 self.finish()
+ 
+-        self.runRequest(httpRequest, MyRequest)
++        self.runRequest(httpRequest, MyRequest, success=True)
+         self.assertEqual(method, [b"GET"])
+         self.assertEqual(
+             args, [[b"value"], [b""], [b"two words", b"more words"]])
+@@ -874,7 +968,7 @@ GET /?key=value&multiple=two+words&multiple=more%20words&empty= HTTP/1.0
+                 testcase.didRequest = True
+                 self.finish()
+ 
+-        self.runRequest(httpRequest, MyRequest)
++        self.runRequest(httpRequest, MyRequest, success=True)
+         self.assertEqual(method, [b'GET'])
+         self.assertEqual(path, [b'/foo'])
+         self.assertEqual(args, [[b'?'], [b'quux']])
+@@ -910,7 +1004,7 @@ Content-Type: application/x-www-form-urlencoded
+                 testcase.didRequest = True
+                 self.finish()
+ 
+-        self.runRequest(httpRequest, MyRequest)
++        self.runRequest(httpRequest, MyRequest, success=True)
+         self.assertEqual(method, [b"POST"])
+         self.assertEqual(
+             args, [[b"value"], [b""], [b"two words", b"more words"]])
+@@ -971,7 +1065,7 @@ Hello,
+                 testcase.didRequest = True
+                 self.finish()
+ 
+-        self.runRequest(httpRequest, MyRequest)
++        self.runRequest(httpRequest, MyRequest, success=True)
+         # The tempfile API used to create content returns an
+         # instance of a different type depending on what platform
+         # we're running on.  The point here is to verify that the
+diff --git a/twisted/web/topfiles/6933.misc b/twisted/web/topfiles/6933.misc
+new file mode 100644
+index 0000000..f72a31f
+--- /dev/null
++++ b/twisted/web/topfiles/6933.misc
+@@ -0,0 +1 @@
++twisted.web.http.HTTPChannel now limit the total headers size, including first command line, to 16KB.
+\ No newline at end of file

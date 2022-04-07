@@ -1,0 +1,714 @@
+diff -Naur -x '*pyc' -x '*CVS*' -x '*~' -x '*#*' -x '*sandbox*' ../Twisted/twisted/lore/default.py ./twisted/lore/default.py
+--- ../Twisted/twisted/lore/default.py	2003-11-26 04:20:38.000000000 -0500
++++ ./twisted/lore/default.py	2003-12-21 18:40:27.000000000 -0500
+@@ -24,21 +24,22 @@
+ 
+ class ProcessingFunctionFactory:
+ 
+-    doFile = [tree.doFile]
++    def getDoFile(self):
++        return tree.doFile
+ 
+-    def generate_html(self, d):
++    def generate_html(self, options, filenameGenerator=tree.getOutputFileName):
+         n = htmlDefault.copy()
+-        n.update(d)
+-        d = n
++        n.update(options)
++        options = n
+         try:
+-            fp = open(d['template'])
++            fp = open(options['template'])
+             templ = microdom.parse(fp)
+         except IOError, e:
+             raise process.NoProcessorError(e.filename+": "+e.strerror)
+         except sux.ParseError, e:
+             raise process.NoProcessorError(str(e))
+-        df = lambda file, linkrel: self.doFile[0](file, linkrel, d['ext'],
+-                                           d['baseurl'], templ, d)
++        df = lambda file, linkrel: self.getDoFile()(file, linkrel, options['ext'],
++                                                    options['baseurl'], templ, options, filenameGenerator)
+         return df
+ 
+     latexSpitters = {None: latex.LatexSpitter,
+@@ -47,10 +48,10 @@
+                      'book': latex.BookLatexSpitter,
+                      }
+ 
+-    def generate_latex(self, d):
++    def generate_latex(self, options):
+         spitter = self.latexSpitters[None]
+         for (key, value) in self.latexSpitters.items():
+-            if key and d.get(key):
++            if key and options.get(key):
+                spitter = value
+         df = lambda file, linkrel: latex.convertFile(file, spitter)
+         return df
+@@ -58,7 +59,7 @@
+     def getLintChecker(self):
+         return lint.getDefaultChecker()
+ 
+-    def generate_lint(self, d):
++    def generate_lint(self, options):
+         checker = self.getLintChecker()
+         return lambda file, linkrel: lint.doFile(file, checker)
+ 
+diff -Naur -x '*pyc' -x '*CVS*' -x '*~' -x '*#*' -x '*sandbox*' ../Twisted/twisted/lore/how_to_separate_output.txt ./twisted/lore/how_to_separate_output.txt
+--- ../Twisted/twisted/lore/how_to_separate_output.txt	1969-12-31 19:00:00.000000000 -0500
++++ ./twisted/lore/how_to_separate_output.txt	2003-12-21 17:59:21.000000000 -0500
+@@ -0,0 +1,34 @@
++To use the new extension to lore, do this:
++
++Specify --docsdir=<location of inputdir>
++        --config inputdir=<location of inputdir>
++        --config outputdir=<location of outputdir>
++        --config ext=.html
++
++The -o html seems to be implicit/default.
++
++(You also need to point to your template file if it's not ./template.tpl )
++
++The inputdir and outputdir no longer need to be fully specified;
++ ., .., and ~ syntax will work, along with environment variables
++(ones the lore process can see, natch).
++
++The following is currently GUARANTEED to work:
++
++lore --config inputdir=src --config outputdir=output --config ext=.html
++
++This also works:
++lore --config inputdir=$HOME/Scratch/src/ --config outputdir=~/newoutput --config ext=.html --docsdir=src
++
++Improvements:
++
++  ++ make it take non-fully-qualified directory names and treat same as fully
++  ++ figure out how to make output files be .html
++     __ maybe protect from overwriting?
++  __ not have to specify stupid --config before every parameter
++  __ maybe take src and output as defaults?
++  __ take a config file (Options may already do this)
++  __ don't require output directory to already exist
++
++  __ we have to specify both docsdir and inputdir -- that's redundant.
++     can we just use docsdir as inputdir?  The former isn't a config option.
+diff -Naur -x '*pyc' -x '*CVS*' -x '*~' -x '*#*' -x '*sandbox*' ../Twisted/twisted/lore/lmath.py ./twisted/lore/lmath.py
+--- ../Twisted/twisted/lore/lmath.py	2003-05-12 02:08:26.000000000 -0400
++++ ./twisted/lore/lmath.py	2003-12-11 19:05:47.000000000 -0500
+@@ -70,10 +70,11 @@
+ 
+ class ProcessingFunctionFactory(default.ProcessingFunctionFactory):
+ 
+-    doFile = [doFile]
+-
+     latexSpitters = {None: MathLatexSpitter}
+ 
++    def getDoFile(self):
++        return doFile
++
+     def getLintChecker(self):
+         checker = lint.getDefaultChecker()
+         checker.allowedClasses = checker.allowedClasses.copy()
+diff -Naur -x '*pyc' -x '*CVS*' -x '*~' -x '*#*' -x '*sandbox*' ../Twisted/twisted/lore/process.py ./twisted/lore/process.py
+--- ../Twisted/twisted/lore/process.py	2003-02-14 19:43:04.000000000 -0500
++++ ./twisted/lore/process.py	2003-12-21 18:21:18.000000000 -0500
+@@ -15,6 +15,7 @@
+ # Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
+ #
+ import sys, os
++import tree #todo: get rid of this later
+ 
+ class NoProcessorError(Exception):
+     pass
+@@ -86,9 +87,40 @@
+     def percentdone(self, percent, fname):
+         pass
+ 
+-def getProcessor(module, output, d):
++def parallelGenerator(originalFileName, outputExtension):
++    return os.path.splitext(originalFileName)[0]+outputExtension
++
++def fooAddingGenerator(originalFileName, outputExtension):
++    return os.path.splitext(originalFileName)[0]+"foo"+outputExtension
++
++def outputdirGenerator(originalFileName, outputExtension, inputdir, outputdir):
++    originalFileName = os.path.abspath(originalFileName)
++    if originalFileName[:len(inputdir)] != inputdir:
++        raise ("Original file name '" + originalFileName +
++              "' not under input directory '" + inputdir + "'")
++
++    adjustedPath = outputdir + originalFileName[len(inputdir):]
++    return tree.getOutputFileName(adjustedPath, outputExtension)
++
++def getFilenameGenerator(config, outputExt):
++    if config.get('outputdir'):
++        return (lambda originalFileName, outputExtension:
++            outputdirGenerator(originalFileName, outputExtension,
++                               os.path.abspath(config.get('inputdir')),
++                               os.path.abspath(config.get('outputdir'))))
++    else:
++        return tree.getOutputFileName
++
++def getProcessor(module, output, config):
+     try:
+         m = getattr(module.factory, 'generate_'+output)
+     except AttributeError:
+         raise NoProcessorError("cannot generate "+output+" output")
+-    return m(d)
++
++    if config.get('ext'):
++        ext = config['ext']
++    else:
++        from default import htmlDefault
++        ext = htmlDefault['ext']
++
++    return m(config, getFilenameGenerator(config, ext))
+diff -Naur -x '*pyc' -x '*CVS*' -x '*~' -x '*#*' -x '*sandbox*' ../Twisted/twisted/lore/slides.py ./twisted/lore/slides.py
+--- ../Twisted/twisted/lore/slides.py	2003-07-14 15:13:23.000000000 -0400
++++ ./twisted/lore/slides.py	2003-12-11 19:05:35.000000000 -0500
+@@ -340,12 +340,15 @@
+ 
+ 
+ class SlidesProcessingFunctionFactory(default.ProcessingFunctionFactory):
+-    doFile = [doFile]
++
+     latexSpitters = default.ProcessingFunctionFactory.latexSpitters.copy()
+     latexSpitters['prosper'] = ProsperSlides
+     latexSpitters['page'] = PagebreakLatex
+     latexSpitters['twopage'] = TwoPagebreakLatex
+ 
++    def getDoFile(self):
++        return doFile
++
+     def generate_mgp(self, d):
+         template = d.get('template', 'template.mgp')
+         df = lambda file, linkrel: convertFile(file, MagicpointOutput, template, ext=".mgp")
+diff -Naur -x '*pyc' -x '*CVS*' -x '*~' -x '*#*' -x '*sandbox*' ../Twisted/twisted/lore/tree.py ./twisted/lore/tree.py
+--- ../Twisted/twisted/lore/tree.py	2003-12-05 18:36:28.000000000 -0500
++++ ./twisted/lore/tree.py	2003-12-21 18:40:28.000000000 -0500
+@@ -63,9 +63,9 @@
+         node.removeAttribute('base')
+ 
+ def fontifyPython(document):
+-    def matcher(n):
+-        return (n.nodeName == 'pre' and n.hasAttribute('class') and
+-                n.getAttribute('class') == 'python')
++    def matcher(node):
++        return (node.nodeName == 'pre' and node.hasAttribute('class') and
++                node.getAttribute('class') == 'python')
+     for node in domhelpers.findElements(document, matcher):
+         fontifyPythonNode(node)
+ 
+@@ -82,46 +82,46 @@
+     node.parentNode.replaceChild(newel, node)
+ 
+ 
+-def addPyListings(document, d):
++def addPyListings(document, dir):
+     for node in domhelpers.findElementsWithAttribute(document, "class",
+                                                      "py-listing"):
+-        fn = node.getAttribute("href")
++        filename = node.getAttribute("href")
+         outfile = cStringIO.StringIO()
+-        lines = map(string.rstrip, open(os.path.join(d, fn)).readlines())
++        lines = map(string.rstrip, open(os.path.join(dir, filename)).readlines())
+         data = '\n'.join(lines[int(node.getAttribute('skipLines', 0)):])
+         data = cStringIO.StringIO(text.removeLeadingTrailingBlanks(data))
+         htmlizer.filter(data, outfile)
+         val = outfile.getvalue()
+-        _replaceWithListing(node, val, fn, "py-listing")
++        _replaceWithListing(node, val, filename, "py-listing")
+ 
+ 
+-def _replaceWithListing(node, val, fn, class_):
++def _replaceWithListing(node, val, filename, class_):
+     captionTitle = domhelpers.getNodeText(node)
+-    if captionTitle == os.path.basename(fn):
++    if captionTitle == os.path.basename(filename):
+         captionTitle = 'Source listing'
+     text = ('<div class="%s">%s<div class="caption">%s - '
+             '<a href="%s"><span class="filename">%s</span></a></div></div>' %
+-            (class_, val, captionTitle, fn, fn))
++            (class_, val, captionTitle, filename, filename))
+     newnode = microdom.parseString(text).documentElement
+     node.parentNode.replaceChild(newnode, node)
+ 
+ 
+-def addHTMLListings(document, d):
++def addHTMLListings(document, dir):
+     for node in domhelpers.findElementsWithAttribute(document, "class",
+                                                      "html-listing"):
+-        fn = node.getAttribute("href")
++        filename = node.getAttribute("href")
+         val = ('<pre class="htmlsource">\n%s</pre>' %
+-               cgi.escape(open(os.path.join(d, fn)).read()))
+-        _replaceWithListing(node, val, fn, "html-listing")
++               cgi.escape(open(os.path.join(dir, filename)).read()))
++        _replaceWithListing(node, val, filename, "html-listing")
+ 
+ 
+-def addPlainListings(document, d):
++def addPlainListings(document, dir):
+     for node in domhelpers.findElementsWithAttribute(document, "class",
+                                                      "listing"):
+-        fn = node.getAttribute("href")
++        filename = node.getAttribute("href")
+         val = ('<pre>\n%s</pre>' %
+-               cgi.escape(open(os.path.join(d, fn)).read()))
+-        _replaceWithListing(node, val, fn, "listing")
++               cgi.escape(open(os.path.join(dir, filename)).read()))
++        _replaceWithListing(node, val, filename, "listing")
+ 
+ 
+ def getHeaders(document):
+@@ -237,16 +237,16 @@
+         node.appendChild(microdom.Text(version))
+       
+ 
+-def munge(document, template, linkrel, d, fullpath, ext, url, config):
++def munge(document, template, linkrel, dir, fullpath, ext, url, config):
+     fixRelativeLinks(template, linkrel)
+     addMtime(template, fullpath)
+     removeH1(document)
+     fixAPI(document, url)
+     fontifyPython(document)
+     fixLinks(document, ext)
+-    addPyListings(document, d)
+-    addHTMLListings(document, d)
+-    addPlainListings(document, d)
++    addPyListings(document, dir)
++    addHTMLListings(document, dir)
++    addPlainListings(document, dir)
+     putInToC(template, generateToC(document))
+     footnotes(document)
+     notes(document)
+@@ -257,8 +257,8 @@
+     setTitle(template, title)
+ 
+     authors = domhelpers.findNodesNamed(document, 'link')
+-    authors = [(n.getAttribute('title',''), n.getAttribute('href', ''))
+-               for n in authors if n.getAttribute('rel', '') == 'author']
++    authors = [(node.getAttribute('title',''), node.getAttribute('href', ''))
++               for node in authors if node.getAttribute('rel', '') == 'author']
+     setAuthors(template, authors)
+ 
+     body = domhelpers.findNodesNamed(document, "body")[0]
+@@ -268,9 +268,9 @@
+     tmplbody.setAttribute("class", "content")
+ 
+ 
+-def parseFileAndReport(fn):
++def parseFileAndReport(filename):
+     try:
+-        return microdom.parse(open(fn))
++        return microdom.parse(open(filename))
+     except microdom.MismatchedTags, e:
+         raise process.ProcessingFailure(
+               "%s:%s: begin mismatched tags <%s>/</%s>" %
+@@ -280,11 +280,20 @@
+     except microdom.ParseError, e:
+         raise process.ProcessingFailure("%s:%s:%s" % (e.line, e.col, e.message))
+     except IOError, e:
+-        raise process.ProcessingFailure(e.strerror)
++        raise process.ProcessingFailure(e.strerror + ", filename was '" + filename + "'")
+ 
+-def doFile(fn, linkrel, ext, url, templ, d=None):
+-    d = d or {}
+-    doc = parseFileAndReport(fn)
+-    cn = templ.cloneNode(1)
+-    munge(doc, cn, linkrel, os.path.dirname(fn), fn, ext, url, d)
+-    cn.writexml(open(os.path.splitext(fn)[0]+ext, 'wb'))
++def getOutputFileName(originalFileName, outputExtension):
++    return os.path.splitext(originalFileName)[0]+outputExtension
++
++def makeSureDirectoryExists(filename):
++    dirname = os.path.dirname(filename)
++    if (not os.path.exists(dirname)):
++        os.mkdir(dirname)
++
++def doFile(filename, linkrel, ext, url, templ, options={}, outfileGenerator=getOutputFileName):
++    doc = parseFileAndReport(filename)
++    clonedNode = templ.cloneNode(1)
++    munge(doc, clonedNode, linkrel, os.path.dirname(filename), filename, ext, url, options)
++    newFilename = outfileGenerator(filename, ext)
++    makeSureDirectoryExists(newFilename)
++    clonedNode.writexml(open(newFilename, 'wb'))
+diff -Naur -x '*pyc' -x '*CVS*' -x '*~' -x '*#*' -x '*sandbox*' ../Twisted/twisted/scripts/lore.py ./twisted/scripts/lore.py
+--- ../Twisted/twisted/scripts/lore.py	2003-12-01 18:52:37.000000000 -0500
++++ ./twisted/scripts/lore.py	2003-12-21 18:44:27.000000000 -0500
+@@ -64,6 +64,15 @@
+         print "%s: %s" % (sys.argv[0], e)
+ 
+ 
++def getWalker(df, opt):
++    klass = process.Walker
++    if opt['plain']: 
++        klass = process.PlainReportingWalker
++    if opt['null']: 
++        klass = process.NullReportingWalker
++    return klass(df, opt['inputext'], opt['linkrel'])
++
++
+ def run():
+     opt = Options()
+     try:
+@@ -72,23 +81,23 @@
+         print '%s: %s' % (sys.argv[0], errortext)
+         print '%s: Try --help for usage details.' % sys.argv[0]
+         sys.exit(1)
++
+     df = getProcessor(opt['input'], opt['output'], opt.config)
+     if not df:
+         sys.exit(1)
+-    klass = process.Walker
+-    if opt['plain']: 
+-        klass = process.PlainReportingWalker
+-    if opt['null']: 
+-        klass = process.NullReportingWalker
+-    w = klass(df, opt['inputext'], opt['linkrel'])
++
++    walker = getWalker(df, opt)
++
+     if opt['files']:
+-        for fn in opt['files']:
+-            w.walked.append(('', fn))
++        for filename in opt['files']:
++            walker.walked.append(('', filename))
+     else:
+-        w.walkdir(opt['docsdir'] or '.')
+-    w.generate()
+-    if w.failures:
+-        for (file, errors) in w.failures:
++        walker.walkdir(opt['docsdir'] or '.')
++
++    walker.generate()
++
++    if walker.failures:
++        for (file, errors) in walker.failures:
+             for error in errors:
+                 print "%s:%s" % (file, error)
+         sys.exit(1)
+diff -Naur -x '*pyc' -x '*CVS*' -x '*~' -x '*#*' -x '*sandbox*' ../Twisted/twisted/scripts/_trial_temp/test.log ./twisted/scripts/_trial_temp/test.log
+--- ../Twisted/twisted/scripts/_trial_temp/test.log	1969-12-31 19:00:00.000000000 -0500
++++ ./twisted/scripts/_trial_temp/test.log	2003-11-20 21:20:41.000000000 -0500
+@@ -0,0 +1 @@
++2003/11/20 21:20 EST [-] Log opened.
+diff -Naur -x '*pyc' -x '*CVS*' -x '*~' -x '*#*' -x '*sandbox*' ../Twisted/twisted/test/good_internal.xhtml ./twisted/test/good_internal.xhtml
+--- ../Twisted/twisted/test/good_internal.xhtml	1969-12-31 19:00:00.000000000 -0500
++++ ./twisted/test/good_internal.xhtml	2003-11-13 21:36:22.000000000 -0500
+@@ -0,0 +1,23 @@
++<?xml version="1.0"?>
++<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Transitional//EN"
++    "http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd">
++
++<html xmlns="http://www.w3.org/1999/xhtml" lang="en">
++ <head>
++  <title>Twisted Documentation: My Test Lore Input</title>
++  <link href="resources/stylesheet.css" type="text/css" rel="stylesheet" />
++ </head>
++ <body bgcolor="white">
++  <h1 class="title">My Test Lore Input
++  </h1>
++  <div class="toc">
++   <ol></ol>
++  </div>
++  <div class="content"><span></span>
++   <p>A Body.
++   </p>
++  </div>
++  <p><a href="index.xhtml">Index</a>
++  </p>
++ </body>
++</html>
+\ No newline at end of file
+diff -Naur -x '*pyc' -x '*CVS*' -x '*~' -x '*#*' -x '*sandbox*' ../Twisted/twisted/test/good_simple.xhtml ./twisted/test/good_simple.xhtml
+--- ../Twisted/twisted/test/good_simple.xhtml	1969-12-31 19:00:00.000000000 -0500
++++ ./twisted/test/good_simple.xhtml	2003-11-13 20:55:47.000000000 -0500
+@@ -0,0 +1,2 @@
++<?xml version="1.0"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Transitional//EN"
++    "http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><title>Twisted Documentation: My Test Lore Input</title><link href="resources/stylesheet.css" type="text/css" rel="stylesheet" /></head><body bgcolor="white"><h1 class="title">My Test Lore Input</h1><div class="toc"><ol></ol></div><div class="content"><span></span><p>A Body.</p></div><p><a href="index.xhtml">Index</a></p></body></html>
+\ No newline at end of file
+diff -Naur -x '*pyc' -x '*CVS*' -x '*~' -x '*#*' -x '*sandbox*' ../Twisted/twisted/test/mydiff.tmp ./twisted/test/mydiff.tmp
+--- ../Twisted/twisted/test/mydiff.tmp	1969-12-31 19:00:00.000000000 -0500
++++ ./twisted/test/mydiff.tmp	2003-11-20 20:14:38.000000000 -0500
+@@ -0,0 +1,7 @@
++? good_internal.xhtml
++? good_simple.xhtml
++? mydiff.tmp
++? simple.html
++? simple.xhtml
++? template.tpl
++? test_lore.py
+diff -Naur -x '*pyc' -x '*CVS*' -x '*~' -x '*#*' -x '*sandbox*' ../Twisted/twisted/test/simple1.xhtml ./twisted/test/simple1.xhtml
+--- ../Twisted/twisted/test/simple1.xhtml	1969-12-31 19:00:00.000000000 -0500
++++ ./twisted/test/simple1.xhtml	2003-12-21 18:18:20.000000000 -0500
+@@ -0,0 +1,2 @@
++<?xml version="1.0"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Transitional//EN"
++    "http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><title>Twisted Documentation: My Test Lore Input</title><link href="resources/stylesheet.css" type="text/css" rel="stylesheet" /></head><body bgcolor="white"><h1 class="title">My Test Lore Input</h1><div class="toc"><ol></ol></div><div class="content"><span></span><p>A Body.</p></div><p><a href="index.xhtml">Index</a></p></body></html>
+\ No newline at end of file
+diff -Naur -x '*pyc' -x '*CVS*' -x '*~' -x '*#*' -x '*sandbox*' ../Twisted/twisted/test/simple2.xhtml ./twisted/test/simple2.xhtml
+--- ../Twisted/twisted/test/simple2.xhtml	1969-12-31 19:00:00.000000000 -0500
++++ ./twisted/test/simple2.xhtml	2003-12-21 18:18:20.000000000 -0500
+@@ -0,0 +1,2 @@
++<?xml version="1.0"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Transitional//EN"
++    "http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><title>Twisted Documentation: My Test Lore Input</title><link href="resources/stylesheet.css" type="text/css" rel="stylesheet" /></head><body bgcolor="white"><h1 class="title">My Test Lore Input</h1><div class="toc"><ol></ol></div><div class="content"><span></span><p>A Body.</p></div><p><a href="index.xhtml">Index</a></p></body></html>
+\ No newline at end of file
+diff -Naur -x '*pyc' -x '*CVS*' -x '*~' -x '*#*' -x '*sandbox*' ../Twisted/twisted/test/simple3.html ./twisted/test/simple3.html
+--- ../Twisted/twisted/test/simple3.html	1969-12-31 19:00:00.000000000 -0500
++++ ./twisted/test/simple3.html	2003-12-11 19:42:20.000000000 -0500
+@@ -0,0 +1,9 @@
++<html>
++<head>
++<title>My Test Lore Input</title>
++</head>
++<body>
++<h1>My Test Lore Input</h1>
++<p>A Body.</p>
++</body>
++</html>
+\ No newline at end of file
+diff -Naur -x '*pyc' -x '*CVS*' -x '*~' -x '*#*' -x '*sandbox*' ../Twisted/twisted/test/simple3xhtml ./twisted/test/simple3xhtml
+--- ../Twisted/twisted/test/simple3xhtml	1969-12-31 19:00:00.000000000 -0500
++++ ./twisted/test/simple3xhtml	2003-12-11 19:46:40.000000000 -0500
+@@ -0,0 +1,2 @@
++<?xml version="1.0"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Transitional//EN"
++    "http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><title>Twisted Documentation: My Test Lore Input</title><link href="resources/stylesheet.css" type="text/css" rel="stylesheet" /></head><body bgcolor="white"><h1 class="title">My Test Lore Input</h1><div class="toc"><ol></ol></div><div class="content"><span></span><p>A Body.</p></div><p><a href="index.xhtml">Index</a></p></body></html>
+\ No newline at end of file
+diff -Naur -x '*pyc' -x '*CVS*' -x '*~' -x '*#*' -x '*sandbox*' ../Twisted/twisted/test/simple3.xhtml ./twisted/test/simple3.xhtml
+--- ../Twisted/twisted/test/simple3.xhtml	1969-12-31 19:00:00.000000000 -0500
++++ ./twisted/test/simple3.xhtml	2003-12-21 18:18:20.000000000 -0500
+@@ -0,0 +1,2 @@
++<?xml version="1.0"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Transitional//EN"
++    "http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><title>Twisted Documentation: My Test Lore Input</title><link href="resources/stylesheet.css" type="text/css" rel="stylesheet" /></head><body bgcolor="white"><h1 class="title">My Test Lore Input</h1><div class="toc"><ol></ol></div><div class="content"><span></span><p>A Body.</p></div><p><a href="index.xhtml">Index</a></p></body></html>
+\ No newline at end of file
+diff -Naur -x '*pyc' -x '*CVS*' -x '*~' -x '*#*' -x '*sandbox*' ../Twisted/twisted/test/simple4foo.xhtml ./twisted/test/simple4foo.xhtml
+--- ../Twisted/twisted/test/simple4foo.xhtml	1969-12-31 19:00:00.000000000 -0500
++++ ./twisted/test/simple4foo.xhtml	2003-12-14 15:44:22.000000000 -0500
+@@ -0,0 +1,2 @@
++<?xml version="1.0"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Transitional//EN"
++    "http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><title>Twisted Documentation: My Test Lore Input</title><link href="resources/stylesheet.css" type="text/css" rel="stylesheet" /></head><body bgcolor="white"><h1 class="title">My Test Lore Input</h1><div class="toc"><ol></ol></div><div class="content"><span></span><p>A Body.</p></div><p><a href="index.xhtml">Index</a></p></body></html>
+\ No newline at end of file
+diff -Naur -x '*pyc' -x '*CVS*' -x '*~' -x '*#*' -x '*sandbox*' ../Twisted/twisted/test/simple4.html ./twisted/test/simple4.html
+--- ../Twisted/twisted/test/simple4.html	1969-12-31 19:00:00.000000000 -0500
++++ ./twisted/test/simple4.html	2003-12-11 19:51:40.000000000 -0500
+@@ -0,0 +1,9 @@
++<html>
++<head>
++<title>My Test Lore Input</title>
++</head>
++<body>
++<h1>My Test Lore Input</h1>
++<p>A Body.</p>
++</body>
++</html>
+\ No newline at end of file
+diff -Naur -x '*pyc' -x '*CVS*' -x '*~' -x '*#*' -x '*sandbox*' ../Twisted/twisted/test/simple4.xhtml ./twisted/test/simple4.xhtml
+--- ../Twisted/twisted/test/simple4.xhtml	1969-12-31 19:00:00.000000000 -0500
++++ ./twisted/test/simple4.xhtml	2003-12-21 18:18:21.000000000 -0500
+@@ -0,0 +1,2 @@
++<?xml version="1.0"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Transitional//EN"
++    "http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><title>Twisted Documentation: My Test Lore Input</title><link href="resources/stylesheet.css" type="text/css" rel="stylesheet" /></head><body bgcolor="white"><h1 class="title">My Test Lore Input</h1><div class="toc"><ol></ol></div><div class="content"><span></span><p>A Body.</p></div><p><a href="index.xhtml">Index</a></p></body></html>
+\ No newline at end of file
+diff -Naur -x '*pyc' -x '*CVS*' -x '*~' -x '*#*' -x '*sandbox*' ../Twisted/twisted/test/simple.html ./twisted/test/simple.html
+--- ../Twisted/twisted/test/simple.html	1969-12-31 19:00:00.000000000 -0500
++++ ./twisted/test/simple.html	2003-11-13 20:59:16.000000000 -0500
+@@ -0,0 +1,9 @@
++<html>
++<head>
++<title>My Test Lore Input</title>
++</head>
++<body>
++<h1>My Test Lore Input</h1>
++<p>A Body.</p>
++</body>
++</html>
+\ No newline at end of file
+diff -Naur -x '*pyc' -x '*CVS*' -x '*~' -x '*#*' -x '*sandbox*' ../Twisted/twisted/test/simple.xhtml ./twisted/test/simple.xhtml
+--- ../Twisted/twisted/test/simple.xhtml	1969-12-31 19:00:00.000000000 -0500
++++ ./twisted/test/simple.xhtml	2003-12-21 18:18:20.000000000 -0500
+@@ -0,0 +1,2 @@
++<?xml version="1.0"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Transitional//EN"
++    "http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><title>Twisted Documentation: My Test Lore Input</title><link href="resources/stylesheet.css" type="text/css" rel="stylesheet" /></head><body bgcolor="white"><h1 class="title">My Test Lore Input</h1><div class="toc"><ol></ol></div><div class="content"><span></span><p>A Body.</p></div><p><a href="index.xhtml">Index</a></p></body></html>
+\ No newline at end of file
+diff -Naur -x '*pyc' -x '*CVS*' -x '*~' -x '*#*' -x '*sandbox*' ../Twisted/twisted/test/template.tpl ./twisted/test/template.tpl
+--- ../Twisted/twisted/test/template.tpl	1969-12-31 19:00:00.000000000 -0500
++++ ./twisted/test/template.tpl	2003-11-13 20:41:14.000000000 -0500
+@@ -0,0 +1,22 @@
++<?xml version="1.0"?>
++<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Transitional//EN"
++    "http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd">
++
++<html xmlns="http://www.w3.org/1999/xhtml" lang="en">
++  <head>
++<title>Twisted Documentation: </title>
++<link type="text/css" rel="stylesheet"
++href="resources/stylesheet.css" />
++  </head>
++
++  <body bgcolor="white">
++    <h1 class="title"></h1>
++    <div class="toc"></div>
++    <div class="body">
++	
++    </div>
++
++    <p><a href="index.xhtml">Index</a></p>
++  </body>
++</html>
++
+diff -Naur -x '*pyc' -x '*CVS*' -x '*~' -x '*#*' -x '*sandbox*' ../Twisted/twisted/test/test_lore.py ./twisted/test/test_lore.py
+--- ../Twisted/twisted/test/test_lore.py	1969-12-31 19:00:00.000000000 -0500
++++ ./twisted/test/test_lore.py	2003-12-21 18:18:16.000000000 -0500
+@@ -0,0 +1,119 @@
++from twisted.trial import unittest
++
++from twisted.lore.default import *
++from twisted.lore import tree
++from twisted.lore import process
++from twisted.lore import default
++
++import os
++
++mydir = os.getcwd() + os.sep
++
++options = {"template" : mydir + "template.tpl", 'baseurl': '%s', 'ext': '.xhtml' }
++d = options
++
++def filenameGenerator(originalFileName, outputExtension):
++    return os.path.splitext(originalFileName)[0]+"1"+outputExtension
++
++def filenameGenerator2(originalFileName, outputExtension):
++    return os.path.splitext(originalFileName)[0]+"2"+outputExtension
++
++
++class TestFactory(unittest.TestCase):
++
++    file = mydir + 'simple.html'
++    linkrel = ""
++
++    def assertEqualFiles(self, exp, act):
++        if (exp == act): return True
++        fact = open(mydir + act)
++        self.assertEqualsFile(exp, fact.read())
++
++    def assertEqualsFile(self, exp, act):
++        expected = open(mydir + exp).read()
++        self.assertEqualsString(expected, act)
++
++    def assertEqualsString(self, expected, act):
++        self.assertEquals(len(expected), len(act))
++        for i in range(len(expected)):
++            e = expected[i]
++            a = act[i]
++            self.assertEquals(e, a, "differ at %d: %s vs. %s" % (i, e, a))
++        self.assertEquals(expected, act)
++
++    def testProcessingFunctionFactory(self):
++        htmlGenerator = factory.generate_html(options)
++        htmlGenerator(self.file, self.linkrel)
++        self.assertEqualFiles('good_simple.xhtml', 'simple.xhtml')
++
++    def testProcessingFunctionFactoryWithFilenameGenerator(self):
++        htmlGenerator = factory.generate_html(options, filenameGenerator2)
++        htmlGenerator(self.file, self.linkrel)
++        self.assertEqualFiles('good_simple.xhtml', 'simple2.xhtml')
++
++    def test_doFile(self):
++        templ = microdom.parse(open(d['template']))
++
++        tree.doFile(self.file, self.linkrel, d['ext'], d['baseurl'], templ, d)
++        self.assertEqualFiles('good_simple.xhtml', 'simple.xhtml')
++
++    def test_doFile_withFilenameGenerator(self):
++        templ = microdom.parse(open(d['template']))
++
++        tree.doFile(self.file, self.linkrel, d['ext'], d['baseurl'], templ, d, filenameGenerator)
++        self.assertEqualFiles('good_simple.xhtml', 'simple1.xhtml')
++
++    def test_munge(self):
++        doc = microdom.parse(open(self.file))
++        templ = microdom.parse(open(d['template']))
++        node = templ.cloneNode(1)
++        tree.munge(doc, node, self.linkrel,
++                   os.path.dirname(self.file),
++                   self.file,
++                   d['ext'], d['baseurl'], d)
++        self.assertEqualsFile('good_internal.xhtml', node.toprettyxml())
++
++    def test_getProcessor(self):
++        options = { 'template': mydir + 'template.tpl', 'ext': '.xhtml', 'baseurl': 'burl',
++                    'filenameMapping': None }
++        p = process.getProcessor(default, "html", options)
++        p(mydir + 'simple3.html', self.linkrel)
++        self.assertEqualFiles('good_simple.xhtml', 'simple3.xhtml')
++
++    def test_getProcessorWithFilenameGenerator(self):
++        options = { 'template': mydir + 'template.tpl',
++                    'ext': '.xhtml',
++                    'baseurl': 'burl',
++                    'filenameMapping': 'addFoo' }
++        p = process.getProcessor(default, "html", options)
++        p(mydir + 'simple4.html', self.linkrel)
++        self.assertEqualFiles('good_simple.xhtml', 'simple4foo.xhtml')
++
++    def test_outputdirGenerator(self):
++        inputdir  = '/home/joe/'
++        outputdir = '/away/joseph/'
++        actual = process.outputdirGenerator('/home/joe/myfile.html', '.xhtml',
++                                            inputdir, outputdir)
++        self.assertEquals('/away/joseph/myfile.xhtml', actual)
++        
++    def XXXtest_outputdirGeneratorBadInput(self):
++        options = {'outputdir': '/away/joseph/', 'inputdir': '/home/joe/' }
++        try:
++            actual = process.outputdirGenerator('.html', '.xhtml',
++                                                options)
++            raised = False;
++        except(e): #todo: how do these exception thingies work in Python?
++            raised = True;
++            print e
++        self.failUnless(raised, 'should throw exception if filename is not under inputdir')
++
++    def test_makeSureDirectoryExists(self):
++        dirname = '/tmp/nonexistentdir'
++        if os.path.exists(dirname):
++            print "REMOVING"
++            os.rmdir(dirname)
++        self.failIf(os.path.exists(dirname), "Hey: someone already created the dir")
++        filename = dirname + '/newfile'
++        tree.makeSureDirectoryExists(filename)
++        self.failUnless(os.path.exists(dirname), 'should have created dir')
++        os.rmdir(dirname)
+diff -Naur -x '*pyc' -x '*CVS*' -x '*~' -x '*#*' -x '*sandbox*' ../Twisted/twisted/test/_trial_temp/test.log ./twisted/test/_trial_temp/test.log
+--- ../Twisted/twisted/test/_trial_temp/test.log	1969-12-31 19:00:00.000000000 -0500
++++ ./twisted/test/_trial_temp/test.log	2003-12-21 18:18:21.000000000 -0500
+@@ -0,0 +1,10 @@
++2003/12/21 18:18 EST [-] Log opened.
++2003/12/21 18:18 EST [-] --> twisted.test.test_lore.TestFactory.testProcessingFunctionFactory <--
++2003/12/21 18:18 EST [-] --> twisted.test.test_lore.TestFactory.testProcessingFunctionFactoryWithFilenameGenerator <--
++2003/12/21 18:18 EST [-] --> twisted.test.test_lore.TestFactory.test_doFile <--
++2003/12/21 18:18 EST [-] --> twisted.test.test_lore.TestFactory.test_doFile_withFilenameGenerator <--
++2003/12/21 18:18 EST [-] --> twisted.test.test_lore.TestFactory.test_getProcessor <--
++2003/12/21 18:18 EST [-] --> twisted.test.test_lore.TestFactory.test_getProcessorWithFilenameGenerator <--
++2003/12/21 18:18 EST [-] --> twisted.test.test_lore.TestFactory.test_makeSureDirectoryExists <--
++2003/12/21 18:18 EST [-] --> twisted.test.test_lore.TestFactory.test_munge <--
++2003/12/21 18:18 EST [-] --> twisted.test.test_lore.TestFactory.test_outputdirGenerator <--
+diff -Naur -x '*pyc' -x '*CVS*' -x '*~' -x '*#*' -x '*sandbox*' ../Twisted/twisted/test/twistedPath.py ./twisted/test/twistedPath.py
+--- ../Twisted/twisted/test/twistedPath.py	1969-12-31 19:00:00.000000000 -0500
++++ ./twisted/test/twistedPath.py	2003-12-02 16:44:26.000000000 -0500
+@@ -0,0 +1,7 @@
++from os import getenv
++if getenv("TWISTEDPATH") != None:
++  mydir = getenv("TWISTEDPATH") + "/Twisted/twisted/test"
++else:
++  mydir = getenv("HOME") + "/Twisted/twisted/test"
++
++print mydir
+diff -Naur -x '*pyc' -x '*CVS*' -x '*~' -x '*#*' -x '*sandbox*' ../Twisted/twisted/_trial_temp/test.log ./twisted/_trial_temp/test.log
+--- ../Twisted/twisted/_trial_temp/test.log	1969-12-31 19:00:00.000000000 -0500
++++ ./twisted/_trial_temp/test.log	2003-11-20 21:53:49.000000000 -0500
+@@ -0,0 +1,5 @@
++2003/11/20 21:53 EST [-] Log opened.
++2003/11/20 21:53 EST [-] --> twisted.test.test_lore.TestFactory.testProcessingFunctionFactory <--
++2003/11/20 21:53 EST [-] --> twisted.test.test_lore.TestFactory.test_doFile <--
++2003/11/20 21:53 EST [-] --> twisted.test.test_lore.TestFactory.test_doFile_withFilenameGenerator <--
++2003/11/20 21:53 EST [-] --> twisted.test.test_lore.TestFactory.test_munge <--

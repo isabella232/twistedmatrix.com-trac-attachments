@@ -1,0 +1,544 @@
+diff --git a/twisted/python/failure.py b/twisted/python/failure.py
+index 90d0afc..ce9b7fb 100644
+--- a/twisted/python/failure.py
++++ b/twisted/python/failure.py
+@@ -18,6 +18,7 @@ import sys
+ import linecache
+ import inspect
+ import opcode
++import bdb
+ import pdb
+ from inspect import getmro
+ 
+@@ -170,8 +171,9 @@ class Failure:
+     # throwExceptionIntoGenerator.
+     _yieldOpcode = chr(opcode.opmap["YIELD_VALUE"])
+ 
+-    def __init__(self, exc_value=None, exc_type=None, exc_tb=None,
+-                 captureVars=False):
++
++    def _realInit(self, exc_value=None, exc_type=None, exc_tb=None,
++                  captureVars=False):
+         """
+         Initialize me with an explanation of the error.
+ 
+@@ -314,6 +316,65 @@ class Failure:
+         else:
+             self.parents = [self.type]
+ 
++
++    __init__ = _realInit
++
++
++    @classmethod
++    def startDebugMode(cls, postMortem=None):
++        """
++        Enable debug hooks for L{Failure}s.
++
++        @param postMortem: a callable taking a single argument, a traceback to
++            post-mortem. By default (or if calling the provided post mortem
++            function fails with an exception other than L{bdb.BdbQuit}),
++            L{pdb.post_mortem} is used.
++        """
++
++        if postMortem is None:
++            postMortem = pdb.post_mortem
++
++        def _debugInit(self, exc_value=None, exc_type=None, exc_tb=None,
++                       captureVars=False):
++            """
++            Initialize me, possibly spawning the debugger.
++            """
++            if (exc_value, exc_type, exc_tb) == (None, None, None):
++                exc = sys.exc_info()
++                if not exc[0] == self.__class__:
++                    try:
++                        strrepr = str(exc[1])
++                    except:
++                        strrepr = "broken str"
++                    print(
++                        "Jumping into debugger for post-mortem of "
++                        "exception '%s'" % (strrepr,))
++
++                    try:
++                        postMortem(exc[2])
++                    except bdb.BdbQuit:
++                        pass
++                    except Exception:
++                        print(
++                            "Debugging with %r failed. Falling back to pdb." %
++                            (postMortem,))
++
++                        pdb.post_mortem(exc[2])
++
++            self._realInit(exc_value, exc_type, exc_tb, captureVars)
++
++        cls.__init__ = _debugInit
++
++
++    @classmethod
++    def stopDebugMode(cls):
++        """
++        Disable debug hooks for L{Failure}s.
++        """
++
++        cls.__init__ = cls._realInit
++
++
+     def trap(self, *errorTypes):
+         """Trap this failure if its type is in a predetermined list.
+ 
+@@ -627,42 +688,5 @@ def _safeReprVars(varsDictItems):
+     return [(name, reflect.safe_repr(obj)) for (name, obj) in varsDictItems]
+ 
+ 
+-# slyphon: make post-morteming exceptions tweakable
+-
+-DO_POST_MORTEM = True
+-_Failure__init__ = Failure.__init__
+-
+-
+-def startDebugMode(debugger=None):
+-    """
+-    Enable debug hooks for L{Failure}s.
+-    """
+-
+-    if debugger is None:
+-        debugger = pdb
+-    post_mortem = getattr(debugger, "post_mortem", pdb.post_mortem)
+-
+-    def _debuginit(self, exc_value=None, exc_type=None, exc_tb=None,
+-                   captureVars=False):
+-        """
+-        Initialize failure object, possibly spawning the debugger.
+-        """
+-        if (exc_value, exc_type, exc_tb) == (None, None, None):
+-            exc = sys.exc_info()
+-            if not exc[0] == self.__class__ and DO_POST_MORTEM:
+-                try:
+-                    strrepr = str(exc[1])
+-                except:
+-                    strrepr = "broken str"
+-                print("Jumping into debugger for post-mortem of exception '%s':" % (strrepr,))
+-                post_mortem(exc[2])
+-        _Failure__init__(self, exc_value, exc_type, exc_tb, captureVars)
+-
+-    Failure.__init__ = _debuginit
+-
+-
+-def stopDebugMode():
+-    """
+-    Disable debug hooks for L{Failure}s.
+-    """
+-    Failure.__init__ = _Failure__init__
++startDebugMode = Failure.startDebugMode
++stopDebugMode = Failure.stopDebugMode
+diff --git a/twisted/scripts/trial.py b/twisted/scripts/trial.py
+index 5ffed53..fa72ae1 100644
+--- a/twisted/scripts/trial.py
++++ b/twisted/scripts/trial.py
+@@ -93,29 +93,6 @@ def _reporterAction():
+                                plugin.getPlugins(itrial.IReporter)])
+ 
+ 
+-def _wrappedPdb():
+-    """
+-    Wrap an instance of C{pdb.Pdb} with readline support and load any .rcs.
+-
+-    """
+-
+-    dbg = pdb.Pdb()
+-    try:
+-        import readline
+-    except ImportError:
+-        print "readline module not available"
+-        sys.exc_clear()
+-    for path in ('.pdbrc', 'pdbrc'):
+-        if os.path.exists(path):
+-            try:
+-                rcFile = file(path, 'r')
+-            except IOError:
+-                sys.exc_clear()
+-            else:
+-                dbg.rcLines.extend(rcFile.readlines())
+-    return dbg
+-
+-
+ class _BasicOptions(object):
+     """
+     Basic options shared between trial and its local workers.
+@@ -230,13 +207,6 @@ class _BasicOptions(object):
+ 
+ 
+     def opt_debugger(self, debugger):
+-        """
+-        Load a debugger.
+-        """
+-        if debugger == 'pdb':
+-            self["debugger"] = _wrappedPdb()
+-            return
+-
+         try:
+             self["debugger"] = reflect.namedAny(debugger)
+         except reflect.ModuleNotFound:
+@@ -358,7 +328,7 @@ class Options(_BasicOptions, usage.Options, app.ReactorSelectionMixin):
+                 ]
+ 
+     optParameters = [
+-        ["debugger", None, _wrappedPdb(),
++        ["debugger", None, pdb,
+          "the fully qualified name of a debugger to use if --debug is passed"],
+         ["logfile", "l", "test.log", "log file name"],
+         ["jobs", "j", None, "Number of local workers to run"]
+@@ -416,18 +386,15 @@ class Options(_BasicOptions, usage.Options, app.ReactorSelectionMixin):
+                 if self[option]:
+                     raise usage.UsageError(
+                         "You can't specify --%s when using --jobs" % option)
+-        if self['nopm']:
+-            if not self['debug']:
+-                raise usage.UsageError("You must specify --debug when using "
+-                                       "--nopm ")
+-            failure.DO_POST_MORTEM = False
+ 
+ 
+ 
+ def _initialDebugSetup(config):
+     # do this part of debug setup first for easy debugging of import failures
+-    if config['debug']:
+-        failure.startDebugMode(debugger=config["debugger"])
++    if config['debug'] and not config['nopm']:
++        debugger = config['debugger']
++        postMortem = getattr(debugger, "post_mortem", pdb.post_mortem)
++        failure.startDebugMode(postMortem)
+     if config['debug'] or config['debug-stacktraces']:
+         defer.setDebugging(True)
+ 
+diff --git a/twisted/test/test_failure.py b/twisted/test/test_failure.py
+index 69f8e23..b55507b 100644
+--- a/twisted/test/test_failure.py
++++ b/twisted/test/test_failure.py
+@@ -10,6 +10,7 @@ from __future__ import division, absolute_import
+ import re
+ import sys
+ import traceback
++import bdb
+ import pdb
+ import linecache
+ 
+@@ -17,6 +18,7 @@ from twisted.python.compat import NativeStringIO, _PY3
+ from twisted.python import _reflectpy3 as reflect
+ from twisted.python import failure
+ 
++from twisted.trial.test.test_runner import CapturingDebugger
+ from twisted.trial.unittest import SynchronousTestCase
+ 
+ 
+@@ -751,33 +753,26 @@ class TestFrameAttributes(SynchronousTestCase):
+ 
+ 
+ 
+-class StubDebugger(object):
+-    """
+-    Used to test L{Failure.startDebugMode}.
+-    """
+-    def __init__(self):
+-        self.mortems = []
+-        self.post_mortem = self.mortems.append
+-
+-
+-
+ class TestDebugMode(SynchronousTestCase):
+     """
+     Failure's debug mode should allow jumping into a debugger.
+     """
+ 
+     def setUp(self):
+-        self.debugger = StubDebugger()
++        self.debugger = CapturingDebugger()
++
+ 
+     def tearDown(self):
+         failure.stopDebugMode()
+ 
++
+     def test_regularFailure(self):
+         """
+-        If L{Failure.startDebugMode} is called, instantiating L{Failure} will
+-        first call the debugger's C{post_mortem} method with the traceback.
++        If L{Failure.startDebugMode} is called with a C{postMortem} function,
++        instantiating L{Failure} will first call the post mortem function with
++        the traceback.
+         """
+-        failure.startDebugMode(self.debugger)
++        failure.startDebugMode(self.debugger.post_mortem)
+ 
+         try:
+             raise ZeroDivisionError()
+@@ -793,7 +788,7 @@ class TestDebugMode(SynchronousTestCase):
+         If L{Failure.startDebugMode} is called, instantiating L{Failure} with
+         C{captureVars} still works.
+         """
+-        failure.startDebugMode(self.debugger)
++        failure.startDebugMode(self.debugger.post_mortem)
+ 
+         try:
+             raise ZeroDivisionError()
+@@ -820,10 +815,30 @@ class TestDebugMode(SynchronousTestCase):
+         self.assertEqual(self.debugger.mortems, [tb])
+ 
+ 
+-    def test_missingPostMortem(self):
++    def test_postMortemQuit(self):
+         """
+-        If L{Failure.startDebugMode} is called with a debugger without a
+-        C{post_mortem}, method L{pdb} is used.
++        If L{Failure.startDebugMode} is called with a post mortem function that
++        quit via L{bdb.BdbQuit}, it does not fall back to L{pdb.post_mortem}.
++        """
++
++        def postMortem(tb):
++            raise bdb.BdbQuit()
++
++        self.patch(pdb, "post_mortem", self.debugger.post_mortem)
++        failure.startDebugMode(postMortem)
++
++        try:
++            raise ZeroDivisionError()
++        except:
++            _, _, tb = sys.exc_info()
++            f = failure.Failure()
++        self.assertEqual(self.debugger.mortems, [])
++
++
++    def test_postMortemRaisedException(self):
++        """
++        If L{Failure.startDebugMode} is called with a post mortem function that
++        raised an exception, it falls back to L{pdb.post_mortem}.
+         """
+         self.patch(pdb, "post_mortem", self.debugger.post_mortem)
+         failure.startDebugMode(object())
+@@ -836,6 +851,18 @@ class TestDebugMode(SynchronousTestCase):
+         self.assertEqual(self.debugger.mortems, [tb])
+ 
+ 
++    def test_stopDebugMode(self):
++        failure.startDebugMode(self.debugger.post_mortem)
++        failure.stopDebugMode()
++
++        try:
++            raise ZeroDivisionError()
++        except:
++            _, _, tb = sys.exc_info()
++            f = failure.Failure()
++        self.assertEqual(self.debugger.mortems, [])
++
++
+ 
+ class ExtendedGeneratorTests(SynchronousTestCase):
+     """
+diff --git a/twisted/trial/test/test_runner.py b/twisted/trial/test/test_runner.py
+index f0a2fef..8dfc75f 100644
+--- a/twisted/trial/test/test_runner.py
++++ b/twisted/trial/test/test_runner.py
+@@ -23,13 +23,43 @@ pyunit = __import__('unittest')
+ 
+ 
+ class CapturingDebugger(object):
++    """
++    Debugger that keeps a log of all actions performed on it.
++    """
+ 
+     def __init__(self):
+-        self._calls = []
++        self.calls = []
++        self.mortems = []
+ 
+-    def runcall(self, *args, **kwargs):
+-        self._calls.append('runcall')
+-        args[0](*args[1:], **kwargs)
++
++    def post_mortem(self, tb):
++        self.mortems.append(tb)
++
++
++    def runcall(self, fn, *args, **kwargs):
++        self.calls.append((args, kwargs))
++        fn(*args, **kwargs)
++
++
++    @classmethod
++    def createAndCleanup(cls, test, attr):
++        """
++        Create a debugger at the given C{attr} and remove it after the test.
++
++        Exists because command line arguments like C{--debugger} will not have
++        access to the instance, they need to find a debugger by fully qualified
++        name on the class.
++
++        @param test: a test case instance where the debugger will live
++        @param attr: a L{str} which is the name of the attribute to set and
++            unset after the test has run. The attribute will be set on the
++            I{class} of the given test case instance.
++
++        """
++
++        debugger = cls()
++        setattr(test.__class__, attr, debugger)
++        test.addCleanup(delattr, test.__class__, attr)
+ 
+ 
+ 
+@@ -542,17 +572,17 @@ class TestRunner(unittest.SynchronousTestCase):
+         self.assertTrue(self.runcall_called)
+ 
+ 
+-    cdebugger = CapturingDebugger()
+-
+-
+     def test_runnerDebugger(self):
+         """
+         Trial uses specified debugger if the debugger is available.
+         """
++
++        CapturingDebugger.createAndCleanup(self, "capturingDebugger")
++
+         self.parseOptions([
+             '--reporter', 'capturing',
+             '--debugger',
+-            'twisted.trial.test.test_runner.TestRunner.cdebugger',
++            'twisted.trial.test.test_runner.TestRunner.capturingDebugger',
+             '--debug',
+             'twisted.trial.test.sample',
+         ])
+diff --git a/twisted/trial/test/test_script.py b/twisted/trial/test/test_script.py
+index e8280a5..a93674e 100644
+--- a/twisted/trial/test/test_script.py
++++ b/twisted/trial/test/test_script.py
+@@ -1,8 +1,11 @@
+ # Copyright (c) Twisted Matrix Laboratories.
+ # See LICENSE for details.
+ 
++import StringIO
+ import gc
+-import StringIO, sys, types
++import pdb
++import sys
++import types
+ 
+ from twisted.trial import unittest
+ from twisted.trial.runner import (
+@@ -14,6 +17,7 @@ from twisted.python.usage import UsageError
+ from twisted.python.filepath import FilePath
+ 
+ from twisted.trial.test.test_loader import testNames
++from twisted.trial.test.test_runner import CapturingDebugger
+ 
+ pyunit = __import__('unittest')
+ 
+@@ -571,6 +575,7 @@ class MakeRunnerTestCase(unittest.TestCase):
+             ["--debug", "--debugger", "doNotFind"])
+ 
+ 
++
+ class TestRun(unittest.TestCase):
+     """
+     Tests for the L{run} function.
+@@ -587,29 +592,91 @@ class TestRun(unittest.TestCase):
+     def test_setsUpFailureDebugMode(self):
+         """
+         When a debug mode is enabled, L{failure.startDebugMode} is called with
+-        the provided debugger.
++        the provided debugger's C{post_mortem} method.
+ 
+         """
+ 
++        CapturingDebugger.createAndCleanup(self, "capturingDebugger")
++
+         self.argv.extend(
+             [
+                 "--debug",
+                 "--debugger",
+-                "twisted.trial.test.test_runner.TestRunner.cdebugger",
++                "twisted.trial.test.test_script.TestRun.capturingDebugger",
+             ],
+         )
+ 
+-        def recordDebugger(debugger):
+-            self.debugger = debugger
+-        self.patch(failure, "startDebugMode", recordDebugger)
++        def recordPostMortem(postMortem):
++            self.postMortem = postMortem
++        self.patch(failure, "startDebugMode", recordPostMortem)
+ 
+         try:
+             trial.run()
+         except SystemExit:
+             pass
+ 
+-        from twisted.trial.test.test_runner import TestRunner
+-        self.assertEqual(self.debugger, TestRunner.cdebugger)
++        self.assertEqual(self.postMortem, self.capturingDebugger.post_mortem)
++
++
++    def test_noPostMortemMethod(self):
++        """
++        When a debug mode is enabled and the provided debugger lacks a
++        C{post_mortem} method, L{pdb.post_method} is used.
++
++        """
++
++        CapturingDebugger.createAndCleanup(self, "capturingDebugger")
++        postMortem = CapturingDebugger.post_mortem
++        del CapturingDebugger.post_mortem
++        self.addCleanup(setattr, CapturingDebugger, "post_mortem", postMortem)
++
++        self.argv.extend(
++            [
++                "--debug",
++                "--debugger",
++                "twisted.trial.test.test_script.TestRun.capturingDebugger",
++            ],
++        )
++
++        def recordPostMortem(postMortem):
++            self.postMortem = postMortem
++        self.patch(failure, "startDebugMode", recordPostMortem)
++
++        try:
++            trial.run()
++        except SystemExit:
++            pass
++
++        self.assertEqual(self.postMortem, pdb.post_mortem)
++
++
++    def test_nopm(self):
++        """
++        When C{--nopm} is passed, L{failure.startDebugMode} is not called so
++        that L{Failure} objects do not automatically invoke a call to post
++        mortem.
++
++        """
++
++        CapturingDebugger.createAndCleanup(self, "capturingDebugger")
++
++        self.argv.extend(
++            [
++                "--debug",
++                "--debugger",
++                "twisted.trial.test.test_script.TestRun.capturingDebugger",
++                "--nopm",
++            ],
++        )
++
++        def startDebugMode(postMortem):
++            self.fail("startDebugMode should not have been called!")
++        self.patch(failure, "startDebugMode", startDebugMode)
++
++        try:
++            trial.run()
++        except SystemExit:
++            pass
+ 
+ 
+     def test_debuggerNotFound(self):

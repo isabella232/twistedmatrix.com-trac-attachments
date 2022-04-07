@@ -1,0 +1,267 @@
+Index: twisted/internet/_glibbase.py
+===================================================================
+--- twisted/internet/_glibbase.py	(revision 33481)
++++ twisted/internet/_glibbase.py	(working copy)
+@@ -94,19 +94,52 @@ class GlibReactorBase(GlibSignalMixin,
+     # callbacks queued from a thread:
+     _wakerFactory = GlibWaker
+ 
+-    def __init__(self):
++    def __init__(self, glib_module, gtk_module, useGtk=False):
+         self._simtag = None
+         self._reads = set()
+         self._writes = set()
+         self._sources = {}
++        self._glib = glib_module
++        self._gtk = gtk_module
+         posixbase.PosixReactorBase.__init__(self)
+ 
++        self._source_remove = self._glib.source_remove
++        self._timeout_add = self._glib.timeout_add
+ 
++        def _mainquit():
++            if self._gtk.main_level():
++                self._gtk.main_quit()
++
++        if useGtk:
++            self._pending = self._gtk.events_pending
++            self._iteration = self._gtk.main_iteration_do
++            self._crash = _mainquit
++            self._run = self._gtk.main
++        else:
++            self.context = self._glib.main_context_default()
++            self._pending = self.context.pending
++            self._iteration = self.context.iteration
++            self.loop = self._glib.MainLoop()
++            self._crash = lambda: self._glib.idle_add(self.loop.quit)
++            self._run = self.loop.run
++
++    # The input_add function in pygtk1 checks for objects with a
++    # 'fileno' method and, if present, uses the result of that method
++    # as the input source. The pygtk2 input_add does not do this. The
++    # function below replicates the pygtk1 functionality.
++
++    # In addition, pygtk maps gtk.input_add to _gobject.io_add_watch, and
++    # g_io_add_watch() takes different condition bitfields than
++    # gtk_input_add(). We use g_io_add_watch() here in case pygtk fixes this
++    # bug.
+     def input_add(self, source, condition, callback):
+-        """
+-        This is a stub to be implemented by inheriting classes.
+-        """
+-        raise NotImplementedError()
++        if hasattr(source, 'fileno'):
++            # handle python objects
++            def wrapper(source, condition, real_s=source, real_cb=callback):
++                return real_cb(real_s, condition)
++            return self._glib.io_add_watch(source.fileno(), condition, wrapper)
++        else:
++            return self._glib.io_add_watch(source, condition, callback)
+ 
+ 
+     def _ioEventCallback(self, source, condition):
+@@ -287,10 +320,27 @@ class PortableGlibReactorBase(GlibSignal
+ 
+     Sockets aren't supported by GObject's input_add on Win32.
+     """
+-    def __init__(self):
++    def __init__(self, glib_module, gtk_module, useGtk=False):
+         self._simtag = None
++        self._glib = glib_module
++        self._gtk = gtk_module
+         selectreactor.SelectReactor.__init__(self)
+ 
++        self._source_remove = self._glib.source_remove
++        self._timeout_add = self._glib.timeout_add
++
++        def _mainquit():
++            if self._gtk.main_level():
++                self._gtk.main_quit()
++
++        if useGtk:
++            self._crash = _mainquit
++            self._run = self._gtk.main
++        else:
++            self.loop = self._glib.MainLoop()
++            self._crash = lambda: self._glib.idle_add(self.loop.quit)
++            self._run = self.loop.run
++
+ 
+     def crash(self):
+         selectreactor.SelectReactor.crash(self)
+@@ -313,4 +363,4 @@ class PortableGlibReactorBase(GlibSignal
+         timeout = min(self.timeout(), 0.01)
+         if timeout is None:
+             timeout = 0.01
+-        self._simtag = self._timeout_add(int(timeout * 1000), self.simulate)
++        self._simtag = self._timeout_add(int(timeout * 1010), self.simulate)
+Index: twisted/internet/gireactor.py
+===================================================================
+--- twisted/internet/gireactor.py	(revision 33481)
++++ twisted/internet/gireactor.py	(working copy)
+@@ -52,43 +52,11 @@ class GIReactor(_glibbase.GlibReactorBas
+     OUTFLAGS = _POLL_OUT | _POLL_DISCONNECTED
+ 
+     def __init__(self, useGtk=False):
+-        _glibbase.GlibReactorBase.__init__(self)
++        _gtk = None
++        if useGtk is True:
++            from gi.repository import Gtk as _gtk
+ 
+-        self._source_remove = GLib.source_remove
+-        self._timeout_add = GLib.timeout_add
+-
+-        if useGtk:
+-            from gi.repository import Gtk
+-
+-            self._pending = Gtk.events_pending
+-            self._iteration = Gtk.main_iteration_do
+-            self._crash = Gtk.main_quit
+-            self._run = Gtk.main
+-        else:
+-            self.context = GLib.main_context_default()
+-            self._pending = self.context.pending
+-            self._iteration = self.context.iteration
+-            self.loop = GLib.MainLoop()
+-            self._crash = lambda: GLib.idle_add(self.loop.quit)
+-            self._run = self.loop.run
+-
+-    # The input_add function in pygtk1 checks for objects with a
+-    # 'fileno' method and, if present, uses the result of that method
+-    # as the input source. The pygtk2 input_add does not do this. The
+-    # function below replicates the pygtk1 functionality.
+-
+-    # In addition, pygtk maps gtk.input_add to _gobject.io_add_watch, and
+-    # g_io_add_watch() takes different condition bitfields than
+-    # gtk_input_add(). We use g_io_add_watch() here in case pygtk fixes this
+-    # bug.
+-    def input_add(self, source, condition, callback):
+-        if hasattr(source, 'fileno'):
+-            # handle python objects
+-            def wrapper(source, condition, real_s=source, real_cb=callback):
+-                return real_cb(real_s, condition)
+-            return GLib.io_add_watch(source.fileno(), condition, wrapper)
+-        else:
+-            return GLib.io_add_watch(source, condition, callback)
++        _glibbase.GlibReactorBase.__init__(self, GLib, _gtk, useGtk=useGtk)
+ 
+ 
+ 
+@@ -97,21 +65,12 @@ class PortableGIReactor(_glibbase.Portab
+     Portable GObject Introspection event loop reactor.
+     """
+     def __init__(self, useGtk=False):
+-        _glibbase.PortableGlibReactorBase.__init__(self)
+-
+-        self._source_remove = GLib.source_remove
+-        self._timeout_add = GLib.timeout_add
+-
+-        if useGtk:
+-            from gi.repository import Gtk
+-
+-            self._crash = Gtk.main_quit
+-            self._run = Gtk.main
+-        else:
+-            self.loop = GLib.MainLoop()
+-            self._crash = lambda: GLib.idle_add(self.loop.quit)
+-            self._run = self.loop.run
++        _gtk = None
++        if useGtk is True:
++            from gi.repository import Gtk as _gtk
+ 
++        _glibbase.PortableGlibReactorBase.__init__(self, GLib, _gtk,
++                                                   useGtk=useGtk)
+ 
+ 
+ def install(useGtk=False):
+Index: twisted/internet/gtk2reactor.py
+===================================================================
+--- twisted/internet/gtk2reactor.py	(revision 33481)
++++ twisted/internet/gtk2reactor.py	(working copy)
+@@ -62,50 +62,11 @@ class Gtk2Reactor(_glibbase.GlibReactorB
+     OUTFLAGS = _POLL_OUT | _POLL_DISCONNECTED
+ 
+     def __init__(self, useGtk=True):
+-        _glibbase.GlibReactorBase.__init__(self)
++        _gtk = None
++        if useGtk is True:
++            import gtk as _gtk
+ 
+-        self._source_remove = gobject.source_remove
+-        self._timeout_add = gobject.timeout_add
+-
+-        # pre 2.3.91 the glib iteration and mainloop functions didn't release
+-        # global interpreter lock, thus breaking thread and signal support.
+-        if getattr(gobject, "pygtk_version", ()) >= (2, 3, 91) and not useGtk:
+-            self.context = gobject.main_context_default()
+-            self._pending = self.context.pending
+-            self._iteration = self.context.iteration
+-            self.loop = gobject.MainLoop()
+-            self._crash = self.loop.quit
+-            self._run = self.loop.run
+-        else:
+-            import gtk
+-
+-            def mainquit():
+-                if gtk.main_level():
+-                    gtk.main_quit()
+-
+-            self._pending = gtk.events_pending
+-            self._iteration = gtk.main_iteration
+-            self._crash = mainquit
+-            self._run = gtk.main
+-
+-
+-    # The input_add function in pygtk1 checks for objects with a
+-    # 'fileno' method and, if present, uses the result of that method
+-    # as the input source. The pygtk2 input_add does not do this. The
+-    # function below replicates the pygtk1 functionality.
+-
+-    # In addition, pygtk maps gtk.input_add to _gobject.io_add_watch, and
+-    # g_io_add_watch() takes different condition bitfields than
+-    # gtk_input_add(). We use g_io_add_watch() here in case pygtk fixes this
+-    # bug.
+-    def input_add(self, source, condition, callback):
+-        if hasattr(source, 'fileno'):
+-            # handle python objects
+-            def wrapper(source, condition, real_s=source, real_cb=callback):
+-                return real_cb(real_s, condition)
+-            return gobject.io_add_watch(source.fileno(), condition, wrapper)
+-        else:
+-            return gobject.io_add_watch(source, condition, callback)
++        _glibbase.GlibReactorBase.__init__(self, gobject, _gtk, useGtk=useGtk)
+ 
+ 
+ 
+@@ -115,25 +76,13 @@ class PortableGtkReactor(_glibbase.Porta
+ 
+     Sockets aren't supported by GTK+'s input_add on Win32.
+     """
+-    def __init__(self, useGtk=False):
+-        _glibbase.PortableGlibReactorBase.__init__(self)
+-
+-        self._source_remove = gobject.source_remove
+-        self._timeout_add = gobject.timeout_add
+-
+-        if useGtk:
+-            import gtk
++    def __init__(self, useGtk=True):
++        _gtk = None
++        if useGtk is True:
++            import gtk as _gtk
+ 
+-            def mainquit():
+-                if gtk.main_level():
+-                    gtk.main_quit()
+-
+-            self._crash = mainquit
+-            self._run = gtk.main
+-        else:
+-            self.loop = gobject.MainLoop()
+-            self._crash = lambda: gobject.idle_add(self.loop.quit)
+-            self._run = self.loop.run
++        _glibbase.PortableGlibReactorBase.__init__(self, gobject, _gtk,
++                                                   useGtk=useGtk)
+ 
+ 
+ def install(useGtk=True):

@@ -1,0 +1,548 @@
+diff --git doc/core/howto/listings/udp/ipv6_listen.py doc/core/howto/listings/udp/ipv6_listen.py
+new file mode 100644
+index 0000000..cac6b85
+--- /dev/null
++++ doc/core/howto/listings/udp/ipv6_listen.py
+@@ -0,0 +1,14 @@
++from twisted.internet.protocol import DatagramProtocol
++from twisted.internet import reactor
++
++
++
++class Echo(DatagramProtocol):
++    def datagramReceived(self, data, addr):
++        print "received %r from %s" % (data, addr)
++        self.transport.write(data, addr)
++
++
++
++reactor.listenUDP(8006, Echo(), interface='::')
++reactor.run()
+diff --git doc/core/howto/udp.xhtml doc/core/howto/udp.xhtml
+index 6fb5141..62c236c 100644
+--- doc/core/howto/udp.xhtml
++++ doc/core/howto/udp.xhtml
+@@ -207,5 +207,16 @@ reactor.run()
+     base="twisted.internet.interfaces">IMulticastTransport</code> for more
+     information.</p>
+ 
++    <h2>IPv6</h2>
++    <p>
++      UDP sockets can also bind to IPv6 addresses to support sending and receiving
++      datagrams over IPv6. By passing an IPv6 address to <code class="API"
++      base="twisted.internet.interfaces.IReactorUDP">listenUDP</code>&apos;s
++      <code>interface</code> argument, the reactor will start an IPv6 socket that 
++      can be used to send and receive UDP datagrams.
++    </p>
++
++    <a href="listings/udp/ipv6_listen.py" class="py-listing">ipv6_listen.py</a>
++
+ </body>
+ </html>
+diff --git twisted/internet/error.py twisted/internet/error.py
+index 4e9fb5f..3da045a 100644
+--- twisted/internet/error.py
++++ twisted/internet/error.py
+@@ -458,6 +458,19 @@ class AlreadyListened(Exception):
+     listened on once.
+     """
+ 
++class InvalidAddressError(Exception):
++    """
++    An invalid address was specified (e.g. neither IPv4 or IPv6)
++
++    @ivar address: the address that was provided
++    @ivar message: Additional information provided by the calling context
++    """
++    def __init__(self, address, message):
++        self.address = address
++        self.message = message
++
++    def __str__(self):
++        return "Invalid address %s: %s" %(self.address, self.message)
+ 
+ __all__ = [
+     'BindError', 'CannotListenError', 'MulticastJoinError',
+@@ -472,4 +485,4 @@ __all__ = [
+     'ProcessTerminated', 'ProcessExitedAlready', 'NotConnectingError',
+     'NotListeningError', 'ReactorNotRunning', 'ReactorAlreadyRunning',
+     'ReactorAlreadyInstalledError', 'ConnectingCancelledError',
+-    'UnsupportedAddressFamily', 'UnsupportedSocketType']
++    'UnsupportedAddressFamily', 'UnsupportedSocketType', 'InvalidAddressError']
+diff --git twisted/internet/interfaces.py twisted/internet/interfaces.py
+index 4021e57..da52c6d 100644
+--- twisted/internet/interfaces.py
++++ twisted/internet/interfaces.py
+@@ -2282,7 +2282,7 @@ class IUDPTransport(Interface):
+ 
+     def getHost():
+         """
+-        Returns L{IPv4Address}.
++        Returns an L{IPv4Address} or L{IPv6Address}.
+         """
+ 
+     def stopListening():
+diff --git twisted/internet/iocpreactor/udp.py twisted/internet/iocpreactor/udp.py
+index 4dec51f..69fb6df 100644
+--- twisted/internet/iocpreactor/udp.py
++++ twisted/internet/iocpreactor/udp.py
+@@ -10,7 +10,7 @@ import socket, operator, struct, warnings, errno
+ from zope.interface import implements
+ 
+ from twisted.internet import defer, address, error, interfaces
+-from twisted.internet.abstract import isIPAddress
++from twisted.internet.abstract import isIPAddress, isIPv6Address
+ from twisted.python import log, failure
+ 
+ from twisted.internet.iocpreactor.const import ERROR_IO_PENDING
+@@ -49,6 +49,7 @@ class Port(abstract.FileHandle):
+         self.interface = interface
+         self.setLogStr()
+         self._connectedAddr = None
++        self._setAddressFamily()
+ 
+         abstract.FileHandle.__init__(self, reactor)
+ 
+@@ -60,6 +61,18 @@ class Port(abstract.FileHandle):
+                 struct.calcsize('i'))
+ 
+ 
++    def _setAddressFamily(self):
++        """
++        Resolve address family for the socket.
++        """
++        if isIPv6Address(self.interface):
++            self.addressFamily = socket.AF_INET6
++        elif isIPAddress(self.interface):
++            self.addressFamily = socket.AF_INET
++        elif self.interface:
++            raise error.InvalidAddressError(self.interface, 'not an IPv4 or IPv6 address.')
++
++
+     def __repr__(self):
+         if self._realPortNumber is not None:
+             return ("<%s on %s>" %
+@@ -95,7 +108,7 @@ class Port(abstract.FileHandle):
+             skt = self.createSocket()
+             skt.bind((self.interface, self.port))
+         except socket.error, le:
+-            raise error.CannotListenError, (self.interface, self.port, le)
++            raise error.CannotListenError(self.interface, self.port, le)
+ 
+         # Make sure that if we listened on port 0, we update that to
+         # reflect what the OS actually assigned us.
+@@ -166,7 +179,7 @@ class Port(abstract.FileHandle):
+                 if no == errno.WSAEINTR:
+                     return self.write(datagram)
+                 elif no == errno.WSAEMSGSIZE:
+-                    raise error.MessageLengthError, "message too long"
++                    raise error.MessageLengthError("message too long")
+                 elif no in (errno.WSAECONNREFUSED, errno.WSAECONNRESET,
+                             ERROR_CONNECTION_REFUSED, ERROR_PORT_UNREACHABLE):
+                     self.protocol.connectionRefused()
+@@ -174,9 +187,12 @@ class Port(abstract.FileHandle):
+                     raise
+         else:
+             assert addr != None
+-            if not addr[0].replace(".", "").isdigit():
+-                warnings.warn("Please only pass IPs to write(), not hostnames",
+-                              DeprecationWarning, stacklevel=2)
++            if not isIPAddress(addr[0]) and not isIPv6Address(addr[0]):
++                raise error.InvalidAddressError(addr[0], "write() only accepts IP addresses, not hostnames")
++            if isIPAddress(addr[0]) and self.addressFamily == socket.AF_INET6:
++                raise error.InvalidAddressError(addr[0], "IPv6 port write() called with IPv4 address")
++            if isIPv6Address(addr[0]) and self.addressFamily == socket.AF_INET:
++                raise error.InvalidAddressError(addr[0], "IPv4 port write() called with IPv6 address")
+             try:
+                 return self.socket.sendto(datagram, addr)
+             except socket.error, se:
+@@ -184,7 +200,7 @@ class Port(abstract.FileHandle):
+                 if no == errno.WSAEINTR:
+                     return self.write(datagram, addr)
+                 elif no == errno.WSAEMSGSIZE:
+-                    raise error.MessageLengthError, "message too long"
++                    raise error.MessageLengthError("message too long")
+                 elif no in (errno.WSAECONNREFUSED, errno.WSAECONNRESET,
+                             ERROR_CONNECTION_REFUSED, ERROR_PORT_UNREACHABLE):
+                     # in non-connected UDP ECONNREFUSED is platform dependent,
+@@ -207,8 +223,8 @@ class Port(abstract.FileHandle):
+             raise RuntimeError(
+                 "already connected, reconnecting is not currently supported "
+                 "(talk to itamar if you want this)")
+-        if not isIPAddress(host):
+-            raise ValueError, "please pass only IP addresses, not domain names"
++        if not isIPAddress(host) and not isIPv6Address(host):
++            raise error.InvalidAddressError(host, 'not an IPv4 or IPv6 address.')
+         self._connectedAddr = (host, port)
+         self.socket.connect((host, port))
+ 
+@@ -268,11 +284,16 @@ class Port(abstract.FileHandle):
+ 
+     def getHost(self):
+         """
+-        Returns an IPv4Address.
++        Return the local address of the UDP connection
+ 
+-        This indicates the address from which I am connecting.
++        @returns: the local address of the UDP connection
++        @rtype: L{IPv4Address} or L{IPv6Address}
+         """
+-        return address.IPv4Address('UDP', *self.socket.getsockname())
++        addr = self.socket.getsockname()
++        if self.addressFamily == socket.AF_INET:
++            return address.IPv4Address('UDP', *addr)
++        elif self.addressFamily == socket.AF_INET6:
++            return address.IPv6Address('UDP', *(addr[:2]))
+ 
+ 
+ 
+@@ -378,5 +399,3 @@ class MulticastPort(MulticastMixin, Port):
+             if hasattr(socket, "SO_REUSEPORT"):
+                 skt.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+         return skt
+-
+-
+diff --git twisted/internet/test/test_udp.py twisted/internet/test/test_udp.py
+index 4452e2c..6a59760 100644
+--- twisted/internet/test/test_udp.py
++++ twisted/internet/test/test_udp.py
+@@ -21,11 +21,13 @@ from twisted.internet.test.reactormixins import ReactorBuilder
+ from twisted.internet.defer import Deferred, maybeDeferred
+ from twisted.internet.interfaces import (
+     ILoggingContext, IListeningPort, IReactorUDP, IReactorSocket)
+-from twisted.internet.address import IPv4Address
++from twisted.internet.address import IPv4Address, IPv6Address
+ from twisted.internet.protocol import DatagramProtocol
+ 
+ from twisted.internet.test.connectionmixins import (LogObserverMixin,
+                                                     findFreePort)
++from twisted.internet import defer, error
++from twisted.test.test_udp import Server, GoodClient
+ from twisted.trial.unittest import SkipTest
+ 
+ 
+@@ -139,6 +141,30 @@ class UDPPortTestsMixin(object):
+             port.getHost(), IPv4Address('UDP', host, portNumber))
+ 
+ 
++    def test_getHostIPv6(self):
++        """
++        L{IListeningPort.getHost} returns an L{IPv6Address} when listening on
++        an IPv6 interface.
++        """
++        reactor = self.buildReactor()
++        port = self.getListeningPort(
++            reactor, DatagramProtocol(), interface='::1')
++        addr = port.getHost()
++        self.assertEqual(addr.host, "::1")
++        self.assertIsInstance(addr, IPv6Address)
++
++
++    def test_invalidInterface(self):
++        """
++        A C{InvalidAddressError} is raised when trying to listen on an address that
++        isn't a valid IPv4 or IPv6 address.
++        """
++        reactor = self.buildReactor()
++        self.assertRaises(
++            error.InvalidAddressError, reactor.listenUDP, DatagramProtocol(), 0,
++            interface='example.com')
++
++
+     def test_logPrefix(self):
+         """
+         Datagram transports implement L{ILoggingContext.logPrefix} to return a
+@@ -192,6 +218,144 @@ class UDPPortTestsMixin(object):
+         self.assertIn(repr(port.getHost().port), str(port))
+ 
+ 
++    def test_writeToIPv6Interface(self):
++        """
++        Writing to an IPv6 UDP socket on the loopback interface succeeds.
++        """
++
++        reactor = self.buildReactor()
++        server = Server()
++        serverStarted = server.startedDeferred = defer.Deferred()
++        self.getListeningPort(reactor, server, interface="::1")
++
++        client = GoodClient()
++        clientStarted = client.startedDeferred = defer.Deferred()
++        self.getListeningPort(reactor, client, interface="::1")
++        cAddr = client.transport.getHost()
++
++        def cbClientStarted(ignored):
++            """
++            Send a datagram from the client once it's started.
++
++            @param ignored: a list of C{[None, None]}, which is ignored
++            @returns: a deferred which fires when the server has received a
++                datagram.
++            """
++            client.transport.write(
++                b"spam", ("::1", server.transport.getHost().port))
++            serverReceived = server.packetReceived = defer.Deferred()
++            return serverReceived
++
++        def cbServerReceived(ignored):
++            """
++            Stop the reactor after a datagram is received.
++
++            @param ignored: C{None}, which is ignored
++            @returns: C{None}
++            """
++            reactor.stop()
++
++        d = defer.gatherResults([serverStarted, clientStarted])
++        d.addCallback(cbClientStarted)
++        d.addCallback(cbServerReceived)
++        d.addErrback(err)
++        self.runReactor(reactor)
++
++        packet = server.packets[0]
++        self.assertEqual(packet[0], b'spam')
++        self.assertEqual(packet[1], (cAddr.host, cAddr.port))
++
++
++    def test_connectedWriteToIPv6Interface(self):
++        """
++        An IPv6 address can be passed as the C{interface} argument to 
++        L{listenUDP}. The resulting Port accepts IPv6 datagrams.
++        """
++
++        reactor = self.buildReactor()
++        server = Server()
++        serverStarted = server.startedDeferred = defer.Deferred()
++        self.getListeningPort(reactor, server, interface="::1")
++
++        client = GoodClient()
++        clientStarted = client.startedDeferred = defer.Deferred()
++        self.getListeningPort(reactor, client, interface="::1")
++        cAddr = client.transport.getHost()
++
++        def cbClientStarted(ignored):
++            """
++            Send a datagram from the client once it's started.
++
++            @param ignored: a list of C{[None, None]}, which is ignored
++            @returns: a deferred which fires when the server has received a
++                datagram.
++            """
++
++            client.transport.connect("::1", server.transport.getHost().port)
++            client.transport.write(b"spam")
++            serverReceived = server.packetReceived = defer.Deferred()
++            return serverReceived
++
++        def cbServerReceived(ignored):
++            """
++            Stop the reactor after a datagram is received.
++
++            @param ignored: C{None}, which is ignored
++            @returns: C{None}
++            """
++
++            reactor.stop()
++
++        d = defer.gatherResults([serverStarted, clientStarted])
++        d.addCallback(cbClientStarted)
++        d.addCallback(cbServerReceived)
++        d.addErrback(err)
++        self.runReactor(reactor)
++
++        packet = server.packets[0]
++        self.assertEqual(packet[0], b'spam')
++        self.assertEqual(packet[1], (cAddr.host, cAddr.port))
++
++
++    def test_writingToHostnameRaisesAddressError(self):
++        """
++        Writing to a hostname instead of an IP address will raise an
++        C{InvalidAddressError}.
++        """
++
++        reactor = self.buildReactor()
++        port = self.getListeningPort(reactor, DatagramProtocol())
++        self.assertRaises(error.InvalidAddressError, port.write, 'spam', ('eggs.com', 1))
++
++    def test_writingToIPv6OnIPv4RaisesAddressError(self):
++        """
++        Writing to an IPv6 address on an IPv4 socket will raise an 
++        C{InvalidAddressError}.
++        """
++        reactor = self.buildReactor()
++        port = self.getListeningPort(reactor, DatagramProtocol())
++        self.assertRaises(error.InvalidAddressError, port.write, 'spam', ('::1', 1))
++
++    def test_writingToIPv4OnIPv6RaisesAddressError(self):
++        """
++        Writing to an IPv6 address on an IPv4 socket will raise an 
++        C{InvalidAddressError}.
++        """
++        reactor = self.buildReactor()
++        port = self.getListeningPort(reactor, DatagramProtocol(), interface="::1")
++        self.assertRaises(error.InvalidAddressError, port.write, 'spam', ('127.0.0.1', 1))
++
++    def test_connectingToHostnameRaisesAddressError(self):
++        """
++        Connecting to a hostname instead of an IP address will raise an
++        C{InvalidAddressError}.
++        """
++
++        reactor = self.buildReactor()
++        port = self.getListeningPort(reactor, DatagramProtocol())
++        self.assertRaises(error.InvalidAddressError, port.connect, 'eggs.com', 1)
++
++
+ 
+ class UDPServerTestsBuilder(ReactorBuilder,
+                             UDPPortTestsMixin, DatagramTransportTestsMixin):
+diff --git twisted/internet/udp.py twisted/internet/udp.py
+index 9dc55df..35eaa75 100644
+--- twisted/internet/udp.py
++++ twisted/internet/udp.py
+@@ -108,6 +108,7 @@ class Port(base.BasePort):
+         self.interface = interface
+         self.setLogStr()
+         self._connectedAddr = None
++        self._setAddressFamily()
+ 
+ 
+     @classmethod
+@@ -230,6 +231,12 @@ class Port(base.BasePort):
+                 raise
+             else:
+                 read += len(data)
++                if self.addressFamily == socket.AF_INET6:
++                    # Remove the flow and scope ID from the address tuple,
++                    # reducing it to a tuple of just (host, port). This should
++                    # be amended later to return an object that can unpack to
++                    # (host, port) but also includes the flow and scope ID.
++                    addr = addr[:2]
+                 try:
+                     self.protocol.datagramReceived(data, addr)
+                 except:
+@@ -245,7 +252,7 @@ class Port(base.BasePort):
+ 
+         @type addr: C{tuple} containing C{str} as first element and C{int} as
+             second element, or C{None}
+-        @param addr: A tuple of (I{stringified dotted-quad IP address},
++        @param addr: A tuple of (I{stringified IPv4 or IPv6 address},
+             I{integer port number}); can be C{None} in connected mode.
+         """
+         if self._connectedAddr:
+@@ -264,9 +271,14 @@ class Port(base.BasePort):
+                     raise
+         else:
+             assert addr != None
+-            if not addr[0].replace(".", "").isdigit() and addr[0] != "<broadcast>":
+-                warnings.warn("Please only pass IPs to write(), not hostnames",
+-                              DeprecationWarning, stacklevel=2)
++            if (not abstract.isIPAddress(addr[0])
++                    and not abstract.isIPv6Address(addr[0])
++                    and addr[0] != "<broadcast>"):
++                raise error.InvalidAddressError(addr[0], "write() only accepts IP addresses, not hostnames")
++            if (abstract.isIPAddress(addr[0]) or addr[0] == "<broadcast>") and self.addressFamily == socket.AF_INET6:
++                raise error.InvalidAddressError(addr[0], "IPv6 port write() called with IPv4 or broadcast address")
++            if abstract.isIPv6Address(addr[0]) and self.addressFamily == socket.AF_INET:
++                raise error.InvalidAddressError(addr[0], "IPv4 port write() called with IPv6 address")
+             try:
+                 return self.socket.sendto(datagram, addr)
+             except socket.error as se:
+@@ -292,8 +304,8 @@ class Port(base.BasePort):
+         """
+         if self._connectedAddr:
+             raise RuntimeError("already connected, reconnecting is not currently supported")
+-        if not abstract.isIPAddress(host):
+-            raise ValueError("please pass only IP addresses, not domain names")
++        if not abstract.isIPAddress(host) and not abstract.isIPv6Address(host):
++            raise error.InvalidAddressError(host, 'not an IPv4 or IPv6 address.')
+         self._connectedAddr = (host, port)
+         self.socket.connect((host, port))
+ 
+@@ -337,6 +349,17 @@ class Port(base.BasePort):
+         logPrefix = self._getLogPrefix(self.protocol)
+         self.logstr = "%s (UDP)" % logPrefix
+ 
++    def _setAddressFamily(self):
++        """
++        Resolve address family for the socket.
++        """
++        if abstract.isIPv6Address(self.interface):
++            self.addressFamily = socket.AF_INET6
++        elif abstract.isIPAddress(self.interface):
++            self.addressFamily = socket.AF_INET
++        elif self.interface:
++            raise error.InvalidAddressError(self.interface, 'not an IPv4 or IPv6 address.')
++
+ 
+     def logPrefix(self):
+         """
+@@ -347,11 +370,16 @@ class Port(base.BasePort):
+ 
+     def getHost(self):
+         """
+-        Returns an IPv4Address.
++        Return the local address of the UDP connection
+ 
+-        This indicates the address from which I am connecting.
++        @returns: the local address of the UDP connection
++        @rtype: L{IPv4Address} or L{IPv6Address}
+         """
+-        return address.IPv4Address('UDP', *self.socket.getsockname())
++        addr = self.socket.getsockname()
++        if self.addressFamily == socket.AF_INET:
++            return address.IPv4Address('UDP', *addr)
++        elif self.addressFamily == socket.AF_INET6:
++            return address.IPv6Address('UDP', *(addr[:2]))
+ 
+ 
+ 
+@@ -417,7 +445,8 @@ class MulticastPort(MulticastMixin, Port):
+     UDP Port that supports multicasting.
+     """
+ 
+-    def __init__(self, port, proto, interface='', maxPacketSize=8192, reactor=None, listenMultiple=False):
++    def __init__(self, port, proto, interface='', maxPacketSize=8192,
++                 reactor=None, listenMultiple=False):
+         """
+         @see: L{twisted.internet.interfaces.IReactorMulticast.listenMulticast}
+         """
+diff --git twisted/test/test_udp.py twisted/test/test_udp.py
+index 21d145c..cfc8f5e 100644
+--- twisted/test/test_udp.py
++++ twisted/test/test_udp.py
+@@ -267,6 +267,7 @@ class UDPTestCase(unittest.TestCase):
+         return d
+ 
+ 
++
+     def test_connectionRefused(self):
+         """
+         A L{ConnectionRefusedError} exception is raised when a connection
+@@ -312,7 +313,7 @@ class UDPTestCase(unittest.TestCase):
+ 
+     def test_badConnect(self):
+         """
+-        A call to the transport's connect method fails with a L{ValueError}
++        A call to the transport's connect method fails with a L{InvalidAddressError}
+         when a non-IP address is passed as the host value.
+ 
+         A call to a transport's connect method fails with a L{RuntimeError}
+@@ -320,7 +321,7 @@ class UDPTestCase(unittest.TestCase):
+         """
+         client = GoodClient()
+         port = reactor.listenUDP(0, client, interface="127.0.0.1")
+-        self.assertRaises(ValueError, client.transport.connect,
++        self.assertRaises(error.InvalidAddressError, client.transport.connect,
+                           "localhost", 80)
+         client.transport.connect("127.0.0.1", 80)
+         self.assertRaises(RuntimeError, client.transport.connect,
+diff --git twisted/topfiles/5086.feature twisted/topfiles/5086.feature
+new file mode 100644
+index 0000000..d0ea2f0
+--- /dev/null
++++ twisted/topfiles/5086.feature
+@@ -0,0 +1 @@
++IReactorUDP.listenUDP, IUDPTransport.write and IUDPTransport.connect now accept ipv6 address literals.
+\ No newline at end of file

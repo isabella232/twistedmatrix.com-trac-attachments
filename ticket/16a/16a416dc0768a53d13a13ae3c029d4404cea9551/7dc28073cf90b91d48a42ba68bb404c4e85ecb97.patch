@@ -1,0 +1,190 @@
+Index: twisted/internet/posixbase.py
+===================================================================
+--- twisted/internet/posixbase.py	(revision 32713)
++++ twisted/internet/posixbase.py	(working copy)
+@@ -319,7 +319,7 @@
+ 
+     def spawnProcess(self, processProtocol, executable, args=(),
+                      env={}, path=None,
+-                     uid=None, gid=None, usePTY=0, childFDs=None):
++                     uid=None, gid=None, usePTY=0, childFDs=None, preexec_fn=None):
+         args, env = self._checkProcessArgs(args, env)
+         if platformType == 'posix':
+             if usePTY:
+@@ -329,7 +329,7 @@
+                                           processProtocol, uid, gid, usePTY)
+             else:
+                 return process.Process(self, executable, args, env, path,
+-                                       processProtocol, uid, gid, childFDs)
++                                       processProtocol, uid, gid, childFDs, preexec_fn)
+         elif platformType == "win32":
+             if uid is not None or gid is not None:
+                 raise ValueError("The uid and gid parameters are not supported on Windows.")
+Index: twisted/internet/test/test_process.py
+===================================================================
+--- twisted/internet/test/test_process.py	(revision 32713)
++++ twisted/internet/test/test_process.py	(working copy)
+@@ -38,6 +38,32 @@
+ 
+ 
+ 
++class _CollectOutputProcessProtocol(ProcessProtocol):
++    """
++    An L{IProcessProtocol} which fires a Deferred with (stdout, stderr) when
++    the process it is associated with ends.
++    """
++    def __init__(self, whenFinished):
++        self.whenFinished = whenFinished
++        self.stdout = []
++        self.stderr = []
++
++
++    def outReceived(self, data):
++        self.stdout.append(data)
++
++
++    def errReceived(self, data):
++        self.stderr.append(data)
++
++
++    def processEnded(self, reason):
++        self.stdout = ''.join(self.stdout)
++        self.stderr = ''.join(self.stderr)
++        self.whenFinished.callback((self.stdout, self.stderr))
++
++
++
+ class ProcessTestsBuilderBase(ReactorBuilder):
+     """
+     Base class for L{IReactorProcess} tests which defines some tests which
+@@ -551,6 +577,98 @@
+ 
+         reactor.callWhenRunning(spawnChild)
+         self.runReactor(reactor)
++
++
++    def test_processPreexecChangeArgs(self):
++        """
++        preexec_fn can successfully change the arguments of a Process.
++        """
++
++        result = []
++        reactor = self.buildReactor()
++
++        def processFinished(output):
++            self.assertEqual(("success\n",""), output)
++
++        def shutdown(result):
++            reactor.stop()
++            return result
++
++        def modifyArgs(args, environment, **kwargs):
++            return args[:-1] + ['print "success",'], environment, kwargs
++
++        ended = Deferred()
++        reactor.spawnProcess(
++            _CollectOutputProcessProtocol(ended), sys.executable,
++            [sys.executable, '-Wignore', "-c", ""],
++            preexec_fn=modifyArgs)
++        ended.addCallback(processFinished)
++        ended.addBoth(shutdown)
++        self.runReactor(reactor)
++        return ended
++
++
++    def test_processPreexecChangeEnvironment(self):
++        """
++        preexec_fn can successfully change the environment of a Process.
++        """
++
++        result = []
++        reactor = self.buildReactor()
++
++        def processFinished(output):
++            self.assertEqual(("success\n", ""), output)
++
++        def shutdown(result):
++            reactor.stop()
++            return result
++
++        def modifyArgs(args, environment, **kwargs):
++            environment["PREEXEC_TEST_RESULT"] = "success"
++            return args, environment, kwargs
++
++        ended = Deferred()
++        reactor.spawnProcess(
++            _CollectOutputProcessProtocol(ended), sys.executable,
++            [sys.executable, '-Wignore', "-c", 'import os; print os.environ.get("PREEXEC_TEST_RESULT"),'],
++            preexec_fn=modifyArgs)
++        ended.addCallback(processFinished)
++        ended.addBoth(shutdown)
++        self.runReactor(reactor)
++        return ended
++
++
++    def test_processPreexecRedirectOutput(self):
++        """
++        preexec_fn can successfully change the FD map of a Process.
++        """
++
++        result = []
++        reactor = self.buildReactor()
++
++        def processFinished(output):
++            self.assertEqual(("","success\n"), output)
++
++        def shutdown(result):
++            reactor.stop()
++            return result
++
++        def modifyArgs(args, environment, **kwargs):
++            fdmap = kwargs['fdmap']
++            os.close(fdmap[1])
++            fdmap[1] = fdmap[2]
++            return args, environment, kwargs
++
++        ended = Deferred()
++        reactor.spawnProcess(
++            _CollectOutputProcessProtocol(ended), sys.executable,
++            [sys.executable, '-Wignore', "-c", 'print "success",'],
++            preexec_fn=modifyArgs)
++        ended.addCallback(processFinished)
++        ended.addBoth(shutdown)
++        self.runReactor(reactor)
++        return ended
++
+ globals().update(ProcessTestsBuilder.makeTestCaseClasses())
+ 
+ 
+Index: twisted/internet/process.py
+===================================================================
+--- twisted/internet/process.py	(revision 32713)
++++ twisted/internet/process.py	(working copy)
+@@ -409,6 +409,8 @@
+                 try:
+                     # Stop debugging. If I am, I don't care anymore.
+                     sys.settrace(None)
++                    if hasattr(self, 'preexec_fn'):
++                        args, environment, kwargs = self.preexec_fn(args=args, environment=environment, **kwargs)
+                     self._setupChild(**kwargs)
+                     self._execChild(path, settingUID, uid, gid,
+                                     executable, args, environment)
+@@ -615,7 +617,7 @@
+ 
+     def __init__(self,
+                  reactor, executable, args, environment, path, proto,
+-                 uid=None, gid=None, childFDs=None):
++                 uid=None, gid=None, childFDs=None, preexec_fn=None, **kwargs):
+         """
+         Spawn an operating-system process.
+ 
+@@ -633,6 +635,9 @@
+             assert 'w' not in childFDs.values()
+         _BaseProcess.__init__(self, proto)
+ 
++        if callable(preexec_fn):
++            self.preexec_fn = preexec_fn
++
+         self.pipes = {}
+         # keys are childFDs, we can sense them closing
+         # values are ProcessReader/ProcessWriters

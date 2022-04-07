@@ -1,0 +1,337 @@
+Index: twisted/test/test_udp.py
+===================================================================
+--- twisted/test/test_udp.py	(revision 38687)
++++ twisted/test/test_udp.py	(working copy)
+@@ -168,7 +168,72 @@
+ 
+         return d.addCallback(cbStarted, p)
+ 
++    def test_bindToIPv6Interface(self):
++        """
++        Bind to ipv6 interface.
++        """
++        server = Server()
++        p = reactor.listenUDP(0, server, interface="::1")
++        self.assertEqual(p.getHost().host, "::1")
+ 
++        return p.stopListening()
++
++    def cbServerStarted(self, ignored, client, interface, d):
++        self.port2 = reactor.listenUDP(0, client, interface=interface)
++        return d
++
++    def cbClientStarted(self, ignored, client, server, interface):
++        client.transport.connect(interface,
++                                 server.transport.getHost().port)
++        cAddr = client.transport.getHost()
++        sAddr = server.transport.getHost()
++
++        serverSend = client.packetReceived = defer.Deferred()
++        server.transport.write(b"hello", (cAddr.host, cAddr.port))
++
++        clientWrites = [
++            (b"a",),
++            (b"b", None),
++            (b"c", (sAddr.host, sAddr.port))]
++
++        def cbClientSend(ignored):
++            if clientWrites:
++                nextClientWrite = server.packetReceived = defer.Deferred()
++                nextClientWrite.addCallback(cbClientSend)
++                client.transport.write(*clientWrites.pop(0))
++                return nextClientWrite
++
++        # No one will ever call .errback on either of these Deferreds,
++        # but there is a non-trivial amount of test code which might
++        # cause them to fail somehow.  So fireOnOneErrback=True.
++        return defer.DeferredList([
++                cbClientSend(None),
++                serverSend], fireOnOneErrback=True)
++
++
++    def cbSendsFinished(self, ignored, client, server, addressAddition=()):
++        cAddr = client.transport.getHost()
++        sAddr = server.transport.getHost()
++        clientAddr = (cAddr.host, cAddr.port) + addressAddition
++        serverAddr = (sAddr.host, sAddr.port) + addressAddition
++        self.assertEqual(
++            client.packets,
++            [(b"hello", serverAddr)])
++        self.assertEqual(
++            server.packets,
++            [(b"a", clientAddr),
++             (b"b", clientAddr),
++             (b"c", clientAddr)])
++
++
++    def cbFinished(self, ignored, port1, port2):
++        return defer.DeferredList([
++            defer.maybeDeferred(port1.stopListening),
++            defer.maybeDeferred(port2.stopListening)],
++            fireOnOneErrback=True)
++
++
++
+     def test_bindError(self):
+         """
+         A L{CannotListenError} exception is raised when attempting to bind a
+@@ -192,81 +257,42 @@
+         d.addCallback(cbFinished)
+         return d
+ 
+-
+-    def test_sendPackets(self):
++    def performTransferServerClient(self, interface, addressAddition=()):
+         """
+-        Datagrams can be sent with the transport's C{write} method and
+-        received via the C{datagramReceived} callback method.
++        Helper method that creates UDP server and client,
++        connects the client to the server, sends some packets
++        and asserts addresses.
+         """
+         server = Server()
+         serverStarted = server.startedDeferred = defer.Deferred()
+-        port1 = reactor.listenUDP(0, server, interface="127.0.0.1")
++        port1 = reactor.listenUDP(0, server, interface=interface)
+ 
+         client = GoodClient()
+         clientStarted = client.startedDeferred = defer.Deferred()
+ 
+-        def cbServerStarted(ignored):
+-            self.port2 = reactor.listenUDP(0, client, interface="127.0.0.1")
+-            return clientStarted
++        d = serverStarted.addCallback(self.cbServerStarted, client, interface,
++                                      clientStarted)
++        d.addCallback(self.cbClientStarted, client, server, interface)
++        d.addCallback(self.cbSendsFinished, client, server, addressAddition)
++        d.addCallback(self.cbFinished, port1, self.port2)
+ 
+-        d = serverStarted.addCallback(cbServerStarted)
++        return d
+ 
+-        def cbClientStarted(ignored):
+-            client.transport.connect("127.0.0.1",
+-                                     server.transport.getHost().port)
+-            cAddr = client.transport.getHost()
+-            sAddr = server.transport.getHost()
++    def test_writeToIPv6Interface(self):
++        """
++        Send packets to ipv6 address.
++        """
++        return self.performTransferServerClient("::1", (0, 0))
+ 
+-            serverSend = client.packetReceived = defer.Deferred()
+-            server.transport.write(b"hello", (cAddr.host, cAddr.port))
+ 
+-            clientWrites = [
+-                (b"a",),
+-                (b"b", None),
+-                (b"c", (sAddr.host, sAddr.port))]
++    def test_sendPackets(self):
++        """
++        Datagrams can be sent with the transport's C{write} method and
++        received via the C{datagramReceived} callback method.
++        """
++        return self.performTransferServerClient("127.0.0.1")
+ 
+-            def cbClientSend(ignored):
+-                if clientWrites:
+-                    nextClientWrite = server.packetReceived = defer.Deferred()
+-                    nextClientWrite.addCallback(cbClientSend)
+-                    client.transport.write(*clientWrites.pop(0))
+-                    return nextClientWrite
+ 
+-            # No one will ever call .errback on either of these Deferreds,
+-            # but there is a non-trivial amount of test code which might
+-            # cause them to fail somehow.  So fireOnOneErrback=True.
+-            return defer.DeferredList([
+-                cbClientSend(None),
+-                serverSend],
+-                fireOnOneErrback=True)
+-
+-        d.addCallback(cbClientStarted)
+-
+-        def cbSendsFinished(ignored):
+-            cAddr = client.transport.getHost()
+-            sAddr = server.transport.getHost()
+-            self.assertEqual(
+-                client.packets,
+-                [(b"hello", (sAddr.host, sAddr.port))])
+-            clientAddr = (cAddr.host, cAddr.port)
+-            self.assertEqual(
+-                server.packets,
+-                [(b"a", clientAddr),
+-                 (b"b", clientAddr),
+-                 (b"c", clientAddr)])
+-
+-        d.addCallback(cbSendsFinished)
+-
+-        def cbFinished(ignored):
+-            return defer.DeferredList([
+-                defer.maybeDeferred(port1.stopListening),
+-                defer.maybeDeferred(self.port2.stopListening)],
+-                fireOnOneErrback=True)
+-
+-        d.addCallback(cbFinished)
+-        return d
+-
+-
+     def test_connectionRefused(self):
+         """
+         A L{ConnectionRefusedError} exception is raised when a connection
+Index: twisted/internet/address.py
+===================================================================
+--- twisted/internet/address.py	(revision 38687)
++++ twisted/internet/address.py	(working copy)
+@@ -77,6 +77,14 @@
+         IPv6 address; for example, "::1".
+     @type host: C{str}
+     """
++    def __init__(self, type, host, port, flowInfo=0, scopeId=0, _bwHack=None):
++        _IPAddress.__init__(self, type, host, port)
++        self.flowInfo = flowInfo
++        self.scopeId = scopeId
++        if _bwHack is not None:
++            warnings.warn("twisted.internet.address.IPv4Address._bwHack "
++                          "is deprecated since Twisted 11.0",
++                          DeprecationWarning, stacklevel=2)
+ 
+ 
+ 
+Index: twisted/internet/udp.py
+===================================================================
+--- twisted/internet/udp.py	(revision 38687)
++++ twisted/internet/udp.py	(working copy)
+@@ -80,6 +80,7 @@
+         self.interface = interface
+         self.setLogStr()
+         self._connectedAddr = None
++        self.setAddressFamily()
+ 
+     def __repr__(self):
+         if self._realPortNumber is not None:
+@@ -207,7 +208,7 @@
+         """
+         if self._connectedAddr:
+             raise RuntimeError("already connected, reconnecting is not currently supported")
+-        if not abstract.isIPAddress(host):
++        if not abstract.isIPAddress(host) and not abstract.isIPv6Address(host):
+             raise ValueError("please pass only IP addresses, not domain names")
+         self._connectedAddr = (host, port)
+         self.socket.connect((host, port))
+@@ -252,7 +253,20 @@
+         logPrefix = self._getLogPrefix(self.protocol)
+         self.logstr = "%s (UDP)" % logPrefix
+ 
++    def setAddressFamily(self):
++        """
++        Resolve address family for the socket.
++        """
++        if abstract.isIPv6Address(self.interface):
++            if not socket.has_ipv6:
++                raise RuntimeError("IPV6 is not supported, "+\
++                                       "compile with ipv6 support")
++            self.addressFamily = socket.AF_INET6
++        elif abstract.isIPAddress(self.interface):
++            self.addressFamily = socket.AF_INET
++        
+ 
++
+     def logPrefix(self):
+         """
+         Return the prefix to log with.
+@@ -262,11 +276,14 @@
+ 
+     def getHost(self):
+         """
+-        Returns an IPv4Address.
++        Returns an IPv4Address or IPv6Address.
+ 
+         This indicates the address from which I am connecting.
+         """
+-        return address.IPv4Address('UDP', *self.socket.getsockname())
++        if self.addressFamily == socket.AF_INET:
++            return address.IPv4Address('UDP', *self.socket.getsockname())
++        elif self.addressFamily == socket.AF_INET6:
++            return address.IPv6Address('UDP', *self.socket.getsockname())
+ 
+ 
+ 
+Index: twisted/internet/test/test_udp.py
+===================================================================
+--- twisted/internet/test/test_udp.py	(revision 38687)
++++ twisted/internet/test/test_udp.py	(working copy)
+@@ -20,7 +20,7 @@
+ from twisted.internet.defer import Deferred, maybeDeferred
+ from twisted.internet.interfaces import (
+     ILoggingContext, IListeningPort, IReactorUDP)
+-from twisted.internet.address import IPv4Address
++from twisted.internet.address import IPv4Address, IPv6Address
+ from twisted.internet.protocol import DatagramProtocol
+ 
+ from twisted.internet.test.connectionmixins import (LogObserverMixin,
+@@ -48,8 +48,14 @@
+         """
+         return "(UDP Port %s Closed)" % (port.getHost().port,)
+ 
++    def getIPv6ListeningPort(self, reactor, protocol):
++        """
++        Get a UDP port binded to ipv6 interface.
++        """
++        return reactor.listenUDP(0, protocol, "::1")
+ 
+ 
++
+ class DatagramTransportTestsMixin(LogObserverMixin):
+     """
+     Mixin defining tests which apply to any port/datagram based transport.
+@@ -162,7 +168,21 @@
+         self.assertEqual(
+             port.getHost(), IPv4Address('UDP', host, portNumber))
+ 
++    def test_getHostIPv6(self):
++        """
++        L{IListeningPort.getHost} returns an L{IPv6Address} giving a
++        IPv6 address, the port number that the protocol is listening on
++        and the port number.
++        """
++        reactor = self.buildReactor()
++        port = self.getIPv6ListeningPort(reactor, DatagramProtocol())
++        addr = port.getHost()
++        self.assertEqual(addr.host, "::1")
++        self.assertEqual(addr.flowInfo, 0)
++        self.assertEqual(addr.scopeId, 0)
+ 
++
++
+     def test_logPrefix(self):
+         """
+         Datagram transports implement L{ILoggingContext.logPrefix} to return a
+Index: twisted/internet/test/test_address.py
+===================================================================
+--- twisted/internet/test/test_address.py	(revision 38687)
++++ twisted/internet/test/test_address.py	(working copy)
+@@ -199,8 +199,23 @@
+         """
+         return IPv6Address("TCP", "::2", 0)
+ 
++    def buildWholeAddress(self):
++        """
++        Like L{buldAddress}, but assigns all fields specific to
++        ipv6 (including flow info and scope id)
++        """
++        return IPv6Address("TCP", "FE80::", 1, 1, None)
+ 
++    def test_specificFields(self):
++        """
++        Simply check if ipv6 specific fields exist.
++        """
++        addr = self.buildWholeAddress()
++        self.assertTrue(hasattr(addr, "flowInfo"))
++        self.assertTrue(hasattr(addr, "scopeId"))
+ 
++
++
+ class UNIXAddressTestCase(unittest.SynchronousTestCase, AddressTestCaseMixin):
+     addressArgSpec = (("name", "%r"),)
+ 

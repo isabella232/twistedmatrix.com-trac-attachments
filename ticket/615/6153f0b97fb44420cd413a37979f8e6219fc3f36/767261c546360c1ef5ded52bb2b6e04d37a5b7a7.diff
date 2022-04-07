@@ -1,0 +1,181 @@
+Index: twisted/enterprise/adbapi.py
+===================================================================
+--- twisted/enterprise/adbapi.py	(revision 10814)
++++ twisted/enterprise/adbapi.py	(working copy)
+@@ -56,6 +56,10 @@
+     number of connections that will be opened by the pool. You can pass
+     the noisy arg which determines whether informational log messages are
+     generated during the pool's operation.
++
++    You can pass a function cp_openfun which will get called after every
++    .connect() operation on the underlying db api. This is useful to setup
++    per-connection state, such as charset, timezone, etc.
+     """
+ 
+     noisy = 1   # if true, generate informational log messages
+@@ -63,6 +67,8 @@
+     max = 5     # maximum number of connections in pool
+     running = 0 # true when the pool is operating
+ 
++    openfun = None # A function to call to setup a new connection
++    
+     def __init__(self, dbapiName, *connargs, **connkw):
+         self.dbapiName = dbapiName
+         self.dbapi = reflect.namedModule(dbapiName)
+@@ -88,6 +94,10 @@
+             self.noisy = connkw['cp_noisy']
+             del connkw['cp_noisy']
+ 
++        if connkw.has_key('cp_openfun'):
++            self.openfun = connkw['cp_openfun']
++            del connkw['cp_openfun']
++        
+         self.min = min(self.min, self.max)
+         self.max = max(self.min, self.max)
+ 
+@@ -200,13 +210,16 @@
+         self.threadpool.stop()
+         self.running = 0
+         for conn in self.connections.values():
+-            if self.noisy:
+-                log.msg('adbapi closing: %s %s%s' % (self.dbapiName,
+-                                                     self.connargs or '',
+-                                                     self.connkw or ''))
+-            conn.close()
++            self._close(conn)
+         self.connections.clear()
+ 
++    def _close(self, conn):
++        if self.noisy:
++            log.msg('adbapi closing: %s %s%s' % (self.dbapiName,
++                                                 self.connargs or '',
++                                                 self.connkw or ''))
++        conn.close()
++        
+     def connect(self):
+         """Return a database connection when one becomes available.
+ 
+@@ -224,9 +237,20 @@
+                                                         self.connargs or '',
+                                                         self.connkw or ''))
+             conn = self.dbapi.connect(*self.connargs, **self.connkw)
++            if self.openfun != None:
++                self.openfun(conn)
+             self.connections[tid] = conn
+         return conn
+ 
++    def disconnect(self):
++        """Disconnect the database connection associated with this thread.
++        """
++        tid = self.threadID()
++        conn = self.connections.get(tid)
++        if conn is not None:
++            self._close(conn)
++            del self.connections[tid]
++        
+     def _runInteraction(self, interaction, *args, **kw):
+         trans = Transaction(self, self.connect())
+         try:
+Index: twisted/test/test_enterprise.py
+===================================================================
+--- twisted/test/test_enterprise.py	(revision 10814)
++++ twisted/test/test_enterprise.py	(working copy)
+@@ -329,6 +329,14 @@
+ 
+     reflectorClass = SQLReflector
+ 
++    openfun_called = False
++    
++    def openfun(self, conn):
++        self.openfun_called = True
++
++    def testOpenfunCalled(self):
++        self.assertEquals(self.openfun_called, True)
++        
+     def createReflector(self):
+         self.startDB()
+         self.dbpool = self.makePool()
+@@ -385,18 +393,18 @@
+         for i in range(self.count):
+             self.failUnless(result[i][1][0][0] == i, "Value not returned")
+ 
+-        # now delete everything
+-        ds = []
++        # now delete everything, testing synchronous operation.
++        conn = self.dbpool.connect()
++        curs = conn.cursor()
+         for i in range(self.count):
+-            sql = "delete from simple where x = %d" % i
+-            ds.append(self.dbpool.runOperation(sql))
+-        dlist = defer.DeferredList(ds, fireOnOneErrback=1)
+-        deferredResult(dlist)
+-
++            curs.execute("delete from simple where x = %d" % i)
++        conn.commit()
++        self.dbpool.disconnect()
++        
+         # verify simple table is empty
+         sql = "select count(1) from simple"
+         row = deferredResult(self.dbpool.runQuery(sql))
+-        self.failUnless(int(row[0][0]) == 0, "Interaction not rolled back")
++        self.failUnless(int(row[0][0]) == 0, "Didn't successfully delete table contents")
+ 
+     def interaction(self, transaction):
+         transaction.execute("select x from simple order by x")
+@@ -445,7 +453,8 @@
+         conn.close()
+ 
+     def makePool(self):
+-        return ConnectionPool('gadfly', self.DB_NAME, self.DB_DIR, cp_max=1)
++        return ConnectionPool('gadfly', self.DB_NAME, self.DB_DIR, cp_max=1,
++                              cp_openfun=self.openfun)
+ 
+ 
+ class SQLiteTestCase(SQLReflectorTestCase, unittest.TestCase):
+@@ -461,7 +470,8 @@
+         if os.path.exists(self.database): os.unlink(self.database)
+ 
+     def makePool(self):
+-        return ConnectionPool('sqlite', database=self.database, cp_max=1)
++        return ConnectionPool('sqlite', database=self.database, cp_max=1,
++                              cp_openfun=self.openfun)
+ 
+ 
+ class PostgresTestCase(SQLReflectorTestCase, unittest.TestCase):
+@@ -471,7 +481,7 @@
+     def makePool(self):
+         return ConnectionPool('pyPgSQL.PgSQL', database=self.DB_NAME,
+                               user=self.DB_USER, password=self.DB_PASS,
+-                              cp_min=0)
++                              cp_min=0, cp_openfun=self.openfun)
+ 
+ class PsycopgTestCase(SQLReflectorTestCase, unittest.TestCase):
+     """Test cases for the SQL reflector using psycopg for Postgres.
+@@ -480,7 +490,7 @@
+     def makePool(self):
+         return ConnectionPool('psycopg', database=self.DB_NAME,
+                               user=self.DB_USER, password=self.DB_PASS,
+-                              cp_min=0)
++                              cp_min=0, cp_openfun=self.openfun)
+ 
+ 
+ class MySQLTestCase(SQLReflectorTestCase, unittest.TestCase):
+@@ -492,7 +502,8 @@
+ 
+     def makePool(self):
+         return ConnectionPool('MySQLdb', db=self.DB_NAME,
+-                              user=self.DB_USER, passwd=self.DB_PASS)
++                              user=self.DB_USER, passwd=self.DB_PASS,
++                              cp_openfun=self.openfun)
+ 
+ 
+ class FirebirdTestCase(SQLReflectorTestCase, unittest.TestCase):
+@@ -515,7 +526,7 @@
+     def makePool(self):
+         return ConnectionPool('kinterbasdb', database=self.DB_NAME,
+                               host='localhost', user=self.DB_USER,
+-                              password=self.DB_PASS)
++                              password=self.DB_PASS, cp_openfun=self.openfun)
+ 
+     def stopDB(self):
+         conn = kinterbasdb.connect(database=self.DB_NAME,

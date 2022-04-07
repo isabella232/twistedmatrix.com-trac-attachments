@@ -1,0 +1,169 @@
+Index: twisted/test/proto_helpers.py
+===================================================================
+--- twisted/test/proto_helpers.py	(revision 33073)
++++ twisted/test/proto_helpers.py	(working copy)
+@@ -425,7 +425,7 @@
+ 
+ 
+     def connectSSL(self, host, port, factory, contextFactory,
+-                   timeout=30, bindAddress=None):
++                   timeout=30, bindAddress=None, sni=None):
+         """
+         Fake L{reactor.connectSSL}, that logs the call and returns an
+         L{IConnector}.
+@@ -500,7 +500,7 @@
+ 
+ 
+     def connectSSL(self, host, port, factory, contextFactory,
+-                   timeout=30, bindAddress=None):
++                   timeout=30, bindAddress=None, sni=None):
+         """
+         Fake L{reactor.connectSSL}, that raises L{self._connectException}.
+         """
+Index: twisted/manhole/gladereactor.py
+===================================================================
+--- twisted/manhole/gladereactor.py	(revision 33073)
++++ twisted/manhole/gladereactor.py	(working copy)
+@@ -42,10 +42,10 @@
+         factory = LoggingFactory(factory)
+         return sup.listenSSL(self, port, factory, contextFactory, backlog, interface)
+ 
+-    def connectSSL(self, host, port, factory, contextFactory, timeout=30, bindAddress=None):
++    def connectSSL(self, host, port, factory, contextFactory, timeout=30, bindAddress=None, sni=None):
+         from _inspectro import LoggingFactory
+         factory = LoggingFactory(factory)
+-        return sup.connectSSL(self, host, port, factory, contextFactory, timeout, bindAddress)
++        return sup.connectSSL(self, host, port, factory, contextFactory, timeout, bindAddress, sni)
+ 
+     def connectUNIX(self, address, factory, timeout=30):
+         from _inspectro import LoggingFactory
+Index: twisted/protocols/tls.py
+===================================================================
+--- twisted/protocols/tls.py	(revision 33073)
++++ twisted/protocols/tls.py	(working copy)
+@@ -271,7 +271,6 @@
+         ProtocolWrapper.__init__(self, factory, wrappedProtocol)
+         self._connectWrapped = _connectWrapped
+ 
+-
+     def getHandle(self):
+         """
+         Return the L{OpenSSL.SSL.Connection} object being used to encrypt and
+@@ -294,6 +293,12 @@
+         self._tlsConnection = Connection(tlsContext, None)
+         if self.factory._isClient:
+             self._tlsConnection.set_connect_state()
++
++            if self.factory._sni is not None:
++                try:
++                    self._tlsConnection.set_tlsext_host_name(self.factory._sni)
++                except AttributeError:
++                    pass
+         else:
+             self._tlsConnection.set_accept_state()
+         self._appSendBuffer = []
+@@ -579,10 +584,11 @@
+ 
+     noisy = False  # disable unnecessary logging.
+     
+-    def __init__(self, contextFactory, isClient, wrappedFactory):
++    def __init__(self, contextFactory, isClient, wrappedFactory, sni=None):
+         WrappingFactory.__init__(self, wrappedFactory)
+         self._contextFactory = contextFactory
+         self._isClient = isClient
++        self._sni      = sni
+ 
+ 
+     def logPrefix(self):
+Index: twisted/internet/posixbase.py
+===================================================================
+--- twisted/internet/posixbase.py	(revision 33073)
++++ twisted/internet/posixbase.py	(working copy)
+@@ -440,11 +440,11 @@
+ 
+     # IReactorSSL (sometimes, not implemented)
+ 
+-    def connectSSL(self, host, port, factory, contextFactory, timeout=30, bindAddress=None):
++    def connectSSL(self, host, port, factory, contextFactory, timeout=30, bindAddress=None, sni=None):
+         """@see: twisted.internet.interfaces.IReactorSSL.connectSSL
+         """
+         if tls is not None:
+-            tlsFactory = tls.TLSMemoryBIOFactory(contextFactory, True, factory)
++            tlsFactory = tls.TLSMemoryBIOFactory(contextFactory, True, factory, sni=sni)
+             return self.connectTCP(host, port, tlsFactory, timeout, bindAddress)
+         elif ssl is not None:
+             c = ssl.Connector(
+Index: twisted/internet/interfaces.py
+===================================================================
+--- twisted/internet/interfaces.py	(revision 33073)
++++ twisted/internet/interfaces.py	(working copy)
+@@ -285,7 +285,7 @@
+ 
+ class IReactorSSL(Interface):
+ 
+-    def connectSSL(host, port, factory, contextFactory, timeout=30, bindAddress=None):
++    def connectSSL(host, port, factory, contextFactory, timeout=30, bindAddress=None, sni=None):
+         """
+         Connect a client Protocol to a remote SSL socket.
+ 
+@@ -303,6 +303,9 @@
+         @param bindAddress: a (host, port) tuple of local address to bind to,
+                             or C{None}.
+ 
++        @param sni: a host name to include as the Server Name Indication field
++                    during the TLS handshake.
++
+         @return: An object which provides L{IConnector}.
+         """
+ 
+Index: twisted/internet/iocpreactor/reactor.py
+===================================================================
+--- twisted/internet/iocpreactor/reactor.py	(revision 33073)
++++ twisted/internet/iocpreactor/reactor.py	(working copy)
+@@ -181,13 +181,13 @@
+             return port
+ 
+ 
+-        def connectSSL(self, host, port, factory, contextFactory, timeout=30, bindAddress=None):
++        def connectSSL(self, host, port, factory, contextFactory, timeout=30, bindAddress=None, sni=None):
+             """
+             @see: twisted.internet.interfaces.IReactorSSL.connectSSL
+             """
+             return self.connectTCP(
+                 host, port,
+-                TLSMemoryBIOFactory(contextFactory, True, factory),
++                TLSMemoryBIOFactory(contextFactory, True, factory, sni=sni),
+                 timeout, bindAddress)
+     else:
+         def listenSSL(self, port, factory, contextFactory, backlog=50, interface=''):
+@@ -202,7 +202,7 @@
+                 "SSL APIs.")
+ 
+ 
+-        def connectSSL(self, host, port, factory, contextFactory, timeout=30, bindAddress=None):
++        def connectSSL(self, host, port, factory, contextFactory, timeout=30, bindAddress=None, sni=None):
+             """
+             Non-implementation of L{IReactorSSL.connectSSL}.  Some dependency
+             is not satisfied.  This implementation always raises
+Index: twisted/internet/protocol.py
+===================================================================
+--- twisted/internet/protocol.py	(revision 33073)
++++ twisted/internet/protocol.py	(working copy)
+@@ -280,7 +280,7 @@
+             checkPID=checkPID)
+ 
+ 
+-    def connectSSL(self, host, port, contextFactory, timeout=30, bindAddress=None):
++    def connectSSL(self, host, port, contextFactory, timeout=30, bindAddress=None, sni=None):
+         """
+         Connect to an SSL server.
+ 
+@@ -294,7 +294,7 @@
+         return self._connect(
+             self.reactor.connectSSL, host, port,
+             contextFactory=contextFactory, timeout=timeout,
+-            bindAddress=bindAddress)
++            bindAddress=bindAddress, sni=sni)
+ 
+ 
+ 

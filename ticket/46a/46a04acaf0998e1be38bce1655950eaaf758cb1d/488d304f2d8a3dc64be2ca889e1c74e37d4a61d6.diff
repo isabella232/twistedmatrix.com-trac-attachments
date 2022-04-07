@@ -1,0 +1,295 @@
+Index: docs/core/howto/ssl.rst
+===================================================================
+--- docs/core/howto/ssl.rst	(revision 44638)
++++ docs/core/howto/ssl.rst	(working copy)
+@@ -173,6 +173,12 @@
+ 
+ .. literalinclude:: ../examples/ssl_clientauth_server.py
+ 
++Or using endpoints:
++
++:download:`ssl_clientauth_server_endpoints.py <../examples/ssl_clientauth_server_endpoints.py>
++
++.. literalinclude:: ../examples/ssl_clientauth_server_endpoints.py
++
+ Client with certificates
+ ~~~~~~~~~~~~~~~~~~~~~~~~
+ 
+Index: twisted/internet/_sslverify.py
+===================================================================
+--- twisted/internet/_sslverify.py	(revision 44638)
++++ twisted/internet/_sslverify.py	(working copy)
+@@ -1264,6 +1264,7 @@
+         ['trustRoot', 'requireCertificate'],
+         ['trustRoot', 'verify'],
+         ['trustRoot', 'caCerts'],
++        ['trustRoot', 'retrieveCertOnly'],
+     ])
+     def __init__(self,
+                  privateKey=None,
+@@ -1281,7 +1282,8 @@
+                  extraCertChain=None,
+                  acceptableCiphers=None,
+                  dhParameters=None,
+-                 trustRoot=None):
++                 trustRoot=None,
++                 retrieveCertOnly=False):
+         """
+         Create an OpenSSL context SSL connection context factory.
+ 
+@@ -1372,6 +1374,11 @@
+ 
+         @type trustRoot: L{IOpenSSLTrustRoot}
+ 
++        @param retrieveCertOnly: When C{verify} and C{caCerts} are not
++            specified and this parameter is L{True}, sets the certificate
++            options such that peer certificates are retrieved. This
++            parameter is L{False} by default.
++
+         @raise ValueError: when C{privateKey} or C{certificate} are set without
+             setting the respective other.
+         @raise ValueError: when C{verify} is L{True} but C{caCerts} doesn't
+@@ -1467,7 +1474,12 @@
+             trustRoot = IOpenSSLTrustRoot(trustRoot)
+         self.trustRoot = trustRoot
+ 
++        if retrieveCertOnly and not self.verify:
++            self.retrieveCertOnly = True
++        else:
++            self.retrieveCertOnly = False
+ 
++
+     def __getstate__(self):
+         d = self.__dict__.copy()
+         try:
+@@ -1510,6 +1522,8 @@
+             if self.verifyOnce:
+                 verifyFlags |= SSL.VERIFY_CLIENT_ONCE
+             self.trustRoot._addCACertsToContext(ctx)
++        elif self.retrieveCertOnly:
++            verifyFlags = SSL.VERIFY_PEER
+ 
+         # It'd be nice if pyOpenSSL let us pass None here for this behavior (as
+         # the underlying OpenSSL API call allows NULL to be passed).  It
+@@ -1516,7 +1530,12 @@
+         # doesn't, so we'll supply a function which does the same thing.
+         def _verifyCallback(conn, cert, errno, depth, preverify_ok):
+             return preverify_ok
+-        ctx.set_verify(verifyFlags, _verifyCallback)
++        def _retrieveCallback(conn, cert, errno, depth, preverify_ok):
++            return True
++        if self.retrieveCertOnly:
++            ctx.set_verify(verifyFlags, _retrieveCallback)
++        else:
++            ctx.set_verify(verifyFlags, _verifyCallback)
+         if self.verifyDepth is not None:
+             ctx.set_verify_depth(self.verifyDepth)
+ 
+Index: twisted/internet/endpoints.py
+===================================================================
+--- twisted/internet/endpoints.py	(revision 44638)
++++ twisted/internet/endpoints.py	(working copy)
+@@ -1066,7 +1066,8 @@
+ 
+ def _parseSSL(factory, port, privateKey="server.pem", certKey=None,
+               sslmethod=None, interface='', backlog=50, extraCertChain=None,
+-              dhParameters=None):
++              dhParameters=None, verifyCACerts=None, requireCert=None,
++              retrieveCerts=None):
+     """
+     Internal parser function for L{_parseServer} to convert the string
+     arguments for an SSL (over TCP/IPv4) stream endpoint into the structured
+@@ -1105,6 +1106,15 @@
+         the forward secret C{DHE} ciphers aren't available for servers.
+     @type dhParameters: L{bytes}
+ 
++    @param verifyCACerts: The file name of a file containing CA certs against
++        which to verify peer certificates.
++    @type verifyCACerts: L{bytes}
++    
++    @param retrieveCerts: If this parameter is set, sets the certificate
++        options to allow simply retrieving remote certificates without
++        performing verification.
++    @type retrieveCerts: L{bytes}
++
+     @return: a 2-tuple of (args, kwargs), describing  the parameters to
+         L{IReactorSSL.listenSSL} (or, modulo argument 2, the factory, arguments
+         to L{SSL4ServerEndpoint}.
+@@ -1118,21 +1128,34 @@
+     certPEM = FilePath(certKey).getContent()
+     keyPEM = FilePath(privateKey).getContent()
+     privateCertificate = ssl.PrivateCertificate.loadPEM(certPEM + keyPEM)
+-    if extraCertChain is not None:
+-        matches = re.findall(
+-            r'(-----BEGIN CERTIFICATE-----\n.+?\n-----END CERTIFICATE-----)',
+-            FilePath(extraCertChain).getContent(),
+-            flags=re.DOTALL
+-        )
+-        chainCertificates = [ssl.Certificate.loadPEM(chainCertPEM).original
+-                             for chainCertPEM in matches]
+-        if not chainCertificates:
+-            raise ValueError(
+-                "Specified chain file '%s' doesn't contain any valid "
+-                "certificates in PEM format." % (extraCertChain,)
+-            )
++    chainCertificates = _getCertificatesFromFile(extraCertChain,
++                            "Specified chain file '%s' doesn't contain any "
++                            "valid certificates in PEM format."
++                            % (extraCertChain,)
++                        )
++    verifyCertificates = _getCertificatesFromFile(verifyCACerts,
++                            "Specified CA certificate file '%s' doesn't "
++                            "contain any valid certificates in PEM format."
++                            % (verifyCACerts,)
++                        )
++    requireCertificate = False
++    if verifyCertificates:
++        verify = True
++        requireCertificate = _valueToBool(requireCert, False)
++        if requireCertificate is None:
++            raise ValueError("The value of requireCert must be a yes/no "
++                             "value.")
+     else:
+-        chainCertificates = None
++        verify = False
++    if not verify:
++        receiveCertOnly = _valueToBool(retrieveCerts, False)
++        if receiveCertOnly is None:
++            raise ValueError("The value of retrieveCerts must be a yes/no "
++                             "value.")
++    if retrieveCerts and not verify:
++        retrieveCertOnly = True
++    else:
++        retrieveCertOnly = False
+     if dhParameters is not None:
+         dhParameters = ssl.DiffieHellmanParameters.fromFile(
+             FilePath(dhParameters),
+@@ -1143,6 +1166,10 @@
+         certificate=privateCertificate.original,
+         extraCertChain=chainCertificates,
+         dhParameters=dhParameters,
++        caCerts=verifyCertificates,
++        requireCertificate=requireCertificate,
++        verify=verify,
++        retrieveCertOnly=retrieveCertOnly,
+         **kw
+     )
+     return ((int(port), factory, cf),
+@@ -1149,7 +1176,34 @@
+             {'interface': interface, 'backlog': int(backlog)})
+ 
+ 
++def _getCertificatesFromFile(fileName, errorMsg):
++    from twisted.internet import ssl
++    if fileName is None:
++        return None
++    matches = re.findall(
++        r'(-----BEGIN CERTIFICATE-----\n.+?\n-----END CERTIFICATE-----)',
++        FilePath(fileName).getContent(),
++        flags=re.DOTALL
++    )
++    certificates = [ssl.Certificate.loadPEM(certPEM).original
++                    for certPEM in matches]
++    if not certificates:
++        raise ValueError(errorMsg)
++    return certificates
+ 
++
++def _valueToBool(value, default):
++    if value is None:
++        return default
++    lowerValue = value.lower()
++    if lowerValue in ("yes", "true", "y", "t"):
++        return True
++    if lowerValue in ("no", "false", "n", "f"):
++        return False
++    return None
++
++
++
+ @implementer(IPlugin, IStreamServerEndpointStringParser)
+ class _StandardIOParser(object):
+     """
+Index: twisted/internet/test/test_endpoints.py
+===================================================================
+--- twisted/internet/test/test_endpoints.py	(revision 44638)
++++ twisted/internet/test/test_endpoints.py	(working copy)
+@@ -2580,11 +2580,78 @@
+         self.assertEqual(FilePath(fileName), cf.dhParameters._dhFile)
+ 
+ 
++    def test_sslVerifyCerts(self):
++        """
++        If C{verifyCACerts} is specified, the certificates are loaded,
++        and verification is enabled for peer certificates.
++        """
++        endpoint = endpoints.serverFromString(
++            object(),
++            "ssl:4321:privateKey={0}:certKey={1}:verifyCACerts={2}"
++            .format(escapedPEMPathName, escapedPEMPathName, escapedCAsPathName)
++        )
++        cf = endpoint._sslContextFactory
++        self.assertTrue(cf.verify)
++        self.assertTrue(cf.caCerts is not None)
++    test_sslVerifyCerts.todo = "Need test CA files against which to verify"
++
++    def test_sslRetrieveCerts(self):
++        """
++        If C{retrieveCerts} is specified, we'll retrieve peer certificates
++        but won't enable full verification.
++        """
++        endpoint = endpoints.serverFromString(
++            object(),
++            "ssl:4321:privateKey={0}:certKey={1}:retrieveCerts=yes"
++            .format(escapedPEMPathName, escapedPEMPathName)
++        )
++        cf = endpoint._sslContextFactory
++        self.assertTrue(cf.retrieveCertOnly)
++
++    def test_sslRetrieveAndVerifyCerts(self):
++        """
++        If both C{retrieveCerts} and C{verifyCACerts} are specified,
++        C{retrieveCerts} will be ignored since we can do verification,
++        which also retrieves the certificate.
++        """
++        endpoint = endpoints.serverFromString(
++            object(),
++            "ssl:4321:privateKey={0}:certKey={1}:verifyCACerts={2}"
++            ":retrieveCerts=yes"
++            .format(escapedPEMPathName, escapedPEMPathName, escapedCAsPathName)
++        )
++        cf = endpoint._sslContextFactory
++        self.assertTrue(cf.verify)
++        self.assertFalse(cf.retrieveCertOnly)
++    test_sslRetrieveAndVerifyCerts.todo = ("Need test CA files against which " 
++        "to verify")
++
++    def test_sslVerifyAndRequireCerts(self):
++        """
++        If C{verifyCACerts} and C{requireCert} are specified, client
++        certificates will be required for the connection.
++        """
++        endpoint = endpoints.serverFromString(
++            object(),
++            "ssl:4321:privateKey={0}:certKey={1}:verfiyCACerts={2}"
++            "requireCert=yes".format(escapedPEMPathName, escapedPEMPathName,
++                                     escapedCAsPathName)
++        )
++        cf = endpoint._sslContextFactory
++        self.assertTrue(cf.verify)
++        self.assertTrue(cf.requireCertificate)
++    test_sslVerifyAndRequireCerts.todo = ("Need test CA files against which "
++        "to verify")
++
++
+     if skipSSL:
+         test_ssl.skip = test_sslWithDefaults.skip = skipSSL
+         test_sslChainLoads.skip = skipSSL
+         test_sslChainFileMustContainCert.skip = skipSSL
+         test_sslDHparameters.skip = skipSSL
++        test_sslVerifyCerts.skip = skipSSL
++        test_sslRetrieveCerts.skip = skipSSL
++        test_sslRetrieveAndVerifyCerts = skipSSL
+ 
+ 
+     def test_unix(self):

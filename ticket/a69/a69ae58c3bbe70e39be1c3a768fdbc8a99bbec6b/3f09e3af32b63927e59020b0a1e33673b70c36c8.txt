@@ -1,0 +1,252 @@
+Index: twisted/internet/test/test_process.py
+===================================================================
+--- twisted/internet/test/test_process.py	(revision 30737)
++++ twisted/internet/test/test_process.py	(working copy)
+@@ -20,9 +20,9 @@
+ from twisted.internet.defer import Deferred, succeed
+ from twisted.internet.protocol import ProcessProtocol
+ from twisted.internet.error import ProcessDone, ProcessTerminated
++from twisted.python import runtime
++from twisted.internet import process
+ 
+-
+-
+ class _ShutdownCallbackProcessProtocol(ProcessProtocol):
+     """
+     An L{IProcessProtocol} which fires a Deferred when the process it is
+@@ -590,3 +590,135 @@
+             "Twisted 10.0.0: There is no longer any potential for zombie "
+             "process.")
+         self.assertEquals(len(warnings), 1)
++
++
++class FakeResourceModule(object):
++    RLIMIT_NOFILE = 1
++    def getrlimit(self, no):
++        return [0, 9223372036854775808]
++        # TODO: Test that this gets rounded down
++
++class FDDetectorTest(TestCase):
++    """
++    Tests for _FDDetector class in twisted.internet.process, which detects
++    which function to drop in place for the _listOpenFDs method.
++    """
++    skip = runtime.platform.getType() == 'win32'
++    sane = False
++    procfs = False
++    devfs = False
++    opened_file = False
++    saved_resource_module = None
++
++    def getpid(self):
++        return 123
++
++    def listdir(self, arg):
++        if arg == '/proc/123/fd':
++            if self.procfs:
++                return ["0","1","2"]
++            else:
++                raise OSError
++
++        if arg == '/dev/fd':
++            if self.devfs:
++                if not self.sane:
++                    # Always return the same thing
++                    return ["0","1","2"]
++                else:
++                    if self.opened_file:
++                        return ["0","1","2","3"]
++                    else:
++                        return ["0","1","2"]
++            else:
++                raise OSError
++
++    def openfile(self, fname, mode):
++        self.opened_file = True
++
++    def save_resource_module(self):
++        try:
++            import resource
++            self.saved_resource_module = resource
++        except:
++            self.saved_resource_module = None
++
++    def hide_resource_module(self):
++        import sys
++        sys.modules['resource'] = None
++
++    def reveal_resource_module(self):
++        import sys
++        sys.modules['resource'] = FakeResourceModule()
++
++    def replace_resource_module(self):
++        sys.modules['resource'] = self.saved_resource_module
++
++    def setUp(self):
++        self.detector = process._FDDetector()
++        self.detector.listdir = self.listdir
++        self.detector.getpid = self.getpid
++        self.detector.openfile = self.openfile
++
++    def test_fddetector_sane_devfd(self):
++        """
++        e.g., FreeBSD with fdescfs mounted
++        """
++        self.procfs = False
++        self.devfs = True
++        self.sane = True
++        self.assertIdentical(
++                self.detector._getImplementation(),
++                process._devFDImplementation
++                )
++
++    def test_fddetector_insane_devfd(self):
++        """
++        e.g., FreeBSD without fdescfs mounted
++        """
++        self.procfs = False
++        self.devfs = True
++        self.sane = False
++        self.assertIdentical(
++                self.detector._getImplementation(),
++                process._fallbackFDImplementation
++                )
++
++    def test_fddetector_procfd(self):
++        """
++        e.g., Linux
++        """
++        self.devfs = False
++        self.procfs = True
++        self.assertIdentical(
++                self.detector._getImplementation(),
++                process._procFDImplementation
++                )
++
++    def test_fddetector_resource_importable(self):
++        """
++        e.g., IRIX?
++        """
++        self.devfs = False
++        self.procfs = False
++        self.resource_importable = True
++        self.reveal_resource_module()
++        self.assertIdentical(
++                self.detector._getImplementation(),
++                process._resourceFDImplementation
++                )
++        self.replace_resource_module()
++
++    def test_fddetector_resource_unimportable(self):
++        """
++        e.g., who knows
++        """
++        self.devfs = False
++        self.procfs = False
++        self.hide_resource_module()
++        self.assertIdentical(
++                self.detector._getImplementation(),
++                process._fallbackFDImplementation
++                )
++        self.replace_resource_module()
++
+Index: twisted/internet/process.py
+===================================================================
+--- twisted/internet/process.py	(revision 30737)
++++ twisted/internet/process.py	(working copy)
+@@ -466,35 +466,74 @@
+         return "<%s pid=%s status=%s>" % (self.__class__.__name__,
+                                           self.pid, self.status)
+ 
++def _listOpenFDs():
++    return _setFDImplementation()
+ 
++def _setFDImplementation():
++    detector = _FDDetector()
++    _listOpenFDs = detector._getImplementation()
++    return _listOpenFDs()
+ 
+-def _listOpenFDs():
+-    """
+-    Return an iterable of potentially open file descriptors.
++def _devFDImplementation():
++    dname = "/dev/fd"
++    result = [int(fd) for fd in os.listdir(dname)]
++    return result
+ 
+-    This function returns an iterable over the contents of /dev/fd or
+-    /proc/<pid>/fd, if they're available on the platform. If they're not, the
+-    returned value is the range [0, maxfds], where 'maxfds' is at least 256.
+-    """
+-    dname = "/dev/fd"
+-    try:
+-        return [int(fd) for fd in os.listdir(dname)]
+-    except:
+-        dname = "/proc/%d/fd" % (os.getpid(),)
++def _procFDImplementation():
++    dname = "/proc/%d/fd" % (os.getpid(),)
++    return [int(fd) for fd in os.listdir(dname)]
++
++def _resourceFDImplementation():
++    import resource
++    maxfds = resource.getrlimit(resource.RLIMIT_NOFILE)[1] + 1
++    # OS-X reports 9223372036854775808. That's a lot of fds
++    # to close
++    if maxfds > 1024:
++        maxfds = 1024
++    return xrange(maxfds)
++
++def _fallbackFDImplementation():
++    maxfds = 256
++    return xrange(maxfds)
++
++class _FDDetector(object):
++    # So that we can unit test this
++    listdir = os.listdir
++    getpid = os.getpid
++    openfile = open
++
++    def _getImplementation(self):
++        # Check if /dev/fd works, if so, use that
++        # Otherwise, check if /proc/%d/fd exists, if so use that
++        # Otherwise, ask resource.getrlimit, if that throws an exception, then
++        # fallback to _fallbackFDImplementation
+         try:
+-            return [int(fd) for fd in os.listdir(dname)]
++            self.listdir("/dev/fd")
++            if self._checkDevFDSanity(): # FreeBSD support :-)
++                return _devFDImplementation
++            else:
++                return _fallbackFDImplementation
++
+         except:
+             try:
+-                import resource
+-                maxfds = resource.getrlimit(resource.RLIMIT_NOFILE)[1] + 1
+-                # OS-X reports 9223372036854775808. That's a lot of fds
+-                # to close
+-                if maxfds > 1024:
+-                    maxfds = 1024
++                self.listdir("/proc/%d/fd" % (self.getpid(),))
++                return _procFDImplementation
+             except:
+-                maxfds = 256
+-            return xrange(maxfds)
++                try:
++                    _resourceFDImplementation() # Imports resource
++                    return _resourceFDImplementation
++                except:
++                    return _fallbackFDImplementation
+ 
++    def _checkDevFDSanity(self):
++        """
++        Returns true iff opening a file modifies the fds visible
++        in /dev/fd, as it should on a sane platform.
++        """
++        start = self.listdir("/dev/fd")
++        fp = self.openfile("/dev/null", "r")
++        end = self.listdir("/dev/fd")
++        return start != end
+ 
+ 
+ class Process(_BaseProcess):

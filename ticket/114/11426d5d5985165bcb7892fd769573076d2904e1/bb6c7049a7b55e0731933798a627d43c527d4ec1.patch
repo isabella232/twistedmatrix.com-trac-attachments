@@ -1,0 +1,120 @@
+diff -ru /Users/habnabit/Desktop/download/2007-12-06/Twisted-2.5.0/TwistedWeb-0.7.0/twisted/web/http.py /Library/Frameworks/Python.framework/Versions/2.5/lib/python2.5/site-packages/twisted/web/http.py
+--- /Users/habnabit/Desktop/download/2007-12-06/Twisted-2.5.0/TwistedWeb-0.7.0/twisted/web/http.py	2006-10-04 02:07:22.000000000 -0700
++++ /Library/Frameworks/Python.framework/Versions/2.5/lib/python2.5/site-packages/twisted/web/http.py	2008-01-03 22:14:01.000000000 -0800
+@@ -349,27 +349,36 @@
+ 
+ 
+ class HTTPClient(basic.LineReceiver):
+-    """A client for HTTP 1.0
++    """A client for HTTP 1.0 and 1.1
+ 
+     Notes:
+     You probably want to send a 'Host' header with the name of
+     the site you're connecting to, in order to not break name
+     based virtual hosting.
+     """
++    version = '1.0'
+     length = None
++    chunked = False
+     firstLine = 1
+     __buffer = None
+ 
+     def sendCommand(self, command, path):
+-        self.transport.write('%s %s HTTP/1.0\r\n' % (command, path))
++        self.transport.write('%s %s HTTP/%s\r\n' % (
++            command, path, self.version
++        ))
+ 
+     def sendHeader(self, name, value):
+         self.transport.write('%s: %s\r\n' % (name, value))
+ 
+     def endHeaders(self):
++        if self.version == '1.1':
++            self.transport.write('Connection: close\r\n')
+         self.transport.write('\r\n')
+ 
+     def lineReceived(self, line):
++        if self.chunked and self.__buffer is not None:
++            self.chunkedDataReceived(line)
++            return
+         if self.firstLine:
+             self.firstLine = 0
+             l = line.split(None, 2)
+@@ -388,10 +397,18 @@
+             self.handleHeader(key, val)
+             if key.lower() == 'content-length':
+                 self.length = int(val)
++            if (key.lower() == 'transfer-encoding' and val.lower() == 'chunked'
++              and self.version == '1.1'):
++                self.chunked = True
+         else:
+             self.__buffer = StringIO()
+             self.handleEndHeaders()
+-            self.setRawMode()
++            if self.chunked:
++                pass
++            elif self.length == 0:
++                self.handleResponseEnd()
++            else:
++                self.setRawMode()
+ 
+     def connectionLost(self, reason):
+         self.handleResponseEnd()
+@@ -420,6 +437,18 @@
+         if self.length == 0:
+             self.handleResponseEnd()
+             self.setLineMode(rest)
++    
++    def chunkedDataReceived(self, line):
++        if not self.length:
++            self.length = int(line, 16)
++            if self.length == 0:
++                self.handleResponseEnd()
++        else:
++            line += '\r\n'
++            if len(line) > self.length:
++                line = line[:self.length]
++            self.handleResponsePart(line)
++            self.length -= len(line)
+ 
+ 
+ # response codes that must have empty bodies
+diff -ru /Users/habnabit/Desktop/download/2007-12-06/Twisted-2.5.0/TwistedWeb-0.7.0/twisted/web/test/test_http.py /Library/Frameworks/Python.framework/Versions/2.5/lib/python2.5/site-packages/twisted/web/test/test_http.py
+--- /Users/habnabit/Desktop/download/2007-12-06/Twisted-2.5.0/TwistedWeb-0.7.0/twisted/web/test/test_http.py	2006-10-04 02:07:22.000000000 -0700
++++ /Library/Frameworks/Python.framework/Versions/2.5/lib/python2.5/site-packages/twisted/web/test/test_http.py	2008-01-03 22:24:30.000000000 -0800
+@@ -241,6 +241,10 @@
+             for header in resultHeaders.keys():
+                 self.assertEquals(req.headers.get(header, None), resultHeaders[header])
+ 
++class ResponseStorer(http.HTTPClient):
++    version = '1.1'
++    def handleResponse(self, resp):
++        self.response = resp
+ 
+ class ChunkingTestCase(unittest.TestCase):
+ 
+@@ -264,7 +268,23 @@
+             except ValueError:
+                 pass
+         self.assertEquals(result, self.strings)
+-
++    
++    def testClientChunks(self):
++        request = [
++            'HTTP/1.1 200 OK',
++            'Transfer-Encoding: chunked',
++            '',
++            'a',
++            '0123456789',
++            'c',
++            'line1',
++            'line2',
++            '0'
++        ]
++        client = ResponseStorer()
++        for line in request:
++            client.lineReceived(line)
++        self.assertEquals(client.response, '0123456789line1\r\nline2')
+ 
+ 
+ class ParsingTestCase(unittest.TestCase):

@@ -1,0 +1,586 @@
+Index: sip-use-cred-2/twisted/test/test_sip.py
+===================================================================
+--- sip-use-cred-2/twisted/test/test_sip.py	(revision 27386)
++++ sip-use-cred-2/twisted/test/test_sip.py	(working copy)
+@@ -5,9 +5,9 @@
+ 
+ """Session Initialization Protocol tests."""
+ 
+-from twisted.trial import unittest
++from twisted.trial import unittest, util
+ from twisted.protocols import sip
+-from twisted.internet import defer, reactor
++from twisted.internet import defer, reactor, utils
+ from twisted.python.versions import Version
+ 
+ from twisted.test import proto_helpers
+@@ -15,6 +15,7 @@
+ from twisted import cred
+ import twisted.cred.portal
+ import twisted.cred.checkers
++import twisted.cred.credentials
+ 
+ from zope.interface import implements
+ 
+@@ -714,7 +715,7 @@
+ From: <sip:exarkun@intarweb.us:50609>\r
+ Call-ID: 94E7E5DAF39111D791C6000393764646@intarweb.us\r
+ CSeq: 9898 REGISTER\r
+-WWW-Authenticate: Digest nonce="92956076410767313901322208775",opaque="1674186428",qop-options="auth",algorithm="MD5",realm="intarweb.us"\r
++WWW-Authenticate: Digest tosh="hey-nonny-nonny",realm="intarweb.us"\r
+ \r
+ """
+ 
+@@ -746,15 +747,42 @@
+ \r
+ """
+ 
++
++
+ class FakeDigestAuthorizer(sip.DigestAuthorizer):
+-    def generateNonce(self):
+-        return '92956076410767313901322208775'
+-    def generateOpaque(self):
+-        return '1674186428'
++    """
++    Mock L{sip.Authorizer}.
++    """
+ 
++    def getChallenge(self, peer):
++        return "tosh=hey-nonny-nonny"
+ 
++
++    def decode(self, response):
++        return FakeCredential()
++
++
++
++class FakeCredential:
++    """
++    Mock L{cred.credentials.ICredential}.
++    """
++
++    implements(cred.credentials.IUsernamePassword)
++
++
++    def __init__(self):
++        self.username = "exarkun"
++
++
++    def checkPassword(self, ignore):
++        return True
++
++
++
+ class FakeRegistry(sip.InMemoryRegistry):
+-    """Make sure expiration is always seen to be 3600.
++    """
++    Make sure expiration is always seen to be 3600.
+ 
+     Otherwise slow reactors fail tests incorrectly.
+     """
+@@ -765,12 +793,16 @@
+         reg.secondsToExpiry = 3600
+         return reg
+ 
++
+     def getRegistrationInfo(self, uri):
+         return sip.InMemoryRegistry.getRegistrationInfo(self, uri).addCallback(self._cbReg)
+ 
++
+     def registerAddress(self, domainURL, logicalURL, physicalURL):
+         return sip.InMemoryRegistry.registerAddress(self, domainURL, logicalURL, physicalURL).addCallback(self._cbReg)
+ 
++
++
+ class AuthorizationTestCase(unittest.TestCase):
+     def setUp(self):
+         self.proxy = sip.RegisterProxy(host="intarweb.us")
+@@ -850,3 +882,131 @@
+         """
+         self.callDeprecated(Version("Twisted", 9, 0, 0),
+                             sip.DigestedCredentials, '', {}, {})
++
++
++
++class EchoAuthorizer:
++    """
++    Mock Authorizer.
++    """
++
++    def getChallenge(self, ignored):
++        return self._challenge
++
++
++    def decode(self, ignored):
++        return self._decode
++
++
++
++class FakeCredentialFactory:
++    """
++    Mock L{iweb.ICredentialFactory}.
++    """
++
++    implements(twisted.web.iweb.ICredentialFactory)
++
++
++    def getChallenge(self, ignored):
++        return None
++
++
++    def decode(self, ignored):
++        return FakeCredential()
++
++
++
++class AuthorizerInterfaceConverterTests(unittest.TestCase):
++    """
++    Tests sip._AuthorizerInterfaceConverter, used to convert between the 
++    deprecated twisted.protocols.sip.IAuthorizer and current
++    twisted.web.iweb.ICredentialFactory interfaces.
++    """
++
++    def setUp(self):
++        self.authorizer = EchoAuthorizer()
++        self.cred_factory = sip._AuthorizerInterfaceConverter(
++            self.authorizer, 'test.realm', "port")
++    setUp = utils.suppressWarnings(
++        setUp, util.suppress(category=DeprecationWarning,
++            message=r'twisted.protocols.sip.IAuthorizer was deprecated'))
++
++
++    def test_converter_getChallenge(self):
++        """
++        Test that the L{sip._AuthorizerInterfaceConverter} converts the
++        challenge string returned by L{twisted.protocols.sip.IAuthorizer}'s
++        getChallenge method into the dict required by 
++        L{twisted.web.iweb.ICredentialFactory}.
++        """
++
++        self.authorizer._challenge = None
++        self.assertEqual(self.cred_factory.getChallenge(""), None)
++
++        self.authorizer._challenge = "key1=value1,  key2  =  value2  ,  key3 = value3a = value3b" 
++        self.assertEqual(self.cred_factory.getChallenge(""), 
++            {'key1':'value1', 'key2':'value2', 'key3':'value3a = value3b', 'realm':'test.realm'})
++
++
++    def test_converter_decode(self):
++        """
++        Test that the L{sip._AuthorizerInterfaceConverter} returns the
++        credential object it gets from L{sip.IAuthorizer} unchanged.
++        """
++        self.authorizer._decode = FakeCredential()
++        self.assertIdentical(self.cred_factory.decode("", "", ""), self.authorizer._decode)
++
++
++
++class RegisterProxyDeprecatedSupportTests(unittest.TestCase):
++    """
++    Flexes the _wrap_authorizer method of RegisterProxy used to support
++    the deprecated use of twisted.protocols.sip.IAuthorizer.
++    """
++
++    def setUp(self):
++        self.proxy = sip.RegisterProxy(host="127.0.0.1")
++
++
++    def test_wrap_old_authorizer(self):
++        """
++        When wrapping an L{IAuthorizer}, a warning is emitted.
++        """
++
++        auth = EchoAuthorizer()
++        wrapped_auth = self.proxy._wrap_authorizer(auth, "port")
++
++        warnings = self.flushWarnings(offendingFunctions=[self.test_wrap_old_authorizer])
++        self.assertEqual(len(warnings), 1)
++        self.assertEqual(
++            warnings[0]['message'],
++            "twisted.protocols.sip.IAuthorizer was deprecated in Twisted 9.0.0. "
++            "Authorizers should implement twisted.web.iweb.ICredentialFactory instead.")
++        self.assertEqual(
++             warnings[0]['category'],
++             DeprecationWarning)
++
++        self.assertTrue(twisted.web.iweb.ICredentialFactory.providedBy(wrapped_auth))
++
++
++    def test_wrap_new_authorizer(self):
++        """
++        L{iweb.ICredentialFactory} doesn't get wrappped.
++        """
++
++        auth = FakeCredentialFactory()
++        wrapped_auth = self.proxy._wrap_authorizer(auth, "port")
++        self.assertIdentical(wrapped_auth, auth)
++        self.assertTrue(twisted.web.iweb.ICredentialFactory.providedBy(wrapped_auth))
++
++
++    def test_wrap_dummy(self):
++        """
++        The placeholder object L{sip.RegisterProxy._DUMMY} is converted to
++        an L{iweb.ICredentialFactory}.
++        """
++
++        auth = self.proxy._DUMMY
++        wrapped_auth = self.proxy._wrap_authorizer(auth, "port")
++        self.assertIdentical(wrapped_auth, self.proxy._digest)
++        self.assertTrue(twisted.web.iweb.ICredentialFactory.providedBy(wrapped_auth))
+Index: sip-use-cred-2/twisted/protocols/sip.py
+===================================================================
+--- sip-use-cred-2/twisted/protocols/sip.py	(revision 27386)
++++ sip-use-cred-2/twisted/protocols/sip.py	(working copy)
+@@ -17,6 +17,7 @@
+ # system imports
+ import socket, time, sys, random, warnings
+ from zope.interface import implements, Interface
++import zope.interface
+ 
+ # twisted imports
+ from twisted.python import log, util
+@@ -24,10 +25,11 @@
+ from twisted.python.versions import Version
+ from twisted.python.hashlib import md5
+ from twisted.internet import protocol, defer, reactor
++from twisted.web import iweb
+ 
+ from twisted import cred
+ import twisted.cred.error
+-from twisted.cred.credentials import UsernameHashedPassword, UsernamePassword
++from twisted.cred.credentials import UsernameHashedPassword, UsernamePassword, DigestCredentialFactory
+ 
+ 
+ # sibling imports
+@@ -1085,30 +1087,34 @@
+         
+         return expected == response
+ 
+-class DigestAuthorizer:
++
++
++class _DigestAuthorizer:
++    """
++    Internal use only version of DigestAuthorizer.
++
++    Do not use this class anywhere except in the RegisterProxy class initalizer.
++    Exists purely to suppress the deprecation warning.
++    """
+     CHALLENGE_LIFETIME = 15
+     
+     implements(IAuthorizer)
++
+     
+     def __init__(self):
+-        warnings.warn(
+-            "twisted.protocols.sip.DigestAuthorizer was deprecated "
+-            "in Twisted 9.0.0",
+-            category=DeprecationWarning,
+-            stacklevel=2)
+-
+         self.outstanding = {}
+ 
+ 
+-
+     def generateNonce(self):
+         c = tuple([random.randrange(sys.maxint) for _ in range(3)])
+         c = '%d%d%d' % c
+         return c
+ 
++
+     def generateOpaque(self):
+         return str(random.randrange(sys.maxint))
+ 
++
+     def getChallenge(self, peer):
+         c = self.generateNonce()
+         o = self.generateOpaque()
+@@ -1119,6 +1125,7 @@
+             'qop-options="auth"',
+             'algorithm="MD5"',
+         ))
++
+         
+     def decode(self, response):
+         response = ' '.join(response.splitlines())
+@@ -1134,8 +1141,53 @@
+             raise SIPError(400)
+ 
+ 
++
++class DigestAuthorizer(_DigestAuthorizer):
++    def __init__(self):
++        warnings.warn(
++            "twisted.protocols.sip.DigestAuthorizer was deprecated "
++            "in Twisted 9.0.0",
++            category=DeprecationWarning,
++            stacklevel=2)
++        _DigestAuthorizer.__init__(self)
++
++
++class _AuthorizerInterfaceConverter:
++    """
++    Adapter to convert between twisted.protocols.sip.IAuthorizer 
++    and twisted.web.iweb.ICredentialFactory.
++    """
++
++    implements(iweb.ICredentialFactory)
++
++
++    def __init__(self, target, realm, port):
++        self.target = target
++        self.realm = realm
++        self.port = port
++
++
++    def decode(self, response, method, host):
++        return self.target.decode(response)
++
++
++    def getChallenge(self, address):
++        response = self.target.getChallenge((address, self.port))
++        if response is None:
++            return response
++
++        response = ' '.join(response.splitlines())
++        parts = response.split(',')
++        auth = dict([(k.strip(), unq(v.strip())) for (k, v) in [p.split('=', 1) for p in parts]])
++        auth['realm'] = self.realm
++
++        return auth
++
++
++
+ class RegisterProxy(Proxy):
+-    """A proxy that allows registration for a specific domain.
++    """
++    A proxy that allows registration for a specific domain.
+ 
+     Unregistered users won't be handled.
+     """
+@@ -1144,13 +1196,15 @@
+ 
+     registry = None # should implement IRegistry
+ 
+-    authorizers = {
+-        'digest': DigestAuthorizer(),
+-    }
++    _DUMMY = _DigestAuthorizer()
++    authorizers = { 'digest': _DUMMY }
+ 
++
+     def __init__(self, *args, **kw):
+         Proxy.__init__(self, *args, **kw)
+         self.liveChallenges = {}
++        self._digest = DigestCredentialFactory('md5', self.host)
++
+         
+     def handle_ACK_request(self, message, (host, port)):
+         # XXX
+@@ -1160,8 +1214,10 @@
+         # if no ACK is received.
+         pass
+ 
++
+     def handle_REGISTER_request(self, message, (host, port)):
+-        """Handle a registration request.
++        """
++        Handle a registration request.
+ 
+         Currently registration is not proxied.
+         """
+@@ -1175,14 +1231,39 @@
+             else:
+                 return self.login(message, host, port)
+ 
++
++    def _wrap_authorizer(self, auth, port):
++        """
++        Convert C{auth} to an object which supports L{twisted.web.iweb.ICredentialFactory}.
++
++        Exists to support the deprecated insertion of objects implementing
++        L{twisted.protocol.sip.IAuthorizer} into RegisterProxy.authorizers 
++        """
++
++        if auth is self._DUMMY:
++            return self._digest
++
++        if not iweb.ICredentialFactory.providedBy(auth):
++            warnings.warn(
++                "twisted.protocols.sip.IAuthorizer was deprecated in Twisted 9.0.0. "
++                "Authorizers should implement twisted.web.iweb.ICredentialFactory instead.", 
++                DeprecationWarning, stacklevel=2)
++            auth = _AuthorizerInterfaceConverter(auth, self.host, port)
++        return auth
++
++
+     def unauthorized(self, message, host, port):
+         m = self.responseFromRequest(401, message)
+         for (scheme, auth) in self.authorizers.iteritems():
+-            chal = auth.getChallenge((host, port))
++            auth = self._wrap_authorizer(auth, port)
++            chal = auth.getChallenge(host)
++
+             if chal is None:
+                 value = '%s realm="%s"' % (scheme.title(), self.host)
+             else:
+-                value = '%s %s,realm="%s"' % (scheme.title(), chal, self.host)
++                chalstring = ','.join(['%s="%s"' % (k, v)
++                                       for (k, v) in chal.iteritems()])
++                value = '%s %s' % (scheme.title(), chalstring)
+             m.headers.setdefault('www-authenticate', []).append(value)
+         self.deliverResponse(m)
+ 
+@@ -1190,9 +1271,10 @@
+     def login(self, message, host, port):
+         parts = message.headers['authorization'][0].split(None, 1)
+         a = self.authorizers.get(parts[0].lower())
++        a = self._wrap_authorizer(a, port)
+         if a:
+             try:
+-                c = a.decode(parts[1])
++                c = a.decode(parts[1], message.method, host)
+             except SIPError:
+                 raise
+             except:
+@@ -1208,14 +1290,17 @@
+         else:
+             self.deliverResponse(self.responseFromRequest(501, message))
+ 
++
+     def _cbLogin(self, (i, a, l), message, host, port):
+         # It's stateless, matey.  What a joke.
+         self.register(message, host, port)
+ 
++
+     def _ebLogin(self, failure, message, host, port):
+         failure.trap(cred.error.UnauthorizedLogin)
+         self.unauthorized(message, host, port)
+ 
++
+     def register(self, message, host, port):
+         """Allow all users to register"""
+         name, toURL, params = parseAddress(message.headers["to"][0], clean=1)
+@@ -1238,6 +1323,7 @@
+                 errbackArgs=(message,)
+             )
+ 
++
+     def _cbRegister(self, registration, message):
+         response = self.responseFromRequest(200, message)
+         if registration.contactURL != None:
+@@ -1246,11 +1332,13 @@
+         response.addHeader("content-length", "0")
+         self.deliverResponse(response)
+ 
++
+     def _ebRegister(self, error, message):
+         error.trap(RegistrationError, LookupError)
+         # XXX return error message, and alter tests to deal with
+         # this, currently tests assume no message sent on failure
+ 
++
+     def unregister(self, message, toURL, contact):
+         try:
+             expires = int(message.headers["expires"][0])
+@@ -1267,16 +1355,19 @@
+                     ).addErrback(self._ebUnregister, message
+                     )
+ 
++
+     def _cbUnregister(self, registration, message):
+         msg = self.responseFromRequest(200, message)
+         msg.headers.setdefault('contact', []).append(registration.contactURL.toString())
+         msg.addHeader("expires", "0")
+         self.deliverResponse(msg)
+ 
++
+     def _ebUnregister(self, registration, message):
+         pass
+ 
+ 
++
+ class InMemoryRegistry:
+     """A simplistic registry for a specific domain."""
+ 
+Index: sip-use-cred-2/twisted/cred/credentials.py
+===================================================================
+--- sip-use-cred-2/twisted/cred/credentials.py	(revision 27386)
++++ sip-use-cred-2/twisted/cred/credentials.py	(working copy)
+@@ -11,6 +11,7 @@
+ from twisted.python.randbytes import secureRandom
+ from twisted.cred._digest import calcResponse, calcHA1, calcHA2
+ from twisted.cred import error
++from twisted.web import iweb
+ 
+ class ICredentials(Interface):
+     """
+@@ -161,6 +162,39 @@
+ 
+ 
+ 
++class BasicAuthorizer:
++    """
++    Authorizer for insecure Basic (base64-encoded plaintext) authentication.
++    
++    This form of authentication is broken and insecure.  Do not use it.
++    """
++
++    implements(iweb.ICredentialFactory)
++
++
++    def getChallenge(self, address):
++        return None
++
++
++    def decode(self, response, method, host):
++        # At least one SIP client improperly pads its Base64 encoded messages
++        for i in range(3):
++            try:
++                creds = (response + ('=' * i)).decode('base64')
++            except:
++                pass
++            else:
++                break
++        else:
++            # Totally bogus
++            raise error.LoginFailed('Invalid response. Response did not have a valid base64 encoding.')
++        p = creds.split(':', 1)
++        if len(p) == 2:
++            return UsernamePassword(*p)
++        raise error.LoginFailed('Invalid response. Unable to find username/password pair in decoded response.')
++
++
++
+ class DigestCredentialFactory(object):
+     """
+     Support for RFC2617 HTTP Digest Authentication
+@@ -180,6 +214,7 @@
+     @param authenticationRealm: case sensitive string that specifies the realm
+         portion of the challenge
+     """
++    implements(iweb.ICredentialFactory)
+ 
+     CHALLENGE_LIFETIME_SECS = 15 * 60    # 15 minutes
+ 
+Index: sip-use-cred-2/twisted/web/iweb.py
+===================================================================
+--- sip-use-cred-2/twisted/web/iweb.py	(revision 27386)
++++ sip-use-cred-2/twisted/web/iweb.py	(working copy)
+@@ -7,7 +7,7 @@
+ """
+ 
+ from zope.interface import Interface, Attribute
+-from twisted.cred.credentials import IUsernameDigestHash
++#from twisted.cred.credentials import IUsernameDigestHash
+ 
+ class IRequest(Interface):
+     """
+@@ -352,4 +352,5 @@
+         @return: The credentials represented by the given response.
+         """
+ 
+-__all__ = ["IUsernameDigestHash", "ICredentialFactory", "IRequest"]
++#__all__ = ["IUsernameDigestHash", "ICredentialFactory", "IRequest"]
++__all__ = ["ICredentialFactory", "IRequest"]

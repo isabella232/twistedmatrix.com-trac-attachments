@@ -1,0 +1,103 @@
+diff --git a/doc/core/man/trial.1 b/doc/core/man/trial.1
+index f01934d..1b89412 100644
+--- a/doc/core/man/trial.1
++++ b/doc/core/man/trial.1
+@@ -13,7 +13,8 @@ packages and files listed on the command line.
+ trial will take either filenames or fully qualified Python names as
+ arguments.  Thus `trial myproject/foo.py', `trial myproject.foo' and
+ `trial myproject.foo.SomeTestCase.test_method' are all valid ways to
+-invoke trial.
++invoke trial. Multiple such arguments are also accepted, and their order will
++determine the order in which the corresponding tests are run.
+ .PP
+ After running the given test suite, the default test reporter prints a summary
+ of the test run. This consists of the word "PASSED" (if all tests ran as
+diff --git a/twisted/scripts/trial.py b/twisted/scripts/trial.py
+index 349b0c6..e57a22f 100644
+--- a/twisted/scripts/trial.py
++++ b/twisted/scripts/trial.py
+@@ -4,7 +4,7 @@
+ # See LICENSE for details.
+ 
+ 
+-import sys, os, random, gc, time, warnings
++import sys, os, collections, random, gc, time, warnings
+ 
+ from twisted.internet import defer
+ from twisted.application import app
+@@ -93,6 +93,35 @@ def _reporterAction():
+     return usage.CompleteList([p.longOpt for p in
+                                plugin.getPlugins(itrial.IReporter)])
+ 
++
++class _OrderedSet(collections.MutableSet):
++    def __init__(self, contents=()):
++        self._contents = collections.OrderedDict()
++        self.update(contents)
++
++    def __contains__(self, e):
++        return e in self._contents
++
++    def __iter__(self):
++        return iter(self._contents)
++
++    def __len__(self):
++        return len(self._contents)
++
++    def __repr__(self):
++        return "%s(%s)" % (self.__class__.__name__, list(self._contents))
++
++    def add(self, e):
++        self._contents[e] = None
++
++    def discard(self, e):
++        if e in self._contents:
++            del self._contents[e]
++
++    def update(self, contents):
++        self._contents.update((e, None) for e in contents)
++
++
+ class Options(usage.Options, app.ReactorSelectionMixin):
+     synopsis = """%s [options] [[file|package|module|TestCase|testmethod]...]
+     """ % (os.path.basename(sys.argv[0]),)
+@@ -146,7 +175,7 @@ class Options(usage.Options, app.ReactorSelectionMixin):
+     tracer = None
+ 
+     def __init__(self):
+-        self['tests'] = set()
++        self['tests'] = _OrderedSet()
+         usage.Options.__init__(self)
+ 
+ 
+diff --git a/twisted/trial/test/test_script.py b/twisted/trial/test/test_script.py
+index 6c93ebe..bcae843 100644
+--- a/twisted/trial/test/test_script.py
++++ b/twisted/trial/test/test_script.py
+@@ -480,3 +480,26 @@ class ExtraTests(unittest.TestCase):
+         self.assertDeprecationWarning(self.config.opt_extra,
+                                       self.flushWarnings([self.test_xDeprecation]))
+ 
++
++
++class TestArgumentOrderTests(unittest.TestCase):
++    def setUp(self):
++        self.config = trial.Options()
++        self.loader = runner.TestLoader()
++
++    def test_preserveArgumentOrder(self):
++        """
++        Multiple tests passed on the command line should not be reordered.
++
++        """
++
++        tests = ["foo", "bar", "quux", "baz"]
++        self.config.parseOptions(tests)
++
++        suite = trial._getSuite(self.config)
++        names = testNames(suite)
++
++        expected_suite = runner.TestSuite(map(self.loader.loadByName, tests))
++        expected_names = testNames(expected_suite)
++
++        self.assertEqual(names, expected_names)

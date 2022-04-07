@@ -1,0 +1,106 @@
+Index: /home/wolf/twisted-trunk/twisted/python/failure.py
+===================================================================
+--- /home/wolf/twisted-trunk/twisted/python/failure.py	(revision 23536)
++++ /home/wolf/twisted-trunk/twisted/python/failure.py	(working copy)
+@@ -465,6 +465,34 @@
+         self.printTraceback(file=io, elideFrameworkCode=elideFrameworkCode, detail=detail)
+         return io.getvalue()
+ 
++    def _formatSyntaxError(self, exc):
++        lines = []
++        value = exc
++        try:
++            msg, (filename, lineno, offset, badline) = exc
++        except Exception:
++            pass
++        else:
++            filename = filename or "<string>"
++            lines.append('  File "%s", line %d\n' % (filename, lineno))
++            if badline is not None:
++                lines.append('    %s\n' % badline.strip())
++                if offset is not None:
++                    caretspace = badline[:offset].lstrip()
++                    # non-space whitespace (likes tabs) must be kept for alignment
++                    spaces = []
++                    for c in caretspace:
++                        if c == '\t':
++                            spaces.append(c)
++                        else:
++                            spaces.append(' ')
++                    lines.append('   %s^\n' % ''.join(spaces))
++                value = msg
++        lines.append(("%s: %s\n" % (reflect.qual(self.type),
++                                    reflect.safe_str(value))))
++        return "".join(lines)
++
++
+     def printTraceback(self, file=None, elideFrameworkCode=0, detail='default'):
+         """Emulate Python's standard error reporting mechanism.
+         """
+@@ -505,6 +533,8 @@
+             # have.
+             if isinstance(self.type, (str, unicode)):
+                 w(self.type + "\n")
++            elif issubclass(self.type, SyntaxError):
++                w(self._formatSyntaxError(self.value))
+             else:
+                 w("%s: %s\n" % (reflect.qual(self.type),
+                                 reflect.safe_str(self.value)))
+Index: /home/wolf/twisted-trunk/twisted/test/test_failure.py
+===================================================================
+--- /home/wolf/twisted-trunk/twisted/test/test_failure.py	(revision 23536)
++++ /home/wolf/twisted-trunk/twisted/test/test_failure.py	(working copy)
+@@ -9,10 +9,12 @@
+ import sys
+ import StringIO
+ import traceback
++import re
+ 
+ from twisted.trial import unittest, util
+ 
+ from twisted.python import failure
++from twisted.python.filepath import FilePath
+ 
+ try:
+     from twisted.test import raiser
+@@ -196,6 +198,40 @@
+         f = failure.Failure(Exception("some error"))
+         self.assertEqual(f.getTracebackObject(), None)
+ 
++
++    def test_syntaxErrorFormattingWhileLoadingModule(self):
++        """
++        Check if Failure._formatSyntaxError(error) formats correctly the error
++        message when there is a SyntaxError in the fake module we try to import.
++        """
++        content = "[['Testing invalid syntax in progress...})"
++        p = FilePath(self.mktemp())
++        p.makedirs()
++        p.child("broken_module_test.py").setContent(content)
++        sys.path.insert(0, p.path)
++        self.addCleanup(sys.path.remove, p.path)
++        try:
++            import broken_module_test
++        except SyntaxError, error:
++            errormsg = failure.Failure()._formatSyntaxError(error)
++        else:
++            self.fail("The test didn't worked as expected")
++
++        # The error message should look like:
++        # File "/path/to/broken_module_test.py", line 1
++        #     [['Testing invalid syntax in progress...})
++        #                                              ^
++        # exceptions.SyntaxError: EOL while scanning single-quoted string
++
++        pattern = ('^File "\S+?broken_module_test\.py", line 1\s+'
++                   '\[\[\'Testing invalid syntax in progress\.\.\.\}\)\s+'
++                   '\^\s+exceptions\.SyntaxError: EOL while scanning '
++                   'single-quoted string$')
++
++        self.assertTrue(re.match(pattern, errormsg.strip()))
++
++
++
+ class FindFailureTests(unittest.TestCase):
+     """
+     Tests for functionality related to L{Failure._findFailure}.

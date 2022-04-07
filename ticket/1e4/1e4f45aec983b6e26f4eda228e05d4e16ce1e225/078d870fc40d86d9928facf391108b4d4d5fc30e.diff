@@ -1,0 +1,106 @@
+diff --git a/twisted/protocols/ftp.py b/twisted/protocols/ftp.py
+index 19504a7..8f71621 100644
+--- a/twisted/protocols/ftp.py
++++ b/twisted/protocols/ftp.py
+@@ -1163,17 +1163,35 @@ class FTP(object, basic.LineReceiver, policies.TimeoutMixin):
+             self.setTimeout(self.factory.timeOut)
+             return result
+ 
+-        def cbSent(result):
+-            return (TXFR_COMPLETE_OK,)
++        def cbOpened(file):
++            """
++            File was opend for reading so launch the data channel transfer via
++            the file consumer.
++            """
++            d = file.receive()
++            d.addCallback(cbConsumer)
++            d.addCallback(lambda ignored: file.close())
++            d.addCallbacks(cbSent, ebSent)
++            return d
+ 
+-        def ebSent(err):
+-            log.msg("Unexpected error receiving file from client:")
+-            log.err(err)
+-            if err.check(FTPCmdError):
+-                return err
+-            return (CNX_CLOSED_TXFR_ABORTED,)
++        def ebOpened(err):
++            """
++            Called when failed to open the file for reading.
++
++            For known errors, return the FTP error code.
++            For all other, return a file not found error.
++            """
++            if isinstance(err.value, FTPCmdError):
++                return (err.value.errorCode, '/'.join(newsegs))
++            return (FILE_NOT_FOUND, '/'.join(newsegs))
+ 
+         def cbConsumer(cons):
++            """
++            Called when file was opended for reading.
++
++            Prepared the handler for data transfer and send the response
++            to the command channel.
++            """
+             if not self.binary:
+                 cons = ASCIIConsumerWrapper(cons)
+ 
+@@ -1187,20 +1205,23 @@ class FTP(object, basic.LineReceiver, policies.TimeoutMixin):
+ 
+             return d
+ 
+-        def cbOpened(file):
+-            d = file.receive()
+-            d.addCallback(cbConsumer)
+-            d.addCallback(lambda ignored: file.close())
+-            d.addCallbacks(cbSent, ebSent)
+-            return d
++        def cbSent(result):
++            """
++            Called from data transport when tranfer is done.
++            """
++            return (TXFR_COMPLETE_OK,)
+ 
+-        def ebOpened(err):
+-            if not err.check(PermissionDeniedError, FileNotFoundError, IsNotADirectoryError):
+-                log.msg("Unexpected error attempting to open file for upload:")
++        def ebSent(err):
++            """
++            Called from data transport when there are errors during the
++            transfer.
++            """
++            if err.check(FTPCmdError):
++                return err
++            else:
++                log.msg("Unexpected error receiving file from client:")
+                 log.err(err)
+-            if isinstance(err.value, FTPCmdError):
+-                return (err.value.errorCode, '/'.join(newsegs))
+-            return (FILE_NOT_FOUND, '/'.join(newsegs))
++            return (CNX_CLOSED_TXFR_ABORTED,)
+ 
+         d = self.shell.openForWriting(newsegs)
+         d.addCallbacks(cbOpened, ebOpened)
+diff --git a/twisted/test/test_ftp.py b/twisted/test/test_ftp.py
+index 7ba434e..4befda0 100644
+--- a/twisted/test/test_ftp.py
++++ b/twisted/test/test_ftp.py
+@@ -541,7 +541,7 @@ class FTPServerTestCaseAdvancedClient(FTPServerTestCase):
+         # Make a failing file writer.
+         class FailingFileWriter(ftp._FileWriter):
+             def receive(self):
+-                return defer.fail(ftp.IsNotADirectoryError("blah"))
++                return defer.fail(ftp.IsADirectoryError("blah"))
+ 
+         def failingSTOR(a, b):
+             return defer.succeed(FailingFileWriter(None))
+@@ -555,7 +555,7 @@ class FTPServerTestCaseAdvancedClient(FTPServerTestCase):
+             res.trap(ftp.CommandFailed)
+             self.assertEqual(
+                 res.value.args[0][0],
+-                "550 Cannot rmd, blah is not a directory")
++                "550 blah: is a directory")
+         d1, d2 = self.client.storeFile('failing_file')
+         d2.addErrback(eb)
+         return defer.gatherResults([d1, d2])

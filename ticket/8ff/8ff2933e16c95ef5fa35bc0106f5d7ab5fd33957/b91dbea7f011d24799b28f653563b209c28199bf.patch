@@ -1,0 +1,110 @@
+Index: twisted/conch/test/test_transport.py
+===================================================================
+--- twisted/conch/test/test_transport.py	(revision 28913)
++++ twisted/conch/test/test_transport.py	(working copy)
+@@ -61,8 +61,17 @@
+         self.unimplementeds = []
+         self.debugs = []
+         self.ignoreds = []
++        self.gotUnsupportedVersion = None
+ 
++    def _unsupportedVersionReceived(self, remoteVersion):
++        """
++        Intercept unsupported version call.
+ 
++        @type remoteVersion: C{str}
++        """
++        self.gotUnsupportedVersion = remoteVersion
++        return transport.SSHTransportBase._unsupportedVersionReceived(self, remoteVersion)
++
+     def receiveError(self, reasonCode, description):
+         """
+         Store any errors received.
+@@ -800,7 +809,26 @@
+         self.assertTrue(proto.gotVersion)
+         self.assertEquals(proto.otherVersionString, "SSH-1.99-OpenSSH")
+ 
++    def test_supportedVersionsAreAllowed(self):
++        """
++        Test that versions configured as supported work.
++        """
++        proto = MockTransportBase()
++        proto.supportedVersions = ("9.99", )
++        proto.makeConnection(proto_helpers.StringTransport())
++        proto.dataReceived("SSH-9.99-OpenSSH\n")
++        self.assert_(not proto.gotUnsupportedVersion)
+ 
++    def test_unsupportedVersionsCallUnsupportedVersionReceived(self):
++        """
++        Test that versions not configured as supported don't work.
++        """
++        proto = MockTransportBase()
++        proto.supportedVersions = ("2.0", )
++        proto.makeConnection(proto_helpers.StringTransport())
++        proto.dataReceived("SSH-9.99-OpenSSH\n")
++        self.assertEquals("9.99", proto.gotUnsupportedVersion)
++
+     def test_badPackets(self):
+         """
+         Test that the transport disconnects with an error when it receives
+Index: twisted/conch/topfiles/4428.feature
+===================================================================
+--- twisted/conch/topfiles/4428.feature	(revision 0)
++++ twisted/conch/topfiles/4428.feature	(revision 0)
+@@ -0,0 +1 @@
++twisted.conch.ssh.transport.SSHTransportBase now allows supported ssh protocol versions to be overriden.
+Index: twisted/conch/ssh/transport.py
+===================================================================
+--- twisted/conch/ssh/transport.py	(revision 28913)
++++ twisted/conch/ssh/transport.py	(working copy)
+@@ -67,6 +67,9 @@
+     @ivar supportedLanguages: A list of strings representing languages
+         supported, from most-preferred to least.
+ 
++    @ivar supportedVersions: A container of strings representing supported ssh
++        protcol version numbers.
++
+     @ivar isClient: A boolean indicating whether this is a client or server.
+ 
+     @ivar gotVersion: A boolean indicating whether we have receieved the
+@@ -149,6 +152,7 @@
+     supportedPublicKeys = ['ssh-rsa', 'ssh-dss']
+     supportedCompressions = ['none', 'zlib']
+     supportedLanguages = ()
++    supportedVersions = ('1.99', '2.0')
+     isClient = False
+     gotVersion = False
+     buf = ''
+@@ -282,7 +286,18 @@
+         self.incomingPacketSequence += 1
+         return payload
+ 
++    def _unsupportedVersionReceived(self, remoteVersion):
++        """
++        Called when an unsupported version of the ssh protocol is received from
++            the remote endpoint.
+ 
++        @param remoteVersion: remote ssh protocol version which is unsupported
++            by us.
++        @type remoteVersion: C{str}
++        """
++        self.sendDisconnect(DISCONNECT_PROTOCOL_VERSION_NOT_SUPPORTED,
++            'bad version ' + remoteVersion)
++
+     def dataReceived(self, data):
+         """
+         First, check for the version string (SSH-2.0-*).  After that has been
+@@ -300,10 +315,9 @@
+                 if p.startswith('SSH-'):
+                     self.gotVersion = True
+                     self.otherVersionString = p.strip()
+-                    if p.split('-')[1] not in ('1.99', '2.0'): # bad version
+-                        self.sendDisconnect(
+-                            DISCONNECT_PROTOCOL_VERSION_NOT_SUPPORTED,
+-                            'bad version ' + p.split('-')[1])
++                    remoteVersion = p.split('-')[1]
++                    if remoteVersion not in self.supportedVersions:
++                        self._unsupportedVersionReceived(remoteVersion)
+                         return
+                     i = lines.index(p)
+                     self.buf = '\n'.join(lines[i + 1:])

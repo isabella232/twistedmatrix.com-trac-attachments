@@ -1,0 +1,201 @@
+diff --git a/twisted/conch/test/test_cftp.py b/twisted/conch/test/test_cftp.py
+index 7303ca3..3d258f4 100644
+--- a/twisted/conch/test/test_cftp.py
++++ b/twisted/conch/test/test_cftp.py
+@@ -27,7 +27,7 @@ else:
+ 
+ 
+ from twisted.python.fakepwd import UserDatabase
+-from twisted.trial.unittest import TestCase
++from twisted.trial.unittest import TestCase, whenRunning
+ from twisted.cred import portal
+ from twisted.internet import reactor, protocol, interfaces, defer, error
+ from twisted.internet.utils import getProcessOutputAndValue
+@@ -222,6 +222,7 @@ class StdioClientTests(TestCase):
+         d = self.client._dispatchCommand("!echo hello")
+         d.addCallback(self.assertEquals, "hello\n")
+         return d
++    test_bang = whenRunning(test_bang)
+ 
+ 
+ 
+diff --git a/twisted/conch/test/test_conch.py b/twisted/conch/test/test_conch.py
+index 82d8b0f..bdea3d5 100644
+--- a/twisted/conch/test/test_conch.py
++++ b/twisted/conch/test/test_conch.py
+@@ -339,6 +339,7 @@ class ForwardingTestBase:
+         """
+         d = self.execute('echo goodbye', ConchTestOpenSSHProcess())
+         return d.addCallback(self.assertEquals, 'goodbye\n')
++    test_exec = unittest.whenRunning(test_exec)
+ 
+ 
+     def test_localToRemoteForwarding(self):
+@@ -353,6 +354,7 @@ class ForwardingTestBase:
+                          % (localPort, self.echoPort))
+         d.addCallback(self.assertEqual, 'test\n')
+         return d
++    test_localToRemoteForwarding = unittest.whenRunning(test_localToRemoteForwarding)
+ 
+ 
+     def test_remoteToLocalForwarding(self):
+@@ -367,6 +369,7 @@ class ForwardingTestBase:
+                          % (localPort, self.echoPort))
+         d.addCallback(self.assertEqual, 'test\n')
+         return d
++    test_remoteToLocalForwarding = unittest.whenRunning(test_remoteToLocalForwarding)
+ 
+ 
+ 
+diff --git a/twisted/trial/test/test_tests.py b/twisted/trial/test/test_tests.py
+index 70439db..91beff5 100644
+--- a/twisted/trial/test/test_tests.py
++++ b/twisted/trial/test/test_tests.py
+@@ -1155,3 +1155,113 @@ class TestIterateTests(unittest.TestCase):
+         test = unittest.TestCase()
+         suite = runner.TestSuite([runner.TestSuite([test]), self])
+         self.assertEqual([test, self], list(unittest._iterateTests(suite)))
++
++
++
++class TestWhenRunningDecorator(unittest.TestCase):
++    """
++    Tests for L{unittest.whenRunning}.
++    """
++
++    def stub(self):
++        """
++        A method to which the L{unittest.whenRunning} decorator is applied.  
++        The tests in this suite are directed at the decorated result.
++        """
++        self.stub_run = True
++    stub = unittest.whenRunning(stub)
++
++
++    def setUp(self):
++        self.stub_run = False
++        self.reactor = self.StubReactor()
++
++
++    def test_deferred(self):
++        """
++        Test that the decorated test case returns a deferred which has been 
++        registered with the reactor.
++        """
++        deferred = self.runStub()
++
++        self.assertIdentical(deferred.__class__, defer.Deferred)
++        self.assertEqual(self.reactor.contents, 
++            [(deferred.callback, (True,), {})])
++
++
++    def test_callback(self):
++        """
++        Test that the deferred returned from the decorated test case has a 
++        callback which invokes the test case.
++        """
++        
++        deferred = self.runStub()
++        deferred.callback(None)
++
++        self.assertTrue(self.stub_run)
++
++
++    def test_copiesMetadata(self):
++        """
++        Confirm that the decorated test case has its original name.
++        """
++        self.assertEqual(self.stub.__name__, "stub")
++
++
++    def test_running(self):
++        """
++        A method to which the L{unittest.whenRunning} decorator has been 
++        applied.
++        """
++        from twisted.internet import reactor
++        self.assertTrue(reactor.running)
++    test_running = unittest.whenRunning(test_running)
++
++
++    # Utility classes and methods.
++
++
++    class StubReactor(object):
++        """
++        A very basic stub reactor.
++        """
++        def __init__(self):
++            self.contents = []
++
++        def callWhenRunning(self, _callable, *args, **kw):
++            self.contents.append((_callable, args, kw))
++
++
++    class ReactorStubContext(object):
++        """
++        Context manager which temporarily replaces the default reactor.
++        """
++        def __init__(self, reactor):
++            self.new_reactor = reactor
++            self.old_reactor = None
++
++        def __enter__(self):
++            import twisted.internet.reactor
++            self.old_reactor = sys.modules['twisted.internet.reactor']
++            sys.modules['twisted.internet.reactor'] = self.new_reactor
++            twisted.internet.reactor = self.new_reactor
++
++        def __exit__(self, exc_type, exc_val, tb):
++            import twisted.internet.reactor
++            twisted.internet.reactor = self.old_reactor
++            sys.modules['twisted.internet.reactor'] = self.old_reactor
++            return False
++
++
++    def runStub(self):
++        """
++        Utility function which runs L{stub} in a L{ReactorStubContext}.
++        """
++        context = self.ReactorStubContext(self.reactor)
++        context.__enter__()
++        try:
++            return self.stub()
++        finally:
++            context.__exit__(None, None, None)
++        
++
+diff --git a/twisted/trial/unittest.py b/twisted/trial/unittest.py
+index 0c2de32..6b15ca0 100644
+--- a/twisted/trial/unittest.py
++++ b/twisted/trial/unittest.py
+@@ -43,6 +43,7 @@ except ImportError:
+ 
+ from twisted.internet import defer, utils
+ from twisted.python import components, failure, log, monkey
++from twisted.python.util import mergeFunctionMetadata 
+ from twisted.python.reflect import qual
+ from twisted.python.compat import set
+ from twisted.python import deprecate
+@@ -1610,6 +1611,21 @@ def decorate(test, decorator):
+ 
+ 
+ 
++def whenRunning(testcase):
++    """
++    Decorate a test case, causing its execution to be delayed until the test 
++    reactor is running.
++    """
++    def _do(test):
++        from twisted.internet import reactor
++        d = defer.Deferred()
++        d.addCallback(lambda ignore: testcase(test))
++        reactor.callWhenRunning(d.callback, True)
++        return d
++    return mergeFunctionMetadata(testcase, _do)
++
++
++
+ class _PyUnitTestCaseAdapter(TestDecorator):
+     """
+     Adapt from pyunit.TestCase to ITestCase.

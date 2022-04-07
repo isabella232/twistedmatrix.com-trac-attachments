@@ -1,0 +1,163 @@
+Index: twisted/words/test/test_jabbersaslmechanisms.py
+===================================================================
+--- twisted/words/test/test_jabbersaslmechanisms.py	(revision 37153)
++++ twisted/words/test/test_jabbersaslmechanisms.py	(working copy)
+@@ -5,9 +5,12 @@
+ Tests for L{twisted.words.protocols.jabber.sasl_mechanisms}.
+ """
+ 
++import binascii
++
+ from twisted.trial import unittest
+ 
+ from twisted.words.protocols.jabber import sasl_mechanisms
++from twisted.python.hashlib import md5
+ 
+ class PlainTest(unittest.TestCase):
+     def test_getInitialResponse(self):
+@@ -72,6 +75,30 @@
+         directives = self.mechanism._parse(self.mechanism.getResponse(challenge))
+         self.assertEqual(directives['realm'], 'example.org')
+ 
++    def test__calculate_response(self):
++        """
++        Tests the response calculation.
++
++        Values were taken from RFC-2831 with additional unicode characters.
++        """
++
++        charset = 'utf-8'
++        nonce = 'OA6MG9tEQGm2hh'
++        nc = '%08x' % 1
++        cnonce = 'OA6MHXh6VqTrRk'
++
++        username = u'\u0418chris'.encode(charset)
++        password = u'\u0418secret'.encode(charset)
++        realm = u'\u0418elwood.innosoft.com'.encode(charset)
++        digest_uri = u'imap/\u0418elwood.innosoft.com'.encode(charset)
++        
++        mechanism = sasl_mechanisms.DigestMD5('imap', realm, None, 
++                                            username, password) 
++        response = mechanism._calculate_response(cnonce, nc, nonce,
++                                                 username, password,
++                                                 realm, digest_uri)
++        self.assertEqual(response, '7928f233258be88392424d094453c5e3')
++
+     def test__parse(self):
+         """
+         Test challenge decoding.
+Index: twisted/words/protocols/jabber/sasl_mechanisms.py
+===================================================================
+--- twisted/words/protocols/jabber/sasl_mechanisms.py	(revision 37153)
++++ twisted/words/protocols/jabber/sasl_mechanisms.py	(working copy)
+@@ -85,13 +85,24 @@
+     name = 'DIGEST-MD5'
+ 
+     def __init__(self, serv_type, host, serv_name, username, password):
++        """
++        @type serv_type: C{unicode}
++
++        @type host: C{unicode}
++
++        @type serv_name: C{unicode}
++
++        @type username: C{unicode}
++
++        @type password: C{unicode}
++        """
+         self.username = username
+         self.password = password
+         self.defaultRealm = host
+ 
+-        self.digest_uri = '%s/%s' % (serv_type, host)
++        self.digest_uri = u'%s/%s' % (serv_type, host)
+         if serv_name is not None:
+-            self.digest_uri += '/%s' % serv_name
++            self.digest_uri += u'/%s' % serv_name
+ 
+ 
+     def getInitialResponse(self):
+@@ -183,16 +194,11 @@
+ 
+         return ','.join(directive_list)
+ 
+-
+-    def _gen_response(self, charset, realm, nonce):
++    def _calculate_response(self, cnonce, nc, nonce,
++                            username, password, realm, uri):
+         """
+-        Generate response-value.
+-
+-        Creates a response to a challenge according to section 2.1.2.1 of
+-        RFC 2831 using the C{charset}, C{realm} and C{nonce} directives
+-        from the challenge.
++        Calculates response with given encoded parameters.
+         """
+-
+         def H(s):
+             return md5(s).digest()
+ 
+@@ -202,9 +208,28 @@
+         def KD(k, s):
+             return H('%s:%s' % (k, s))
+ 
++        a1 = "%s:%s:%s" % (H("%s:%s:%s" % (username, realm, password)),
++                                nonce, cnonce)
++        a2 = "AUTHENTICATE:%s" % uri
++        response = HEX( KD ( HEX(H(a1)),
++                             "%s:%s:%s:%s:%s" % (nonce, nc,
++                                        cnonce, "auth", HEX(H(a2)))))
++        return response
++
++    def _gen_response(self, charset, realm, nonce):
++        """
++        Generate response-value.
++
++        Creates a response to a challenge according to section 2.1.2.1 of
++        RFC 2831 using the C{charset}, C{realm} and C{nonce} directives
++        from the challenge.
++        """
++
+         try:
+             username = self.username.encode(charset)
+             password = self.password.encode(charset)
++            realm = realm.encode(charset)
++            digest_uri = self.digest_uri.encode(charset)
+         except UnicodeError:
+             # TODO - add error checking
+             raise
+@@ -214,22 +239,17 @@
+         qop = 'auth'
+ 
+         # TODO - add support for authzid
+-        a1 = "%s:%s:%s" % (H("%s:%s:%s" % (username, realm, password)),
+-                           nonce,
+-                           cnonce)
+-        a2 = "AUTHENTICATE:%s" % self.digest_uri
++        response = self._calculate_response(cnonce, nc, nonce,
++                                            username, password, realm,
++                                            digest_uri)
+ 
+-        response = HEX( KD ( HEX(H(a1)),
+-                             "%s:%s:%s:%s:%s" % (nonce, nc,
+-                                                 cnonce, "auth", HEX(H(a2)))))
+-
+         directives = {'username': username,
+                       'realm' : realm,
+                       'nonce' : nonce,
+                       'cnonce' : cnonce,
+                       'nc' : nc,
+                       'qop' : qop,
+-                      'digest-uri': self.digest_uri,
++                      'digest-uri': digest_uri,
+                       'response': response,
+                       'charset': charset}
+ 
+@@ -237,4 +257,6 @@
+ 
+ 
+     def _gen_nonce(self):
+-        return md5("%s:%s:%s" % (str(random.random()) , str(time.gmtime()),str(os.getpid()))).hexdigest()
++        return md5("%s:%s:%s" % (random.random(),
++                                 time.gmtime(),
++                                 os.getpid())).hexdigest()

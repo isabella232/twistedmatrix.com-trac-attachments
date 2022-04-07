@@ -1,0 +1,203 @@
+diff -uNr Twisted-new/doc/core/howto/listings/pb/pb6clientAnon.py Twisted-anon/doc/core/howto/listings/pb/pb6clientAnon.py
+--- Twisted-new/doc/core/howto/listings/pb/pb6clientAnon.py	1969-12-31 21:00:00.000000000 -0300
++++ Twisted-anon/doc/core/howto/listings/pb/pb6clientAnon.py	2006-12-20 10:00:17.096943000 -0200
+@@ -0,0 +1,27 @@
++#! /usr/bin/python
++
++from twisted.spread import pb
++from twisted.internet import reactor
++from twisted.cred import credentials
++
++def main():
++    factory = pb.PBClientFactory()
++    reactor.connectTCP("localhost", 8800, factory)
++    
++    #def1 = factory.login(credentials.UsernamePassword("user1", "pass1"))   #Use this to login as authenticated
++    def1 = factory.login(credentials.Anonymous())        #Use this to login as anonymous
++    
++    def1.addCallback(connected)
++    def1.addErrback(error)
++    reactor.run()
++
++def error(why):
++    print "----------ERROR------------"
++    print why
++    
++def connected(perspective):
++    print "got perspective1 ref:", perspective
++    print "asking it to foo(13)"
++    perspective.callRemote("foo", 13)
++
++main()
+diff -uNr Twisted-new/doc/core/howto/listings/pb/pb6serverAnon.py Twisted-anon/doc/core/howto/listings/pb/pb6serverAnon.py
+--- Twisted-new/doc/core/howto/listings/pb/pb6serverAnon.py	1969-12-31 21:00:00.000000000 -0300
++++ Twisted-anon/doc/core/howto/listings/pb/pb6serverAnon.py	2006-12-20 09:59:41.026536600 -0200
+@@ -0,0 +1,32 @@
++#! /usr/bin/python
++from zope.interface import implements
++
++from twisted.spread import pb
++from twisted.cred import checkers, portal, credentials
++from twisted.internet import reactor
++
++class MyPerspective(pb.Avatar):
++    def __init__(self, name):
++        self.name = name
++    def perspective_foo(self, arg):
++        print "I am", self.name, "perspective_foo(",arg,") called on", self
++
++class MyRealm:
++    implements(portal.IRealm)
++    def requestAvatar(self, avatarId, mind, *interfaces):
++        assert pb.IPerspective in interfaces
++        if avatarId == checkers.ANONYMOUS:
++            return pb.IPerspective, MyPerspective("Anonymous"), lambda:None
++        else:
++            return pb.IPerspective, MyPerspective(avatarId), lambda:None
++
++p = portal.Portal(MyRealm())
++# Here the user/password checker is registered
++c1 = checkers.InMemoryUsernamePasswordDatabaseDontUse(user1="pass1", user2="pass2")
++# Here the anonymous checker is registered, this server accepts both authenticated or anonymous logins
++c2 = checkers.AllowAnonymousAccess()
++
++p.registerChecker(c1)
++p.registerChecker(c2)
++reactor.listenTCP(8800, pb.PBServerFactory(p))
++reactor.run()
+diff -uNr Twisted-new/doc/core/howto/pb-cred.xhtml Twisted-anon/doc/core/howto/pb-cred.xhtml
+--- Twisted-new/doc/core/howto/pb-cred.xhtml	2006-02-10 17:50:14.000000000 -0200
++++ Twisted-anon/doc/core/howto/pb-cred.xhtml	2006-12-20 12:26:11.769838000 -0200
+@@ -573,6 +573,20 @@
+ that Avatar.</p>
+ 
+ 
++<h3>Anonymous Clients</h3>
++
++<a href="listings/pb/pb6serverAnon.py" class="py-listing">pb6serverAnon.py</a>
++<a href="listings/pb/pb6clientAnon.py" class="py-listing">pb6clientAnon.py</a>
++
++<p>The pb6serverAnon.py is is a server based on pb6server.py, that permits the
++anonymous and authenticated logins. Both checkers are registered and the client
++chooses the login method. In this method, one can choose different perspectives
++for each login method.</p>
++
++<p>In client side, the only change is the use of <code>credentials.Anonymous()</code>
++in the <code>PBClientFactory.login</code> method.</p>
++
++
+ <h2>Using Avatars</h2>
+ 
+diff -uNr Twisted-new/twisted/spread/pb.py Twisted-anon/twisted/spread/pb.py
+--- Twisted-new/twisted/spread/pb.py	2006-07-01 13:08:18.000000000 -0300
++++ Twisted-anon/twisted/spread/pb.py	2006-12-20 15:38:00.455778900 -0200
+@@ -74,7 +74,7 @@
+ from twisted.python import log, failure
+ from twisted.internet import defer, protocol
+ from twisted.cred.portal import Portal
+-from twisted.cred.credentials import ICredentials, IUsernameHashedPassword
++from twisted.cred.credentials import *
+ from twisted.persisted import styles
+ from twisted.python.components import registerAdapter
+ 
+@@ -1085,17 +1085,33 @@
+ 
+     def _cbResponse(self, (challenge, challenger), password, client):
+         return challenger.callRemote("respond", respond(challenge, password), client)
++        
++    def _cbLoginAnonymous(self, root, credentials, client):
++        """Passes the credentials to handle anonymous login"""
++        return root.callRemote("loginAnonymous", credentials, client).addCallback(
++            self._cbAnonymousOk, credentials, client)
++    
++    def _cbAnonymousOk(self, challenger, username, client):
++        """Receives the AnonymousChallenger class and forwards the credentials"""
++        return challenger.callRemote("logon", username, client)
+ 
+     def login(self, credentials, client=None):
+         """Login and get perspective from remote PB server.
+ 
+         Currently only credentials implementing
+         L{twisted.cred.credentials.IUsernamePassword} are supported.
+-
++        L{twisted.cred.credentials.IAnonymous} are supported
++        
+         @return: Deferred of RemoteReference to the perspective.
+         """
+         d = self.getRootObject()
+-        d.addCallback(self._cbSendUsername, credentials.username, credentials.password, client)
++
++        if isinstance(credentials,Anonymous):
++            """Handles anonymous logins via credentials.Anonymous passes an empty tuple as anonymous"""
++            d.addCallback(self._cbLoginAnonymous, (), client)
++        elif isinstance(credentials,(UsernamePassword,UsernameHashedPassword)):
++            """Handles non anonymous logins"""
++            d.addCallback(self._cbSendUsername, credentials.username, credentials.password, client)
+         return d
+ 
+ 
+@@ -1192,7 +1208,34 @@
+         c = challenge()
+         return c, _PortalAuthChallenger(self, username, c)
+ 
++    def remote_loginAnonymous(self, username, mind):
++        """Handles the anonymous logins via portal"""
++        return _PortalAnonymousChallenger(self, username, mind)
++
++
+ 
++class _PortalAnonymousChallenger(Referenceable):
++    """Called on anonymous login attempt.
++       Follows almost the same structure from _PortalAuthChallenger"""
++    
++    implements(IAnonymous)
++    
++    def __init__(self, portalWrapper, username, mind):
++        self.portalWrapper = portalWrapper
++        self.username = username
++
++    def remote_logon(self, username, mind):
++        d = self.portalWrapper.portal.login(self, mind, IPerspective)
++        d.addCallback(self._loggedIn)
++        return d
++        
++    def _loggedIn(self, (interface, perspective, logout)):
++        if not IJellyable.providedBy(perspective):
++            perspective = AsReferenceable(perspective, "perspective")
++        self.portalWrapper.broker.notifyOnDisconnect(logout)
++        return perspective
++        
++        
+ class _PortalAuthChallenger(Referenceable):
+     """Called with response to password challenge."""
+ 
+diff -uNr Twisted-new/twisted/test/test_pb.py Twisted-anon/twisted/test/test_pb.py
+--- Twisted-new/twisted/test/test_pb.py	2006-12-05 12:35:32.000000000 -0200
++++ Twisted-anon/twisted/test/test_pb.py	2006-12-20 09:53:56.275175400 -0200
+@@ -1128,3 +1128,26 @@
+         d.addCallback(lambda res: factory.disconnect())
+         return d
+ 
++class AnonymousLoginTestCase(unittest.TestCase):
++    def setUp(self):
++        self.realm = MyRealm()
++        self.realm.p = NonSubclassingPerspective()
++        self.portal = portal.Portal(self.realm)
++        self.checker = checkers.AllowAnonymousAccess()
++        self.portal.registerChecker(self.checker)
++        self.factory = pb.PBServerFactory(self.portal)
++        self.port = reactor.listenTCP(0, self.factory, interface="127.0.0.1")
++        self.portno = self.port.getHost().port
++
++    def tearDown(self):
++        self.port.stopListening()
++
++    def testAnonymousLogin(self):
++        factory = pb.PBClientFactory()
++        d = factory.login(credentials.Anonymous(),"BRAINS!")
++        reactor.connectTCP('127.0.0.1', self.portno, factory)
++        d.addCallback(lambda p: p.callRemote('ANYTHING', 'here', bar='baz'))
++        d.addCallback(self.assertEquals, 
++                      ('ANYTHING', ('here',), {'bar': 'baz'}))
++        d.addCallback(lambda res: factory.disconnect())
++        return d

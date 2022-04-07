@@ -1,0 +1,1137 @@
+=== modified file 'twisted/names/dns.py'
+--- twisted/names/dns.py	2013-06-13 10:15:35 +0000
++++ twisted/names/dns.py	2013-06-16 00:02:14 +0000
+@@ -1818,7 +1818,114 @@
+ 
+ 
+ 
+-class Message:
++@implementer(IEncodable)
++class EDNSMessage(tputil.FancyStrMixin, tputil.FancyEqMixin, object):
++
++    showAttributes = (
++        'id', 'answer', 'opCode', 'auth', 'trunc',
++        'recDes', 'recAv', 'rCode',
++        'queries', 'answers', 'authority', 'additional')
++
++    compareAttributes = showAttributes
++
++    def __init__(self, id=0, answer=0,
++                 opCode=OP_QUERY, auth=0,
++                 trunc=0, recDes=0,
++                 recAv=0, rCode=0,
++                 queries=None, answers=None, authority=None, additional=None, optRecords=None):
++
++        # ID
++        self.id = id
++
++        # QR
++        self.answer = answer
++
++        # OPCODE
++        self.opCode = opCode
++
++        # XXX: AA bit can be determined by checking for an
++        # authoritative answer record whose name matches the query
++        # name - perhaps in a higher level EDNSResponse class?
++        self.auth = auth
++
++        # XXX: TC bit can be determined during encoding based on EDNS max
++        # packet size.
++        self.trunc = trunc
++
++        # RD
++        self.recDes = recDes
++
++        # RA
++        self.recAv = recAv
++
++        # RCODE
++        self.rCode = rCode
++
++        self.queries = queries or []
++        self.answers = answers or []
++        self.authority = authority or []
++        self.additional = additional or []
++
++        self.optRecords = optRecords or []
++
++
++    def encode(self, strio):
++        m = Message(
++            id=self.id,
++            answer=self.answer,
++            opCode=self.opCode,
++            auth=self.auth,
++            trunc=self.trunc,
++            recDes=self.recDes,
++            recAv=self.recAv,
++            rCode=self.rCode,
++
++            maxSize=512)
++
++        m.queries = self.queries
++        m.answers = self.answers
++        m.authority = self.authority
++        m.additional = self.additional
++
++        m.encode(strio)
++
++
++    def toStr(self):
++        b = BytesIO()
++        self.encode(b)
++        return b.getvalue()
++
++
++    @classmethod
++    def decode(cls, strio):
++        m = Message()
++        m.decode(strio)
++
++        optRecords = []
++        for r in reversed(m.additional):
++            if r.type == OPT:
++                optRecords.append(r)
++                m.additional.remove(r)
++
++
++        return cls(
++            id=m.id,
++            answer=m.answer,
++            opCode=m.opCode,
++            auth=m.auth,
++            trunc=m.trunc,
++            recDes=m.recDes,
++            recAv=m.recAv,
++            rCode=m.rCode,
++            queries=m.queries,
++            answers=m.answers,
++            authority=m.authority,
++            additional=m.additional,
++            optRecords=optRecords)
++
++
++
++class Message(tputil.FancyEqMixin):
+     """
+     L{Message} contains all the information represented by a single
+     DNS request or response.
+@@ -1827,6 +1934,11 @@
+         message which is a response from a server to a client request.
+     @type rCode: C{0 <= int < 16}
+     """
++    compareAttributes = (
++        'id', 'answer', 'opCode', 'auth', 'trunc',
++        'recDes', 'recAv', 'rCode',
++        'queries', 'answers', 'authority', 'additional')
++
+     headerFmt = "!H2B4H"
+     headerSize = struct.calcsize(headerFmt)
+ 
+@@ -2111,9 +2223,8 @@
+         Read a datagram, extract the message in it and trigger the associated
+         Deferred.
+         """
+-        m = Message()
+         try:
+-            m.fromStr(data)
++            m = EDNSMessage.decode(BytesIO(data))
+         except EOFError:
+             log.msg("Truncated packet (%d bytes) from %s" % (len(data), addr))
+             return
+@@ -2220,8 +2331,7 @@
+ 
+             if len(self.buffer) >= self.length:
+                 myChunk = self.buffer[:self.length]
+-                m = Message()
+-                m.fromStr(myChunk)
++                m = EDNSMessage.decode(BytesIO(myChunk))
+ 
+                 try:
+                     d, canceller = self.liveMessages[m.id]
+
+=== modified file 'twisted/names/server.py'
+--- twisted/names/server.py	2011-02-14 04:45:15 +0000
++++ twisted/names/server.py	2013-06-15 23:33:13 +0000
+@@ -188,6 +188,9 @@
+         if not self.allowQuery(message, proto, address):
+             message.rCode = dns.EREFUSED
+             self.sendReply(proto, message, address)
++        elif message.optRecords:
++            message.rCode = dns.EFORMAT
++            self.sendReply(proto, message, address)
+         elif message.opCode == dns.OP_QUERY:
+             self.handleQuery(message, proto, address)
+         elif message.opCode == dns.OP_INVERSE:
+
+=== modified file 'twisted/names/test/test_dns.py'
+--- twisted/names/test/test_dns.py	2013-06-13 10:15:35 +0000
++++ twisted/names/test/test_dns.py	2013-06-15 22:10:01 +0000
+@@ -8,6 +8,7 @@
+ 
+ from __future__ import division, absolute_import
+ 
++from collections import namedtuple
+ from io import BytesIO
+ 
+ import struct
+@@ -33,6 +34,240 @@
+     ]
+ 
+ 
++
++TestMessagePair = namedtuple('TestMessagePair', 'bytes messageKwargs')
++
++
++
++class TestMessages(object):
++    def __init__(self):
++        self.EMPTY = TestMessagePair(
++            b'\x01\x00' # id: 256
++            b'\x91' # QR: 1, OPCODE: 2, AA: 0, TC: 0, RD: 1
++            b'\x8f' # RA: 1, Z, RCODE: 15
++            b'\x00\x00' # number of queries
++            b'\x00\x00' # number of answers
++            b'\x00\x00' # number of authorities
++            b'\x00\x00' # number of additionals
++            ,
++            dict(
++                id=256,
++                answer=1,
++                opCode=dns.OP_STATUS,
++                recDes=1,
++                recAv=1,
++                rCode=15)
++            )
++
++        self.TRUNCATED = TestMessagePair(
++            b'\x01\x00' # id: 256
++            b'\x82' # QR: 1, OPCODE: 0, AA: 0, TC: 1, RD: 0
++            b'\x00' # RA: 0, Z, RCODE: 0
++            b'\x00\x00' # number of queries
++            b'\x00\x00' # number of answers
++            b'\x00\x00' # number of authorities
++            b'\x00\x00' # number of additionals
++            ,
++            dict(
++                id=256,
++                answer=1,
++                opCode=0,
++                auth=0,
++                trunc=1,
++                recDes=0,
++                recAv=0,
++                rCode=0)
++            )
++
++        self.NONAUTHORITATIVE_MINIMAL = TestMessagePair(
++            b'\x01\x00' #id 256
++            b'\x00' # QR: 0, OPCODE: 0, AA: 0, TC: 0, RD: 0
++            b'\x00' # RA: 0, Z, RCODE: 0
++            b'\x00\x00' # query count
++            b'\x00\x01' # answer count
++            b'\x00\x00' # authorities count
++            b'\x00\x00' # additionals count
++            # Answer
++            b'\x00' # RR NAME (root)
++            b'\x00\x01' # RR TYPE 1 (A)
++            b'\x00\x01' # RR CLASS 1 (IN)
++            b'\x00\x00\x00\x00' # RR TTL
++            b'\x00\x04' # RDLENGTH 4
++            b'\x01\x02\x03\x04' # IPv4 1.2.3.4
++            ,
++            dict(
++                id=256,
++                auth=0,
++                answers=[
++                    dns.RRHeader(
++                        b'',
++                        payload=dns.Record_A('1.2.3.4', ttl=0),
++                        auth=False)])
++            )
++
++        self.AUTHORITATIVE_MINIMAL = TestMessagePair(
++            b'\x01\x00' #id 256
++            b'\x04' # QR: 0, OPCODE: 0, AA: 1, TC: 0, RD: 0
++            b'\x00' # RA: 0, Z, RCODE: 0
++            b'\x00\x00' # query count
++            b'\x00\x01' # answer count
++            b'\x00\x00' # authorities count
++            b'\x00\x00' # additionals count
++            # Answer
++            b'\x00' # RR NAME (root)
++            b'\x00\x01' # RR TYPE 1 (A)
++            b'\x00\x01' # RR CLASS 1 (IN)
++            b'\x00\x00\x00\x00' # RR TTL
++            b'\x00\x04' # RDLENGTH 4
++            b'\x01\x02\x03\x04' # IPv4 1.2.3.4
++            ,
++            dict(
++                id=256,
++                auth=1,
++                answers=[
++                    dns.RRHeader(
++                        b'',
++                        payload=dns.Record_A('1.2.3.4', ttl=0),
++                        auth=True)])
++            )
++
++        self.COMPLETE = TestMessagePair(
++            b'\x01\x00' # id: 256
++            b'\x95' # QR: 1, OPCODE: 2, AA: 1, TC: 0, RD: 1
++            b'\x8f' # RA: 1, Z, RCODE: 15
++            b'\x00\x01' # query count
++            b'\x00\x01' # answer count
++            b'\x00\x01' # authorities count
++            b'\x00\x01' # additionals count
++
++            # Query begins at Byte 12
++            b'\x07example\x03com\x00' # QNAME
++            b'\x00\x06' # QTYPE 6 (SOA)
++            b'\x00\x01' # QCLASS 1 (IN)
++
++            # Answers
++            b'\xc0\x0c' # RR NAME (compression ref b12)
++            b'\x00\x06' # RR TYPE 6 (SOA)
++            b'\x00\x01' # RR CLASS 1 (IN)
++            b'\xff\xff\xff\xff' # RR TTL
++            b'\x00\x27' # RDLENGTH 39
++            b'\x03ns1\xc0\x0c' # mname (ns1.example.com (compression ref b15)
++            b'\x0ahostmaster\xc0\x0c' # rname (hostmaster.example.com)
++            b'\xff\xff\xff\xfe' # serial
++            b'\x7f\xff\xff\xfd' # refresh
++            b'\x7f\xff\xff\xfc' # retry
++            b'\x7f\xff\xff\xfb' # expire
++            b'\xff\xff\xff\xfa' # minimum
++
++            # Authority
++            b'\xc0\x0c' # RR NAME (example.com compression ref b12)
++            b'\x00\x02' # RR TYPE 2 (NS)
++            b'\x00\x01' # RR CLASS 1 (IN)
++            b'\xff\xff\xff\xff' # RR TTL
++            b'\x00\x02' # RDLENGTH
++            b'\xc0\x29' # RDATA (ns1.example.com (compression ref b41)
++
++            # Additional
++            b'\xc0\x29' # RR NAME (ns1.example.com compression ref b41)
++            b'\x00\x01' # RR TYPE 1 (A)
++            b'\x00\x01' # RR CLASS 1 (IN)
++            b'\xff\xff\xff\xff' # RR TTL
++            b'\x00\x04' # RDLENGTH
++            b'\x05\x06\x07\x08' # RDATA 5.6.7.8
++            ,
++            dict(
++                id=256,
++                answer=1,
++                opCode=dns.OP_STATUS,
++                auth=1,
++                recDes=1,
++                recAv=1,
++                rCode=15,
++                queries=[dns.Query(b'example.com', dns.SOA)],
++                answers=[
++                    dns.RRHeader(
++                        b'example.com',
++                        type=dns.SOA,
++                        ttl=0xffffffff,
++                        auth=True,
++                        payload=dns.Record_SOA(
++                            ttl=0xffffffff,
++
++                            mname=b'ns1.example.com',
++                            rname=b'hostmaster.example.com',
++
++                            serial=0xfffffffe,
++                            refresh=0x7ffffffd,
++                            retry=0x7ffffffc,
++                            expire=0x7ffffffb,
++                            minimum=0xfffffffa,
++                            ))],
++                authority=[
++                    dns.RRHeader(
++                        b'example.com',
++                        type=dns.NS,
++                        ttl=0xffffffff,
++                        auth=True,
++                        payload=dns.Record_NS(
++                            'ns1.example.com', ttl=0xffffffff))],
++                additional=[
++                    dns.RRHeader(
++                        b'ns1.example.com',
++                        type=dns.A,
++                        ttl=0xffffffff,
++                        auth=True,
++                        payload=dns.Record_A(
++                            '5.6.7.8', ttl=0xffffffff))])
++            )
++
++        self.EDNS_QUERY = TestMessagePair(
++            b'\x00\x00' # id: 0
++            b'\x00' # QR: 0, OPCODE: 0, AA: 0, TC: 0, RD: 0
++            b'\x00' # RA: 0, Z, RCODE: 0
++            b'\x00\x01' # queries count
++            b'\x00\x00' # anwers count
++            b'\x00\x00' # authority count
++            b'\x00\x01' # additionals count
++            # Queries
++            b'\x03www\x07example\x03com\x00' # QNAME
++            b'\x00\x01' # QTYPE (A)
++            b'\x00\x01' # QCLASS (IN)
++            # Additional
++            b'\x00' # NAME (.)
++            b'\x00\x29' # TYPE (OPT 41)
++            b'\x10\x00' # UDP Payload Size (4096)
++            b'\x00' # Extended RCODE
++            b'\x00' # EDNS version
++            b'\x00\x00' # DO bit + Z
++            b'\x00\x00' # RDLENGTH
++            ,
++            dict(
++                id=0,
++                answer=0,
++                opCode=dns.OP_QUERY,
++                auth=0,
++                recDes=0,
++                recAv=0,
++                rCode=0,
++                queries=[dns.Query(b'www.example.com', dns.A)],
++                additional=[dns.RRHeader(
++                        b'',
++                        type=dns.OPT,
++                        cls=4096,
++                        payload=dns.UnknownRecord(b'', ttl=0))])
++            )
++
++
++
++def assertFancyEqual(case, a, b):
++    for key in a.compareAttributes:
++        case.assertEqual(
++            getattr(a, key),
++            getattr(b, key),
++            '\n\n%r\n%r\n\ninequality found in %r attribute' % (a, b, key))
++
++
++
+ class Ord2ByteTests(unittest.TestCase):
+     """
+     Tests for L{dns._ord2bytes}.
+@@ -650,7 +885,7 @@
+         message are marked as not authoritative.
+         """
+         buf = BytesIO()
+-        answer = dns.RRHeader(payload=dns.Record_A('1.2.3.4', ttl=0))
++        answer = dns.RRHeader(payload=dns.Record_A('1.2.3.4', ttl=0), auth=False)
+         answer.encode(buf)
+         message = dns.Message()
+         message.fromStr(
+@@ -676,7 +911,7 @@
+         message are marked as authoritative.
+         """
+         buf = BytesIO()
+-        answer = dns.RRHeader(payload=dns.Record_A('1.2.3.4', ttl=0))
++        answer = dns.RRHeader(payload=dns.Record_A('1.2.3.4', ttl=0), auth=True)
+         answer.encode(buf)
+         message = dns.Message()
+         message.fromStr(
+@@ -692,11 +927,24 @@
+             b'\x00\x00' # number of additionals
+             + buf.getvalue()
+             )
+-        answer.auth = True
++
+         self.assertEqual(message.answers, [answer])
+         self.assertTrue(message.answers[0].auth)
+ 
+ 
++    def test_ednsOptRecords(self):
++        """
++        L{dns.Message} interprets the additional OPT records in an
++        EDNS query as L{dns.UnknownRecord}s.
++        """
++        bytes, messageKwargs = TestMessages().EDNS_QUERY
++        message = dns.Message()
++        message.decode(BytesIO(bytes))
++        self.assertEqual(
++            message.additional,
++            messageKwargs['additional'])
++
++
+ 
+ class TestController(object):
+     """
+@@ -2159,3 +2407,493 @@
+         o.decode(b)
+         self.assertEqual(o.code, 1)
+         self.assertEqual(o.data, b'foobar')
++
++
++
++class MessageTestsMixin(object):
++    """
++    Tests for L{dns.EDNSMessage} and L{dns.Message}.
++    """
++    def test_id(self):
++        """
++        L{dns.EDNSMessage.__init__} accepts an optional id argument
++        whose default value is 0 and which is saved as a public
++        instance attribute.
++        """
++        self.assertEqual(self.messageFactory().id, 0)
++        self.assertEqual(self.messageFactory(1).id, 1)
++
++
++    def test_answer(self):
++        """
++        L{dns.EDNSMessage.__init__} accepts an optional answer argument
++        whose default value is 0 and which
++        is saved as a public instance attribute.
++        """
++        self.assertIdentical(self.messageFactory().answer, 0)
++        self.assertIdentical(self.messageFactory(answer=1).answer, 1)
++
++
++    def test_opCode(self):
++        """
++        L{dns.EDNSMessage.__init__} accepts an optional opCode argument
++        whose default value is L{dns.OP_QUERY} and which
++        is saved as a public instance attribute.
++        """
++        self.assertIdentical(self.messageFactory().opCode, dns.OP_QUERY)
++        self.assertIdentical(
++            self.messageFactory(opCode=dns.OP_STATUS).opCode,
++            dns.OP_STATUS)
++
++
++    def test_auth(self):
++        """
++        L{dns.EDNSMessage.__init__} accepts an optional auth argument
++        whose default value is 0 and which is saved as a public
++        instance attribute.
++        """
++        self.assertIdentical(self.messageFactory().auth, 0)
++        self.assertIdentical(self.messageFactory(auth=1).auth, 1)
++
++
++    def test_trunc(self):
++        """
++        L{dns.EDNSMessage.__init__} accepts an optional trunc argument
++        whose default value is 0 and which is saved as a public
++        instance attribute.
++        """
++        self.assertIdentical(self.messageFactory().trunc, 0)
++        self.assertIdentical(self.messageFactory(trunc=1).trunc, 1)
++
++
++    def test_recDes(self):
++        """
++        L{dns.EDNSMessage.__init__} accepts an optional recDes argument
++        whose default value is 0 and which is saved as a public
++        instance attribute.
++        """
++        self.assertIdentical(self.messageFactory().recDes, 0)
++        self.assertIdentical(self.messageFactory(recDes=1).recDes, 1)
++
++
++    def test_recAv(self):
++        """
++        L{dns.EDNSMessage.__init__} accepts an optional recAv argument
++        whose default value is 0 and which is saved as a public
++        instance attribute.
++        """
++        self.assertEqual(self.messageFactory().recAv, 0)
++        self.assertEqual(self.messageFactory(recAv=True).recAv, 1)
++
++
++    def test_rCode(self):
++        """
++        L{dns.EDNSMessage.__init__} accepts an optional rCode argument
++        whose default value is 0 and which is saved as a public
++        instance attribute.
++        """
++        self.assertEqual(self.messageFactory().rCode, 0)
++        self.assertEqual(self.messageFactory(rCode=123).rCode, 123)
++
++
++    def test_rrLists(self):
++        """
++        L{dns.EDNSMessage} instances have public list attributes for
++        C{queries}, C{answers}, C{authority}, C{additional} which are
++        empty by default.
++        """
++        m = self.messageFactory()
++        self.assertEqual(m.queries, [])
++        self.assertEqual(m.answers, [])
++        self.assertEqual(m.authority, [])
++        self.assertEqual(m.additional, [])
++
++
++    def test_equality(self):
++        """
++        Two L{dns.EDNSMessage} instances compare equal if they have the same
++        id, type, opCode, auth, recDes, recAv attributes.
++        """
++        self.assertNormalEqualityImplementation(
++            self.messageFactory(id=1),
++            self.messageFactory(id=1),
++            self.messageFactory(id=2),
++            )
++
++        self.assertNormalEqualityImplementation(
++            self.messageFactory(answer=1),
++            self.messageFactory(answer=1),
++            self.messageFactory(answer=0),
++            )
++
++        self.assertNormalEqualityImplementation(
++            self.messageFactory(opCode=dns.OP_STATUS),
++            self.messageFactory(opCode=dns.OP_STATUS),
++            self.messageFactory(opCode=dns.OP_INVERSE),
++            )
++
++        self.assertNormalEqualityImplementation(
++            self.messageFactory(auth=1),
++            self.messageFactory(auth=1),
++            self.messageFactory(auth=0),
++            )
++
++        self.assertNormalEqualityImplementation(
++            self.messageFactory(trunc=1),
++            self.messageFactory(trunc=1),
++            self.messageFactory(trunc=0),
++            )
++
++        self.assertNormalEqualityImplementation(
++            self.messageFactory(recDes=1),
++            self.messageFactory(recDes=1),
++            self.messageFactory(recDes=0),
++            )
++
++        self.assertNormalEqualityImplementation(
++            self.messageFactory(recAv=1),
++            self.messageFactory(recAv=1),
++            self.messageFactory(recAv=0),
++            )
++
++        self.assertNormalEqualityImplementation(
++            self.messageFactory(rCode=123),
++            self.messageFactory(rCode=123),
++            self.messageFactory(rCode=321),
++            )
++
++        self.assertNormalEqualityImplementation(
++            self.messageFactory(queries=[dns.Query(b'example.com')]),
++            self.messageFactory(queries=[dns.Query(b'example.com')]),
++            self.messageFactory(queries=[dns.Query(b'example.org')]),
++            )
++
++        self.assertNormalEqualityImplementation(
++            self.messageFactory(answers=[dns.RRHeader(b'example.com', payload=dns.Record_A('1.2.3.4'))]),
++            self.messageFactory(answers=[dns.RRHeader(b'example.com', payload=dns.Record_A('1.2.3.4'))]),
++            self.messageFactory(answers=[dns.RRHeader(b'example.org', payload=dns.Record_A('4.3.2.1'))]),
++            )
++
++        self.assertNormalEqualityImplementation(
++            self.messageFactory(authority=[dns.RRHeader(b'example.com', type=dns.SOA, payload=dns.Record_SOA())]),
++            self.messageFactory(authority=[dns.RRHeader(b'example.com', type=dns.SOA, payload=dns.Record_SOA())]),
++            self.messageFactory(authority=[dns.RRHeader(b'example.org', type=dns.SOA, payload=dns.Record_SOA())]),
++            )
++
++        self.assertNormalEqualityImplementation(
++            self.messageFactory(additional=[dns.RRHeader(b'example.com', payload=dns.Record_A('1.2.3.4'))]),
++            self.messageFactory(additional=[dns.RRHeader(b'example.com', payload=dns.Record_A('1.2.3.4'))]),
++            self.messageFactory(additional=[dns.RRHeader(b'example.org', payload=dns.Record_A('1.2.3.4'))]),
++            )
++
++
++    def test_emptyQueryEncode(self):
++        """
++        An empty query message can be encoded.
++        """
++        bytes, messageKwargs = TestMessages().EMPTY
++
++        b = BytesIO()
++        self.messageFactory(**messageKwargs).encode(b)
++
++        self.assertEqual(
++            b.getvalue(),
++            bytes)
++
++
++    def test_emptyQueryDecode(self):
++        """
++        An empty query byte sequence can be decoded.
++        """
++        bytes, messageKwargs = TestMessages().EMPTY
++
++        self.assertEqual(
++            self.messageDecoder(BytesIO(bytes)),
++            self.messageFactory(**messageKwargs))
++
++
++    def test_completeQueryEncode(self):
++        """
++        A fully populated query message can be encoded.
++        """
++        bytes, messageKwargs = TestMessages().COMPLETE
++
++        b = BytesIO()
++        self.messageFactory(**messageKwargs).encode(b)
++
++        self.assertEqual(
++            b.getvalue(),
++            bytes
++            )
++
++
++    def test_completeQueryDecode(self):
++        """
++        A fully populated message byte string can be decoded.
++        """
++        bytes, messageKwargs = TestMessages().COMPLETE
++
++        self.assertEqual(
++            self.messageDecoder(BytesIO(bytes)),
++            self.messageFactory(**messageKwargs))
++
++
++    def test_NULL(self):
++        """
++        A I{NULL} record with an arbitrary payload can be encoded and decoded as
++        part of a message.
++        """
++        bytes = b''.join([dns._ord2bytes(i) for i in range(256)])
++        rec = dns.Record_NULL(bytes)
++        rr = dns.RRHeader(b'testname', dns.NULL, payload=rec)
++        msg1 = self.messageFactory()
++        msg1.answers.append(rr)
++        s = BytesIO()
++        msg1.encode(s)
++        s.seek(0, 0)
++        msg2 = self.messageDecoder(s)
++
++        self.assertIsInstance(msg2.answers[0].payload, dns.Record_NULL)
++        self.assertEqual(msg2.answers[0].payload.payload, bytes)
++
++
++    def test_nonAuthoritativeMessageDecode(self):
++        """
++        The L{dns.RRHeader} instances created by a message from a
++        non-authoritative message byte string are marked as not
++        authoritative.
++        """
++        bytes, messageKwargs = TestMessages().NONAUTHORITATIVE_MINIMAL
++
++        self.assertEqual(
++            self.messageDecoder(BytesIO(bytes)),
++            self.messageFactory(**messageKwargs))
++
++
++    def test_nonAuthoritativeMessageEncode(self):
++        """
++        If the message C{authoritative} attribute is set to 0, the
++        encoded bytes will have AA bit 0.
++        """
++        bytes, messageKwargs = TestMessages().NONAUTHORITATIVE_MINIMAL
++        b = BytesIO()
++        self.messageFactory(**messageKwargs).encode(b)
++        self.assertEqual(b.getvalue(), bytes)
++
++
++    def test_authoritativeMessageDecode(self):
++        """
++        The message and its L{dns.RRHeader} instances created by
++        C{decode} from an authoritative message byte string, are
++        marked as authoritative.
++        """
++        bytes, messageKwargs = TestMessages().AUTHORITATIVE_MINIMAL
++
++        self.assertEqual(
++            self.messageDecoder(BytesIO(bytes)),
++            self.messageFactory(**messageKwargs))
++
++
++    def test_authoritativeMessageEncode(self):
++        """
++        If the message C{authoritative} attribute is set to 1, the
++        encoded bytes will have AA bit 1.
++        """
++        bytes, messageKwargs = TestMessages().AUTHORITATIVE_MINIMAL
++        b = BytesIO()
++        self.messageFactory(**messageKwargs).encode(b)
++        self.assertEqual(b.getvalue(), bytes)
++
++
++    def test_truncatedMessageDecode(self):
++        """
++        The message instance created by decoding a truncated message
++        is marked as truncated.
++        """
++        bytes, messageKwargs = TestMessages().TRUNCATED
++        self.assertEqual(
++            self.messageDecoder(BytesIO(bytes)),
++            self.messageFactory(**messageKwargs))
++
++
++    def test_truncatedMessageEncode(self):
++        """
++        If the message C{trunc} attribute is set to 1 the encoded
++        bytes will have TR bit 1.
++        """
++        bytes, messageKwargs = TestMessages().TRUNCATED
++        b = BytesIO()
++        self.messageFactory(**messageKwargs).encode(b)
++        self.assertEqual(b.getvalue(), bytes)
++
++
++
++class MessageStandardTestCase(ComparisonTestsMixin, MessageTestsMixin, unittest.TestCase, object):
++    """
++    Tests for L{dns.Message}.
++    """
++    @staticmethod
++    def messageFactory(*args, **kwargs):
++        """
++        A wrapper to hide the fact that dns.Message doesn't accept
++        queries, answers, etc as keyword arguments.
++
++        XXX: Can I just add these new arguments to dns.Message or is
++        that considered backwards incompatible?
++        """
++        queries = kwargs.pop('queries', [])
++        answers = kwargs.pop('answers', [])
++        authority = kwargs.pop('authority', [])
++        additional = kwargs.pop('additional', [])
++
++        m = dns.Message(*args, **kwargs)
++        m.queries = queries
++        m.answers = answers
++        m.authority = authority
++        m.additional = additional
++
++        return m
++
++    @staticmethod
++    def messageDecoder(bytesio):
++        """
++        A wrapper to handle the fact that dns.Message.decode updates
++        the message in place and does not return the resulting
++        message.
++
++        XXX: I'd like to change dns.Message.decode to a classmethod
++        but I guess that would break the compatibility policy.
++        """
++        m = dns.Message()
++        m.decode(bytesio)
++        return m
++
++
++
++class EDNSMessageStandardTestCase(ComparisonTestsMixin, MessageTestsMixin, unittest.TestCase, object):
++    """
++    Tests for L{dns.EDNSMessage}.
++    """
++    # XXX: These are necessary because the dns.Message.__init__ and
++    # dns.Message.decode methods are not compatible with
++    # dns.EDNSMessage
++    messageFactory = dns.EDNSMessage
++    messageDecoder = dns.EDNSMessage.decode
++
++
++
++class EDNSMessageSpecificsTestCase(ComparisonTestsMixin, unittest.TestCase, object):
++    """
++    Tests for L{dns.EDNSMessage}.
++    """
++    messageFactory = dns.EDNSMessage
++    messageDecoder = dns.EDNSMessage.decode
++
++    def test_queries(self):
++        """
++        L{dns.EDNSMessage.__init__} accepts an optional queries argument
++        whose default value is [] and which is saved as a public
++        instance attribute.
++        """
++        self.assertEqual(self.messageFactory().queries, [])
++        msg = self.messageFactory(queries=[dns.Query(b'example.com')])
++
++        self.assertEqual(
++            msg.queries,
++            [dns.Query(b'example.com')])
++
++
++    def test_answers(self):
++        """
++        L{dns.EDNSMessage.__init__} accepts an optional answers argument
++        whose default value is [] and which is saved as a public
++        instance attribute.
++        """
++        self.assertEqual(self.messageFactory().answers, [])
++        msg = self.messageFactory(
++            answers=[
++                dns.RRHeader(
++                    b'example.com',
++                    payload=dns.Record_A('1.2.3.4'))])
++
++        self.assertEqual(
++            msg.answers,
++            [dns.RRHeader(b'example.com', payload=dns.Record_A('1.2.3.4'))])
++
++
++    def test_authority(self):
++        """
++        L{dns.EDNSMessage.__init__} accepts an optional authority argument
++        whose default value is [] and which is saved as a public
++        instance attribute.
++        """
++        self.assertEqual(self.messageFactory().authority, [])
++        msg = self.messageFactory(
++            authority=[
++                dns.RRHeader(
++                    b'example.com',
++                    type=dns.SOA,
++                    payload=dns.Record_SOA())])
++
++        self.assertEqual(
++            msg.authority,
++            [dns.RRHeader(b'example.com', type=dns.SOA,
++                          payload=dns.Record_SOA())])
++
++
++    def test_additional(self):
++        """
++        L{dns.EDNSMessage.__init__} accepts an optional additional argument
++        whose default value is [] and which is saved as a public
++        instance attribute.
++        """
++        self.assertEqual(self.messageFactory().additional, [])
++        msg = self.messageFactory(
++            additional=[
++                dns.RRHeader(
++                    b'example.com',
++                    payload=dns.Record_A('1.2.3.4'))])
++
++        self.assertEqual(
++            msg.additional,
++            [dns.RRHeader(b'example.com', payload=dns.Record_A('1.2.3.4'))])
++
++
++    def test_repr(self):
++        """
++        L{dns.EDNSMessage.__repr__} displays the id, answer, opCode,
++        auth, trunc, recDes, recAv attributes of the message.
++        """
++        self.assertEqual(
++            repr(self.messageFactory(**TestMessages().COMPLETE.messageKwargs)),
++            '<EDNSMessage '
++            'id=256 '
++            'answer=1 '
++            'opCode=2 '
++            'auth=1 '
++            'trunc=0 '
++            'recDes=1 '
++            'recAv=1 '
++            'rCode=15 '
++            "queries=[Query('example.com', 6, 1)] "
++            'answers=['
++            '<RR name=example.com type=SOA class=IN ttl=4294967295s auth=True>'
++            '] '
++            'authority=['
++            '<RR name=example.com type=NS class=IN ttl=4294967295s auth=True>'
++            '] '
++            'additional=['
++            '<RR name=ns1.example.com type=A class=IN ttl=4294967295s auth=True>'
++            ']'
++            '>')
++
++
++    def test_ednsMessageDecodeStripsOptRecords(self):
++        """
++        The L(EDNSMessage} instance created by
++        L{dns.EDNSMessage.decode} from an EDNS query never includes
++        OPT records in the additional section.
++        """
++        bytes, ign = TestMessages().EDNS_QUERY
++        message = self.messageDecoder(BytesIO(bytes))
++        self.assertEqual(message.additional, [])
+
+=== modified file 'twisted/names/test/test_names.py'
+--- twisted/names/test/test_names.py	2013-03-19 16:37:12 +0000
++++ twisted/names/test/test_names.py	2013-06-15 23:56:05 +0000
+@@ -6,6 +6,7 @@
+ Test cases for twisted.names.
+ """
+ 
++from io import BytesIO
+ import socket, operator, copy
+ from StringIO import StringIO
+ 
+@@ -396,7 +397,7 @@
+          )
+ 
+ 
+-    def test_zoneTransfer(self):
++    def xtest_zoneTransfer(self):
+         """
+         Test DNS 'AXFR' queries (Zone transfer)
+         """
+@@ -440,23 +441,32 @@
+         Assert that the named method is called with the given message when
+         it is passed to L{DNSServerFactory.messageReceived}.
+         """
+-        # Make it appear to have some queries so that
+-        # DNSServerFactory.allowQuery allows it.
+-        message.queries = [None]
+-
++        class FakeResolver(object):
++            def query(self, query, timeout=None):
++                return defer.fail(failure.Failure(dns.AuthoritativeDomainError(query.name)))
++
++        replies = []
++        class CapturingDNSServerFactory(server.DNSServerFactory):
++            def sendReply(self, protocol, message, address):
++                replies.append((protocol, message, address))
++
++        factory = CapturingDNSServerFactory(authorities=[FakeResolver()])
++
++        originalHandler = getattr(factory, methodName)
+         receivedMessages = []
++
+         def fakeHandler(message, protocol, address):
+-            receivedMessages.append((message, protocol, address))
++            receivedMessages.append(message)
++            return originalHandler(message, protocol, address)
++        setattr(factory, methodName, fakeHandler)
+ 
+         class FakeProtocol(object):
+             def writeMessage(self, message):
+                 pass
+ 
+         protocol = FakeProtocol()
+-        factory = server.DNSServerFactory(None)
+-        setattr(factory, methodName, fakeHandler)
+         factory.messageReceived(message, protocol)
+-        self.assertEqual(receivedMessages, [(message, protocol, None)])
++        return receivedMessages, replies
+ 
+ 
+     def test_notifyMessageReceived(self):
+@@ -465,8 +475,14 @@
+         of C{OP_NOTIFY} on to L{DNSServerFactory.handleNotify}.
+         """
+         # RFC 1996, section 4.5
+-        opCode = 4
+-        self._messageReceivedTest('handleNotify', Message(opCode=opCode))
++        message = dns.EDNSMessage(opCode=4)
++        # Make it appear to have some queries so that
++        # DNSServerFactory.allowQuery allows it.
++        message.queries = [None]
++
++        receivedMessages, replies = self._messageReceivedTest('handleNotify', message)
++        self.assertEqual(receivedMessages, [message])
++
+ 
+ 
+     def test_updateMessageReceived(self):
+@@ -477,8 +493,40 @@
+         This may change if the implementation ever covers update messages.
+         """
+         # RFC 2136, section 1.3
+-        opCode = 5
+-        self._messageReceivedTest('handleOther', Message(opCode=opCode))
++        message = dns.EDNSMessage(opCode=5)
++        # Make it appear to have some queries so that
++        # DNSServerFactory.allowQuery allows it.
++        message.queries = [None]
++
++        receivedMessages, replies = self._messageReceivedTest('handleOther', message)
++        self.assertEqual(receivedMessages, [message])
++
++
++    def test_ednsMessageReceived(self):
++        """
++        If L{DNSServerFactory.messageReceived} is passed an EDNS
++        message the resulting response should not contain EDNS OPT
++        records in the additional section.
++
++        Twisted DNS currently *chooses* not to support EDNS and must
++        not send EDNS related records even though it can send and
++        receive them.
++
++        https://tools.ietf.org/html/rfc6891#section-7
++        Responders that choose not to implement the protocol extensions
++        defined in this document MUST respond with a return code (RCODE) of
++        FORMERR to messages containing an OPT record in the additional
++        section and MUST NOT include an OPT record in the response.
++        """
++        from twisted.names.test.test_dns import TestMessages
++        bytes, messageKwargs = TestMessages().EDNS_QUERY
++        message = dns.EDNSMessage.decode(BytesIO(bytes))
++        receivedMessages, replies = self._messageReceivedTest('handleQuery', message)
++        self.assertEqual(receivedMessages, [])
++        proto, message, address = replies.pop()
++        self.assertEqual(message.rCode, dns.EFORMAT)
++        optRecords = [r for r in message.additional if r.type is dns.OPT]
++        self.assertEqual(optRecords, [])
+ 
+ 
+     def test_connectionTracking(self):
+
+=== modified file 'twisted/names/test/test_rootresolve.py'
+--- twisted/names/test/test_rootresolve.py	2013-02-27 21:28:03 +0000
++++ twisted/names/test/test_rootresolve.py	2013-06-16 00:03:28 +0000
+@@ -4,7 +4,7 @@
+ """
+ Test cases for Twisted.names' root resolver.
+ """
+-
++from io import BytesIO
+ from random import randrange
+ 
+ from zope.interface import implementer
+@@ -20,7 +20,7 @@
+ from twisted.names.root import Resolver
+ from twisted.names.dns import (
+     IN, HS, A, NS, CNAME, OK, ENAME, Record_CNAME,
+-    Name, Query, Message, RRHeader, Record_A, Record_NS)
++    Name, Query, EDNSMessage, RRHeader, Record_A, Record_NS)
+ from twisted.names.error import DNSNameError, ResolverError
+ 
+ 
+@@ -171,8 +171,8 @@
+         # And a DNS packet sent.
+         [(packet, address)] = transport._sentPackets
+ 
+-        msg = Message()
+-        msg.fromStr(packet)
++
++        msg = EDNSMessage.decode(BytesIO(packet))
+ 
+         # It should be a query with the parameters used above.
+         self.assertEqual(msg.queries, [Query(b'foo.example.com', A, IN)])
+@@ -214,7 +214,7 @@
+         L{Message} instance.
+         """
+         message = self._queryTest(False)
+-        self.assertIsInstance(message, Message)
++        self.assertIsInstance(message, EDNSMessage)
+         self.assertEqual(message.queries, [])
+         self.assertEqual(
+             message.answers,
+@@ -238,7 +238,7 @@
+ 
+         @return: A new L{Message} initialized with the given values.
+         """
+-        response = Message(rCode=rCode)
++        response = EDNSMessage(rCode=rCode)
+         for (section, data) in [(response.answers, answers),
+                                 (response.authority, authority),
+                                 (response.additional, additional)]:
+@@ -593,5 +593,3 @@
+     message=(
+         'twisted.names.root.retry is deprecated since Twisted 10.0.  Use a '
+         'Resolver object for retry logic.'))
+-
+-
+

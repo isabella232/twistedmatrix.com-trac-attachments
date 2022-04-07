@@ -1,0 +1,75 @@
+Index: twisted/scripts/twistd.py
+===================================================================
+--- twisted/scripts/twistd.py	(revision 12747)
++++ twisted/scripts/twistd.py	(working copy)
+@@ -3,8 +3,7 @@
+ # See LICENSE for details.
+ 
+ 
+-from twisted.python import log, syslog
+-from twisted.python.util import switchUID
++from twisted.python import log, syslog, util
+ from twisted.application import app, service
+ from twisted import copyright
+ import os, errno, signal, sys
+@@ -118,7 +117,7 @@
+     os.close(null)
+ 
+ def shedPrivileges(euid, uid, gid):
+-    switchUID(uid, gid, euid)
++    util.switchUID(uid, gid, euid)
+     extra = euid and 'e' or ''
+     log.msg('set %suid/%sgid %s/%s' % (extra, extra, uid, gid))
+ 
+@@ -144,10 +143,18 @@
+         launchWithName(process.processName)
+     setupEnvironment(config)
+     service.IService(application).privilegedStartService()
+-    shedPrivileges(config['euid'], process.uid, process.gid)
+-    app.startApplication(application, not config['no_save'])
++    try:
++        shedPrivileges(config['euid'], process.uid, process.gid)
++    except util.CannotSetGroups, e:
++        e.desiredGroups.sort()
++        e.actualGroups.sort()
++        log.msg("Tried to set groups to %r but failed (got %r instead)." % (
++            e.desiredGroups, e.actualGroups))
++        log.msg("Refusing to start application.")
++        raise SystemExit()
++    else:
++        app.startApplication(application, not config['no_save'])
+ 
+-
+ def runApp(config):
+     checkPID(config['pidfile'])
+     passphrase = app.getPassphrase(config['encrypted'])
+Index: twisted/python/util.py
+===================================================================
+--- twisted/python/util.py	(revision 12747)
++++ twisted/python/util.py	(working copy)
+@@ -562,6 +562,13 @@
+     L2.sort()
+     return [e[2] for e in L2]
+ 
++class CannotSetGroups(RuntimeError):
++    """Raised when os.setgroups() fails with a permission error.
++    """
++    def __init__(self, actualGroups, desiredGroups):
++        self.actualGroups = actualGroups
++        self.desiredGroups = desiredGroups
++
+ try:
+     import pwd, grp
+     from os import setgroups, getgroups
+@@ -576,9 +583,9 @@
+         except OSError, e:
+             if e.errno == errno.EPERM:
+                 groups = getgroups()
+-                for g in getgroups():
++                for g in groups:
+                     if g not in l:
+-                        raise
++                        raise CannotSetGroups(groups, l)
+             else:
+                 raise
+ 

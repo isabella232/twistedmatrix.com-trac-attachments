@@ -1,0 +1,1275 @@
+diff -r 32bd907eefae -r e255d835eef1 twisted/plugins/twisted_words.py
+--- a/twisted/plugins/twisted_words.py	Fri Sep 12 16:30:24 2008 +0200
++++ b/twisted/plugins/twisted_words.py	Fri Sep 12 22:14:26 2008 +0200
+@@ -20,6 +20,12 @@
+     "A modern words server",
+     "words")
+ 
++TwistedXMPPRouter = ServiceMaker(
++    "XMPP Router",
++    "twisted.words.xmpproutertap",
++    "An XMPP Router server",
++    "xmpp-router")
++
+ class RelayChatInterface(object):
+     classProvides(IPlugin, iwords.IProtocolPlugin)
+ 
+diff -r 32bd907eefae -r e255d835eef1 twisted/words/protocols/jabber/client.py
+--- a/twisted/words/protocols/jabber/client.py	Fri Sep 12 16:30:24 2008 +0200
++++ b/twisted/words/protocols/jabber/client.py	Fri Sep 12 22:14:26 2008 +0200
+@@ -1,6 +1,6 @@
+ # -*- test-case-name: twisted.words.test.test_jabberclient -*-
+ #
+-# Copyright (c) 2001-2005 Twisted Matrix Laboratories.
++# Copyright (c) 2001-2008 Twisted Matrix Laboratories.
+ # See LICENSE for details.
+ 
+ from twisted.internet import defer
+@@ -17,8 +17,7 @@
+ PlaintextAuthQry = xpath.internQuery("/iq/query/password")
+ 
+ def basicClientFactory(jid, secret):
+-    a = BasicAuthenticator(jid, secret)
+-    return xmlstream.XmlStreamFactory(a)
++    return xmlstream.XmlStreamFactory(BasicAuthenticator, jid, secret)
+ 
+ class IQ(domish.Element):
+     """
+@@ -298,8 +297,7 @@
+     @return: XML stream factory.
+     @rtype: L{xmlstream.XmlStreamFactory}
+     """
+-    a = XMPPAuthenticator(jid, password)
+-    return xmlstream.XmlStreamFactory(a)
++    return xmlstream.XmlStreamFactory(XMPPAuthenticator, jid, password)
+ 
+ 
+ 
+@@ -339,22 +337,10 @@
+ 
+     namespace = 'jabber:client'
+ 
+-    def __init__(self, jid, password):
+-        xmlstream.ConnectAuthenticator.__init__(self, jid.host)
++    def __init__(self, xs, jid, password):
++        xmlstream.ConnectAuthenticator.__init__(self, xs, jid.host)
+         self.jid = jid
+         self.password = password
+-
+-
+-    def associateWithStream(self, xs):
+-        """
+-        Register with the XML stream.
+-
+-        Populates stream's list of initializers, along with their
+-        requiredness. This list is used by
+-        L{ConnectAuthenticator.initializeStream} to perform the initalization
+-        steps.
+-        """
+-        xmlstream.ConnectAuthenticator.associateWithStream(self, xs)
+ 
+         xs.initializers = [CheckVersionInitializer(xs)]
+         inits = [ (xmlstream.TLSInitiatingInitializer, False),
+diff -r 32bd907eefae -r e255d835eef1 twisted/words/protocols/jabber/component.py
+--- a/twisted/words/protocols/jabber/component.py	Fri Sep 12 16:30:24 2008 +0200
++++ b/twisted/words/protocols/jabber/component.py	Fri Sep 12 22:14:26 2008 +0200
+@@ -1,6 +1,6 @@
+ # -*- test-case-name: twisted.words.test.test_jabbercomponent -*-
+ #
+-# Copyright (c) 2001-2007 Twisted Matrix Laboratories.
++# Copyright (c) 2001-2008 Twisted Matrix Laboratories.
+ # See LICENSE for details.
+ 
+ """
+@@ -21,9 +21,13 @@
+ from zope.interface import implements
+ 
+ from twisted.application import service
+-from twisted.internet import defer
++from twisted.internet import defer, reactor
++from twisted.python import log
+ from twisted.words.xish import domish
+-from twisted.words.protocols.jabber import ijabber, jstrports, xmlstream
++from twisted.words.protocols.jabber import error, ijabber, jstrports, xmlstream
++from twisted.words.protocols.jabber.jid import internJID as JID
++
++NS_COMPONENT_ACCEPT = 'jabber:component:accept'
+ 
+ def componentFactory(componentid, password):
+     """
+@@ -34,8 +38,10 @@
+     @param password: password used to authenticate to the server.
+     @type password: L{str}
+     """
+-    a = ConnectComponentAuthenticator(componentid, password)
+-    return xmlstream.XmlStreamFactory(a)
++    return xmlstream.XmlStreamFactory(ConnectComponentAuthenticator,
++                                      componentid, password)
++
++
+ 
+ class ComponentInitiatingInitializer(object):
+     """
+@@ -68,15 +74,17 @@
+         self.xmlstream.thisEntity = self.xmlstream.otherEntity
+         self._deferred.callback(None)
+ 
++
++
+ class ConnectComponentAuthenticator(xmlstream.ConnectAuthenticator):
+     """
+     Authenticator to permit an XmlStream to authenticate against a Jabber
+     server as an external component (where the Authenticator is initiating the
+     stream).
+     """
+-    namespace = 'jabber:component:accept'
++    namespace = NS_COMPONENT_ACCEPT
+ 
+-    def __init__(self, componentjid, password):
++    def __init__(self, xs, componentjid, password):
+         """
+         @type componentjid: L{str}
+         @param componentjid: Jabber ID that this component wishes to bind to.
+@@ -85,19 +93,65 @@
+         @param password: Password/secret this component uses to authenticate.
+         """
+         # Note that we are sending 'to' our desired component JID.
+-        xmlstream.ConnectAuthenticator.__init__(self, componentjid)
++        xs.version = (0, 0)
++        xmlstream.ConnectAuthenticator.__init__(self, xs, componentjid)
++        xs.initializers = [ComponentInitiatingInitializer(xs)]
+         self.password = password
+ 
+-    def associateWithStream(self, xs):
++
++
++class ListenComponentAuthenticator(xmlstream.ListenAuthenticator):
++    """
++    Authenticator for accepting components.
++    """
++    namespace = NS_COMPONENT_ACCEPT
++
++    def __init__(self, xs, secret):
+         xs.version = (0, 0)
+-        xmlstream.ConnectAuthenticator.associateWithStream(self, xs)
++        self.secret = secret
++        xmlstream.ListenAuthenticator.__init__(self, xs)
+ 
+-        xs.initializers = [ComponentInitiatingInitializer(xs)]
+ 
+-class ListenComponentAuthenticator(xmlstream.Authenticator):
+-    """
+-    Placeholder for listening components.
+-    """
++    def streamStarted(self, rootElement):
++        xmlstream.ListenAuthenticator.streamStarted(self, rootElement)
++
++        if rootElement.defaultUri != self.namespace:
++            exc = error.StreamError('invalid-namespace')
++            self.xmlstream.sendStreamError(exc)
++            return
++
++        # self.xmlstream.thisEntity is set to the address the component
++        # wants to assume. This should probably be checked.
++        if not self.xmlstream.thisEntity:
++            exc = error.StreamError('improper-addressing')
++            self.xmlstream.sendStreamError(exc)
++            return
++
++        self.xmlstream.sid = 'random' # FIXME
++
++        self.xmlstream.sendHeader()
++        self.xmlstream.addOnetimeObserver('/*', self.onElement)
++
++
++    def onElement(self, element):
++        if (element.uri, element.name) == (self.namespace, 'handshake'):
++            self.onHandshake(unicode(element))
++        else:
++            exc = error.streamError('not-authorized')
++            self.xmlstream.sendStreamError(exc)
++
++
++    def onHandshake(self, handshake):
++        calculatedHash = xmlstream.hashPassword(self.xmlstream.sid, self.secret)
++        if handshake != calculatedHash:
++            exc = error.StreamError('not-authorized', text='Invalid hash')
++            self.xmlstream.sendStreamError(exc)
++        else:
++            self.xmlstream.send('<handshake/>')
++            self.xmlstream.dispatch(self.xmlstream,
++                                    xmlstream.STREAM_AUTHD_EVENT)
++
++
+ 
+ class Service(service.Service):
+     """
+@@ -227,3 +281,156 @@
+     client_svc = jstrports.client(strport, svc.getFactory())
+     client_svc.setServiceParent(svc)
+     return svc
++
++
++
++class RouterService(service.Service):
++    """
++    XMPP Server's Router Service.
++
++    This service connects the different components of the XMPP service and
++    routes messages between them based on the given routing table.
++
++    Connected components are trusted to have correct addressing in the
++    stanzas they offer for routing.
++
++    A route destination of C{None} adds a default route. Traffic for which no
++    specific route exists, will be routed to this default route.
++
++    @ivar routes: Routes based on the host part of JIDs. Maps host names to the
++                  L{EventDispatcher<utility.EventDispatcher>}s that should
++                  receive the traffic. A key of C{None} means the default
++                  route.
++    @type routes: C{dict}
++    """
++
++    def __init__(self):
++        self.routes = {}
++
++
++    def addRoute(self, destination, xs):
++        """
++        Add a new route.
++
++        The passed XML Stream C{xs} will have an observer for all stanzas
++        added to route its outgoing traffic. In turn, traffic for
++        C{destination} will be passed to this stream.
++
++        @param destination: Destination of the route to be added as a host name
++                            or C{None} for the default route.
++        @type destination: C{str} or C{NoneType}.
++        @param xs: XML Stream to register the route for.
++        @type xs: L{EventDispatcher<utility.EventDispatcher>}.
++        """
++        self.routes[destination] = xs
++        xs.addObserver('/*', self.route)
++
++
++    def removeRoute(self, destination, xs):
++        """
++        Remove a route.
++
++        @param destination: Destination of the route that should be removed.
++        @type destination: C{str}.
++        @param xs: XML Stream to remove the route for.
++        @type xs: L{EventDispatcher<utility.EventDispatcher>}.
++        """
++        xs.removeObserver('/*', self.route)
++        if (xs == self.routes[destination]):
++            del self.routes[destination]
++
++
++    def route(self, stanza):
++        """
++        Route a stanza.
++
++        @param stanza: The stanza to be routed.
++        @type stanza: L{domish.Element}.
++        """
++        if not list(stanza.elements()):
++            return
++
++        destination = JID(stanza['to'])
++
++        log.msg("Routing to %s: %r" % (destination.full(), stanza.toXml()))
++
++        if destination.host in self.routes:
++            self.routes[destination.host].send(stanza)
++        else:
++            self.routes[None].send(stanza)
++
++
++
++class ComponentServer(service.Service):
++    """
++    XMPP Component Server service.
++
++    This service accepts XMPP external component connections and makes
++    the router service route traffic for a component's bound domain
++    to that component.
++    """
++
++    logTraffic = False
++
++    def __init__(self, router, port=5347, secret='secret'):
++        self.router = router
++        self.port = port
++        self.secret = secret
++
++        self.factory = xmlstream.XmlStreamServerFactory(
++                ListenComponentAuthenticator, self.secret)
++        self.factory.addBootstrap(xmlstream.STREAM_CONNECTED_EVENT,
++                                  self.makeConnection)
++        self.factory.addBootstrap(xmlstream.STREAM_AUTHD_EVENT,
++                                  self.connectionInitialized)
++
++        self.serial = 0
++
++
++    def startService(self):
++        service.Service.startService(self)
++        reactor.listenTCP(self.port, self.factory)
++
++
++    def makeConnection(self, xs):
++        """
++        Called when a component connection was made.
++
++        This enables traffic debugging on incoming streams.
++        """
++        xs.serial = self.serial
++        self.serial += 1
++
++        def logDataIn(buf):
++            log.msg("RECV (%d): %r" % (xs.serial, buf))
++
++        def logDataOut(buf):
++            log.msg("SEND (%d): %r" % (xs.serial, buf))
++
++        if self.logTraffic:
++            xs.rawDataInFn = logDataIn
++            xs.rawDataOutFn = logDataOut
++
++        xs.addObserver(xmlstream.STREAM_ERROR_EVENT, self.onError)
++
++
++    def connectionInitialized(self, xs):
++        """
++        Called when a component has succesfully authenticated.
++
++        Add the component to the routing table and establish a handler
++        for a closed connection.
++        """
++        destination = xs.thisEntity.host
++
++        self.router.addRoute(destination, xs)
++        xs.addObserver(xmlstream.STREAM_END_EVENT, self.connectionLost, 0,
++                                                   destination, xs)
++
++
++    def onError(self, reason):
++        log.err(reason, "Stream Error")
++
++
++    def connectionLost(self, destination, xs, reason):
++        self.router.removeRoute(destination, xs)
+diff -r 32bd907eefae -r e255d835eef1 twisted/words/protocols/jabber/xmlstream.py
+--- a/twisted/words/protocols/jabber/xmlstream.py	Fri Sep 12 16:30:24 2008 +0200
++++ b/twisted/words/protocols/jabber/xmlstream.py	Fri Sep 12 22:14:26 2008 +0200
+@@ -13,7 +13,7 @@
+ 
+ from zope.interface import directlyProvides, implements
+ 
+-from twisted.internet import defer
++from twisted.internet import defer, protocol
+ from twisted.internet.error import ConnectionLost
+ from twisted.python import failure, log
+ from twisted.words.protocols.jabber import error, ijabber, jid
+@@ -57,9 +57,7 @@
+     Rules:
+       1. The Authenticator MUST dispatch a L{STREAM_AUTHD_EVENT} when the
+          stream has been completely initialized.
+-      2. The Authenticator SHOULD reset all state information when
+-         L{associateWithStream} is called.
+-      3. The Authenticator SHOULD override L{streamStarted}, and start
++      2. The Authenticator SHOULD override L{streamStarted}, and start
+          initialization there.
+ 
+     @type xmlstream: L{XmlStream}
+@@ -70,8 +68,8 @@
+            of XML stanzas.
+     """
+ 
+-    def __init__(self):
+-        self.xmlstream = None
++    def __init__(self, xs):
++        self.xmlstream = xs
+ 
+ 
+     def connectionMade(self):
+@@ -116,23 +114,6 @@
+         self.xmlstream.version = min(self.xmlstream.version, version)
+ 
+ 
+-    def associateWithStream(self, xmlstream):
+-        """
+-        Called by the XmlStreamFactory when a connection has been made
+-        to the requested peer, and an XmlStream object has been
+-        instantiated.
+-
+-        The default implementation just saves a handle to the new
+-        XmlStream.
+-
+-        @type xmlstream: L{XmlStream}
+-        @param xmlstream: The XmlStream that will be passing events to this
+-                          Authenticator.
+-
+-        """
+-        self.xmlstream = xmlstream
+-
+-
+ 
+ class ConnectAuthenticator(Authenticator):
+     """
+@@ -141,7 +122,8 @@
+ 
+     namespace = None
+ 
+-    def __init__(self, otherHost):
++    def __init__(self, xs, otherHost):
++        Authenticator.__init__(self, xs)
+         self.otherHost = otherHost
+ 
+ 
+@@ -240,15 +222,9 @@
+ 
+     namespace = None
+ 
+-    def associateWithStream(self, xmlstream):
+-        """
+-        Called by the XmlStreamFactory when a connection has been made.
+-
+-        Extend L{Authenticator.associateWithStream} to set the L{XmlStream}
+-        to be non-initiating.
+-        """
+-        Authenticator.associateWithStream(self, xmlstream)
+-        self.xmlstream.initiating = False
++    def __init__(self, xs):
++        xs.initiating = False
++        Authenticator.__init__(self, xs)
+ 
+ 
+     def streamStarted(self, rootElement):
+@@ -475,16 +451,13 @@
+ 
+     _headerSent = False     # True if the stream header has been sent
+ 
+-    def __init__(self, authenticator):
++    def __init__(self, authenticatorClass, *args, **kwargs):
+         xmlstream.XmlStream.__init__(self)
+ 
+         self.prefixes = {NS_STREAMS: 'stream'}
+-        self.authenticator = authenticator
+         self.initializers = []
+         self.features = {}
+-
+-        # Reset the authenticator
+-        authenticator.associateWithStream(self)
++        self.authenticator = authenticatorClass(self, *args, **kwargs)
+ 
+ 
+     def _callLater(self, *args, **kwargs):
+@@ -639,17 +612,19 @@
+ class XmlStreamFactory(xmlstream.XmlStreamFactory):
+     """
+     Factory for Jabber XmlStream objects as a reconnecting client.
+-
+-    Note that this differs from L{xmlstream.XmlStreamFactory} in that
+-    it generates Jabber specific L{XmlStream} instances that have
+-    authenticators.
+     """
+ 
+     protocol = XmlStream
+ 
+-    def __init__(self, authenticator):
+-        xmlstream.XmlStreamFactory.__init__(self, authenticator)
+-        self.authenticator = authenticator
++
++
++class XmlStreamServerFactory(xmlstream.XmlStreamFactoryMixin,
++                             protocol.ServerFactory):
++    """
++    Factory for Jabber XmlStream objects as a server.
++    """
++
++    protocol = XmlStream
+ 
+ 
+ 
+diff -r 32bd907eefae -r e255d835eef1 twisted/words/test/test_jabberclient.py
+--- a/twisted/words/test/test_jabberclient.py	Fri Sep 12 16:30:24 2008 +0200
++++ b/twisted/words/test/test_jabberclient.py	Fri Sep 12 22:14:26 2008 +0200
+@@ -1,4 +1,4 @@
+-# Copyright (c) 2001-2007 Twisted Matrix Laboratories.
++# Copyright (c) 2001-2008 Twisted Matrix Laboratories.
+ # See LICENSE for details.
+ 
+ """
+@@ -12,8 +12,7 @@
+ 
+ class CheckVersionInitializerTest(unittest.TestCase):
+     def setUp(self):
+-        a = xmlstream.Authenticator()
+-        xs = xmlstream.XmlStream(a)
++        xs = xmlstream.XmlStream(xmlstream.Authenticator)
+         self.init = client.CheckVersionInitializer(xs)
+ 
+     def testSupported(self):
+@@ -35,8 +34,8 @@
+ class InitiatingInitializerHarness(object):
+     def setUp(self):
+         self.output = []
+-        self.authenticator = xmlstream.ConnectAuthenticator('example.org')
+-        self.xmlstream = xmlstream.XmlStream(self.authenticator)
++        self.xmlstream = xmlstream.XmlStream(xmlstream.ConnectAuthenticator,
++                                             'example.org')
+         self.xmlstream.send = self.output.append
+         self.xmlstream.connectionMade()
+         self.xmlstream.dataReceived("<stream:stream xmlns='jabber:client' "
+@@ -48,8 +47,8 @@
+     def setUp(self):
+         super(IQAuthInitializerTest, self).setUp()
+         self.init = client.IQAuthInitializer(self.xmlstream)
+-        self.authenticator.jid = jid.JID('user@example.com/resource')
+-        self.authenticator.password = 'secret'
++        self.xmlstream.authenticator.jid = jid.JID('user@example.com/resource')
++        self.xmlstream.authenticator.password = 'secret'
+ 
+     def testBasic(self):
+         """
+@@ -158,7 +157,7 @@
+     def setUp(self):
+         super(BindInitializerTest, self).setUp()
+         self.init = client.BindInitializer(self.xmlstream)
+-        self.authenticator.jid = jid.JID('user@example.com/resource')
++        self.xmlstream.authenticator.jid = jid.JID('user@example.com/resource')
+ 
+     def testBasic(self):
+         """
+@@ -168,7 +167,7 @@
+         """
+         def cb(result):
+             self.assertEquals(jid.JID('user@example.com/other resource'),
+-                              self.authenticator.jid)
++                              self.xmlstream.authenticator.jid)
+ 
+         d = self.init.start().addCallback(cb)
+         iq = self.output[-1]
+diff -r 32bd907eefae -r e255d835eef1 twisted/words/test/test_jabbercomponent.py
+--- a/twisted/words/test/test_jabbercomponent.py	Fri Sep 12 16:30:24 2008 +0200
++++ b/twisted/words/test/test_jabbercomponent.py	Fri Sep 12 22:14:26 2008 +0200
+@@ -1,4 +1,4 @@
+-# Copyright (c) 2001-2007 Twisted Matrix Laboratories.
++# Copyright (c) 2001-2008 Twisted Matrix Laboratories.
+ # See LICENSE for details.
+ 
+ """
+@@ -6,11 +6,14 @@
+ """
+ 
+ import sha
++
++from twisted.python import failure
++from twisted.test import proto_helpers
+ from twisted.trial import unittest
+-
+-from twisted.words.protocols.jabber import component
+-from twisted.words.protocols import jabber
+-from twisted.words.protocols.jabber import xmlstream
++from twisted.words.protocols.jabber import component, xmlstream
++from twisted.words.protocols.jabber.jid import JID
++from twisted.words.xish import domish
++from twisted.words.xish.utility import XmlPipe
+ 
+ class DummyTransport:
+     def __init__(self, list):
+@@ -23,9 +26,8 @@
+     def setUp(self):
+         self.output = []
+ 
+-        self.authenticator = xmlstream.Authenticator()
+-        self.authenticator.password = 'secret'
+-        self.xmlstream = xmlstream.XmlStream(self.authenticator)
++        self.xmlstream = xmlstream.XmlStream(xmlstream.Authenticator)
++        self.xmlstream.authenticator.password = 'secret'
+         self.xmlstream.namespace = 'test:component'
+         self.xmlstream.send = self.output.append
+         self.xmlstream.connectionMade()
+@@ -66,8 +68,8 @@
+         self.authComplete = False
+         outlist = []
+ 
+-        ca = component.ConnectComponentAuthenticator("cjid", "secret")
+-        xs = xmlstream.XmlStream(ca)
++        xs = xmlstream.XmlStream(component.ConnectComponentAuthenticator,
++                                 "cjid", "secret")
+         xs.transport = DummyTransport(outlist)
+ 
+         xs.addObserver(xmlstream.STREAM_AUTHD_EVENT,
+@@ -87,7 +89,7 @@
+         self.assertEquals(self.authComplete, True)
+ 
+ 
+-class JabberServiceHarness(jabber.component.Service):
++class JabberServiceHarness(component.Service):
+     def __init__(self):
+         self.componentConnectedFlag = False
+         self.componentDisconnectedFlag = False
+@@ -106,7 +108,7 @@
+ class TestJabberServiceManager(unittest.TestCase):
+     def testSM(self):
+         # Setup service manager and test harnes
+-        sm = jabber.component.ServiceManager("foo", "password")
++        sm = component.ServiceManager("foo", "password")
+         svc = JabberServiceHarness()
+         svc.setServiceParent(sm)
+ 
+@@ -135,3 +137,252 @@
+ 
+         # Ensure the test service harness got notified
+         self.assertEquals(True, svc.componentDisconnectedFlag)
++
++
++
++class RouterServiceTest(unittest.TestCase):
++    """
++    Tests for L{component.RouterService}.
++    """
++
++    def test_addRoute(self):
++        """
++        Test route registration and routing on incoming stanzas.
++        """
++        router = component.RouterService()
++        routed = []
++        router.route = lambda element: routed.append(element)
++
++        pipe = XmlPipe()
++        router.addRoute('example.org', pipe.sink)
++        self.assertEquals(1, len(router.routes))
++        self.assertEquals(pipe.sink, router.routes['example.org'])
++
++        element = domish.Element(('testns', 'test'))
++        pipe.source.send(element)
++        self.assertEquals([element], routed)
++
++
++    def test_route(self):
++        """
++        Test routing of a message.
++        """
++        component1 = XmlPipe()
++        component2 = XmlPipe()
++        router = component.RouterService()
++        router.addRoute('component1.example.org', component1.sink)
++        router.addRoute('component2.example.org', component2.sink)
++
++        outgoing = []
++        component2.source.addObserver('/*',
++                                      lambda element: outgoing.append(element))
++        stanza = domish.Element((None, 'route'))
++        stanza['from'] = 'component1.example.org'
++        stanza['to'] = 'component2.example.org'
++        stanza.addElement('presence')
++        component1.source.send(stanza)
++        self.assertEquals([stanza], outgoing)
++
++
++    def test_routeDefault(self):
++        """
++        Test routing of a message using the default route.
++
++        The default route is the one with C{None} as its key in the
++        routing table. It is taken when there is no more specific route
++        in the routing table that matches the stanza's destination.
++        """
++        component1 = XmlPipe()
++        s2s = XmlPipe()
++        router = component.RouterService()
++        router.addRoute('component1.example.org', component1.sink)
++        router.addRoute(None, s2s.sink)
++
++        outgoing = []
++        s2s.source.addObserver('/*', lambda element: outgoing.append(element))
++        stanza = domish.Element((None, 'route'))
++        stanza['from'] = 'component1.example.org'
++        stanza['to'] = 'example.com'
++        stanza.addElement('presence')
++        component1.source.send(stanza)
++        self.assertEquals([stanza], outgoing)
++
++
++
++class ListenComponentAuthenticatorTest(unittest.TestCase):
++    """
++    Tests for L{component.ListenComponentAuthenticator}.
++    """
++
++    def setUp(self):
++        self.output = []
++        authenticator = component.ListenComponentAuthenticator
++        self.xmlstream = xmlstream.XmlStream(authenticator, 'secret')
++        self.xmlstream.send = self.output.append
++
++
++    def loseConnection(self):
++        """
++        Stub loseConnection because we are a transport.
++        """
++        self.xmlstream.connectionLost("no reason")
++
++
++    def test_streamStarted(self):
++        observers = []
++
++        def addOnetimeObserver(event, observerfn):
++            observers.append((event, observerfn))
++
++        xs = self.xmlstream
++        xs.addOnetimeObserver = addOnetimeObserver
++
++        xs.makeConnection(self)
++        self.assertIdentical(None, xs.sid)
++        self.assertFalse(xs._headerSent)
++
++        xs.dataReceived("<stream:stream xmlns='jabber:component:accept' "
++                         "xmlns:stream='http://etherx.jabber.org/streams' "
++                         "to='component.example.org'>")
++        self.assertEqual((0, 0), xs.version)
++        self.assertNotIdentical(None, xs.sid)
++        self.assertTrue(xs._headerSent)
++        self.assertEquals(('/*', xs.authenticator.onElement), observers[-1])
++
++
++    def test_streamStartedWrongNamespace(self):
++        """
++        The received stream header should have a correct namespace.
++        """
++        streamErrors = []
++
++        xs = self.xmlstream
++        xs.sendStreamError = streamErrors.append
++        xs.makeConnection(self)
++        xs.dataReceived("<stream:stream xmlns='jabber:client' "
++                         "xmlns:stream='http://etherx.jabber.org/streams' "
++                         "to='component.example.org'>")
++        self.assertEquals(1, len(streamErrors))
++        self.assertEquals('invalid-namespace', streamErrors[-1].condition)
++
++
++    def test_streamStartedNoTo(self):
++        streamErrors = []
++
++        xs = self.xmlstream
++        xs.sendStreamError = streamErrors.append
++        xs.makeConnection(self)
++        xs.dataReceived("<stream:stream xmlns='jabber:component:accept' "
++                         "xmlns:stream='http://etherx.jabber.org/streams'>")
++        self.assertEquals(1, len(streamErrors))
++        self.assertEquals('improper-addressing', streamErrors[-1].condition)
++
++
++    def test_onElement(self):
++        """
++        We expect a handshake element with a hash.
++        """
++        handshakes = []
++
++        xs = self.xmlstream
++        xs.authenticator.onHandshake = handshakes.append
++
++        handshake = domish.Element(('jabber:component:accept', 'handshake'))
++        handshake.addContent('1234')
++        xs.authenticator.onElement(handshake)
++        self.assertEqual('1234', handshakes[-1])
++
++    def test_onHandshake(self):
++        xs = self.xmlstream
++        xs.sid = '1234'
++        theHash = '32532c0f7dbf1253c095b18b18e36d38d94c1256'
++        xs.authenticator.onHandshake(theHash)
++        self.assertEqual('<handshake/>', self.output[-1])
++
++
++    def test_onHandshakeWrongHash(self):
++        streamErrors = []
++        authd = []
++
++        def authenticated(self, xs):
++            authd.append(xs)
++
++        xs = self.xmlstream
++        xs.addOnetimeObserver(xmlstream.STREAM_AUTHD_EVENT, authenticated)
++        xs.sendStreamError = streamErrors.append
++
++        xs.sid = '1234'
++        theHash = '1234'
++        xs.authenticator.onHandshake(theHash)
++        self.assertEquals('not-authorized', streamErrors[-1].condition)
++        self.assertEquals(0, len(authd))
++
++
++
++class ComponentServerTest(unittest.TestCase):
++    """
++    Tests for L{component.ComponentServer}.
++    """
++
++    def setUp(self):
++        self.router = component.RouterService()
++        self.server = component.ComponentServer(self.router)
++        self.xmlstream = self.server.factory.buildProtocol(None)
++        self.xmlstream.thisEntity = JID('component.example.org')
++
++
++    def test_makeConnection(self):
++        """
++        A new connection increases the stream serial count. No logs by default.
++        """
++        self.xmlstream.dispatch(self.xmlstream,
++                                xmlstream.STREAM_CONNECTED_EVENT)
++        self.assertEqual(0, self.xmlstream.serial)
++        self.assertEqual(1, self.server.serial)
++        self.assertIdentical(None, self.xmlstream.rawDataInFn)
++        self.assertIdentical(None, self.xmlstream.rawDataOutFn)
++
++
++    def test_makeConnectionLogTraffic(self):
++        """
++        Setting logTraffic should set up raw data loggers.
++        """
++        self.server.logTraffic = True
++        self.xmlstream.dispatch(self.xmlstream,
++                                xmlstream.STREAM_CONNECTED_EVENT)
++        self.assertNotIdentical(None, self.xmlstream.rawDataInFn)
++        self.assertNotIdentical(None, self.xmlstream.rawDataOutFn)
++
++
++    def test_onError(self):
++        """
++        An observer for stream errors should trigger onError to log it.
++        """
++        self.xmlstream.dispatch(self.xmlstream,
++                                xmlstream.STREAM_CONNECTED_EVENT)
++
++        class TestError(Exception):
++            pass
++
++        reason = failure.Failure(TestError())
++        self.xmlstream.dispatch(reason, xmlstream.STREAM_ERROR_EVENT)
++        self.assertEqual(1, len(self.flushLoggedErrors(TestError)))
++
++
++    def test_connectionInitialized(self):
++        """
++        Make sure a new stream is added to the routing table.
++        """
++        self.xmlstream.dispatch(self.xmlstream, xmlstream.STREAM_AUTHD_EVENT)
++        self.assertIn('component.example.org', self.router.routes)
++        self.assertIdentical(self.xmlstream,
++                             self.router.routes['component.example.org'])
++
++
++    def test_connectionLost(self):
++        """
++        Make sure a stream is removed from the routing table on disconnect.
++        """
++        self.xmlstream.dispatch(self.xmlstream, xmlstream.STREAM_AUTHD_EVENT)
++        self.xmlstream.dispatch(None, xmlstream.STREAM_END_EVENT)
++        self.assertNotIn('component.example.org', self.router.routes)
+diff -r 32bd907eefae -r e255d835eef1 twisted/words/test/test_jabbersasl.py
+--- a/twisted/words/test/test_jabbersasl.py	Fri Sep 12 16:30:24 2008 +0200
++++ b/twisted/words/test/test_jabbersasl.py	Fri Sep 12 22:14:26 2008 +0200
+@@ -1,4 +1,4 @@
+-# Copyright (c) 2001-2007 Twisted Matrix Laboratories.
++# Copyright (c) 2001-2008 Twisted Matrix Laboratories.
+ # See LICENSE for details.
+ 
+ from zope.interface import implements
+@@ -60,8 +60,7 @@
+     def setUp(self):
+         self.output = []
+ 
+-        self.authenticator = xmlstream.Authenticator()
+-        self.xmlstream = xmlstream.XmlStream(self.authenticator)
++        self.xmlstream = xmlstream.XmlStream(xmlstream.Authenticator)
+         self.xmlstream.send = self.output.append
+         self.xmlstream.connectionMade()
+         self.xmlstream.dataReceived("<stream:stream xmlns='jabber:client' "
+diff -r 32bd907eefae -r e255d835eef1 twisted/words/test/test_jabberxmlstream.py
+--- a/twisted/words/test/test_jabberxmlstream.py	Fri Sep 12 16:30:24 2008 +0200
++++ b/twisted/words/test/test_jabberxmlstream.py	Fri Sep 12 22:14:26 2008 +0200
+@@ -27,10 +27,10 @@
+     """
+ 
+     def setUp(self):
+-        authenticator = xmlstream.ConnectAuthenticator('otherhost')
+-        authenticator.namespace = 'testns'
+-        self.xmlstream = xmlstream.XmlStream(authenticator)
++        self.xmlstream = xmlstream.XmlStream(xmlstream.ConnectAuthenticator,
++                                             'otherhost')
+         self.clock = task.Clock()
++        self.xmlstream.authenticator.namespace = 'testns'
+         self.xmlstream._callLater = self.clock.callLater
+         self.xmlstream.makeConnection(proto_helpers.StringTransport())
+         self.xmlstream.dataReceived(
+@@ -206,7 +206,7 @@
+         self.gotStreamStart = False
+         self.gotStreamEnd = False
+         self.gotStreamError = False
+-        xs = xmlstream.XmlStream(xmlstream.Authenticator())
++        xs = xmlstream.XmlStream(xmlstream.Authenticator)
+         xs.addObserver('//event/stream/start', self.onStreamStart)
+         xs.addObserver('//event/stream/end', self.onStreamEnd)
+         xs.addObserver('//event/stream/error', self.onStreamError)
+@@ -395,19 +395,14 @@
+         streamStartedCalls = []
+         associateWithStreamCalls = []
+ 
+-        class TestAuthenticator:
++        class TestAuthenticator(xmlstream.Authenticator):
+             def connectionMade(self):
+                 connectionMadeCalls.append(None)
+ 
+             def streamStarted(self, rootElement):
+                 streamStartedCalls.append(rootElement)
+ 
+-            def associateWithStream(self, xs):
+-                associateWithStreamCalls.append(xs)
+-
+-        a = TestAuthenticator()
+-        xs = xmlstream.XmlStream(a)
+-        self.assertEqual([xs], associateWithStreamCalls)
++        xs = xmlstream.XmlStream(TestAuthenticator)
+         xs.connectionMade()
+         self.assertEqual([None], connectionMadeCalls)
+         xs.dataReceived("<stream:stream xmlns='jabber:client' "
+@@ -426,8 +421,7 @@
+ 
+ class AuthenticatorTest(unittest.TestCase):
+     def setUp(self):
+-        self.authenticator = xmlstream.ListenAuthenticator()
+-        self.xmlstream = xmlstream.XmlStream(self.authenticator)
++        self.xmlstream = xmlstream.XmlStream(xmlstream.ListenAuthenticator)
+ 
+ 
+     def test_streamStart(self):
+@@ -493,8 +487,8 @@
+     def setUp(self):
+         self.gotAuthenticated = False
+         self.initFailure = None
+-        self.authenticator = xmlstream.ConnectAuthenticator('otherHost')
+-        self.xmlstream = xmlstream.XmlStream(self.authenticator)
++        self.xmlstream = xmlstream.XmlStream(xmlstream.ConnectAuthenticator,
++                                             'otherHost')
+         self.xmlstream.addObserver('//event/stream/authd', self.onAuthenticated)
+         self.xmlstream.addObserver('//event/xmpp/initfailed', self.onInitFailed)
+ 
+@@ -518,7 +512,7 @@
+         init = Initializer()
+         self.xmlstream.initializers = [init]
+ 
+-        self.authenticator.initializeStream()
++        self.xmlstream.authenticator.initializeStream()
+         self.assertEqual([], self.xmlstream.initializers)
+         self.assertTrue(self.gotAuthenticated)
+ 
+@@ -534,7 +528,7 @@
+         init = Initializer()
+         self.xmlstream.initializers = [init]
+ 
+-        self.authenticator.initializeStream()
++        self.xmlstream.authenticator.initializeStream()
+         self.assertEqual([init], self.xmlstream.initializers)
+         self.assertFalse(self.gotAuthenticated)
+         self.assertNotIdentical(None, self.initFailure)
+@@ -546,7 +540,7 @@
+         Test streamStart to fill the appropriate attributes from the
+         stream header.
+         """
+-        self.authenticator.namespace = 'testns'
++        self.xmlstream.authenticator.namespace = 'testns'
+         xs = self.xmlstream
+         xs.makeConnection(proto_helpers.StringTransport())
+         xs.dataReceived("<stream:stream xmlns='jabber:client' "
+@@ -569,8 +563,7 @@
+ 
+ class ListenAuthenticatorTest(unittest.TestCase):
+     def setUp(self):
+-        self.authenticator = xmlstream.ListenAuthenticator()
+-        self.xmlstream = xmlstream.XmlStream(self.authenticator)
++        self.xmlstream = xmlstream.XmlStream(xmlstream.ListenAuthenticator)
+ 
+ 
+     def test_streamStart(self):
+@@ -599,8 +592,7 @@
+ 
+         self.savedSSL = xmlstream.ssl
+ 
+-        self.authenticator = xmlstream.Authenticator()
+-        self.xmlstream = xmlstream.XmlStream(self.authenticator)
++        self.xmlstream = xmlstream.XmlStream(xmlstream.Authenticator)
+         self.xmlstream.send = self.output.append
+         self.xmlstream.connectionMade()
+         self.xmlstream.dataReceived("<stream:stream xmlns='jabber:client' "
+@@ -720,7 +712,7 @@
+ class BaseFeatureInitiatingInitializerTest(unittest.TestCase):
+ 
+     def setUp(self):
+-        self.xmlstream = xmlstream.XmlStream(xmlstream.Authenticator())
++        self.xmlstream = xmlstream.XmlStream(xmlstream.Authenticator)
+         self.init = TestFeatureInitializer(self.xmlstream)
+ 
+ 
+@@ -894,7 +886,7 @@
+                 self.doneMade = True
+ 
+         handler = TestXMPPHandler()
+-        xs = xmlstream.XmlStream(xmlstream.Authenticator())
++        xs = xmlstream.XmlStream(xmlstream.Authenticator)
+         handler.makeConnection(xs)
+         self.assertTrue(handler.doneMade)
+         self.assertIdentical(xs, handler.xmlstream)
+@@ -905,7 +897,7 @@
+         Test that connectionLost forgets the XML stream.
+         """
+         handler = xmlstream.XMPPHandler()
+-        xs = xmlstream.XmlStream(xmlstream.Authenticator())
++        xs = xmlstream.XmlStream(xmlstream.Authenticator)
+         handler.makeConnection(xs)
+         handler.connectionLost(Exception())
+         self.assertIdentical(None, handler.xmlstream)
+@@ -985,7 +977,7 @@
+         sm = self.streamManager
+         handler = DummyXMPPHandler()
+         handler.setHandlerParent(sm)
+-        xs = xmlstream.XmlStream(xmlstream.Authenticator())
++        xs = xmlstream.XmlStream(xmlstream.Authenticator)
+         sm._connected(xs)
+         self.assertEquals(1, handler.doneMade)
+         self.assertEquals(0, handler.doneInitialized)
+@@ -999,7 +991,7 @@
+         sm = self.streamManager
+         handler = DummyXMPPHandler()
+         handler.setHandlerParent(sm)
+-        xs = xmlstream.XmlStream(xmlstream.Authenticator())
++        xs = xmlstream.XmlStream(xmlstream.Authenticator)
+         sm._connected(xs)
+         self.assertIdentical(None, xs.rawDataInFn)
+         self.assertIdentical(None, xs.rawDataOutFn)
+@@ -1013,7 +1005,7 @@
+         sm.logTraffic = True
+         handler = DummyXMPPHandler()
+         handler.setHandlerParent(sm)
+-        xs = xmlstream.XmlStream(xmlstream.Authenticator())
++        xs = xmlstream.XmlStream(xmlstream.Authenticator)
+         sm._connected(xs)
+         self.assertNotIdentical(None, xs.rawDataInFn)
+         self.assertNotIdentical(None, xs.rawDataOutFn)
+@@ -1027,7 +1019,7 @@
+         sm = self.streamManager
+         handler = DummyXMPPHandler()
+         handler.setHandlerParent(sm)
+-        xs = xmlstream.XmlStream(xmlstream.Authenticator())
++        xs = xmlstream.XmlStream(xmlstream.Authenticator)
+         sm._authd(xs)
+         self.assertEquals(0, handler.doneMade)
+         self.assertEquals(1, handler.doneInitialized)
+@@ -1042,7 +1034,7 @@
+         sm = self.streamManager
+         handler = DummyXMPPHandler()
+         handler.setHandlerParent(sm)
+-        xs = xmlstream.XmlStream(xmlstream.Authenticator())
++        xs = xmlstream.XmlStream(xmlstream.Authenticator)
+         sm._disconnected(xs)
+         self.assertEquals(0, handler.doneMade)
+         self.assertEquals(0, handler.doneInitialized)
+@@ -1072,7 +1064,7 @@
+         called.
+         """
+         sm = self.streamManager
+-        xs = xmlstream.XmlStream(xmlstream.Authenticator())
++        xs = xmlstream.XmlStream(xmlstream.Authenticator)
+         sm._connected(xs)
+         sm._authd(xs)
+         handler = DummyXMPPHandler()
+@@ -1089,7 +1081,7 @@
+ 
+         The data should be sent directly over the XML stream.
+         """
+-        factory = xmlstream.XmlStreamFactory(xmlstream.Authenticator())
++        factory = xmlstream.XmlStreamFactory(xmlstream.Authenticator)
+         sm = xmlstream.StreamManager(factory)
+         xs = factory.buildProtocol(None)
+         xs.transport = proto_helpers.StringTransport()
+@@ -1109,7 +1101,7 @@
+         The data should be cached until an XML stream has been established and
+         initialized.
+         """
+-        factory = xmlstream.XmlStreamFactory(xmlstream.Authenticator())
++        factory = xmlstream.XmlStreamFactory(xmlstream.Authenticator)
+         sm = xmlstream.StreamManager(factory)
+         handler = DummyXMPPHandler()
+         sm.addHandler(handler)
+@@ -1139,7 +1131,7 @@
+ 
+         The data should be cached until the XML stream has been initialized.
+         """
+-        factory = xmlstream.XmlStreamFactory(xmlstream.Authenticator())
++        factory = xmlstream.XmlStreamFactory(xmlstream.Authenticator)
+         sm = xmlstream.StreamManager(factory)
+         xs = factory.buildProtocol(None)
+         xs.transport = proto_helpers.StringTransport()
+@@ -1159,7 +1151,7 @@
+         The data should be cached until a new XML stream has been established
+         and initialized.
+         """
+-        factory = xmlstream.XmlStreamFactory(xmlstream.Authenticator())
++        factory = xmlstream.XmlStreamFactory(xmlstream.Authenticator)
+         sm = xmlstream.StreamManager(factory)
+         handler = DummyXMPPHandler()
+         sm.addHandler(handler)
+diff -r 32bd907eefae -r e255d835eef1 twisted/words/test/test_xmlstream.py
+--- a/twisted/words/test/test_xmlstream.py	Fri Sep 12 16:30:24 2008 +0200
++++ b/twisted/words/test/test_xmlstream.py	Fri Sep 12 22:14:26 2008 +0200
+@@ -1,4 +1,4 @@
+-# Copyright (c) 2001-2007 Twisted Matrix Laboratories.
++# Copyright (c) 2001-2008 Twisted Matrix Laboratories.
+ # See LICENSE for details.
+ 
+ """
+@@ -7,53 +7,76 @@
+ 
+ from twisted.internet import defer, protocol
+ from twisted.trial import unittest
+-from twisted.words.xish import utility, xmlstream
++from twisted.words.xish import domish, utility, xmlstream
+ 
+ class XmlStreamTest(unittest.TestCase):
+     def setUp(self):
+-        self.errorOccurred = False
+-        self.streamStarted = False
+-        self.streamEnded = False
+         self.outlist = []
+         self.xmlstream = xmlstream.XmlStream()
+         self.xmlstream.transport = self
+         self.xmlstream.transport.write = self.outlist.append
+ 
+-    # Auxilary methods
++
+     def loseConnection(self):
++        """
++        Stub loseConnection because we are a transport.
++        """
+         self.xmlstream.connectionLost("no reason")
+ 
+-    def streamStartEvent(self, rootelem):
+-        self.streamStarted = True
+ 
+-    def streamErrorEvent(self, errelem):
+-        self.errorOccurred = True
+-
+-    def streamEndEvent(self, _):
+-        self.streamEnded = True
+-
+-    def testBasicOp(self):
+-        xs = self.xmlstream
+-        xs.addObserver(xmlstream.STREAM_START_EVENT,
+-                       self.streamStartEvent)
+-        xs.addObserver(xmlstream.STREAM_ERROR_EVENT,
+-                       self.streamErrorEvent)
+-        xs.addObserver(xmlstream.STREAM_END_EVENT,
+-                       self.streamEndEvent)
+-
+-        # Go...
+-        xs.connectionMade()
+-        xs.send("<root>")
++    def test_send(self):
++        """
++        Sending data should result into it being written to the transport.
++        """
++        self.xmlstream.connectionMade()
++        self.xmlstream.send("<root>")
+         self.assertEquals(self.outlist[0], "<root>")
+ 
+-        xs.dataReceived("<root>")
+-        self.assertEquals(self.streamStarted, True)
+ 
+-        self.assertEquals(self.errorOccurred, False)
+-        self.assertEquals(self.streamEnded, False)
+-        xs.dataReceived("<child><unclosed></child>")
+-        self.assertEquals(self.errorOccurred, True)
+-        self.assertEquals(self.streamEnded, True)
++    def test_receiveRoot(self):
++        """
++        Receiving the starttag of the root element results in stream start.
++        """
++        streamStarted = []
++
++        def streamStartEvent(rootelem):
++            streamStarted.append(None)
++
++        self.xmlstream.addObserver(xmlstream.STREAM_START_EVENT,
++                                   streamStartEvent)
++        self.xmlstream.connectionMade()
++        self.xmlstream.dataReceived("<root>")
++        self.assertEquals(1, len(streamStarted))
++
++
++    def test_receiveBadXML(self):
++        """
++        Receiving malformed XML should result in in error.
++        """
++        streamError = []
++        streamEnd = []
++
++        def streamErrorEvent(reason):
++            streamError.append(reason)
++
++        def streamEndEvent(_):
++            streamEnd.append(None)
++
++        self.xmlstream.addObserver(xmlstream.STREAM_ERROR_EVENT,
++                                   streamErrorEvent)
++        self.xmlstream.addObserver(xmlstream.STREAM_END_EVENT,
++                                   streamEndEvent)
++        self.xmlstream.connectionMade()
++
++        self.xmlstream.dataReceived("<root>")
++        self.assertEquals(0, len(streamError))
++        self.assertEquals(0, len(streamEnd))
++
++        self.xmlstream.dataReceived("<child><unclosed></child>")
++        self.assertEquals(1, len(streamError))
++        self.assertTrue(streamError[0].check(domish.ParserError))
++        self.assertEquals(1, len(streamEnd))
++
+ 
+ 
+ class DummyProtocol(protocol.Protocol, utility.EventDispatcher):
+diff -r 32bd907eefae -r e255d835eef1 twisted/words/xish/xmlstream.py
+--- a/twisted/words/xish/xmlstream.py	Fri Sep 12 16:30:24 2008 +0200
++++ b/twisted/words/xish/xmlstream.py	Fri Sep 12 22:14:26 2008 +0200
+@@ -1,6 +1,6 @@
+ # -*- test-case-name: twisted.words.test.test_xmlstream -*-
+ #
+-# Copyright (c) 2001-2007 Twisted Matrix Laboratories.
++# Copyright (c) 2001-2008 Twisted Matrix Laboratories.
+ # See LICENSE for details.
+ 
+ """
+@@ -16,6 +16,7 @@
+ Maintainer: Ralph Meijer
+ """
+ 
++from twisted.python import failure
+ from twisted.internet import protocol
+ from twisted.words.xish import domish, utility
+ 
+@@ -73,7 +74,7 @@
+                 self.rawDataInFn(data)
+             self.stream.parse(data)
+         except domish.ParserError:
+-            self.dispatch(self, STREAM_ERROR_EVENT)
++            self.dispatch(failure.Failure(), STREAM_ERROR_EVENT)
+             self.transport.loseConnection()
+ 
+     def connectionLost(self, reason):

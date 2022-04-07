@@ -1,0 +1,988 @@
+=== added file 'twisted/plugins/twisted_runner.py'
+--- twisted/plugins/twisted_runner.py	1970-01-01 00:00:00 +0000
++++ twisted/plugins/twisted_runner.py	2010-03-07 13:53:37 +0000
+@@ -0,0 +1,10 @@
++# Copyright (c) 2001-2010 Twisted Matrix Laboratories.
++# See LICENSE for details.
++
++from twisted.application.service import ServiceMaker
++
++TwistedProcmon = ServiceMaker(
++    "Twisted Process Monitor",
++    "twisted.runner.procmontap",
++    ("A process watchdog / supervisor"),
++    "procmon")
+
+=== modified file 'twisted/runner/procmon.py'
+--- twisted/runner/procmon.py	2010-02-23 23:46:04 +0000
++++ twisted/runner/procmon.py	2010-03-07 13:47:36 +0000
+@@ -1,3 +1,4 @@
++# -*- test-case-name: twisted.runner.test.test_procmon -*-
+ # Copyright (c) 2001-2010 Twisted Matrix Laboratories.
+ # See LICENSE for details.
+ 
+@@ -61,7 +62,7 @@
+     run will reset the counter.
+ 
+     The primary interface is L{addProcess} and L{removeProcess}. When the
+-    service is active (that is, when the application it is attached to is
++    service is running (that is, when the application it is attached to is
+     running), adding a process automatically starts it.
+ 
+     Each process has a name. This name string must uniquely identify the
+@@ -77,6 +78,14 @@
+         order before it gets killed with an unmaskable signal. The default value
+         is 5 seconds.
+ 
++    @type minRestartDelay: C{float}
++    @ivar minRestartDelay: The minimum time (in seconds) to wait before
++        attempting to restart a process. Default 1s.
++
++    @type maxRestartDelay: C{float}
++    @ivar maxRestartDelay: The maximum time (in seconds) to wait before
++        attempting to restart a process. Default 3600s (1h).
++
+     @type _reactor: L{IReactorProcess}
+     @ivar _reactor: An implementor of L{IReactorProcess} and
+         L{IReactorTime} which will be used to spawn processes and
+@@ -84,8 +93,10 @@
+ 
+     """
+     threshold = 1
+-    active = 0
+     killTime = 5
++    minRestartDelay = 1
++    maxRestartDelay = 3600
++
+ 
+     def __init__(self, reactor=_reactor):
+         self._reactor = reactor
+@@ -95,30 +106,29 @@
+         self.delay = {}
+         self.timeStarted = {}
+         self.murder = {}
++        self.restart = {}
+ 
+ 
+     def __getstate__(self):
+         dct = service.Service.__getstate__(self)
+-        for k in ('active',):
+-            if dct.has_key(k):
+-                del dct[k]
+         dct['protocols'] = {}
+         dct['delay'] = {}
+         dct['timeStarted'] = {}
+         dct['murder'] = {}
++        dct['restart'] = {}
+         return dct
+ 
+ 
+     def addProcess(self, name, args, uid=None, gid=None, env={}):
+         """
+         Add a new monitored process and start it immediately if the
+-        L{ProcessMonitor} service is active.
++        L{ProcessMonitor} service is running.
+ 
+         Note that args are passed to the system call, not to the shell. If
+         running the shell is desired, the common idiom is to use
+         L{ProcessMonitor.addProcess("name", ['/bin/sh', '-c', shell_script])}
+ 
+-        @param name: A label for this process.  This value must be
++        @param name: A name for this process.  This value must be
+             unique across all processes added to this monitor.
+         @type name: C{str}
+         @param args: The argv sequence for the process to launch.
+@@ -137,7 +147,8 @@
+         if name in self.processes:
+             raise KeyError("remove %s first" % (name,))
+         self.processes[name] = args, uid, gid, env
+-        if self.active:
++        self.delay[name] = self.minRestartDelay
++        if self.running:
+             self.startProcess(name)
+ 
+ 
+@@ -147,10 +158,10 @@
+         processes.
+ 
+         @type name: C{str}
+-        @param name: The string that uniquely identifies the process.
++        @param name: A string that uniquely identifies the process.
+         """
++        self.stopProcess(name)
+         del self.processes[name]
+-        self.stopProcess(name)
+ 
+ 
+     def startService(self):
+@@ -158,63 +169,70 @@
+         Start all monitored processes.
+         """
+         service.Service.startService(self)
+-        self.active = 1
+-        for name in self.processes.keys():
+-            self._reactor.callLater(0, self.startProcess, name)
++        for name in self.processes:
++            self.startProcess(name)
+ 
+ 
+     def stopService(self):
+         """
+-        Stop all monitored processes.
++        Stop all monitored processes and cancel all scheduled process restarts.
+         """
+         service.Service.stopService(self)
+-        self.active = 0
+-        for name in self.processes.keys():
++
++        # Cancel any outstanding restarts
++        for name, delayedCall in self.restart.items():
++            if delayedCall.active():
++                delayedCall.cancel()
++
++        for name in self.processes:
+             self.stopProcess(name)
+ 
+ 
+     def connectionLost(self, name):
+         """
+         Called when a monitored processes exits. If
+-        L{ProcessMonitor.active} is C{True} (ie the service is started), the
++        L{ProcessMonitor.running} is C{True} (ie the service is started), the
+         process will be restarted.
+         If the process had been running for more than
+         L{ProcessMonitor.threshold} seconds it will be restarted immediately.
+         If the process had been running for less than
+-        L{ProcessMonitor.threshold} seconds the restart will be delayed, and
++        L{ProcessMonitor.threshold} seconds, the restart will be delayed and
+         each time the process dies before the configured threshold, the restart
+-        delay will be doubled - up to a maximum delay of 1 minute.
++        delay will be doubled - up to a maximum delay of maxRestartDelay sec.
+ 
+         @type name: C{str}
+-        @param name: The string that uniquely identifies the process
++        @param name: A string that uniquely identifies the process
+             which exited.
+         """
+         # Cancel the scheduled _forceStopProcess function if the process
+         # dies naturally
+-        if self.murder.has_key(name):
++        if name in self.murder:
+             if self.murder[name].active():
+                 self.murder[name].cancel()
+             del self.murder[name]
+ 
+-        if self.protocols.has_key(name):
++        if name in self.protocols:
+             del self.protocols[name]
+ 
+         if self._reactor.seconds()-self.timeStarted[name]<self.threshold:
++            nextDelay = min(self.delay[name], self.maxRestartDelay)
+             # The process died too fast - backoff
+-            self.delay[name] = min(max(1, 2*self.delay.get(name, 0)), 3600)
++            self.delay[name] *= 2
+         else:
+             # Process had been running for a significant amount of time
+             # restart immediately
+-            self.delay[name] = 0
++            nextDelay = 0
++            self.delay[name] = self.minRestartDelay
+ 
+         # Schedule a process restart if the service is running
+-        if self.active and self.processes.has_key(name):
+-            self._reactor.callLater(self.delay[name], self.startProcess, name)
+-
++        if self.running and name in self.processes:
++            self.restart[name] = self._reactor.callLater(nextDelay,
++                                                         self.startProcess,
++                                                         name)
+ 
+     def startProcess(self, name):
+         """
+-        @param name: The keyname of the process to be started
++        @param name: The name of the process to be started
+         """
+         # If a protocol instance already exists, it means the process is
+         # already running
+@@ -244,17 +262,22 @@
+ 
+     def stopProcess(self, name):
+         """
+-        @param name: The keyname of the process to be stopped
++        @param name: The name of the process to be stopped
+         """
+-        proc = self.protocols[name].transport
+-        try:
+-            proc.signalProcess('TERM')
+-        except error.ProcessExitedAlready:
+-            pass
+-        else:
+-            self.murder[name] = self._reactor.callLater(
+-                                        self.killTime,
+-                                        self._forceStopProcess, proc)
++        if name not in self.processes:
++            raise KeyError('Unrecognized process name: %s' % (name,))
++
++        proto = self.protocols.get(name, None)
++        if proto is not None:
++            proc = proto.transport
++            try:
++                proc.signalProcess('TERM')
++            except error.ProcessExitedAlready:
++                pass
++            else:
++                self.murder[name] = self._reactor.callLater(
++                                            self.killTime,
++                                            self._forceStopProcess, proc)
+ 
+ 
+     def restartAll(self):
+@@ -264,7 +287,7 @@
+         in circumstances -- for example, a new version of a library is
+         installed.
+         """
+-        for name in self.processes.keys():
++        for name in self.processes:
+             self.stopProcess(name)
+ 
+ 
+
+=== added file 'twisted/runner/procmontap.py'
+--- twisted/runner/procmontap.py	1970-01-01 00:00:00 +0000
++++ twisted/runner/procmontap.py	2010-03-07 14:48:43 +0000
+@@ -0,0 +1,73 @@
++# -*- test-case-name: twisted.runner.test.test_procmontap -*-
++# Copyright (c) 2001-2010 Twisted Matrix Laboratories.
++# See LICENSE for details.
++
++"""
++Support for creating a service which runs a process monitor.
++"""
++
++# Twisted Imports
++from twisted.python import usage
++from twisted.runner.procmon import ProcessMonitor
++
++
++class Options(usage.Options):
++    """
++    Define the options accepted by the I{twistd procmon} plugin.
++    """
++    synopsis = "[procmon options] commandline"
++
++    optParameters = [["threshold", "t", 1, "How long a process has to live "
++                      "before the death is considered instant, in seconds.",
++                      float],
++                     ["killtime", "k", 5, "How long a process being killed "
++                      "has to get its affairs in order before it gets killed "
++                      "with an unmaskable signal.",
++                      float],
++                     ["minrestartdelay", "m", 1, "The minimum time (in seconds) "
++                      "to wait before attempting to restart a process",
++                      float],
++                     ["maxrestartdelay", "M", 3600, "The maximum time (in "
++                      "seconds) to wait before attempting to restart a process",
++                      float]]
++
++    optFlags = []
++
++    zsh_actions = {}
++
++
++    longdesc = """\
++ProcessMonitor runs processes, monitors their progress, and restarts them
++when they die.
++
++The ProcessMonitor will not attempt to restart a process that appears to die
++instantly -- with each "instant" death (less than 1 second, by default), it
++will delay approximately twice as long before restarting it. A successful
++run will reset the counter.
++
++Eg twistd procmon sleep 10"""
++
++    def parseArgs(self, *args):
++        """
++        Grab the command line that is going to be started and monitored
++        """
++        self['args'] = args
++
++    def postOptions(self):
++        """
++        Check for dependencies.
++        """
++        if len(self["args"]) < 1:
++            raise usage.UsageError("Please specify a process commandline")
++
++
++def makeService(config):
++    s = ProcessMonitor()
++
++    s.threshold = config["threshold"]
++    s.killTime = config["killtime"]
++    s.minRestartDelay = config["minrestartdelay"]
++    s.maxRestartDelay = config["maxrestartdelay"]
++
++    s.addProcess(" ".join(config["args"]), config["args"])
++    return s
+
+=== modified file 'twisted/runner/test/test_procmon.py'
+--- twisted/runner/test/test_procmon.py	2010-02-23 23:46:04 +0000
++++ twisted/runner/test/test_procmon.py	2010-03-07 13:47:09 +0000
+@@ -12,6 +12,89 @@
+ from twisted.test.proto_helpers import MemoryReactor
+ 
+ 
++
++class DummyProcess(object):
++    """
++    An incomplete and fake L{IProcessTransport} implementation for testing
++    """
++
++    pid = None
++    status = None
++    lostProcess = 0
++    proto = None
++
++    _terminationDelay = 1
++    _signalProcessHandler = None
++
++    def __init__(self, reactor, executable, args, environment, path,
++                 proto, uid=None, gid=None, usePTY=0, childFDs=None):
++
++        self.proto = proto
++
++        self._reactor = reactor
++        self._executable = executable
++        self._args = args
++        self._environment = environment
++        self._path = path
++        self._uid = uid
++        self._gid = gid
++        self._usePTY = usePTY
++        self._childFDs = childFDs
++
++
++    def signalProcess(self, signalID):
++        """
++        A partial implentation of signalProcess
++
++        @ivar signalID: The signal name or number to be issued to the process.
++        @type signalID: C{int} or C{str}
++        """
++        params = {
++            "TERM": (self._terminationDelay, 0),
++            "KILL": (0, 1)
++        }
++
++        if self._signalProcessHandler and self._signalProcessHandler.active():
++            self._signalProcessHandler.cancel()
++
++        if signalID in params:
++            delay, status = params[signalID]
++            self._signalHandler = self._reactor.callLater(
++                                    delay,
++                                    self.proto.processEnded,
++                                    error.ProcessDone(status))
++
++
++
++class DummyProcessReactor(MemoryReactor, Clock):
++    """
++    @ivar spawnedProcesses: a list that keeps track of the fake process
++    instances built by C{spawnProcess}.
++    @type spawnedProcesses: C{list}
++    """
++    def __init__(self):
++        MemoryReactor.__init__(self)
++        Clock.__init__(self)
++
++        self.spawnedProcesses = []
++
++
++    def spawnProcess(self, processProtocol, executable, args=(), env={},
++                     path=None, uid=None, gid=None, usePTY=0,
++                     childFDs=None):
++        """
++        Fake L{reactor.spawnProcess}, that logs all the process
++        arguments and returns a L{DummyProcess}.
++        """
++
++        proc = DummyProcess(self, executable, args, env, path,
++                            processProtocol, uid, gid, usePTY, childFDs)
++        processProtocol.makeConnection(proc)
++        self.spawnedProcesses.append(proc)
++        return proc
++
++
++
+ class ProcmonTests(unittest.TestCase):
+     """
+     Tests for L{ProcessMonitor}.
+@@ -21,13 +104,10 @@
+         """
+         Create an L{ProcessMonitor} wrapped around a fake reactor.
+         """
+-        class Reactor(MemoryReactor, Clock):
+-            def __init__(self):
+-                MemoryReactor.__init__(self)
+-                Clock.__init__(self)
+-
+-        self.reactor = Reactor()
++        self.reactor = DummyProcessReactor()
+         self.pm = ProcessMonitor(reactor=self.reactor)
++        self.pm.minRestartDelay = 2
++        self.pm.maxRestartDelay = 15
+         self.pm.threshold = 10
+ 
+ 
+@@ -35,8 +115,6 @@
+         """
+         L{ProcessMonitor.addProcess} only starts the named program if
+         L{ProcessMonitor.startService} has been called.
+-        L{ProcessMonitor.addProcess} raises a C{KeyError} if a process with the
+-        given name already exists.
+         """
+ 
+         self.pm.addProcess("foo", ["arg1", "arg2"],
+@@ -47,6 +125,16 @@
+         self.pm.startService()
+         self.reactor.advance(0)
+         self.assertEquals(self.pm.protocols.keys(), ["foo"])
++
++
++    def test_addProcessDuplicateKeyError(self):
++        """
++        L{ProcessMonitor.addProcess} raises a C{KeyError} if a process with the
++        given name already exists.
++        """
++
++        self.pm.addProcess("foo", ["arg1", "arg2"],
++                           uid=1, gid=2, env={})
+         self.assertRaises(KeyError, self.pm.addProcess,
+                           "foo", ["arg1", "arg2"], uid=1, gid=2, env={})
+ 
+@@ -66,55 +154,71 @@
+ 
+     def test_removeProcess(self):
+         """
+-        L{ProcessMonitor.removeProcess} raises a C{KeyError} if the given
+-        process name isn't recognised and removes the process from the public
++        L{ProcessMonitor.removeProcess} removes the process from the public
+         processes list.
+         """
+         self.pm.startService()
+-        self.assertRaises(KeyError, self.pm.removeProcess, "foo")
+         self.pm.addProcess("foo", ["foo"])
+         self.assertEquals(len(self.pm.processes), 1)
+         self.pm.removeProcess("foo")
+         self.assertEquals(len(self.pm.processes), 0)
+ 
+ 
++    def test_removeProcessUnknownKeyError(self):
++        """
++        L{ProcessMonitor.removeProcess} raises a C{KeyError} if the given
++        process name isn't recognised.
++        """
++        self.pm.startService()
++        self.assertRaises(KeyError, self.pm.removeProcess, "foo")
++
++
+     def test_startProcess(self):
+         """
+-        L{ProcessMonitor.startProcess} raises a C{KeyError} if the given
+-        process name isn't recognised, returns C{None} and can be called
+-        multiple times without consequence.
+         When a process has been started, an instance of L{LoggingProtocol} will
+         be added to the L{ProcessMonitor.protocols} dict and the start time of
+         the process will be recorded in the L{ProcessMonitor.timeStarted}
+         dictionary.
+         """
++        self.pm.addProcess("foo", ["foo"])
++        self.pm.startProcess("foo")
++        self.assertIsInstance(self.pm.protocols["foo"], LoggingProtocol)
++        self.assertIn("foo", self.pm.timeStarted.keys())
++
++
++    def test_startProcessUnknownKeyError(self):
++        """
++        L{ProcessMonitor.startProcess} raises a C{KeyError} if the given
++        process name isn't recognised.
++        """
+         self.assertRaises(KeyError, self.pm.startProcess, "foo")
+-        self.pm.addProcess("foo", ["foo"])
+-        return_val = self.pm.startProcess("foo")
+-        self.assertEquals(return_val, None)
+-        return_val = self.pm.startProcess("foo")
+-        self.assertEquals(return_val, None)
+-        self.assertTrue(isinstance(self.pm.protocols["foo"],
+-                                   LoggingProtocol))
+-
+-        self.assertIn("foo", self.pm.timeStarted.keys())
+ 
+ 
+     def test_stopProcessNaturalTermination(self):
+         """
+-        L{ProcessMonitor.stopProcess} raises a C{KeyError} if the given process
+-        name isn't recognised and immediately sends a TERM signal to the named
+-        process.
++        L{ProcessMonitor.stopProcess} immediately sends a TERM signal to the
++        named process.
+         """
+-        self.assertRaises(KeyError, self.pm.stopProcess, "foo")
+         self.pm.startService()
+         self.pm.addProcess("foo", ["foo"])
+         self.assertIn("foo", self.pm.protocols)
++
++        # Configure fake process to die 1 second after receiving term signal
++        timeToDie = self.pm.protocols["foo"].transport._terminationDelay = 1
++        # Save the next restart delay value for this process.
++        nextDelay = self.pm.delay["foo"]
++
++        # Advance the reactor to just before the short lived process threshold
++        # and leave enough time for the process to die
+         self.reactor.advance(self.pm.threshold)
++        # Then signal the process to stop
+         self.pm.stopProcess("foo")
+-        # The fake process will die 1 second after receiving the signal
+-        self.reactor.advance(1)
+-        # We expect it to be immediately restarted
++
++        # Advance the reactor just enough to give the process time to die and
++        # verify that the process restarts
++        self.reactor.advance(timeToDie)
++
++        # We expect it to be restarted immediately
+         self.assertEqual(self.reactor.seconds(),
+                          self.pm.timeStarted["foo"])
+ 
+@@ -124,7 +228,6 @@
+         L{ProcessMonitor.stopProcess} kills a process which fails to terminate
+         naturally within L{ProcessMonitor.killTime} seconds.
+         """
+-        self.assertRaises(KeyError, self.pm.stopProcess, "foo")
+         self.pm.startService()
+         self.pm.addProcess("foo", ["foo"])
+         self.assertIn("foo", self.pm.protocols)
+@@ -143,13 +246,31 @@
+         self.assertEqual(self.reactor.seconds(), self.pm.timeStarted["foo"])
+ 
+ 
++    def test_stopProcessUnknownKeyError(self):
++        """
++        L{ProcessMonitor.stopProcess} raises a C{KeyError} if the given process
++        name isn't recognised.
++        """
++        self.assertRaises(KeyError, self.pm.stopProcess, "foo")
++
++
++    def test_stopProcessAlreadyStopped(self):
++        """
++        L{ProcessMonitor.stopProcess} silently returns if the named process
++        is already stopped. eg Process has crashed and a restart has been
++        rescheduled, but in the meantime, the service is stopped.
++        """
++        self.pm.addProcess("foo", ["foo"])
++        self.assertIdentical(None, self.pm.stopProcess("foo"))
++
++
+     def test_connectionLostLongLivedProcess(self):
+         """
+         L{ProcessMonitor.connectionLost} should immediately restart a process
+         if it has been running longer than L{ProcessMonitor.threshold} seconds.
+         """
+         self.pm.addProcess("foo", ["foo"])
+-        # Shedule the process to start
++        # Schedule the process to start
+         self.pm.startService()
+         # advance the reactor to start the process
+         self.reactor.advance(0)
+@@ -163,6 +284,7 @@
+         self.reactor.advance(0)
+         self.assertIn("foo", self.pm.protocols)
+ 
++
+     def test_connectionLostShortLivedProcess(self):
+         """
+         L{ProcessMonitor.connectionLost} postpone restarting a process if it
+@@ -170,48 +292,71 @@
+         backing off each time the process dies too quickly.
+         """
+         self.pm.addProcess("foo", ["foo"])
+-        # Shedule the process to start
++        # Schedule the process to start
+         self.pm.startService()
+-        # advance the reactor to start the process
+-        self.reactor.advance(0)
++
++        # Advance to within 1s of the threshold, process should have started
++        self.reactor.advance(self.pm.threshold - 1) #9s
+         self.assertIn("foo", self.pm.protocols)
+ 
+-        # process dies once after a short time
+-        self.reactor.advance(self.pm.threshold-1)
++        # process dies within the threshold and should not restart immediately
+         self.pm.protocols["foo"].processEnded(error.ProcessDone(0))
++        self.assertNotIn("foo", self.pm.protocols)
+ 
+-        self.reactor.advance(0)
+         # The process won't have been restarted, we have to wait
+-        # initially for 1 second
+-        delay = 1
+-        self.assertNotIn("foo", self.pm.protocols)
+-        self.reactor.advance(delay)
+-        self.assertIn("foo", self.pm.protocols)
+-
+-        # Process dies again - quickly
+-        self.reactor.advance(self.pm.threshold-1)
+-        self.pm.protocols["foo"].processEnded(error.ProcessDone(0))
+-        self.assertNotIn("foo", self.pm.protocols)
+-
+-        # This scheduled restart should backoff - we don't expect the
+-        # process yet
+-        # The restart delay has doubled
+-        delay *= 2
+-        self.reactor.advance(delay-1)
+-        self.assertNotIn("foo", self.pm.protocols)
+-        self.reactor.advance(1)
+-        self.assertIn("foo", self.pm.protocols)
+-
+-        # Die quickly once more
+-        self.reactor.advance(self.pm.threshold-1)
+-        self.pm.protocols["foo"].processEnded(error.ProcessDone(0))
+-        self.assertNotIn("foo", self.pm.protocols)
+-
+-        # Backoff again
+-        delay *= 2
+-        self.reactor.advance(delay-1)
+-        self.assertNotIn("foo", self.pm.protocols)
+-        self.reactor.advance(1)
++        # initially for minRestartDelay seconds (2)
++        nextRestartdelay = self.pm.minRestartDelay
++        self.reactor.advance(nextRestartdelay) #11s
++        self.assertIn("foo", self.pm.protocols)
++
++        # Advance to within 1s of the threshold and kill the process
++        self.reactor.advance(self.pm.threshold - 1) #20s
++        self.assertEquals(self.reactor.seconds(), 20)
++
++        nextRestartDelay = self.pm.delay["foo"]
++        self.assertEquals(nextRestartDelay, 4)
++
++        self.pm.protocols["foo"].processEnded(error.ProcessDone(0))
++        self.assertNotIn("foo", self.pm.protocols)
++
++        # Advance to within 1s of the restart time and test that the process is
++        # restarted in the following second.
++        self.reactor.advance(nextRestartDelay - 1) #23s
++        self.assertNotIn("foo", self.pm.protocols)
++
++        self.reactor.advance(1) #24s
++        self.assertIn("foo", self.pm.protocols)
++
++        # Advance to within 1s of the threshold and kill the process
++        self.reactor.advance(self.pm.threshold - 1) #33s
++
++        nextRestartDelay = self.pm.delay["foo"]
++        self.assertEquals(nextRestartDelay, 8)
++
++        self.pm.protocols["foo"].processEnded(error.ProcessDone(0))
++        self.assertNotIn("foo", self.pm.protocols)
++
++        # Advance to within 1s of the expected restart time and test that
++        # process is restarted in the following second.
++        self.reactor.advance(nextRestartDelay - 1) #40
++        self.assertNotIn("foo", self.pm.protocols)
++        self.reactor.advance(1) #41s
++        self.assertIn("foo", self.pm.protocols)
++
++        # Advance to within 1s of the threshold and kill the process
++        self.reactor.advance(self.pm.threshold - 1) #50s
++
++        nextRestartDelay = self.pm.delay["foo"]
++        self.assertEquals(nextRestartDelay, 16)
++
++        self.pm.protocols["foo"].processEnded(error.ProcessDone(0))
++        self.assertNotIn("foo", self.pm.protocols)
++
++        # Advance to within 1s of the expected restart time. This time, the
++        # restart delay has reached 16s which is above the configured
++        # maxRestartTime (15s). So this time we find that the process has been
++        # restarted already.
++        self.reactor.advance(nextRestartDelay-1) #65s
+         self.assertIn("foo", self.pm.protocols)
+ 
+ 
+@@ -220,7 +365,7 @@
+         L{ProcessMonitor.startService} starts all monitored processes.
+         """
+         self.pm.addProcess("foo", ["foo"])
+-        # Shedule the process to start
++        # Schedule the process to start
+         self.pm.startService()
+         # advance the reactor to start the process
+         self.reactor.advance(0)
+@@ -233,7 +378,7 @@
+         """
+         self.pm.addProcess("foo", ["foo"])
+         self.pm.addProcess("bar", ["bar"])
+-        # Shedule the process to start
++        # Schedule the process to start
+         self.pm.startService()
+         # advance the reactor to start the processes
+         self.reactor.advance(self.pm.threshold)
+@@ -248,3 +393,27 @@
+         self.reactor.advance(self.pm.killTime + 1)
+         # The processes shouldn't be restarted
+         self.assertEquals({}, self.pm.protocols)
++
++
++    def test_stopServiceCleanupScheduledRestarts(self):
++        """
++        L{ProcessMonitor.stopService} should cancel all scheduled process
++        restarts.
++        """
++        self.pm.threshold = 5
++        self.pm.minRestartDelay = 5
++        # Start service and add a process (started immediately)
++        self.pm.startService()
++        self.pm.addProcess("foo", ["foo"])
++        # Stop the process after 1s
++        self.reactor.advance(1)
++        self.pm.stopProcess("foo")
++        # Wait 1s for it to exit it will be scheduled to restart 5s later
++        self.reactor.advance(1)
++        # Meanwhile stop the service
++        self.pm.stopService()
++        # Advance to beyond the process restart time
++        self.reactor.advance(6)
++        # The process shouldn't have restarted because stopService has cancelled
++        # all pending process restarts.
++        self.assertEqual(self.pm.protocols, {})
+
+=== added file 'twisted/runner/test/test_procmontap.py'
+--- twisted/runner/test/test_procmontap.py	1970-01-01 00:00:00 +0000
++++ twisted/runner/test/test_procmontap.py	2010-03-07 15:06:22 +0000
+@@ -0,0 +1,82 @@
++# Copyright (c) 2001-2010 Twisted Matrix Laboratories.
++# See LICENSE for details.
++
++"""
++Tests for L{twisted.runner.procmontap}.
++"""
++
++from twisted.python.usage import UsageError
++from twisted.trial import unittest
++from twisted.runner.procmon import ProcessMonitor
++from twisted.runner import procmontap as tap
++
++
++class ProcessMonitorTapTest(unittest.TestCase):
++
++    def test_commandLineRequired(self):
++        """
++        The command line arguments must be provided.
++        """
++        opt = tap.Options()
++        self.assertRaises(UsageError, opt.parseOptions, [])
++
++
++    def test_threshold(self):
++        """
++        The threshold option is recognised as a parameter and coerced to float.
++        """
++        opt = tap.Options()
++        opt.parseOptions(['--threshold', '7.5', 'foo'])
++        self.assertEquals(opt['threshold'], 7.5)
++
++
++    def test_killTime(self):
++        """
++        The killtime option is recognised as a parameter and coerced to float.
++        """
++        opt = tap.Options()
++        opt.parseOptions(['--killtime', '7.5', 'foo'])
++        self.assertEquals(opt['killtime'], 7.5)
++
++
++    def test_minRestartDelay(self):
++        """
++        The minrestartdelay option is recognised as a parameter and coerced to
++        float.
++        """
++        opt = tap.Options()
++        opt.parseOptions(['--minrestartdelay', '7.5', 'foo'])
++        self.assertEquals(opt['minrestartdelay'], 7.5)
++
++
++    def test_maxRestartDelay(self):
++        """
++        The maxrestartdelay option is recognised as a parameter and coerced to
++        float.
++        """
++        opt = tap.Options()
++        opt.parseOptions(['--maxrestartdelay', '7.5', 'foo'])
++        self.assertEquals(opt['maxrestartdelay'], 7.5)
++
++
++    def test_parameterDefaults(self):
++        """
++        The parameters all have default values
++        """
++        opt = tap.Options()
++        opt.parseOptions(['foo'])
++        self.assertEquals(opt['threshold'], 1)
++        self.assertEquals(opt['killtime'], 5)
++        self.assertEquals(opt['minrestartdelay'], 1)
++        self.assertEquals(opt['maxrestartdelay'], 3600)
++
++
++    def test_makeService(self):
++        """
++        The command line gets added as a process to the ProcessMontor.
++        """
++        opt = tap.Options()
++        opt.parseOptions(['ping', '-c', '3', '8.8.8.8'])
++        s = tap.makeService(opt)
++        self.assertIsInstance(s, ProcessMonitor)
++        self.assertIn('ping -c 3 8.8.8.8', s.processes)
+
+=== added file 'twisted/runner/topfiles/1763.misc'
+--- twisted/runner/topfiles/1763.misc	1970-01-01 00:00:00 +0000
++++ twisted/runner/topfiles/1763.misc	2010-03-06 21:46:43 +0000
+@@ -0,0 +1,2 @@
++Remove the ProcessMonitor.active attribute and instead use the standard
++Service.running attribute from the base class.
+
+=== added file 'twisted/runner/topfiles/3775.misc'
+--- twisted/runner/topfiles/3775.misc	1970-01-01 00:00:00 +0000
++++ twisted/runner/topfiles/3775.misc	2010-03-06 21:38:29 +0000
+@@ -0,0 +1,3 @@
++Parameterize the reactor in twisted.runner.procmon.ProcessMonitor for ease of
++testing.
++Add tests for twisted.runner.procmon.ProcessMonitor.
+
+=== added file 'twisted/runner/topfiles/4356.feature'
+--- twisted/runner/topfiles/4356.feature	1970-01-01 00:00:00 +0000
++++ twisted/runner/topfiles/4356.feature	2010-03-07 15:29:29 +0000
+@@ -0,0 +1,2 @@
++twistd now has a procmon subcommand - a convenient way to monitor and
++automatically restart another process.
+
+=== modified file 'twisted/test/proto_helpers.py'
+--- twisted/test/proto_helpers.py	2010-02-23 23:46:04 +0000
++++ twisted/test/proto_helpers.py	2010-02-24 22:23:25 +0000
+@@ -13,7 +13,7 @@
+ 
+ from twisted.internet.interfaces import IConsumer, IPushProducer
+ from twisted.internet.interfaces import ITransport
+-from twisted.internet.interfaces import IReactorProcess, IReactorTCP
++from twisted.internet.interfaces import IReactorTCP
+ from twisted.protocols import basic
+ from twisted.internet import protocol, error
+ 
+@@ -260,59 +260,6 @@
+         """
+ 
+ 
+-class DummyProcess(object):
+-    """
+-    An incomplete and fake L{IProcessTransport} implementation for testing
+-    """
+-
+-    pid = None
+-    status = None
+-    lostProcess = 0
+-    proto = None
+-
+-    _terminationDelay = 1
+-    _signalProcessHandler = None
+-
+-    def __init__(self, reactor, executable, args, environment, path,
+-                 proto, uid=None, gid=None, usePTY=0, childFDs=None):
+-
+-        self.proto = proto
+-
+-        self._reactor = reactor
+-        self._executable = executable
+-        self._args = args
+-        self._environment = environment
+-        self._path = path
+-        self._uid = uid
+-        self._gid = gid
+-        self._usePTY = usePTY
+-        self._childFDs = childFDs
+-
+-
+-    def signalProcess(self, signalID):
+-        """
+-        A partial implentation of signalProcess
+-
+-        @ivar signalID: The signal name or number to be issued to the process.
+-        @type signalID: C{int} or C{str}
+-        """
+-        params = {
+-            "TERM": (self._terminationDelay, 0),
+-            "KILL": (0, 1)
+-        }
+-
+-        if self._signalProcessHandler and self._signalProcessHandler.active():
+-            self._signalProcessHandler.cancel()
+-
+-        if signalID in params:
+-            delay, status = params[signalID]
+-            self._signalHandler = self._reactor.callLater(
+-                                    delay,
+-                                    self.proto.processEnded,
+-                                    error.ProcessDone(status))
+-
+-
+-
+ class MemoryReactor(object):
+     """
+     A fake reactor to be used in tests.  This reactor doesn't actually do
+@@ -326,12 +273,8 @@
+     @ivar tcpServers: a list that keeps track of server listen attempts (ie, calls
+         to C{listenTCP}).
+     @type tcpServers: C{list}
+-
+-    @ivar spawnedProcesses: a list that keeps track of the fake process
+-        instances built by C{spawnProcess}.
+-    @type spawnedProcesses: C{list}
+     """
+-    implements(IReactorProcess, IReactorTCP)
++    implements(IReactorTCP)
+ 
+     def __init__(self):
+         """
+@@ -339,7 +282,6 @@
+         """
+         self.tcpClients = []
+         self.tcpServers = []
+-        self.spawnedProcesses = []
+ 
+ 
+     def listenTCP(self, port, factory, backlog=50, interface=''):
+@@ -356,22 +298,7 @@
+         self.tcpClients.append((host, port, factory, timeout, bindAddress))
+ 
+ 
+-    def spawnProcess(self, processProtocol, executable, args=(), env={},
+-                     path=None, uid=None, gid=None, usePTY=0,
+-                     childFDs=None):
+-        """
+-        Fake L{reactor.spawnProcess}, that logs all the process
+-        arguments and returns a L{DummyProcess}.
+-        """
+-
+-        proc = DummyProcess(self, executable, args, env, path,
+-                            processProtocol, uid, gid, usePTY, childFDs)
+-        processProtocol.makeConnection(proc)
+-        self.spawnedProcesses.append(proc)
+-        return proc
+-
+ 
+ _memoryReactor = MemoryReactor()
+ verifyObject(IReactorTCP, _memoryReactor)
+-verifyObject(IReactorProcess, _memoryReactor)
+ del _memoryReactor
+

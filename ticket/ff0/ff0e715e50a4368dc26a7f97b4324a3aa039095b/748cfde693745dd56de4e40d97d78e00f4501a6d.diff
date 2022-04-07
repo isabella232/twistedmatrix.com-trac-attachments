@@ -1,0 +1,92 @@
+diff -ru twisted-old/conch/ssh/forwarding.py twisted/conch/ssh/forwarding.py
+--- twisted-old/conch/ssh/forwarding.py	2011-02-14 04:45:15.000000000 +0000
++++ twisted/conch/ssh/forwarding.py	2015-01-18 13:44:16.000000000 +0100
+@@ -73,9 +73,10 @@
+         self.clientBuf = ''
+ 
+     def channelOpen(self, specificData):
+-        cc = protocol.ClientCreator(reactor, SSHForwardingClient, self)
+         log.msg("connecting to %s:%i" % self.hostport)
+-        cc.connectTCP(*self.hostport).addCallbacks(self._setClient, self._close)
++        ep = HostnameEndpoint(reactor, self.hostport[0], self.hostport[1])
++        d = ep.connect(SSHForwardingClientFactory(self))
++        d.addCallbacks(self._setClient, self._close)
+ 
+     def _setClient(self, client):
+         self.client = client
+@@ -130,6 +131,15 @@
+             self.channel = None
+ 
+ 
++class SSHForwardingClientFactory(protocol.Factory):
++
++    channel = None
++    def __init__(self, channel):
++        self.channel = channel
++    def buildProtocol(self, addr):
++        return SSHForwardingClient(self.channel)
++
++
+ def packOpen_direct_tcpip((connHost, connPort), (origHost, origPort)):
+     """Pack the data suitable for sending in a CHANNEL_OPEN packet.
+     """
+diff -ru twisted-old/conch/test/test_conch.py twisted/conch/test/test_conch.py
+--- twisted-old/conch/test/test_conch.py	2012-01-15 02:23:55.613313858 +0000
++++ twisted/conch/test/test_conch.py	2015-01-18 15:07:14.776638856 +0100
+@@ -311,7 +311,8 @@
+         self.conchFactory.expectedLoseConnection = 1
+         self.conchServer = reactor.listenTCP(0, self.conchFactory,
+                                              interface="127.0.0.1")
+-        self.echoServer = reactor.listenTCP(0, EchoFactory())
++        self.echoServer = reactor.listenTCP(0, EchoFactory(),
++                                             interface="::")
+         self.echoPort = self.echoServer.getHost().port
+ 
+ 
+@@ -381,6 +382,37 @@
+ 
+ 
+ 
++class ForwardingMixinV6(ConchServerSetupMixin):
++    """
++    Template class for tests of the Conch server's ability to forward arbitrary
++    IPv6 protocols over SSH.
++
++    These tests are integration tests, not unit tests. They launch a Conch
++    server, a custom TCP server (just an L{EchoProtocol}) and then call
++    L{execute}.
++
++    L{execute} is implemented by subclasses of L{ForwardingMixin}. It should
++    cause an SSH client to connect to the Conch server, asking it to forward
++    data to the custom TCP server.
++    """
++
++    def test_localToRemoteForwardingV6(self):
++        """
++        Test that we can use whatever client to forward a local port to a
++        specified port on the IPv6 server.
++        """
++        localPort = self._getFreePort()
++        process = ConchTestForwardingProcess(localPort, 'test\n')
++        d = self.execute('', process,
++                         sshArgs='-N -L%i:[::1]:%i'
++                         % (localPort, self.echoPort))
++        d.addCallback(self.assertEqual, 'test\n')
++        return d
++
++
++
+ class RekeyAvatar(ConchUser):
+     """
+     This avatar implements a shell which sends 60 numbered lines to whatever
+@@ -506,8 +536,8 @@
+ 
+ 
+ 
+-class OpenSSHClientForwardingTestCase(ForwardingMixin, OpenSSHClientMixin,
+-                                      unittest.TestCase):
++class OpenSSHClientForwardingTestCase(ForwardingMixin, ForwardingMixinV6,
++                                      OpenSSHClientMixin, unittest.TestCase):
+     """
+     Connection forwarding tests run against the OpenSSL command line client.
+     """

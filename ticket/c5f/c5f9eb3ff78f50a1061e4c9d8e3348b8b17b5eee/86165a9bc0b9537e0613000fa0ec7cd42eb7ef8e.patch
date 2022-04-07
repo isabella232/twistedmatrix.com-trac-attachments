@@ -1,0 +1,331 @@
+diff --git a/doc/core/howto/listings/amp/basic_client.py b/doc/core/howto/listings/amp/basic_client.py
+index 6d99b68..dfbef8d 100644
+--- a/doc/core/howto/listings/amp/basic_client.py
++++ b/doc/core/howto/listings/amp/basic_client.py
+@@ -13,9 +13,7 @@ from twisted.internet.endpoints import TCP4ClientEndpoint
+ 
+ def connect():
+     endpoint = TCP4ClientEndpoint(reactor, "127.0.0.1", 8750)
+-    factory = Factory()
+-    factory.protocol = AMP
+-    return endpoint.connect(factory)
++    return endpoint.connect(Factory.forProtocol(AMP))
+ 
+ 
+ def main():
+diff --git a/doc/words/examples/msn_example.py b/doc/words/examples/msn_example.py
+index dee9035..2df3a1a 100644
+--- a/doc/words/examples/msn_example.py
++++ b/doc/words/examples/msn_example.py
+@@ -29,10 +29,9 @@ To run the script::
+ 
+ 
+ def _createNotificationFac():
+-    fac = msn.NotificationFactory()
++    fac = msn.NotificationFactory.forProtocol(Notification)
+     fac.userHandle = USER_HANDLE
+     fac.password = PASSWORD
+-    fac.protocol = Notification
+     return fac
+ 
+ class Dispatch(msn.DispatchClient):
+diff --git a/twisted/internet/protocol.py b/twisted/internet/protocol.py
+index 4c455bd..2aba51d 100644
+--- a/twisted/internet/protocol.py
++++ b/twisted/internet/protocol.py
+@@ -33,6 +33,21 @@ class Factory:
+     numPorts = 0
+     noisy = True
+ 
++    @classmethod
++    def forProtocol(cls, protocol, *args, **kwargs):
++        """
++        Create a factory for the given protocol.
++
++        Sets the C{protocol} attribute and returns the constructed factory
++        instance.
++
++        @param protocol: a L{Protocol} subclass
++        """
++        factory = cls(*args, **kwargs)
++        factory.protocol = protocol
++        return factory
++
++
+     def logPrefix(self):
+         """
+         Describe this factory for log messages.
+diff --git a/twisted/internet/test/connectionmixins.py b/twisted/internet/test/connectionmixins.py
+index a239f0d..e9c917a 100644
+--- a/twisted/internet/test/connectionmixins.py
++++ b/twisted/internet/test/connectionmixins.py
+@@ -28,23 +28,6 @@ from twisted.test.test_tcp import ClosingProtocol
+ 
+ 
+ 
+-def serverFactoryFor(protocol):
+-    """
+-    Helper function which returns a L{ServerFactory} which will build instances
+-    of C{protocol}.
+-
+-    @param protocol: A callable which returns an L{IProtocol} provider to be
+-        used to handle connections to the port the returned factory listens on.
+-    """
+-    factory = ServerFactory()
+-    factory.protocol = protocol
+-    return factory
+-
+-# ServerFactory is good enough for client endpoints, too.
+-factoryFor = serverFactoryFor
+-
+-
+-
+ def findFreePort(interface='127.0.0.1', family=socket.AF_INET,
+                  type=socket.SOCK_STREAM):
+     """
+@@ -350,14 +333,14 @@ class ConnectionTestsMixin(object):
+         serverConnectionLostDeferred = Deferred()
+         protocol = lambda: ClosingLaterProtocol(serverConnectionLostDeferred)
+         portDeferred = self.endpoints.server(reactor).listen(
+-            serverFactoryFor(protocol))
++            ServerFactory.forProtocol(protocol))
+         def listening(port):
+             msg("Listening on %r" % (port.getHost(),))
+             endpoint = self.endpoints.client(reactor, port.getHost())
+ 
+             lostConnectionDeferred = Deferred()
+             protocol = lambda: ClosingLaterProtocol(lostConnectionDeferred)
+-            client = endpoint.connect(factoryFor(protocol))
++            client = endpoint.connect(ClientFactory.forProtocol(protocol))
+             def write(proto):
+                 msg("About to write to %r" % (proto,))
+                 proto.transport.write(b'x')
+@@ -395,12 +378,13 @@ class ConnectionTestsMixin(object):
+ 
+         reactor = self.buildReactor()
+         portDeferred = self.endpoints.server(reactor).listen(
+-            serverFactoryFor(Protocol))
++            ServerFactory.forProtocol(Protocol))
+         def listening(port):
+             msg("Listening on %r" % (port.getHost(),))
+             endpoint = self.endpoints.client(reactor, port.getHost())
+ 
+-            client = endpoint.connect(factoryFor(lambda: clientProtocol))
++            client = endpoint.connect(
++                ClientFactory.forProtocol(lambda: clientProtocol))
+             def disconnect(proto):
+                 msg("About to disconnect %r" % (proto,))
+                 proto.transport.loseConnection()
+@@ -488,7 +472,7 @@ class StreamClientTestsMixin(object):
+         """
+         reactor = self.buildReactor()
+ 
+-        self.listen(reactor, serverFactoryFor(Protocol))
++        self.listen(reactor, ServerFactory.forProtocol(Protocol))
+         connected = []
+ 
+         class CheckConnection(Protocol):
+@@ -516,7 +500,7 @@ class StreamClientTestsMixin(object):
+         would be necessary if the transport were still connected.
+         """
+         reactor = self.buildReactor()
+-        self.listen(reactor, serverFactoryFor(ClosingProtocol))
++        self.listen(reactor, ServerFactory.forProtocol(ClosingProtocol))
+ 
+         finished = Deferred()
+         finished.addErrback(log.err)
+@@ -578,7 +562,7 @@ class StreamClientTestsMixin(object):
+             def resumeProducing(self):
+                 log.msg("Producer.resumeProducing")
+ 
+-        self.listen(reactor, serverFactoryFor(Protocol))
++        self.listen(reactor, ServerFactory.forProtocol(Protocol))
+ 
+         finished = Deferred()
+         finished.addErrback(log.err)
+diff --git a/twisted/internet/test/test_protocol.py b/twisted/internet/test/test_protocol.py
+index 00d1b8f..0357c37 100644
+--- a/twisted/internet/test/test_protocol.py
++++ b/twisted/internet/test/test_protocol.py
+@@ -11,11 +11,10 @@ from zope.interface.verify import verifyObject
+ from zope.interface import implementer
+ 
+ from twisted.python.failure import Failure
+-from twisted.internet.interfaces import (IProtocol, ILoggingContext,
+-                                         IProtocolFactory, IConsumer)
++from twisted.internet.interfaces import IProtocol, ILoggingContext, IConsumer
+ from twisted.internet.defer import CancelledError
+ from twisted.internet.protocol import (
+-    Protocol, ClientCreator, Factory, ProtocolToConsumerAdapter,
++    Protocol, ClientCreator, ProtocolToConsumerAdapter,
+     ConsumerToProtocolAdapter)
+ from twisted.trial.unittest import TestCase
+ from twisted.test.proto_helpers import MemoryReactorClock, StringTransport
+@@ -338,46 +337,6 @@ class ProtocolTests(TestCase):
+ 
+ 
+ 
+-class FactoryTests(TestCase):
+-    """
+-    Tests for L{protocol.Factory}.
+-    """
+-    def test_interfaces(self):
+-        """
+-        L{Factory} instances provide both L{IProtocolFactory} and
+-        L{ILoggingContext}.
+-        """
+-        factory = Factory()
+-        self.assertTrue(verifyObject(IProtocolFactory, factory))
+-        self.assertTrue(verifyObject(ILoggingContext, factory))
+-
+-
+-    def test_logPrefix(self):
+-        """
+-        L{Factory.logPrefix} returns the name of the factory class.
+-        """
+-        class SomeKindOfFactory(Factory):
+-            pass
+-
+-        self.assertEqual("SomeKindOfFactory", SomeKindOfFactory().logPrefix())
+-
+-
+-    def test_defaultBuildProtocol(self):
+-        """
+-        L{Factory.buildProtocol} by default constructs a protocol by
+-        calling its C{protocol} attribute, and attaches the factory to the
+-        result.
+-        """
+-        class SomeProtocol(Protocol):
+-            pass
+-        f = Factory()
+-        f.protocol = SomeProtocol
+-        protocol = f.buildProtocol(None)
+-        self.assertIsInstance(protocol, SomeProtocol)
+-        self.assertIdentical(protocol.factory, f)
+-
+-
+-
+ class AdapterTests(TestCase):
+     """
+     Tests for L{ProtocolToConsumerAdapter} and L{ConsumerToProtocolAdapter}.
+diff --git a/twisted/internet/test/test_tcp.py b/twisted/internet/test/test_tcp.py
+index 086ff54..2d643a0 100644
+--- a/twisted/internet/test/test_tcp.py
++++ b/twisted/internet/test/test_tcp.py
+@@ -26,7 +26,7 @@ from twisted.internet.error import (
+ from twisted.internet.test.connectionmixins import (
+     LogObserverMixin, ConnectionTestsMixin, StreamClientTestsMixin,
+     findFreePort, ConnectableProtocol, EndpointCreator,
+-    runProtocolsWithReactor, serverFactoryFor, Stop, BrokenContextFactory)
++    runProtocolsWithReactor, Stop, BrokenContextFactory)
+ from twisted.internet.test.reactormixins import (
+     ReactorBuilder, needsRunningReactor)
+ from twisted.internet.interfaces import (
+@@ -508,7 +508,7 @@ class TCPClientTestsBase(ReactorBuilder, ConnectionTestsMixin,
+         reactor.installResolver(FakeResolver({fakeDomain: self.interface}))
+ 
+         server = reactor.listenTCP(
+-            0, serverFactoryFor(Protocol), interface=host)
++            0, ServerFactory.forProtocol(Protocol), interface=host)
+         serverAddress = server.getHost()
+ 
+         transportData = {'host': None, 'peer': None, 'instance': None}
+@@ -560,9 +560,7 @@ class TCPClientTestsBase(ReactorBuilder, ConnectionTestsMixin,
+         brokenFactory = BrokenContextFactory()
+         results = []
+ 
+-        serverFactory = ServerFactory()
+-        serverFactory.protocol = Protocol
+-
++        serverFactory = ServerFactory.forProtocol(Protocol)
+         port = reactor.listenTCP(0, serverFactory, interface=self.interface)
+         endpoint = self.endpoints.client(reactor, port.getHost())
+ 
+diff --git a/twisted/test/test_factories.py b/twisted/test/test_factories.py
+index dffaf5a..8b6c93e 100644
+--- a/twisted/test/test_factories.py
++++ b/twisted/test/test_factories.py
+@@ -9,10 +9,14 @@ from __future__ import division, absolute_import
+ 
+ import pickle
+ 
++from zope.interface.verify import verifyObject
++
+ from twisted.trial.unittest import TestCase
+ 
++from twisted.internet.interfaces import ILoggingContext, IProtocolFactory
+ from twisted.internet.task import Clock
+-from twisted.internet.protocol import ReconnectingClientFactory, Protocol
++from twisted.internet.protocol import (
++    Factory, ReconnectingClientFactory, Protocol)
+ 
+ 
+ class FakeConnector(object):
+@@ -29,6 +33,60 @@ class FakeConnector(object):
+ 
+ 
+ 
++class FactoryTests(TestCase):
++    """
++    Tests for L{protocol.Factory}.
++    """
++    def test_interfaces(self):
++        """
++        L{Factory} instances provide both L{IProtocolFactory} and
++        L{ILoggingContext}.
++        """
++        factory = Factory()
++        self.assertTrue(verifyObject(IProtocolFactory, factory))
++        self.assertTrue(verifyObject(ILoggingContext, factory))
++
++
++    def test_logPrefix(self):
++        """
++        L{Factory.logPrefix} returns the name of the factory class.
++        """
++        class SomeKindOfFactory(Factory):
++            pass
++
++        self.assertEqual("SomeKindOfFactory", SomeKindOfFactory().logPrefix())
++
++
++    def test_defaultBuildProtocol(self):
++        """
++        L{Factory.buildProtocol} by default constructs a protocol by
++        calling its C{protocol} attribute, and attaches the factory to the
++        result.
++        """
++        class SomeProtocol(Protocol):
++            pass
++        f = Factory()
++        f.protocol = SomeProtocol
++        protocol = f.buildProtocol(None)
++        self.assertIsInstance(protocol, SomeProtocol)
++        self.assertIdentical(protocol.factory, f)
++
++    def test_forProtocol(self):
++        """
++        L{Factory.forProtocol} constructs a Factory, passing along any
++        additional arguments, and sets its C{protocol} attribute to the
++        given Protocol subclass.
++        """
++        class ArgTakingFactory(Factory):
++            def __init__(self, *args, **kwargs):
++                self.args, self.kwargs = args, kwargs
++        factory = ArgTakingFactory.forProtocol(Protocol, 1, 2, foo=12)
++        self.assertEqual(factory.protocol, Protocol)
++        self.assertEqual(factory.args, (1, 2))
++        self.assertEqual(factory.kwargs, {"foo" : 12})
++
++
++
+ class ReconnectingFactoryTestCase(TestCase):
+     """
+     Tests for L{ReconnectingClientFactory}.
+diff --git a/twisted/topfiles/5016.feature b/twisted/topfiles/5016.feature
+new file mode 100644
+index 0000000..1dce0cc
+--- /dev/null
++++ b/twisted/topfiles/5016.feature
+@@ -0,0 +1 @@
++Factory now has a forProtocol classmethod that constructs an instance and sets its protocol attribute.

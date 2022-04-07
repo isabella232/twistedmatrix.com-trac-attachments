@@ -1,0 +1,118 @@
+Index: twisted/web/test/test_xmlrpc.py
+===================================================================
+--- twisted/web/test/test_xmlrpc.py	(revision 28673)
++++ twisted/web/test/test_xmlrpc.py	(working copy)
+@@ -128,6 +128,15 @@
+         xmlrpc._QueryFactory.__init__(self, *args, **kwargs)
+ 
+ 
++class TestQueryFactoryCancel(xmlrpc._QueryFactory):
++    """
++    QueryFactory that records connection lost.
++    """
++
++    def startedConnecting(self, connector):
++        self.test_connector = connector
++
++
+ class XMLRPCTestCase(unittest.TestCase):
+ 
+     def setUp(self):
+@@ -149,9 +158,9 @@
+         self.factories.append(factory)
+         return factory
+ 
+-    def proxy(self):
++    def proxy(self, factory=None):
+         p = xmlrpc.Proxy("http://127.0.0.1:%d/" % self.port)
+-        p.queryFactory = self.queryFactory
++        p.queryFactory = factory or self.queryFactory
+         return p
+ 
+     def test_results(self):
+@@ -194,6 +203,21 @@
+         d.addCallback(cb)
+         return d
+ 
++    def test_cancel(self):
++        """
++        Test that a deferred from the Proxy can be cancelled,
++        closing the connection.
++        """
++        def factory(*args, **kw):
++            factory.f = TestQueryFactoryCancel(*args, **kw)
++            return factory.f
++        d = self.proxy(factory).callRemote('add', 2, 3)
++        self.assertNotEquals(factory.f.test_connector.state, "disconnected")
++        d.cancel()
++        self.assertEquals(factory.f.test_connector.state, "disconnected")
++        d = self.assertFailure(d, defer.CancelledError)
++        return d
++
+     def test_errorGet(self):
+         """
+         A classic GET on the xml server should return a NOT_ALLOWED.
+@@ -260,9 +284,9 @@
+     Test with proxy that doesn't add a slash.
+     """
+ 
+-    def proxy(self):
++    def proxy(self, factory=None):
+         p = xmlrpc.Proxy("http://127.0.0.1:%d" % self.port)
+-        p.queryFactory = self.queryFactory
++        p.queryFactory = factory or self.queryFactory
+         return p
+ 
+ 
+@@ -287,7 +311,7 @@
+         return self.p.stopListening()
+ 
+ 
+-    def proxy(self):
++    def proxy(self, factory=None):
+         return xmlrpc.Proxy("http://127.0.0.1:%d" % (self.port,),
+                             allowNone=True)
+ 
+Index: twisted/web/xmlrpc.py
+===================================================================
+--- twisted/web/xmlrpc.py	(revision 28673)
++++ twisted/web/xmlrpc.py	(working copy)
+@@ -303,12 +303,12 @@
+     protocol = QueryProtocol
+ 
+     def __init__(self, path, host, method, user=None, password=None,
+-                 allowNone=False, args=()):
++                 allowNone=False, args=(), canceller=None):
+         self.path, self.host = path, host
+         self.user, self.password = user, password
+         self.payload = payloadTemplate % (method,
+             xmlrpclib.dumps(args, allow_none=allowNone))
+-        self.deferred = defer.Deferred()
++        self.deferred = defer.Deferred(canceller)
+ 
+     def parseResponse(self, contents):
+         if not self.deferred:
+@@ -409,15 +409,19 @@
+             be L{Fault}, but you can also have an C{IndexError} on some buggy
+             servers giving empty responses.
+         """
++        def cancel(d):
++            d._suppressAlreadyCalled = 1
++            d.errback(defer.CancelledError())
++            connector.disconnect()
+         factory = self.queryFactory(
+             self.path, self.host, method, self.user,
+-            self.password, self.allowNone, args)
++            self.password, self.allowNone, args, cancel)
+         if self.secure:
+             from twisted.internet import ssl
+-            reactor.connectSSL(self.host, self.port or 443,
+-                               factory, ssl.ClientContextFactory())
++            connector = reactor.connectSSL(self.host, self.port or 443,
++                                           factory, ssl.ClientContextFactory())
+         else:
+-            reactor.connectTCP(self.host, self.port or 80, factory)
++            connector = reactor.connectTCP(self.host, self.port or 80, factory)
+         return factory.deferred
+ 
+ 

@@ -1,0 +1,174 @@
+Index: twisted/test/test_pb.py
+===================================================================
+--- twisted/test/test_pb.py	(revision 31766)
++++ twisted/test/test_pb.py	(working copy)
+@@ -11,7 +11,7 @@
+ # issue1195 TODOs: replace pump.pump() with something involving Deferreds.
+ # Clean up warning suppression.
+ 
+-import sys, os, time, gc
++import sys, os, time, gc, weakref
+ 
+ from cStringIO import StringIO
+ from zope.interface import implements, Interface
+@@ -19,7 +19,7 @@
+ from twisted.python.versions import Version
+ from twisted.trial import unittest
+ from twisted.spread import pb, util, publish, jelly
+-from twisted.internet import protocol, main, reactor
++from twisted.internet import protocol, main, reactor, defer
+ from twisted.internet.error import ConnectionRefusedError
+ from twisted.internet.defer import Deferred, gatherResults, succeed
+ from twisted.protocols.policies import WrappingFactory
+@@ -1041,10 +1041,15 @@
+ 
+     @ivar loggedOut: set to C{True} when the avatar is logged out.
+     @type loggedOut: C{bool}
++
++    @ivar logoutDeferred: if set, a deferred that will be fired after
++        logout has been called and returned
++    @type logoutDeferred: Deferred
+     """
+     implements(pb.IPerspective)
+ 
+     loggedIn = loggedOut = False
++    logoutDeferred = None
+ 
+     def __init__(self, avatarId):
+         self.avatarId = avatarId
+@@ -1070,11 +1075,13 @@
+         return a + b
+ 
+ 
+-    def logout(self):
++    def logout(self, ignored=None):
+         self.loggedOut = True
++        # fire this *after* logout() has returned, to test resource freeing
++        if self.logoutDeferred:
++            reactor.callLater(0, self.logoutDeferred.callback, None)
+ 
+ 
+-
+ class TestRealm(object):
+     """
+     A realm which repeatedly gives out a single instance of L{MyPerspective}
+@@ -1117,6 +1124,86 @@
+ 
+ 
+ 
++
++class NewCredLeakTests(unittest.TestCase):
++    """
++    Tests to try to trigger memory leaks.
++    """
++    class LeakyRealm(TestRealm):
++        """
++        A realm which hangs onto a reference to the mind object in its logout
++        function.
++        """
++        def __init__(self, testcase, logoutDeferred):
++            self.testcase = testcase
++            self.logoutDeferred = logoutDeferred
++
++        def requestAvatar(self, avatarId, mind, interface):
++            self.testcase.mind_ref = weakref.ref(mind)
++            persp = self.perspectiveFactory(avatarId)
++            persp.logoutDeferred = self.logoutDeferred
++            return (pb.IPerspective, persp, lambda : persp.logout(mind))
++
++    def test_logout_leak(self):
++        """
++        Test that the server does not leak a reference when the client
++        disconnects suddenly.  This leak occurs because the logout function
++        maintains a reference to the perspective, which maintains a reference
++        to the logout function.
++        """
++        # the function calls here ensure that various intermediary objects
++        # aren't left in local variables, which would keep refs around, making
++        # it hard to test a refleak
++        def makeServer():
++            d = defer.Deferred()
++            realm = self.LeakyRealm(self, d)
++            prtl = portal.Portal(realm)
++            prtl.registerChecker(
++                checkers.InMemoryUsernamePasswordDatabaseDontUse(u='p'))
++            factory = ConnectionNotifyServerFactory(prtl)
++            port = reactor.listenTCP(0, factory, interface="127.0.0.1")
++
++            def stop_listening(_, port):
++                return port.stopListening()
++            d.addCallback(stop_listening, port)
++
++            portno = port.getHost().port
++            return d, portno
++        server_d, portno = makeServer()
++
++        def makeClient(portno):
++            # connect as a client
++            factory = pb.PBClientFactory()
++            creds = credentials.UsernamePassword("u", "p")
++            mind = SimpleRemote()
++            d = factory.login(creds, mind)
++            def cbLogin(perspective):
++                # drop the connection *very* abruptly; loseConnection by itself
++                # seems to do this too nicely
++                os.close(perspective.broker.transport.fileno())
++                perspective.broker.transport.loseConnection()
++            d.addCallback(cbLogin)
++
++            connector = reactor.connectTCP("127.0.0.1", portno, factory)
++            self.addCleanup(connector.disconnect)
++
++            return d
++        client_d = makeClient(portno)
++
++        # wait until everything's done and shut down, then check for
++        # lingering references
++        d = defer.gatherResults([server_d, client_d])
++        def check(_):
++            gc.collect()
++            # requestAvatar sets our mind_ref attribute to a weakref to the
++            # mind; this object should be gc'd, and thus the ref should return
++            # None.
++            self.assertEqual(self.mind_ref(), None)
++        d.addCallback(check)
++
++        return d
++
++
+ class NewCredTestCase(unittest.TestCase):
+     """
+     Tests related to the L{twisted.cred} support in PB.
+Index: twisted/spread/pb.py
+===================================================================
+--- twisted/spread/pb.py	(revision 31766)
++++ twisted/spread/pb.py	(working copy)
+@@ -1278,17 +1278,18 @@
+ 
+         puid = avatar.processUniqueID()
+ 
+-        def dereferenceLogout():
+-            self.broker.dontNotifyOnDisconnect(logout)
+-            logout()
++        # only call logout once, whether the connection is dropped (disconnect)
++        # or a logout occurs (cleanup), and be careful to drop the reference to
++        # it in either case
++        logout = [ logout ]
++        def maybeLogout():
++            if not logout: return
++            fn = logout[0]
++            del logout[0]
++            fn()
++        self.broker._localCleanup[puid] = maybeLogout
++        self.broker.notifyOnDisconnect(maybeLogout)
+ 
+-        self.broker._localCleanup[puid] = dereferenceLogout
+-        # No special helper function is necessary for notifyOnDisconnect
+-        # because dereference callbacks won't be invoked if the connection is
+-        # randomly dropped.  I'm not sure those are ideal semantics, but this
+-        # is the only user of the (private) API at the moment and it works just
+-        # fine as things are. -exarkun
+-        self.broker.notifyOnDisconnect(logout)
+         return avatar
+ 
+ 

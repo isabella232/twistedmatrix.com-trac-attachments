@@ -1,0 +1,331 @@
+Index: twisted/python/_winapi.py
+===================================================================
+--- twisted/python/_winapi.py	(revision 0)
++++ twisted/python/_winapi.py	(working copy)
+@@ -0,0 +1,109 @@
++# -*- test-case-name: twisted.python.test.test_winapi -*-
++# Copyright (c) Twisted Matrix Laboratories.
++# See LICENSE for details.
++
++"""
++Wrapped Windows API functions for use by Twisted.  This module is designed
++to replace the pywin32 package.
++"""
++
++import cffi
++
++from twisted.python.util import sibpath
++
++try:
++    LONG = long
++except NameError:
++    # Python 3
++    LONG = int
++
++ffi = cffi.FFI()
++ffi.set_unicode(True)
++
++
++class WindowsAPIError(Exception):
++    """
++    An error which is raised when a Windows API call has failed.
++    """
++    def __init__(self, code, function, error):
++        super(WindowsAPIError, self).__init__(code, function, error)
++        self.code = code
++        self.function = function
++        self.error = error
++
++
++
++def loadLibrary(library):
++    """
++    This function will load and return a dynamic library object
++    for the given name.
++
++    @param library: The name of the library you wish to load, 'kernel32' for
++                    example.  Please note, you must have a corresponding header
++                    named '_winapi_<library>.h'
++    @type library: C{str}
++
++    @return: returns the dynamically loaded library
++    @rtype: C{cffi.api.FFILibrary}
++    """
++    headerPath = sibpath(__file__, "_winapi_{name}.h".format(name=library))
++    with open(headerPath, "rb") as header:
++        ffi.cdef(header.read())
++
++    return ffi.dlopen(library)
++
++
++# Load libraries which will be used in the rest of the module.
++kernel32 = loadLibrary("kernel32")
++
++
++def raiseErrorIfZero(ok, function):
++    """
++    Checks to see if there was an error while calling
++    a Windows API function.  This function should only
++    be used on Windows API calls which have a return
++    value of non-zero for success and zero for failure.
++
++    @param ok: The return value from a Windows API function.
++    @type ok: C{int,long}
++
++    @param function: The name of the function that was called
++    @type function: C{str}
++
++    @raises WindowsAPIError: Raised if ok != 0
++    @raises TypeError: Raised if `ok` is not an integer
++    """
++    # Be sure we're getting an integer here.  Because we're working
++    # with cffi it's possible we could get an object that acts like
++    # an integer without in fact being in integer to `ok`.
++    if not isinstance(ok, (int, LONG)):
++        raise TypeError("Internal error, expected integer for `ok`")
++
++    if ok == 0:
++        code, error = ffi.getwinerror()
++        raise WindowsAPIError(code, function, error)
++
++
++
++def OpenProcess(dwProcessId, dwDesiredAccess=0, bInheritHandle=False):
++    """
++    This function wraps Microsoft's OpenProcess() function:
++
++        https://msdn.microsoft.com/en-us/library/windows/desktop/ms684320(v=vs.85).aspx
++
++    @param dwProcessId: The process ID we're attempting to open
++    @type dwProcessId: C{int}
++
++    @param dwDesiredAccess: The desired access right(s) to the process
++    @type dwDesiredAccess: C{int}
++
++    @param bInheritHandle: Should child processes inherit the handle of
++                           this process
++    @type bInheritHandle: C{bool}
++
++    @return: This function does not return anything
++    """
++    kernel32.OpenProcess(dwDesiredAccess, bInheritHandle, dwProcessId)
++    code, error = ffi.getwinerror()
++    if code != 0:
++        raise WindowsAPIError(code, "OpenProcess", error)
+Index: twisted/python/_winapi_kernel32.h
+===================================================================
+--- twisted/python/_winapi_kernel32.h	(revision 0)
++++ twisted/python/_winapi_kernel32.h	(working copy)
+@@ -0,0 +1,27 @@
++// Copyright (c) Twisted Matrix Laboratories.
++// See LICENSE for details.
++
++/*
++    This file's purpose is to define the functions we wish to
++    use from the kernel32 dynamic library.
++
++    You may also #define constants for use within Twisted as well. One
++    advantage of defining constants here is attempts to modify the
++    constant later on, hopefully by accident, will result in an
++    exception being raised.
++
++    Take care when defining functions to provide and always research
++    the functions you plan to provide.  Although Microsoft may have
++    dropped support for XP it's not going away anytime soon.  Because
++    of this we either need to stick to XP compatible libraries or provide
++    workarounds in _winapi.py.
++*/
++
++// Process access rights
++#define PROCESS_QUERY_INFORMATION 0x0400
++
++// Error codes which are used by Twisted
++#define ERROR_ACCESS_DENIED 0x5
++#define ERROR_INVALID_PARAMETER 0x57
++
++HANDLE OpenProcess(DWORD, BOOL, DWORD);
+Index: twisted/python/lockfile.py
+===================================================================
+--- twisted/python/lockfile.py	(revision 44699)
++++ twisted/python/lockfile.py	(working copy)
+@@ -27,28 +27,20 @@
+     _windows = False
+ else:
+     _windows = True
++    from twisted.python._winapi import OpenProcess, WindowsAPIError, kernel32
+ 
+-    try:
+-        from win32api import OpenProcess
+-        import pywintypes
+-    except ImportError:
+-        kill = None
+-    else:
+-        ERROR_ACCESS_DENIED = 5
+-        ERROR_INVALID_PARAMETER = 87
++    def kill(pid, signal):
++        try:
++            OpenProcess(pid)
++        except WindowsAPIError as e:
++            if e.args[0] == kernel32.ERROR_ACCESS_DENIED:
++                return
++            elif e.args[0] == kernel32.ERROR_INVALID_PARAMETER:
++                raise OSError(errno.ESRCH, None)
++            raise
++        else:
++            raise RuntimeError("OpenProcess is required to fail.")
+ 
+-        def kill(pid, signal):
+-            try:
+-                OpenProcess(0, 0, pid)
+-            except pywintypes.error as e:
+-                if e.args[0] == ERROR_ACCESS_DENIED:
+-                    return
+-                elif e.args[0] == ERROR_INVALID_PARAMETER:
+-                    raise OSError(errno.ESRCH, None)
+-                raise
+-            else:
+-                raise RuntimeError("OpenProcess is required to fail.")
+-
+     _open = file
+ 
+     # XXX Implement an atomic thingamajig for win32
+Index: twisted/python/test/test_winapi.py
+===================================================================
+--- twisted/python/test/test_winapi.py	(revision 0)
++++ twisted/python/test/test_winapi.py	(working copy)
+@@ -0,0 +1,95 @@
++# Copyright (c) Twisted Matrix Laboratories.
++# See LICENSE for details.
++
++"""
++Tests for C{twisted.python._winapi}
++"""
++
++import os
++import unittest
++
++from twisted.python import _winapi
++
++
++class RaiseErrorIfZeroTests(unittest.TestCase):
++    """
++    Tests for C{twisted.python._winapi.raiseErrorIfZero}.
++    """
++    def test_raisesTypeError(self):
++        """
++        TypeError should be raised if the first argument
++        to raiseErrorIfZero is not an integer.
++        """
++        with self.assertRaises(TypeError):
++            _winapi.raiseErrorIfZero(1.0, "")
++
++
++    def test_raisesWindowsAPIError(self):
++        """
++        Test that _winapi.raiseErrorIfZero(0, "") raises WindowsAPIError
++        """
++        with self.assertRaises(_winapi.WindowsAPIError):
++            _winapi.raiseErrorIfZero(0, "")
++
++
++    def test_noErrorForPositiveInt(self):
++        """
++        Test that _winapi.raiseErrorIfZero(1, "") does nothing.  This is
++        testing the expected behavior of the function call.
++        """
++        _winapi.raiseErrorIfZero(1, "")
++
++
++    def test_noErrorForNegativeInt(self):
++        """
++        Test that _winapi.raiseErrorIfZero(-1, "") does nothing.
++
++        This test exists to guard against a change that modifies the logic
++        of _raiseErrorIfZero from ``if ok == 0:`` to ``if ok >= 0`` or similar
++        statement. The type of errors _raiseErrorIfZero handles are
++        documented by Microsoft such that any non-zero value is considered
++        success.  If this test breaks either _raiseErrorIfZero was updated on
++        purpose to allow for a new value or the value being passed into
++        _raiseErrorIfZero is incorrect and someone thought they found a bug.
++        """
++        _winapi.raiseErrorIfZero(-1, "")
++
++
++    def test_allowsLongForOk(self):
++        """
++        In Python 2 int and long are two different things, in Python
++        3 there's only int.  This test ensures we accept a long when it's
++        available because the Windows API can sometimes return a long even
++        though a number can fit within an int.
++        """
++        _winapi.raiseErrorIfZero(_winapi.LONG(1), "")
++
++
++
++class OpenProcessTests(unittest.TestCase):
++    """
++    Tests for C{twisted.python._winapi.OpenProcess}.
++    """
++    def test_openWithoutAccessRights(self):
++        """
++        Tests to ensure that the default implementation of OpenProcess()
++        remains unchanged.  This is requesting to open the current process
++        without any access rights
++        """
++        with self.assertRaises(_winapi.WindowsAPIError) as error:
++            _winapi.OpenProcess(os.getpid())
++
++        self.assertEqual(
++            error.exception.code, _winapi.kernel32.ERROR_ACCESS_DENIED)
++
++
++    def test_canAccessCurrentProcess(self):
++        """
++        Minimally, we should be able be access the current process
++        with some basic query rights.  If we can't, then it's probably
++        a bug in our code.
++        """
++        _winapi.OpenProcess(
++            os.getpid(),
++            dwDesiredAccess=_winapi.kernel32.PROCESS_QUERY_INFORMATION
++        )
+Index: twisted/test/test_lockfile.py
+===================================================================
+--- twisted/test/test_lockfile.py	(revision 44699)
++++ twisted/test/test_lockfile.py	(working copy)
+@@ -13,13 +13,6 @@
+ from twisted.python.reflect import requireModule
+ from twisted.python.runtime import platform
+ 
+-skipKill = None
+-if platform.isWindows():
+-    if(requireModule('win32api.OpenProcess') is None and
+-        requireModule('pywintypes') is None
+-            ):
+-        skipKill = ("On windows, lockfile.kill is not implemented in the "
+-                    "absence of win32api and/or pywintypes.")
+ 
+ class UtilTests(unittest.TestCase):
+     """
+@@ -94,7 +87,6 @@
+         process which exists and signal C{0}.
+         """
+         lockfile.kill(os.getpid(), 0)
+-    test_kill.skip = skipKill
+ 
+ 
+     def test_killESRCH(self):
+@@ -105,7 +97,6 @@
+         # Hopefully there is no process with PID 2 ** 31 - 1
+         exc = self.assertRaises(OSError, lockfile.kill, 2 ** 31 - 1, 0)
+         self.assertEqual(exc.errno, errno.ESRCH)
+-    test_killESRCH.skip = skipKill
+ 
+ 
+     def test_noKillCall(self):
+Index: twisted/topfiles/7889.feature
+===================================================================
+--- twisted/topfiles/7889.feature	(revision 0)
++++ twisted/topfiles/7889.feature	(working copy)
+@@ -0,0 +1 @@
++twisted.python.python.lockfile and twisted.python.win32._ErrorFormatter.fromEnvironment no longer depend on win32api from pywin32.

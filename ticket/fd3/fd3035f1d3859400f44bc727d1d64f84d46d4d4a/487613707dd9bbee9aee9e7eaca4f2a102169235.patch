@@ -1,0 +1,194 @@
+Index: twisted/web/test/test_xmlrpc.py
+===================================================================
+--- twisted/web/test/test_xmlrpc.py	(revision 30599)
++++ twisted/web/test/test_xmlrpc.py	(working copy)
+@@ -150,9 +150,9 @@
+             ' ' + other)
+ 
+ 
+-    def _getFunction(self, functionPath):
++    def getFunction(self, functionPath):
+         try:
+-            return XMLRPC._getFunction(self, functionPath)
++            return XMLRPC.getFunction(self, functionPath)
+         except xmlrpc.NoSuchFunction:
+             if functionPath.startswith("SESSION"):
+                 raise xmlrpc.Fault(self.SESSION_EXPIRED,
+@@ -160,7 +160,25 @@
+             else:
+                 raise
+ 
++class TestGetFunction(XMLRPC):
+ 
++    def echo(self, x):
++        return x
++
++    def getFunction(self, functionName):
++
++        x = {
++            'echo':self.echo
++        }
++
++        try:
++            return x[functionName]
++        except KeyError, e:
++            raise xmlrpc.NoSuchFunction(self.NOT_FOUND, 
++                        'function %s not found' % functionName)
++
++        return self.echo
++
+ class TestAuthHeader(Test):
+     """
+     This is used to get the header info so that we can test
+@@ -390,6 +408,37 @@
+         return p
+ 
+ 
++class XMLRPCTestPublicGetFunction(unittest.TestCase):
++    """
++    Test to make sure that a overridden getFunction is correctly
++    called.
++    """
++    
++    def setUp(self):
++        self.p = reactor.listenTCP(0, server.Site(TestGetFunction()),
++                                   interface="127.0.0.1")
++        self.port = self.p.getHost().port
++        self.proxy = xmlrpc.Proxy('http://127.0.0.1:%d' % self.port)
++        
++    def tearDown(self):
++        return self.p.stopListening()
++
++    def test_getFunction(self):
++        """
++        The overridden only implements one method
++        and it will return whatever is passed.
++        """        
++        what = "hello"
++        d = self.proxy.callRemote("echo", what)
++        d.addCallback(self.assertEqual, what)
++        return d
++
++    def test_errors(self):
++        d = self.proxy.callRemote("xxxx", "hello")
++        d = self.assertFailure(d, xmlrpc.Fault)
++        return d
++        
++
+ class SerializationConfigMixin:
+     """
+     Mixin which defines a couple tests which should pass when a particular flag
+Index: twisted/web/xmlrpc.py
+===================================================================
+--- twisted/web/xmlrpc.py	(revision 30599)
++++ twisted/web/xmlrpc.py	(working copy)
+@@ -155,7 +155,7 @@
+             self._cbRender(f, request)
+         else:
+             try:
+-                function = self._getFunction(functionPath)
++                function = self.getFunction(functionPath)
+             except Fault, f:
+                 self._cbRender(f, request)
+             else:
+@@ -204,7 +204,7 @@
+         log.err(failure)
+         return Fault(self.FAILURE, "error")
+ 
+-    def _getFunction(self, functionPath):
++    def getFunction(self, functionPath):
+         """
+         Given a string, return a function, or raise NoSuchFunction.
+ 
+@@ -223,7 +223,7 @@
+             if handler is None:
+                 raise NoSuchFunction(self.NOT_FOUND,
+                     "no such subHandler %s" % prefix)
+-            return handler._getFunction(functionPath)
++            return handler.getFunction(functionPath)
+ 
+         f = getattr(self, "xmlrpc_%s" % functionPath, None)
+         if not f:
+@@ -285,7 +285,7 @@
+         """
+         Return a documentation string describing the use of the given method.
+         """
+-        method = self._xmlrpc_parent._getFunction(method)
++        method = self._xmlrpc_parent.getFunction(method)
+         return (getattr(method, 'help', None)
+                 or getattr(method, '__doc__', None) or '')
+ 
+@@ -300,7 +300,7 @@
+         argument. If no signature information is available, the empty
+         string is returned.
+         """
+-        method = self._xmlrpc_parent._getFunction(method)
++        method = self._xmlrpc_parent.getFunction(method)
+         return getattr(method, 'signature', None) or ''
+ 
+     xmlrpc_methodSignature.signature = [['array', 'string'],
+Index: doc/web/howto/xmlrpc.xhtml
+===================================================================
+--- doc/web/howto/xmlrpc.xhtml	(revision 30599)
++++ doc/web/howto/xmlrpc.xhtml	(working copy)
+@@ -141,6 +141,60 @@
+ XML-RPC server. XML-RPC servers may be nested to arbitrary depths
+ using this method.</p>
+ 
++<h3>Using your own Function getter</h3>
++
++<p>Sometimes, you want to implement your own policy of getting the end implementation. 
++E.g. just like sub-handlers you want to divide the implementations into separate classes but
++may not want to introduce <code class="python">XMLRPC.separator</code> in the function name. 
++In such cases just override the <code class="python">getFunction(self, functionPath)</code>
++method and return the correct callable. 
++Raise <code class="API">twisted.web.xmlrpc.NoSuchFunction</code> otherwise.</p>
++
++<pre class="python">
++from twisted.web import xmlrpc, server
++
++class EchoHandler:
++
++    def echo(self, x):
++        """ Return all passed args """
++        return x
++
++class AddHandler:
++
++    def add(self, a, b):
++        """Return sum of arguments."""
++        return a + b
++
++class Example(xmlrpc.XMLRPC):
++    """An example of using you own policy
++    to fetch the handler"""
++
++    def __init__(self):
++        xmlrpc.XMLRPC.__init__(self)
++        self._addHandler = AddHandler()
++        self._echoHandler = EchoHandler()
++
++        #We keep a dict of all relevant
++        #function names and callable.
++        self._functionToCallable = {
++            'add':self._addHandler.add,
++            'echo':self._echoHandler.echo
++        }
++
++    def getFunction(self, functionPath):
++        try:
++            return self._functionToCallable[functionPath]
++        except KeyError, e:
++            raise xmlrpc.NoSuchFunction(self.NOT_FOUND,
++                        "function %s not found" % functionPath)
++
++if __name__ == '__main__':
++    from twisted.internet import reactor
++    r = Example()
++    reactor.listenTCP(7080, server.Site(r))
++    reactor.run()
++</pre>
++
+ <h3>Adding XML-RPC Introspection support</h3>
+ 
+ <p>XML-RPC has an

@@ -1,0 +1,167 @@
+Index: twisted/words/test/test_jabberxmlstream.py
+===================================================================
+--- twisted/words/test/test_jabberxmlstream.py	(révision 30808)
++++ twisted/words/test/test_jabberxmlstream.py	(copie de travail)
+@@ -1331,7 +1331,8 @@
+         self.xmlstream.connectionMade = lambda: self.done.append("connMade")
+         self.compressed.makeConnection(self.xmlstream.transport)
+         self.assertTrue(self.xmlstream.transport is self.compressed)
+-        self.assertEquals(["connMade"], self.done)
++        # connectionMade must not be called twice
++        self.assertEquals([], self.done)
+ 
+ 
+     def test_write(self):
+@@ -1414,6 +1415,30 @@
+         return d
+ 
+ 
++    def test_TLSAlreadyOnButWithTLSSet(self):
++        """
++        Test start when compression is wanted and the TLS already set up, but
++        stream compression has been explicitely asked for using the with_tls
++        attribute.
++        """
++        self.xmlstream.transport.TLS = True
++        self.init.with_tls = True
++
++        d = self.init.start()
++        def cb(result):
++            self.assertEquals(result, xmlstream.Reset)
++            self.assertTrue(isinstance(self.xmlstream.transport,
++                                       xmlstream.CompressedTransport))
++        d.addCallback(cb)
++        self.assertTrue(len(self.output) > 0)
++        compress = self.output[0]
++        self.assertEquals('compress', compress.name)
++        self.xmlstream.dataReceived("<compressed xmlns='%s'/>"
++                                    % NS_XMPP_COMPRESS)
++
++        return d
++
++
+     def test_noMethod(self):
+         """
+         Test start when there is no allowed method.
+Index: twisted/words/test/test_jabberclient.py
+===================================================================
+--- twisted/words/test/test_jabberclient.py	(révision 30808)
++++ twisted/words/test/test_jabberclient.py	(copie de travail)
+@@ -401,14 +401,14 @@
+         self.assertEqual('secret', xs.authenticator.password)
+ 
+         # test list of initializers
+-        version, tls, compress, sasl, bind, session = xs.initializers
++        version, tls, sasl, compress, bind, session = xs.initializers
+ 
+-        self.assert_(isinstance(tls, xmlstream.TLSInitiatingInitializer))
+-        self.assert_(isinstance(compress,
+-                                xmlstream.CompressInitiatingInitializer))
+-        self.assert_(isinstance(sasl, SASLInitiatingInitializer))
+-        self.assert_(isinstance(bind, client.BindInitializer))
+-        self.assert_(isinstance(session, client.SessionInitializer))
++        self.assertIsInstance(tls, xmlstream.TLSInitiatingInitializer)
++        self.assertIsInstance(sasl, SASLInitiatingInitializer)
++        self.assertIsInstance(compress,
++                              xmlstream.CompressInitiatingInitializer)
++        self.assertIsInstance(bind, client.BindInitializer)
++        self.assertIsInstance(session, client.SessionInitializer)
+ 
+         self.assertFalse(tls.required)
+         self.assertFalse(compress.required)
+Index: twisted/words/protocols/jabber/xmlstream.py
+===================================================================
+--- twisted/words/protocols/jabber/xmlstream.py	(révision 30808)
++++ twisted/words/protocols/jabber/xmlstream.py	(copie de travail)
+@@ -13,7 +13,7 @@
+ 
+ import zlib
+ 
+-from zope.interface import directlyProvides, implements
++from zope.interface import directlyProvides, implements, providedBy
+ 
+ from twisted.internet import defer, protocol
+ from twisted.internet.error import ConnectionLost
+@@ -468,8 +468,16 @@
+     def makeConnection(self, transport):
+         """
+         Connects the factory to us and us to the underlying transport.
++
++        L{ProtocolWrapper.makeConnection}() can't be used because it calls
++        makeConnection on the wrapped protocol, which causes a second full
++        initialization, while the stream just needs a reset (done by
++        L{CompressInitiatingInitializer}).
+         """
+-        ProtocolWrapper.makeConnection(self, transport)
++        directlyProvides(self, providedBy(transport))
++        protocol.Protocol.makeConnection(self, transport)
++        self.factory.registerProtocol(self)
++        self.wrappedProtocol.transport = self
+         transport.protocol = self
+ 
+ 
+@@ -522,13 +530,17 @@
+     The only supported compression method at the moment is C{zlib}.
+ 
+     @cvar wanted: indicates if stream compression negotiation is wanted.
+-    @type wanted: L{bool}
++    @type wanted: C{bool}
++    @cvar with_tls: if set to C{True}, allows negociating compression when TLS
++        is already used.
++    @type with_tls: C{bool}
+ 
+     @since: 11.0
+     """
+ 
+     feature = (NS_XMPP_FEATURE_COMPRESS, 'compression')
+     wanted = True
++    with_tls = False
+     _deferred = None
+ 
+     def onProceed(self, obj):
+@@ -538,6 +550,8 @@
+         self.xmlstream.removeObserver('/failure', self.onFailure)
+         compressedTransport = CompressedTransport(self.xmlstream)
+         compressedTransport.makeConnection(self.xmlstream.transport)
++        self.xmlstream.reset()
++        self.xmlstream.sendHeader()
+         self._deferred.callback(Reset)
+ 
+ 
+@@ -551,16 +565,18 @@
+         Start compression negotiation.
+ 
+         This checks the TLS status and the proposed compression methods.
+-        TLS and stream compression are mutually exclusive: XEP-0138 states
+-        that compression may be offered if TLS failed.
++        TLS and stream compression should be mutually exclusive: XEP-0138
++        states that compression may be offered if TLS failed.
++        If both TLS and stream compression are desired, the L{with_tls}
++        attribute should be set to C{True}.
+ 
+         If TLS is active or if no proposed compression method is supported,
+         the initialization silently succeeds, moving on to the next step.
+         """
+         if not self.wanted:
+             return defer.succeed(None)
+-        if (hasattr(self.xmlstream.transport, "TLS") and
+-                self.xmlstream.transport.TLS):
++        if (not self.with_tls and hasattr(self.xmlstream.transport, "TLS")
++                and self.xmlstream.transport.TLS):
+             return defer.succeed(None)
+ 
+         allowed_methods = [ str(m) for m in
+Index: twisted/words/protocols/jabber/client.py
+===================================================================
+--- twisted/words/protocols/jabber/client.py	(révision 30808)
++++ twisted/words/protocols/jabber/client.py	(copie de travail)
+@@ -359,8 +359,8 @@
+ 
+         xs.initializers = [CheckVersionInitializer(xs)]
+         inits = [ (xmlstream.TLSInitiatingInitializer, False),
++                  (sasl.SASLInitiatingInitializer, True),
+                   (xmlstream.CompressInitiatingInitializer, False),
+-                  (sasl.SASLInitiatingInitializer, True),
+                   (BindInitializer, False),
+                   (SessionInitializer, False),
+                 ]

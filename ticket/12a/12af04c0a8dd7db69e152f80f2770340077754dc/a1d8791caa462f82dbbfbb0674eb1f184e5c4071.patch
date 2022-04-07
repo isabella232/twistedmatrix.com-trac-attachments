@@ -1,0 +1,428 @@
+=== modified file 'twisted/names/dns.py'
+--- twisted/names/dns.py	2013-06-17 13:17:22 +0000
++++ twisted/names/dns.py	2013-06-17 16:34:39 +0000
+@@ -2089,6 +2089,10 @@
+                                 a particular operation (e.g., zone
+                                 transfer) for particular data.
+ 
++    @ivar ednsVersion: Indicates the EDNS implementation level. Set to
++        C{None} to prevent any EDNS attributes and options being added
++        to the encoded byte string.
++
+     @ivar queries: A L{list} of L{Query} instances.
+ 
+     @ivar answers: A L{list} of L{RRHeader} instances.
+@@ -2100,7 +2104,7 @@
+ 
+     showAttributes = (
+         'id', 'answer', 'opCode', 'auth', 'trunc',
+-        'recDes', 'recAv', 'rCode',
++        'recDes', 'recAv', 'rCode', 'ednsVersion',
+         'queries', 'answers', 'authority', 'additional')
+ 
+     compareAttributes = showAttributes
+@@ -2108,8 +2112,8 @@
+     def __init__(self, id=0, answer=0,
+                  opCode=OP_QUERY, auth=0,
+                  trunc=0, recDes=0,
+-                 recAv=0, rCode=0,
+-                 queries=None, answers=None, authority=None, additional=None, optRecords=None):
++                 recAv=0, rCode=0, ednsVersion=0,
++                 queries=None, answers=None, authority=None, additional=None):
+         """
+         All arguments are stored as attributes with the same names.
+ 
+@@ -2124,6 +2128,7 @@
+         @type recDes: C{int}
+         @type recAv: C{int}
+         @type rCode: C{int}
++        @type ednsVersion: C{int} or C{None}
+         @type queries: C{list} of L{Query}
+         @type answers: C{list} of L{RRHeader}
+         @type authority: C{list} of L{RRHeader}
+@@ -2145,18 +2150,25 @@
+         self.recDes = recDes
+         self.recAv = recAv
+         self.rCode = rCode
++        self.ednsVersion = ednsVersion
+ 
+         self.queries = queries or []
+         self.answers = answers or []
+         self.authority = authority or []
+         self.additional = additional or []
+ 
+-        self.optRecords = optRecords or []
++        self._decodingErrors = []
+ 
+ 
+     def toStr(self):
+         """
+-        Encode to a wire format.
++        Encode to wire format.
++
++        If C{ednsVersion} is not None, an L{_OPTHeader} instance
++        containing all the I{EDNS} specific attributes and options
++        will be appended to the list of C{additional} records and this
++        will be encoded into the byte string as an C{OPT} record byte
++        string.
+ 
+         @return: A L{bytes} string.
+         """
+@@ -2177,9 +2189,69 @@
+         m.authority = self.authority
+         m.additional = self.additional
+ 
++        if self.ednsVersion is not None:
++            o = _OPTHeader(version=self.ednsVersion)
++            m.additional.append(o)
++
+         return m.toStr()
+ 
+ 
++    @classmethod
++    def fromMessage(cls, message):
++        """
++        Construct and return a new L(_EDNSMessage} whose attributes
++        and records are derived from the attributes and records of
++        C{message} (a L{Message} instance)
++
++        If present, an I{OPT} record will be extracted from the
++        C{additional} section and its attributes and options will be
++        used to set the EDNS specific attributes C{extendedRCODE},
++        c{ednsVersion}, c{dnssecOK}, c{ednsOptions}.
++
++        The C{extendedRCODE} will be combined with C{message.rCode}
++        and assigned to C{self.rCode}.
++
++        If multiple I{OPT} records are found, this is considered an
++        error and no EDNS specific attributes will be
++        set. Additionally, an L{EFORMAT} error will be appended to
++        C{_decodingErrors}.
++        """
++        additional = []
++        optRecords = []
++        for r in message.additional:
++            if r.type == OPT:
++                optRecords.append(_OPTHeader.fromRRHeader(r))
++            else:
++                additional.append(r)
++
++        newMessage = cls(
++            id=message.id,
++            answer=message.answer,
++            opCode=message.opCode,
++            auth=message.auth,
++            trunc=message.trunc,
++            recDes=message.recDes,
++            recAv=message.recAv,
++            rCode=message.rCode,
++            # Default to None, it will be updated later when the OPT
++            # records are parsed.
++            ednsVersion=None,
++            queries=list(message.queries),
++            answers=list(message.answers),
++            authority=list(message.authority),
++            additional=additional,
++            )
++
++        if optRecords:
++            if len(optRecords) > 1:
++                newMessage._decodingErrors.append(EFORMAT)
++            else:
++                opt = optRecords[0]
++                newMessage.ednsVersion = opt.version
++
++        return newMessage
++
++
+     def fromStr(self, bytes):
+         """
+         Decode from wire format, saving flags, values and records to
+@@ -2191,25 +2263,8 @@
+         m = Message()
+         m.fromStr(bytes)
+ 
+-        optRecords = []
+-        for r in reversed(m.additional):
+-            if r.type == OPT:
+-                optRecords.append(r)
+-                m.additional.remove(r)
+-
+-        self.id = m.id
+-        self.answer = m.answer
+-        self.opCode = m.opCode
+-        self.auth = m.auth
+-        self.trunc = m.trunc
+-        self.recDes = m.recDes
+-        self.recAv = m.recAv
+-        self.rCode = m.rCode
+-        self.queries = m.queries
+-        self.answers = m.answers
+-        self.authority = m.authority
+-        self.additional = m.additional
+-        self.optRecords = optRecords
++        ednsMessage = self.fromMessage(m)
++        self.__dict__ = ednsMessage.__dict__
+ 
+ 
+ 
+
+=== modified file 'twisted/names/test/test_dns.py'
+--- twisted/names/test/test_dns.py	2013-06-17 13:17:22 +0000
++++ twisted/names/test/test_dns.py	2013-06-17 16:29:53 +0000
+@@ -1803,7 +1803,8 @@
+             opCode=dns.OP_STATUS,
+             recDes=1,
+             recAv=1,
+-            rCode=15)
++            rCode=15,
++            ednsVersion=None,)
+ 
+ 
+ 
+@@ -1832,7 +1833,8 @@
+             trunc=1,
+             recDes=0,
+             recAv=0,
+-            rCode=0)
++            rCode=0,
++            ednsVersion=None,)
+ 
+ 
+ 
+@@ -1863,6 +1865,7 @@
+         return dict(
+             id=256,
+             auth=0,
++            ednsVersion=None,
+             answers=[
+                 dns.RRHeader(
+                     b'',
+@@ -1898,6 +1901,7 @@
+         return dict(
+             id=256,
+             auth=1,
++            ednsVersion=None,
+             answers=[
+                 dns.RRHeader(
+                     b'',
+@@ -1968,6 +1972,7 @@
+             recDes=1,
+             recAv=1,
+             rCode=15,
++            ednsVersion=None,
+             queries=[dns.Query(b'example.com', dns.SOA)],
+             answers=[
+                 dns.RRHeader(
+@@ -2025,7 +2030,7 @@
+         b'\x00\x29' # TYPE (OPT 41)
+         b'\x10\x00' # UDP Payload Size (4096)
+         b'\x00' # Extended RCODE
+-        b'\x00' # EDNS version
++        b'\x03' # EDNS version
+         b'\x00\x00' # DO bit + Z
+         b'\x00\x00' # RDLENGTH
+         )
+@@ -2041,12 +2046,9 @@
+             recDes=0,
+             recAv=0,
+             rCode=0,
++            ednsVersion=3,
+             queries=[dns.Query(b'www.example.com', dns.A)],
+-            additional=[dns.RRHeader(
+-                    b'',
+-                    type=dns.OPT,
+-                    cls=4096,
+-                    payload=dns.UnknownRecord(b'', ttl=0))])
++            additional=[])
+ 
+ 
+ 
+@@ -2055,7 +2057,10 @@
+     A version of L{dns.Message} which is comparable so that it can be
+     tested using some of the L{dns._EDNSMessage} tests.
+     """
+-    showAttributes = compareAttributes = dns._EDNSMessage.compareAttributes
++    showAttributes = compareAttributes = (
++        'id', 'answer', 'opCode', 'auth', 'trunc',
++        'recDes', 'recAv', 'rCode',
++        'queries', 'answers', 'authority', 'additional')
+ 
+ 
+ 
+@@ -2182,6 +2187,17 @@
+     """
+     messageFactory = dns._EDNSMessage
+ 
++    def test_ednsVersion(self):
++        """
++        L{dns._EDNSMessage.__init__} accepts an optional ednsVersion argument
++        whose default value is 0 and which is saved as a public
++        instance attribute.
++        """
++        self.assertEqual(self.messageFactory().ednsVersion, 0)
++        self.assertEqual(
++            self.messageFactory(ednsVersion=None).ednsVersion, None)
++
++
+     def test_queries(self):
+         """
+         L{dns._EDNSMessage.__init__} accepts an optional queries argument
+@@ -2268,6 +2284,7 @@
+             'recDes=1 '
+             'recAv=1 '
+             'rCode=15 '
++            'ednsVersion=None '
+             "queries=[Query('example.com', 6, 1)] "
+             'answers=['
+             '<RR name=example.com type=SOA class=IN ttl=4294967295s auth=True>'
+@@ -2281,6 +2298,18 @@
+             '>')
+ 
+ 
++    def test_fromMessage(self):
++        """
++        L{dns._EDNSMessage.fromMessage} constructs a new
++        L{dns._EDNSMessage} using the attributes and records from an
++        existing L{dns.Message} instance.
++        """
++        m = dns.Message(rCode=0xabcd)
++        m.queries = [dns.Query(b'www.example.com')]
++
++        ednsMessage = dns._EDNSMessage.fromMessage(m)
++        self.assertEqual(ednsMessage.rCode, 0xabcd)
++
+ 
+ class EDNSMessageEqualityTests(ComparisonTestsMixin, unittest.SynchronousTestCase):
+     """
+@@ -2388,6 +2417,18 @@
+             )
+ 
+ 
++    def test_ednsVersion(self):
++        """
++        Two L{dns._EDNSMessage} instances compare equal if they have the same
++        ednsVersion.
++        """
++        self.assertNormalEqualityImplementation(
++            self.messageFactory(ednsVersion=1),
++            self.messageFactory(ednsVersion=1),
++            self.messageFactory(ednsVersion=None),
++            )
++
++
+     def test_queries(self):
+         """
+         Two L{dns._EDNSMessage} instances compare equal if they have the same
+@@ -2603,6 +2644,8 @@
+         L{dns._EDNSMessage}, L{dns.Message.__init__} does not accept
+         queries, answers etc as arguments.
+ 
++        Also removes any L{dns._EDNSMessage} specific arguments.
++
+         @return: An L{dns.Message} instance.
+         """
+         queries = kwargs.pop('queries', [])
+@@ -2610,6 +2653,8 @@
+         authority = kwargs.pop('authority', [])
+         additional = kwargs.pop('additional', [])
+ 
++        kwargs.pop('ednsVersion', None)
++
+         m = MessageComparable(*args, **kwargs)
+         m.queries = queries
+         m.answers = answers
+@@ -2639,6 +2684,92 @@
+         self.assertEqual(m.additional, [])
+ 
+ 
++    def test_ednsMessageDecodeMultipleOptRecords(self):
++        """
++        An L(_EDNSMessage} instance created from a byte string
++        containing multiple I{OPT} records will discard all the C{OPT}
++        records.
++
++        L{dns.EFORMAT} will be appended to C{_decodingErrors} list so
++        that a server responding to this message can respond with the
++        C{rCode = dns.EFORMAT}.
++
++        C{ednsVersion} will be set to C{None}.
++
++        "If a query message with more than one
++        OPT RR is received, a FORMERR (RCODE=1) MUST be returned."
++
++        RFC6891 does not say whether any OPT records should be
++        included in the response.
++
++        Querying ISC.ORG Bind servers with a multi OPT message,
++        results in a response message without any OPT records so lets
++        copy that behaviour.
++
++        @see: U{https://tools.ietf.org/html/rfc6891#section-6.1.1}
++        """
++        m = dns.Message()
++        m.additional = [
++            dns._OPTHeader(version=2),
++            dns._OPTHeader(version=3)]
++
++        ednsMessage = dns._EDNSMessage()
++        ednsMessage.fromStr(m.toStr())
++        self.assertEqual(ednsMessage._decodingErrors, [dns.EFORMAT])
++        self.assertEqual(ednsMessage.ednsVersion, None)
++
++
++    def test_optHeaderPosition(self):
++        """
++        L{dns._EDNSMessage} can decode OPT records, regardless of
++        their position in the additional records section.
++
++        "The OPT RR MAY be placed anywhere within the additional data
++        section."
++
++        @see: U{https://tools.ietf.org/html/rfc6891#section-6.1.1}
++        """
++        m = dns.Message()
++        m.additional = [dns.RRHeader(type=dns.OPT)]
++        self.assertEqual(dns._EDNSMessage.fromMessage(m)._decodingErrors, [])
++
++        m.additional.append(dns.RRHeader(type=dns.A))
++        self.assertEqual(dns._EDNSMessage.fromMessage(m)._decodingErrors, [])
++
++        m.additional.insert(0, dns.RRHeader(type=dns.A))
++        self.assertEqual(dns._EDNSMessage.fromMessage(m)._decodingErrors, [])
++
++
++    def test_ednsDecode(self):
++        """
++        The L(_EDNSMessage} instance created by
++        L{dns._EDNSMessage.fromStr} derives its edns specific values
++        (C{ednsVersion}, etc) from the supplied OPT record.
++        """
++        m = self.messageFactory()
++        m.fromStr(MESSAGE_EDNS_QUERY.bytes)
++
++        self.assertEqual(m, self.messageFactory(**MESSAGE_EDNS_QUERY.kwargs()))
++
++
++    def test_ednsEncode(self):
++        """
++        The L(_EDNSMessage} instance created by
++        L{dns._EDNSMessage.toStr} encodes its edns specific values
++        (C{ednsVersion}, etc) into an OPT record added to the
++        additional section.
++        """
++        self.assertEqual(
++            self.messageFactory(**MESSAGE_EDNS_QUERY.kwargs()).toStr(),
++            MESSAGE_EDNS_QUERY.bytes)
++
++
++def sendMessage():
++    p = dns.DNSDatagramProtocol(None)
++    p.startListening()
++    p.writeMessage(m, ('199.6.0.30', 53))
++
++
+ 
+ class OPTHeaderTests(ComparisonTestsMixin, unittest.TestCase):
+     """
+

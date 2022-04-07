@@ -1,0 +1,174 @@
+--- policies.py	2006-07-01 09:08:17.000000000 -0700
++++ policies.py	2008-03-08 17:18:07.000000000 -0800
+@@ -10,7 +10,7 @@
+ """
+ 
+ # system imports
+-import sys, operator
++import sys, operator, time
+ 
+ # twisted imports
+ from twisted.internet.protocol import ServerFactory, Protocol, ClientFactory
+@@ -136,10 +136,11 @@
+         ProtocolWrapper.registerProducer(self, producer, streaming)
+ 
+     def unregisterProducer(self):
+-        del self.producer
++        try:
++            del self.producer
++        except AttributeError: pass
+         ProtocolWrapper.unregisterProducer(self)
+ 
+-
+     def throttleReads(self):
+         self.transport.pauseProducing()
+ 
+@@ -147,13 +148,55 @@
+         self.transport.resumeProducing()
+ 
+     def throttleWrites(self):
+-        if hasattr(self, "producer"):
++        try:
+             self.producer.pauseProducing()
++        except AttributeError: pass
+ 
+     def unthrottleWrites(self):
+-        if hasattr(self, "producer"):
++        try:
+             self.producer.resumeProducing()
++        except AttributeError: pass
+ 
++READ,WRITE = range(2)
++class ThrottlingPipe(object):
++    """Throttles data in one direction or another, by waiting as long as to keep the rate at a certain level. Call check with every read."""
++    def __init__(self,direction,limit,throttle,unthrottle):
++        """direction = right or left, limit = how many bytes per second, throttle = something that throttles the byte processing operation, unthrottle = vice versa"""
++        self.throttle = throttle
++        self.unthrottle = unthrottle
++        self.direction = direction
++        self.limit = limit
++        self.startTime = time.time()
++        self.lastDuration = 0
++        self.rate = 0.0
++    def check(self,length):
++        if self.limit is None: return
++        now = time.time()
++        duration = now - self.startTime
++        soFar = self.rate * self.lastDuration + length
++        self.rate = soFar / duration
++#        print soFar,duration
++#        print "Rate vs limit: ",self.rate,self.limit
++        if self.rate > self.limit:
++            self.throttle()
++            wait = round(soFar / self.limit - duration,2)
++            self.unthrottleLater(wait)
++        self.lastDuration = duration
++    unthrottleID = None
++    def unthrottleLater(self,wait):
++        if self.unthrottleID:
++            if self.unthrottleID.called: return # XXX: should never happen?
++            self.unthrottleID.cancel()
++#        print "\nWaiting boo",wait
++        self.unthrottleID = reactor.callLater(wait,self.clearAndUnthrottle)
++    def clearAndUnthrottle(self):
++        del self.unthrottleID
++        self.unthrottle()
++    def cancel(self):
++        if self.unthrottleID:
++            if not self.unthrottleID.called:
++                self.unthrottleID.cancel()
++            del self.unthrottleID
+ 
+ class ThrottlingFactory(WrappingFactory):
+     """Throttles bandwidth and number of connections.
+@@ -168,42 +211,16 @@
+         WrappingFactory.__init__(self, wrappedFactory)
+         self.connectionCount = 0
+         self.maxConnectionCount = maxConnectionCount
+-        self.readLimit = readLimit # max bytes we should read per second
+-        self.writeLimit = writeLimit # max bytes we should write per second
+-        self.readThisSecond = 0
+-        self.writtenThisSecond = 0
+-        self.unthrottleReadsID = None
+-        self.checkReadBandwidthID = None
+-        self.unthrottleWritesID = None
+-        self.checkWriteBandwidthID = None
++        self.reader = ThrottlingPipe(READ,readLimit,self.throttleReads,self.unthrottleReads)
++        self.writer = ThrottlingPipe(WRITE,writeLimit,self.throttleWrites,self.unthrottleWrites)
+ 
+     def registerWritten(self, length):
+         """Called by protocol to tell us more bytes were written."""
+-        self.writtenThisSecond += length
++        self.writer.check(length)
+ 
+     def registerRead(self, length):
+         """Called by protocol to tell us more bytes were read."""
+-        self.readThisSecond += length
+-
+-    def checkReadBandwidth(self):
+-        """Checks if we've passed bandwidth limits."""
+-        if self.readThisSecond > self.readLimit:
+-            self.throttleReads()
+-            throttleTime = (float(self.readThisSecond) / self.readLimit) - 1.0
+-            self.unthrottleReadsID = reactor.callLater(throttleTime,
+-                                                       self.unthrottleReads)
+-        self.readThisSecond = 0
+-        self.checkReadBandwidthID = reactor.callLater(1, self.checkReadBandwidth)
+-
+-    def checkWriteBandwidth(self):
+-        if self.writtenThisSecond > self.writeLimit:
+-            self.throttleWrites()
+-            throttleTime = (float(self.writtenThisSecond) / self.writeLimit) - 1.0
+-            self.unthrottleWritesID = reactor.callLater(throttleTime,
+-                                                        self.unthrottleWrites)
+-        # reset for next round
+-        self.writtenThisSecond = 0
+-        self.checkWriteBandwidthID = reactor.callLater(1, self.checkWriteBandwidth)
++        self.reader.check(length)
+ 
+     def throttleReads(self):
+         """Throttle reads on all protocols."""
+@@ -213,7 +230,6 @@
+ 
+     def unthrottleReads(self):
+         """Stop throttling reads on all protocols."""
+-        self.unthrottleReadsID = None
+         log.msg("Stopped throttling reads on %s" % self)
+         for p in self.protocols.keys():
+             p.unthrottleReads()
+@@ -226,18 +242,11 @@
+ 
+     def unthrottleWrites(self):
+         """Stop throttling writes on all protocols."""
+-        self.unthrottleWritesID = None
+         log.msg("Stopped throttling writes on %s" % self)
+         for p in self.protocols.keys():
+             p.unthrottleWrites()
+ 
+     def buildProtocol(self, addr):
+-        if self.connectionCount == 0:
+-            if self.readLimit is not None:
+-                self.checkReadBandwidth()
+-            if self.writeLimit is not None:
+-                self.checkWriteBandwidth()
+-
+         if self.connectionCount < self.maxConnectionCount:
+             self.connectionCount += 1
+             return WrappingFactory.buildProtocol(self, addr)
+@@ -249,14 +258,8 @@
+         WrappingFactory.unregisterProtocol(self, p)
+         self.connectionCount -= 1
+         if self.connectionCount == 0:
+-            if self.unthrottleReadsID is not None:
+-                self.unthrottleReadsID.cancel()
+-            if self.checkReadBandwidthID is not None:
+-                self.checkReadBandwidthID.cancel()
+-            if self.unthrottleWritesID is not None:
+-                self.unthrottleWritesID.cancel()
+-            if self.checkWriteBandwidthID is not None:
+-                self.checkWriteBandwidthID.cancel()
++            self.reader.cancel()
++            self.writer.cancel()
+ 
+ class SpewingProtocol(ProtocolWrapper):
+     def dataReceived(self, data):

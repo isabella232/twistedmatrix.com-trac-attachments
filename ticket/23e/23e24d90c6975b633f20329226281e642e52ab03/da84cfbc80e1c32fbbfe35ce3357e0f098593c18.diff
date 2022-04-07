@@ -1,0 +1,198 @@
+diff -r 5f95cfe718ff twisted/test/test_threadpool.py
+--- a/twisted/test/test_threadpool.py	Tue Apr 03 16:21:39 2007 +0200
++++ b/twisted/test/test_threadpool.py	Tue Apr 03 19:41:31 2007 +0200
+@@ -5,50 +5,11 @@ import pickle, time, weakref, gc
+ import pickle, time, weakref, gc
+ 
+ from twisted.trial import unittest
+-from twisted.python import threadable
+-from twisted.internet import reactor, interfaces
++from twisted.internet import defer, reactor, interfaces
+ 
+ #
+ # See the end of this module for the remainder of the imports.
+ #
+-
+-class Synchronization(object):
+-    failures = 0
+-
+-    def __init__(self, N, waiting):
+-        self.N = N
+-        self.waiting = waiting
+-        self.lock = threading.Lock()
+-        self.runs = []
+-
+-    def run(self):
+-        # This is the testy part: this is supposed to be invoked
+-        # serially from multiple threads.  If that is actually the
+-        # case, we will never fail to acquire this lock.  If it is
+-        # *not* the case, we might get here while someone else is
+-        # holding the lock.
+-        if self.lock.acquire(False):
+-            if not len(self.runs) % 5:
+-                time.sleep(0.0002) # Constant selected based on
+-                                   # empirical data to maximize the
+-                                   # chance of a quick failure if this
+-                                   # code is broken.
+-            self.lock.release()
+-        else:
+-            self.failures += 1
+-
+-        # This is just the only way I can think of to wake up the test
+-        # method.  It doesn't actually have anything to do with the
+-        # test.
+-        self.lock.acquire()
+-        self.runs.append(None)
+-        if len(self.runs) == self.N:
+-            self.waiting.release()
+-        self.lock.release()
+-
+-    synchronized = ["run"]
+-threadable.synchronize(Synchronization)
+-
+ 
+ 
+ class ThreadPoolTestCase(unittest.TestCase):
+@@ -125,60 +86,47 @@ class ThreadPoolTestCase(unittest.TestCa
+         tp2.stop()
+ 
+ 
+-    def _waitForLock(self, lock):
+-        for i in xrange(1000000):
+-            if lock.acquire(False):
+-                break
+-            time.sleep(1e-5)
+-        else:
++    def _waitForQueue(self, queue):
++        try:
++            return queue.get(True, 0.2)
++        except Queue.Empty:
+             self.fail("A long time passed without succeeding")
+ 
+ 
+     def _threadpoolTest(self, method):
+-        # This is a schizophrenic test: it seems to be trying to test
+-        # both the dispatch() behavior of the ThreadPool as well as
+-        # the serialization behavior of threadable.synchronize().  It
+-        # would probably make more sense as two much simpler tests.
+-        N = 10
++        N = 50
+ 
+         tp = threadpool.ThreadPool()
+         tp.start()
+         try:
+-            waiting = threading.Lock()
+-            waiting.acquire()
+-            actor = Synchronization(N, waiting)
+-
++            queue = Queue.Queue()
+             for i in xrange(N):
+-                tp.dispatch(actor, actor.run)
+-
+-            self._waitForLock(waiting)
+-
+-            self.failIf(actor.failures, "run() re-entered %d times" %
+-                                        (actor.failures,))
++                method(tp, queue, lambda: queue.put(None, True))
++            for i in xrange(N):
++                self._waitForQueue(queue)
+         finally:
+             tp.stop()
+ 
+ 
+     def testDispatch(self):
+         return self._threadpoolTest(
+-            lambda tp, actor: tp.dispatch(actor, actor.run))
++            lambda tp, owner, func: tp.dispatch(owner, func))
+ 
+ 
+     def testCallInThread(self):
+         return self._threadpoolTest(
+-            lambda tp, actor: tp.callInThread(actor.run))
++            lambda tp, owner, func: tp.callInThread(func))
+ 
+ 
+     def testExistingWork(self):
+-        waiter = threading.Lock()
+-        waiter.acquire()
++        queue = Queue.Queue()
+ 
+         tp = threadpool.ThreadPool(0, 1)
+-        tp.callInThread(waiter.release) # before start()
+-        tp.start()
+-
+-        try:
+-            self._waitForLock(waiter)
++        tp.callInThread(queue.put, None) # before start()
++        tp.start()
++
++        try:
++            self._waitForQueue(queue)
+         finally:
+             tp.stop()
+ 
+@@ -219,17 +167,50 @@ class RaceConditionTestCase(unittest.Tes
+         Test that the creation of new threads in the pool occurs only when
+         more jobs are added and all existing threads are occupied.
+         """
++        N = 10
+         # Ensure no threads running
+         self.assertEquals(self.threadpool.workers, 0)
+ 
+-        for i in range(10):
+-            self.threadpool.callInThread(self.event.set)
+-            self.event.wait()
+-            self.event.clear()
+-
+-            # Ensure there are very few threads running
+-            self.failUnless(self.threadpool.workers <= 2)
+-
++        d = defer.Deferred()
++        # Number of callInThread's to be done
++        counter = [N]
++        # Number of calls actually made
++        calls = [0]
++        # Store weakref somewhere so that its callback gets called
++        wr = [None]
++        def triggerNextIteration():
++            # *Main check*: ensure that no more than one thread is running
++            self.failUnless(self.threadpool.workers <= 1)
++            if not counter[0]:
++                d.callback(None)
++                return
++            counter[0] -= 1
++            def fun():
++                # This may not be atomic but our test ensures serialization anyway
++                calls[0] += 1
++            # Do next iteration when we are sure the previous is finished,
++            # i.e. the worker thread is idle again.
++            # NOTE: reactor.callFromThread here has two purposes:
++            # 1. The weakref callback can be triggered in the worker thread,
++            # which causes problem with the tearDown method being called from
++            # another thread than the main thread.
++            # 2. It also avoids recursion, which can blow up the stack.
++            wr[0] = weakref.ref(fun,
++                lambda _: reactor.callFromThread(triggerNextIteration))
++            self.threadpool.callInThread(fun)
++            # Make the test deterministic
++            # (unfortunately gc.collect() slows things down a bit)
++            del fun
++            gc.collect()
++
++        triggerNextIteration()
++
++        # At end, also check calls were actually made
++        def checkCalls(v):
++            self.assertEquals(calls[0], N)
++            return v
++        d.addCallback(checkCalls)
++        return d
+ 
+ 
+ if interfaces.IReactorThreads(reactor, None) is None:
+@@ -238,3 +219,5 @@ else:
+ else:
+     import threading
+     from twisted.python import threadpool
++    import Queue
++

@@ -1,0 +1,91 @@
+diff --git twisted/names/client.py twisted/names/client.py
+index e5e8176..f402b22 100644
+--- twisted/names/client.py
++++ twisted/names/client.py
+@@ -369,7 +369,24 @@ class Resolver(common.ResolverBase):
+         the answers section, the authority section, and the additional section.
+         """
+         if message.trunc:
+-            return self.queryTCP(message.queries).addCallback(self.filterAnswers)
++            timeout = 10
++            if isinstance(message.trunc, tuple):
++                # Truncated message got from UDP server as trunc is an address and not a bool
++                # NOTE: UDP server should be also a TCP server (on the address and port) as required by RFCs
++                addr = message.trunc
++                # Try to reuse a connection already established with the server
++                for connection in self.connections:
++                    if connection.transport.addr == addr:
++                        return connection.query(message.queries, timeout).addCallback(self.filterAnswers)
++                # Build a new connection with the server
++                deferred = defer.Deferred()
++                self._reactor.connectTCP(addr[0], addr[1], self.factory)
++                self.pending.append((deferred, message.queries, timeout))
++                return deferred.addCallback(self.filterAnswers)
++            # Don't use this call as it will establish the connection with nother server,
++            # which is more than likely not able to answer the request.
++            # TODO If here, it is probably a truncated message got from TCP!
++            return self.queryTCP(message.queries, timeout).addCallback(self.filterAnswers)
+         if message.rCode != dns.OK:
+             return failure.Failure(self.exceptionForCode(message.rCode)(message))
+         return (message.answers, message.authority, message.additional)
+diff --git twisted/names/dns.py twisted/names/dns.py
+index b6bc1c1..4e48244 100644
+--- twisted/names/dns.py
++++ twisted/names/dns.py
+@@ -2738,6 +2738,9 @@ class DNSDatagramProtocol(DNSMixin, protocol.DatagramProtocol):
+         m = Message()
+         try:
+             m.fromStr(data)
++            m.maxSize = self.transport.maxPacketSize
++            if m.trunc:
++                m.trunc = addr # will be used for TCP
+         except EOFError:
+             log.msg("Truncated packet (%d bytes) from %s" % (len(data), addr))
+             return
+diff --git twisted/names/test/test_client.py twisted/names/test/test_client.py
+index 39175c1..0f2135b 100644
+--- twisted/names/test/test_client.py
++++ twisted/names/test/test_client.py
+@@ -1059,7 +1059,7 @@ class FilterAnswersTests(unittest.TestCase):
+         m = dns.Message(trunc=True)
+         m.addQuery(b'example.com')
+ 
+-        def queryTCP(queries):
++        def queryTCP(queries, timeout = 10):
+             self.assertEqual(queries, m.queries)
+             response = dns.Message()
+             response.answers = ['answer']
+diff --git twisted/names/test/test_rootresolve.py twisted/names/test/test_rootresolve.py
+index cffb46c..334734c 100644
+--- twisted/names/test/test_rootresolve.py
++++ twisted/names/test/test_rootresolve.py
+@@ -119,6 +119,10 @@ class MemoryDatagramTransport(object):
+         """
+         pass
+ 
++    @property
++    def maxPacketSize(self):
++        return self._maxPacketSize
++
+ 
+ verifyClass(IUDPTransport, MemoryDatagramTransport)
+ 
+diff --git twisted/test/proto_helpers.py twisted/test/proto_helpers.py
+index 3b0d27f..7ff5e6a 100644
+--- twisted/test/proto_helpers.py
++++ twisted/test/proto_helpers.py
+@@ -100,10 +100,14 @@ class FakeDatagramTransport:
+ 
+     def __init__(self):
+         self.written = []
++        self._maxPacketSize = 512
+ 
+     def write(self, packet, addr=noAddr):
+         self.written.append((packet, addr))
+ 
++    @property
++    def maxPacketSize(self):
++        return self._maxPacketSize
+ 
+ 
+ @implementer(ITransport, IConsumer, IPushProducer)

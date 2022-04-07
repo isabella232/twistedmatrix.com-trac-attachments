@@ -1,0 +1,164 @@
+diff --git a/twisted/python/syslog.py b/twisted/python/syslog.py
+index cfa9020..ef09c1e 100644
+--- a/twisted/python/syslog.py
++++ b/twisted/python/syslog.py
+@@ -28,6 +28,7 @@ class SyslogObserver:
+         syslog.openlog(prefix, options, facility)
+ 
+     def emit(self, eventDict):
++        # Figure out what the message-text is.
+         edm = eventDict['message']
+         if not edm:
+             if eventDict['isError'] and eventDict.has_key('failure'):
+@@ -40,6 +41,17 @@ class SyslogObserver:
+         else:
+             text = ' '.join(map(str, edm))
+ 
++        # Figure out what syslog parameters we might need to use.
++        priority = syslog.LOG_INFO
++        facility = 0
++        if eventDict['isError']:
++            priority = syslog.LOG_ALERT
++        if 'syslogPriority' in eventDict:
++            priority = int(eventDict['syslogPriority'])
++        if 'syslogFacility' in eventDict:
++            facility = int(eventDict['syslogFacility'])
++
++        # Break the message up into lines and send them.
+         lines = text.split('\n')
+         while lines[-1:] == ['']:
+             lines.pop()
+@@ -50,7 +62,8 @@ class SyslogObserver:
+                 firstLine=0
+             else:
+                 line = '\t%s' % line
+-            syslog.syslog('[%s] %s' % (eventDict['system'], line))
++            syslog.syslog(priority|facility,
++                    '[%s] %s' % (eventDict['system'], line))
+ 
+ def startLogging(prefix='Twisted', options=DEFAULT_OPTIONS,
+         facility=DEFAULT_FACILITY, setStdout=1):
+diff --git a/twisted/python/test/test_syslog.py b/twisted/python/test/test_syslog.py
+new file mode 100644
+index 0000000..90b72c1
+--- /dev/null
++++ b/twisted/python/test/test_syslog.py
+@@ -0,0 +1,118 @@
++# -*- test-case-name: twisted.test.test_syslog -*-
++# Copyright (c) 2008 Twisted Matrix Laboratories.
++# See LICENSE for details.
++
++from twisted.trial import unittest
++import syslog as pysyslog
++from twisted.python import syslog as twsyslog
++from twisted.python.log import msg, addObserver, removeObserver
++
++class FakeSyslogFunctions:
++
++	def openlog(self, prefix=None, options=None, facility=None):
++		self.lastPrefix = prefix
++		self.lastOptions = options
++		self.lastFacility = facility
++
++	def syslog(self, arg1, arg2=None):
++		if arg2 is None:
++			self.lastPriority = None
++			self.lastMessage = arg1
++		else:
++			self.lastPriority = arg1
++			self.lastMessage = arg2
++
++class TestSyslogObserver(unittest.TestCase):
++
++	def setUp(self):
++		self.fakeSyslogFunctions = FakeSyslogFunctions()
++		self.patch(pysyslog, "openlog", self.fakeSyslogFunctions.openlog)
++		self.patch(pysyslog, "syslog", self.fakeSyslogFunctions.syslog)
++		self.syslogObserver = twsyslog.SyslogObserver("testPrefix")
++		addObserver(self.syslogObserver.emit)
++
++	def tearDown(self):
++		removeObserver(self.syslogObserver.emit)
++		del self.syslogObserver
++		del self.fakeSyslogFunctions
++
++	def test_openDefaults(self):
++		"""
++		SyslogObserver's options and facility should have sensible defaults.
++		"""
++
++		# Passing no extra values should give us the defaults.
++		twsyslog.SyslogObserver("testPrefix")
++		self.failUnlessEqual(
++				self.fakeSyslogFunctions.lastOptions,
++				twsyslog.DEFAULT_OPTIONS)
++		self.failUnlessEqual(
++				self.fakeSyslogFunctions.lastFacility,
++				twsyslog.DEFAULT_FACILITY)
++
++		# Explicitly setting options should be accepted.
++		twsyslog.SyslogObserver("testPrefix", pysyslog.LOG_PID)
++		self.failUnlessEqual(
++				self.fakeSyslogFunctions.lastOptions,
++				pysyslog.LOG_PID)
++		self.failUnlessEqual(
++				self.fakeSyslogFunctions.lastFacility,
++				twsyslog.DEFAULT_FACILITY)
++
++		# Explicitly setting facility should be accepted.
++		twsyslog.SyslogObserver("testPrefix", facility=pysyslog.LOG_LOCAL0)
++		self.failUnlessEqual(
++				self.fakeSyslogFunctions.lastOptions,
++				twsyslog.DEFAULT_OPTIONS)
++		self.failUnlessEqual(
++				self.fakeSyslogFunctions.lastFacility,
++				pysyslog.LOG_LOCAL0)
++
++	def test_syslogMessageRouting(self):
++		"""
++		SyslogObserver should do its best to interpret message fields.
++		"""
++		# An ordinary message should wind up with LOG_INFO priority, and no
++		# explicit facility.
++		msg("hello")
++		self.failUnlessEqual(
++				self.fakeSyslogFunctions.lastPriority,
++				pysyslog.LOG_INFO)
++
++		# An error should wind up with LOG_ALERT priority.
++		msg("hello", isError=True)
++		self.failUnlessEqual(
++				self.fakeSyslogFunctions.lastPriority,
++				pysyslog.LOG_ALERT)
++
++		# A message with an explicit priority set should respect it.
++		msg("hello", syslogPriority=pysyslog.LOG_DEBUG)
++		self.failUnlessEqual(
++				self.fakeSyslogFunctions.lastPriority,
++				pysyslog.LOG_DEBUG)
++
++		# An error with an explicit priority set should respect it.
++		msg("hello", isError=True, syslogPriority=pysyslog.LOG_DEBUG)
++		self.failUnlessEqual(
++				self.fakeSyslogFunctions.lastPriority,
++				pysyslog.LOG_DEBUG)
++
++		# A message with an explicit facility set should respect it.
++		msg("hello", syslogFacility=pysyslog.LOG_LOCAL0)
++		self.failUnlessEqual(
++				self.fakeSyslogFunctions.lastPriority,
++				pysyslog.LOG_LOCAL0|pysyslog.LOG_INFO)
++
++		# A message with both a priority and a facility should respect them.
++		msg("hello", syslogPriority=pysyslog.LOG_DEBUG,
++				syslogFacility=pysyslog.LOG_LOCAL0)
++		self.failUnlessEqual(
++				self.fakeSyslogFunctions.lastPriority,
++				pysyslog.LOG_DEBUG|pysyslog.LOG_LOCAL0)
++
++		# An error with both a priority and a facility should respect them.
++		msg("hello", isError=True, syslogPriority=pysyslog.LOG_DEBUG,
++				syslogFacility=pysyslog.LOG_LOCAL0)
++		self.failUnlessEqual(
++				self.fakeSyslogFunctions.lastPriority,
++				pysyslog.LOG_DEBUG|pysyslog.LOG_LOCAL0)

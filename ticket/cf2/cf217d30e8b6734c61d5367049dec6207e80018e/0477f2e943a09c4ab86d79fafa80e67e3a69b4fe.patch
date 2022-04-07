@@ -1,0 +1,173 @@
+Index: twisted/python/filepath.py
+===================================================================
+--- twisted/python/filepath.py	(revision 23118)
++++ twisted/python/filepath.py	(working copy)
+@@ -377,12 +377,66 @@
+         os.symlink(self.path, linkFilePath.path)
+ 
+ 
+-    def open(self, mode='r'):
+-        if self.alwaysCreate:
+-            assert 'a' not in mode, "Appending not supported when alwaysCreate == True"
+-            return self.create()
+-        return open(self.path, mode+'b')
++    def open(self, mode=None, flags=None):
++        """
++        Opens self with either a given mode or given flags (such as
++        os.O_RDONLY, os.O_CREAT, etc or-ed together - see os module 
++        documentation).  If both are passed, raises an error.
+ 
++        If flags are passed, a mode will automatically be generated from
++        the flags.  By default, the file will be readable unless os.O_WRONLY
++        is passed (without also passing os.O_RDWR - passing os.O_RDONLY also
++        will do nothing).  A file will only be writable (appending or 
++        otherwise) if os.WRONLY or os.RDWR flags are passed.
++
++        @returns: file object to self
++        @raises OSError if both mode and flags are passed
++        """
++        # User provided flags should not be used with a user given mode because
++        # certain combinations of modes and flags will raises very unhelpful
++        # "Invalid argument" type errors.  Besides, modes can be generated
++        # from the flags given.
++        if flags is None:
++            if not mode:
++                mode = 'r'
++            if self.alwaysCreate:
++                if 'a' in mode:
++                    raise ValueError(
++                        "Appending not supported when alwaysCreate == True")
++                return self.create()
++            return open(self.path, mode+'b')
++        else:
++            if mode:
++                raise ValueError("Either mode or flags accepted, but not both")
++
++            def isInFlags(lookingFor):
++                return flags & lookingFor == lookingFor
++
++            # Given that os.open returns only a file descriptor,
++            # FilePath.open returns a file object, a mode must be passed
++            # to os.fdopen - this will be determined based on the flags.
++
++            # Modes we care about: 'r', 'w', 'a', 'r+', 'a+'
++            # We don't care about w+, because if os.open is called with
++            # os.O_CREAT the file will already have been created.  If that
++            # flag was not passed, then we don't want the file to be created
++            # anyway.
++            
++            if isInFlags(os.O_RDWR):
++                if isInFlags(os.O_APPEND):
++                    mode = 'a+'
++                else:
++                    mode = 'r+'
++            elif isInFlags(os.O_WRONLY):
++                if isInFlags(os.O_APPEND):
++                    mode = 'a'
++                else:
++                    mode = 'w'
++            else:
++                mode = 'r'
++
++            return os.fdopen(os.open(self.path, flags), mode)
++
+     # stat methods below
+ 
+     def restat(self, reraise=True):
+Index: twisted/test/test_paths.py
+===================================================================
+--- twisted/test/test_paths.py	(revision 23118)
++++ twisted/test/test_paths.py	(working copy)
+@@ -496,7 +496,7 @@
+             os.rename = originalRename
+ 
+ 
+-    def testOpen(self):
++    def test_openWithMode(self):
+         # Opening a file for reading when it does not already exist is an error
+         nonexistent = self.path.child('nonexistent')
+         e = self.assertRaises(IOError, nonexistent.open)
+@@ -584,7 +584,83 @@
+         del nonexistent
+         self.assertRaises((OSError, IOError), existent.open)
+ 
++        # Opening a file exclusively with append mode will fail
++        failappender = self.path.child("failedAppend")
++        failappender.requireCreate(True)
++        self.assertRaises(ValueError, failappender.open, 'a')
+ 
++    def test_openWithFlags(self):
++        """
++        Verify that opening with flags works and the mode is generated 
++        correctly.
++        """
++        created = self.path.child('createdFile')
++
++        #passing both modes and flags will raise an error
++        self.assertRaises(ValueError, created.open, mode='w+', flags=os.O_RDWR)
++
++        #nonexistant file opened without the create flag will fail
++        self.assertRaises((OSError, IOError), created.open, flags=os.O_RDWR)
++
++        #file opened with no read/write flags will default to reading
++        f = created.open(flags=os.O_CREAT)
++        self.failUnless(created.exists())
++        self.assertEquals(f.read(), '')
++        f.close()
++
++        #file opened write only will not be readable.
++        f = created.open(flags=os.O_WRONLY)
++        f.write('writeonly')
++        self.assertRaises((OSError, IOError), f.read)
++        f.close()
++
++        #file opened with no write can be read from but not written to
++        f = created.open(flags=os.O_APPEND)
++        self.assertEquals(f.read(), 'writeonly')
++        self.assertRaises((OSError, IOError), f.write, "append")
++        f.close()
++        
++        #file opened with the append flag and the writeonly flag can be
++        #appended to but not overwritten, and not read from
++        f = created.open(flags=os.O_WRONLY | os.O_APPEND)
++        self.assertRaises((OSError, IOError), f.read)
++        f.write('append')
++        f.seek(0)
++        f.write('append2')
++        f.close()
++        f = created.open()
++        self.assertEquals(f.read(), 'writeonlyappendappend2')
++        f.close()
++
++        #file opened readwrite is both readable and writable.
++        f = created.open(flags=os.O_RDWR)
++        f.write('readwrite')
++        f.seek(0)
++        self.assertEquals(f.read(), 'readwriteappendappend2')
++        #len('readwrite') = len('writeonly')
++        f.close()
++
++        #file opened with readwrite and append is both appendable to and
++        #readable from
++        f = created.open(flags=os.O_RDWR | os.O_APPEND)
++        f.write('append3')
++        f.seek(0)
++        f.write('append4')
++        f.seek(0)
++        self.assertEquals(f.read(), 'readwriteappendappend2append3append4')
++        f.close()
++
++        #file called with truncate will be overwritten
++        f = created.open(flags=os.O_RDWR | os.O_TRUNC)
++        f.write('overwrite')
++        f.seek(0)
++        self.assertEquals(f.read(), 'overwrite')
++        f.close()
++
++        #file opened with the exclusive flag will raise an error
++        self.assertRaises((OSError, IOError), created.open, 
++                          flags=(os.O_RDWR | os.O_CREAT | os.O_EXCL))
++
+     def test_existsCache(self):
+         """
+         Check that C{filepath.FilePath.exists} correctly restat the object if

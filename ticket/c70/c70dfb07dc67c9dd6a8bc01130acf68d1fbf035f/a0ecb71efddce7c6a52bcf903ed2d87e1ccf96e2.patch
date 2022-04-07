@@ -1,0 +1,182 @@
+Index: twisted/test/test_internet.py
+===================================================================
+--- twisted/test/test_internet.py	(revision 12882)
++++ twisted/test/test_internet.py	(working copy)
+@@ -4,7 +4,7 @@
+ 
+ from twisted.trial import unittest
+ from twisted.trial.util import spinUntil
+-from twisted.internet import reactor, protocol, error, app, abstract, interfaces
++from twisted.internet import defer, reactor, protocol, error, app, abstract, interfaces, utils
+ try:
+     from twisted.internet import ssl
+ except ImportError:
+@@ -13,15 +13,15 @@
+     ssl = None
+ 
+ from twisted.internet.defer import SUCCESS, FAILURE, Deferred, succeed, fail
+-from twisted.python import util, threadable, log
++from twisted.python import failure, util, threadable, log
+ threadable.init(1)
+ 
++import gc
+ import sys
+ import time
+ import threading
+ import types
+ 
+-
+ class SystemEventTestCase(unittest.TestCase):
+     def setUp(self):
+         self.triggers = []
+@@ -197,6 +197,86 @@
+ 
+     _called = 0
+ 
++    def __init__(self, *args, **kwargs):
++        unittest.TestCase.__init__(self, *args, **kwargs)
++        self.byez = []
++        self.splotzh = []
++        self.f = None
++        self.d = None
++
++    def _callback_check_result2(self):
++        if len(self.splotzh) != 0:
++            self.d.errback(failure.DefaultException("The Foo instance ought to have been collected and thus the splotz task ought never to have gone off, so this splotz holder ought to be empty."))
++            return
++
++        self.d.callback("Whee!")
++
++    def _callback_check_result1(self):
++        """Callback for testCallLater_weakly"""
++        if not self.splotzh or self.splotzh[0] != "SPLOTZ!":
++            self.d.errback(failure.DefaultException("A task ought to have gone off by now that left a SPLOTZ.  It didn't."))
++            return
++        self.byez = []
++        self.splotzh = []
++        utils.callLater_weakly(0, self.f.splotz)
++        self.f = None
++        gc.collect()
++        if not self.byez or self.byez[0] != "BYE!":
++            self.d.errback(failure.DefaultException("A Foo instance ought to have been gc'ed by now and left a BYE.  It didn't."))
++            return
++        reactor.callLater(0, self._callback_check_result2)
++       
++    def testCallLater_weakly(self):
++        class Foo:
++            def splotz(self, testy=self):
++                testy.splotzh.append("SPLOTZ!")
++            def __del__(self, testy=self):
++                testy.byez.append("BYE!")
++
++        self.f = Foo()
++        utils.callLater_weakly(0, self.f.splotz)
++        self.d = defer.Deferred() # I will trigger this when the test finishes.
++        reactor.callLater(0, self._callback_check_result1)
++        return self.d
++
++    def testWeakMethod(self):
++        byeflagh = []
++        splotzh = []
++        class Foo:
++            def splotz(self):
++                splotzh.append("SPLOTZ!")
++            def __del__(self):
++                byeflagh.append("BYE!")
++
++        f = Foo()
++        splotzer = utils.WeakMethod(f.splotz)
++        gc.collect()
++        splotzer()
++        self.failUnless(splotzh and splotzh[0] == "SPLOTZ!")
++        del f
++        gc.collect()
++        splotzer()
++        self.failUnless(len(splotzh) == 1 and splotzh[0] == "SPLOTZ!")
++        
++    def testWeakMethod_more(self):
++        byeflagh = []
++        splotzh = []
++        class Foo:
++            def splotz(self):
++                splotzh.append("SPLOTZ!")
++            def __del__(self):
++                byeflagh.append("BYE!")
++
++        f = Foo()
++        splotzer = utils.WeakMethod(f.splotz)
++        del f
++        gc.collect()
++        splotzer()
++        self.failUnless(len(splotzh) == 0)
++        gc.collect()
++        splotzer()
++        self.failUnless(len(splotzh) == 0)
++        
+     def _callback(self, x, **d):
+         """Callback for testCallLater"""
+         self.assertEquals(x, 1)
+Index: twisted/internet/utils.py
+===================================================================
+--- twisted/internet/utils.py	(revision 12882)
++++ twisted/internet/utils.py	(working copy)
+@@ -5,6 +5,8 @@
+ 
+ """Utility methods."""
+ 
++from weakref import ref
++
+ from twisted.internet import protocol, reactor, defer
+ from twisted.python import failure
+ 
+@@ -19,7 +21,50 @@
+     reactor.spawnProcess(p, executable, (executable,)+tuple(args), env, path)
+     return d
+ 
++# Thanks to Thomas Wouters, JP Calderone and the authors from the Python Cookbook.
+ 
++# class WeakMethod copied from The Python Cookbook and simplified.
++
++class WeakMethod:
++    """ Wraps a bound method, in a way that allows a bound method's object to be
++        GC'd """
++    def __init__(self, fn, callback=None):
++        assert hasattr(fn, 'im_self'), "fn is required to be a bound method."
++        self._cleanupcallback = callback
++        self._obj = ref(fn.im_self, self.call_cleanup_cb)
++        self._meth = fn.im_func
++
++    def __call__(self, *args, **kws):
++        s = self._obj()
++        if s:
++            return self._meth(s, *args,**kws)
++
++    def __repr__(self):
++        return "<%s %s %s>" % (self.__class__.__name__, self._obj, self._meth,)
++
++    def call_cleanup_cb(self, thedeadweakref):
++        if self._cleanupcallback is not None:
++            self._cleanupcallback(self, thedeadweakref)
++
++def factory_function_name_here(o):
++    if hasattr(o, 'im_self'):
++        return WeakMethod(o)
++    else:
++        return o
++
++def callLater_weakly(delay, func, *args, **kwargs):
++    """
++    Call func later, but if func is a bound method then make the reference it holds to object be a weak reference.
++
++    Therefore, if this scheduled event is a bound method and it is the only thing keeping the object from being garbage collected, the object will be garbage collected and the event will be cancelled.
++    """
++    def cleanup(weakmeth, thedeadweakref):
++        if weakmeth.callId.active():
++            weakmeth.callId.cancel()
++    weakmeth = WeakMethod(func, callback=cleanup)
++    weakmeth.callId = reactor.callLater(delay, weakmeth, *args, **kwargs)
++    return weakmeth
++
+ class _BackRelay(protocol.ProcessProtocol):
+ 
+     def __init__(self, deferred, errortoo=0):

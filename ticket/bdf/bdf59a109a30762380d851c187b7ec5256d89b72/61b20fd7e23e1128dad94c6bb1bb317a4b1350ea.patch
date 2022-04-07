@@ -1,0 +1,183 @@
+Index: twisted/scripts/twistd.py
+===================================================================
+--- twisted/scripts/twistd.py	(revision 13480)
++++ twisted/scripts/twistd.py	(working copy)
+@@ -34,8 +34,9 @@
+                       "Name of the pidfile"],
+                      ['chroot', None, None,
+                       'Chroot to a supplied directory before running'],
+-                     ['uid', 'u', None, "The uid to run as."],
+-                     ['gid', 'g', None, "The gid to run as."],
++                     ['uid',   'u', None, "The uid to run as."],
++                     ['gid',   'g', None, "The gid to run as."],
++                     ['umask', 'm', None, "The umask to run under."],
+                     ]
+     zsh_altArgDescr = {"prefix":"Use the given prefix when syslogging (default: twisted)",
+                        "pidfile":"Name of the pidfile (default: twistd.pid)",}
+@@ -123,7 +124,6 @@
+     os.setsid()
+     if os.fork():   # launch child and...
+         os._exit(0) # kill off parent again.
+-    os.umask(077)
+     null=os.open('/dev/null', os.O_RDWR)
+     for i in range(3):
+         try:
+@@ -133,6 +133,9 @@
+                 raise
+     os.close(null)
+ 
++    # umask setting (which for daemons should default to 0) is done in
++    # startApplication so daemon and non-daemon can be handled correctly
++
+ def shedPrivileges(euid, uid, gid):
+     if uid is not None or gid is not None:
+         switchUID(uid, gid, euid)
+@@ -162,6 +165,16 @@
+     setupEnvironment(config)
+     service.IService(application).privilegedStartService()
+ 
++    umask = config['umask']
++    if umask is None:
++        umask = process.umask
++
++    if umask is None:
++        if not config['nodaemon']:
++            os.umask(0)
++    else:
++        os.umask(int(umask, 0)) # takes into account octal, hex, ...
++
+     uid, gid = mktap.getid(config['uid'], config['gid'])
+     if uid is None:
+         uid = process.uid
+Index: twisted/application/service.py
+===================================================================
+--- twisted/application/service.py	(revision 13480)
++++ twisted/application/service.py	(working copy)
+@@ -244,36 +244,42 @@
+ 
+     @ivar processName: the name the process should have in ps (or None)
+     @type processName: C{str}
+-    @ivar uid: the user-id the process should run under.
+-    @type uid: C{int}
+-    @ivar gid: the group-id the process should run under.
+-    @type gid: C{int}
++    @ivar uid:   the user-id the process should run under.
++    @type uid:   C{int}
++    @ivar gid:   the group-id the process should run under.
++    @type gid:   C{int}
++    @ivar umask: the umask the process should run under.
++    @type umask: C{int}
+     """
+ 
+ 
+ class Process:
+     """Process running parameters
+ 
+-    Sets up uid/gid in the constructor, and has a default
++    Sets up uid/gid/umask in the constructor, and has a default
+     of C{None} as C{processName}.
+     """
+     implements(IProcess)
+     processName = None
+ 
+-    def __init__(self, uid=None, gid=None):
+-        """Set uid and gid.
++    def __init__(self, uid=None, gid=None, umask=None):
++        """Set uid, gid and umask.
+ 
+         @param uid: The user ID as whom to execute the process.  If
+         this is None, no attempt will be made to change the UID.
+ 
+         @param gid: The group ID as whom to execute the process.  If
+         this is None, no attempt will be made to change the GID.
++
++        @param umask: The umask under which to execute the process.  If
++        this is None, no attempt will be made to change the umask.
+         """
+         self.uid = uid
+         self.gid = gid
++        self.umask = umask
+ 
+ 
+-def Application(name, uid=None, gid=None):
++def Application(name, uid=None, gid=None, umask=None):
+     """Return a compound class.
+ 
+     Return an object supporting the C{IService}, C{IServiceCollection},
+@@ -282,7 +288,7 @@
+     one of the interfaces.
+     """
+     ret = components.Componentized()
+-    for comp in (MultiService(), sob.Persistent(ret, name), Process(uid, gid)):
++    for comp in (MultiService(), sob.Persistent(ret, name), Process(uid, gid, umask)):
+         ret.addComponent(comp, ignoreClass=1)
+     IService(ret).setName(name)
+     return ret
+Index: twisted/test/test_application.py
+===================================================================
+--- twisted/test/test_application.py	(revision 13480)
++++ twisted/test/test_application.py	(working copy)
+@@ -160,20 +160,28 @@
+ class TestProcess(unittest.TestCase):
+ 
+     def testID(self):
+-        p = service.Process(5, 6)
++        p = service.Process(5, 6, 7)
+         self.assertEqual(p.uid, 5)
+         self.assertEqual(p.gid, 6)
++        self.assertEqual(p.umask, 7)
+ 
+     def testDefaults(self):
+         p = service.Process(5)
+         self.assertEqual(p.uid, 5)
+         self.assertEqual(p.gid, None)
++        self.assertEqual(p.umask, None)
+         p = service.Process(gid=5)
+         self.assertEqual(p.uid, None)
+         self.assertEqual(p.gid, 5)
++        self.assertEqual(p.umask, None)
++        p = service.Process(umask=5)
++        self.assertEqual(p.uid, None)
++        self.assertEqual(p.gid, None)
++        self.assertEqual(p.umask, 5)
+         p = service.Process()
+         self.assertEqual(p.uid, None)
+         self.assertEqual(p.gid, None)
++        self.assertEqual(p.umask, None)
+ 
+     def testProcessName(self):
+         p = service.Process()
+@@ -201,17 +209,25 @@
+         service.Application("hello")
+         service.Application("hello", 5)
+         service.Application("hello", 5, 6)
++        service.Application("hello", 5, 6, 7)
+ 
+     def testProcessComponent(self):
+         a = service.Application("hello")
+         self.assertEqual(service.IProcess(a).uid, None)
+         self.assertEqual(service.IProcess(a).gid, None)
++        self.assertEqual(service.IProcess(a).umask, None)
+         a = service.Application("hello", 5)
+         self.assertEqual(service.IProcess(a).uid, 5)
+         self.assertEqual(service.IProcess(a).gid, None)
++        self.assertEqual(service.IProcess(a).umask, None)
+         a = service.Application("hello", 5, 6)
+         self.assertEqual(service.IProcess(a).uid, 5)
+         self.assertEqual(service.IProcess(a).gid, 6)
++        self.assertEqual(service.IProcess(a).umask, None)
++        a = service.Application("hello", 5, 6, 7)
++        self.assertEqual(service.IProcess(a).uid, 5)
++        self.assertEqual(service.IProcess(a).gid, 6)
++        self.assertEqual(service.IProcess(a).umask, 7)
+ 
+     def testServiceComponent(self):
+         a = service.Application("hello")
+@@ -456,6 +472,7 @@
+         appl = compat.convert(a)
+         self.assertEqual(service.IProcess(appl).uid, 1000)
+         self.assertEqual(service.IProcess(appl).gid, 1000)
++        self.assertEqual(service.IProcess(appl).umask, None) # not in old app
+         self.assertEqual(service.IService(appl).name, "web")
+         services = list(service.IServiceCollection(appl))
+         self.assertEqual(len(services), 1)

@@ -1,0 +1,189 @@
+Index: twisted/internet/kqreactor.py
+===================================================================
+--- twisted/internet/kqreactor.py	(revision 28812)
++++ twisted/internet/kqreactor.py	(working copy)
+@@ -10,51 +10,43 @@
+     | from twisted.internet import kqreactor
+     | kqreactor.install()
+ 
+-This reactor only works on FreeBSD and requires PyKQueue 1.3, which is
+-available at:  U{http://people.freebsd.org/~dwhite/PyKQueue/}
++This reactor only works on FreeBSD and requires Python 2.6 and above select.kqueue
++module or the backport of it for Python 2.5 U{http://pypi.python.org/pypi/select26/0.1a3}
+ 
++You're going to need to patch select26::
+ 
++# HG changeset patch -- Bitbucket.org
++# Project select26
++# URL http://bitbucket.org/psykidellic/select26/overview/
++# User psykidellic
++# Date 1268883306 25200
++# Node ID aefd0e6a228b32cb4673e32806fcb415ff79152f
++# Parent  d79af7cb2ea63803bcd621a11aaa3739f882d135
++Apply the patch
+ 
+-You're going to need to patch PyKqueue::
++--- a/select26module.c
+++++ b/select26module.c
++@@ -861,7 +861,7 @@ kqueue_queue_control(kqueue_queue_Object
++ 	if (nevents < 0) {
++ 		PyErr_Format(PyExc_ValueError,
++ 			"Length of eventlist must be 0 or positive, got %d",
++-			nchanges);
+++			nevents);
++ 		return NULL;
++ 	}
++ 
++@@ -927,7 +927,7 @@ kqueue_queue_control(kqueue_queue_Object
++ 				 	"select26.kevent objects");
++ 				goto error;
++ 			} else {
++-				chl[i] = ((kqueue_event_Object *)ei)->e;
+++				chl[i++] = ((kqueue_event_Object *)ei)->e;
++ 			}
++ 			Py_DECREF(ei);
++ 		}
+ 
+-    =====================================================
+-    --- PyKQueue-1.3/kqsyscallmodule.c	Sun Jan 28 21:59:50 2001
+-    +++ PyKQueue-1.3/kqsyscallmodule.c.new	Tue Jul 30 18:06:08 2002
+-    @@ -137,7 +137,7 @@
+-     }
+-     
+-     statichere PyTypeObject KQEvent_Type = {
+-    -  PyObject_HEAD_INIT(NULL)
+-    +  PyObject_HEAD_INIT(&PyType_Type)
+-       0,                             // ob_size
+-       "KQEvent",                     // tp_name
+-       sizeof(KQEventObject),         // tp_basicsize
+-    @@ -291,13 +291,14 @@
+-     
+-       /* Build timespec for timeout */
+-       totimespec.tv_sec = timeout / 1000;
+-    -  totimespec.tv_nsec = (timeout % 1000) * 100000;
+-    +  totimespec.tv_nsec = (timeout % 1000) * 1000000;
+-     
+-       // printf("timespec: sec=%d nsec=%d\\n", totimespec.tv_sec, totimespec.tv_nsec);
+-     
+-       /* Make the call */
+-    -
+-    +  Py_BEGIN_ALLOW_THREADS
+-       gotNumEvents = kevent (self->fd, changelist, haveNumEvents, triggered, wantNumEvents, &totimespec);
+-    +  Py_END_ALLOW_THREADS
+-     
+-       /* Don't need the input event list anymore, so get rid of it */
+-       free (changelist);
+-    @@ -361,7 +362,7 @@
+-     statichere PyTypeObject KQueue_Type = {
+-            /* The ob_type field must be initialized in the module init function
+-             * to be portable to Windows without using C++. */
+-    -	PyObject_HEAD_INIT(NULL)
+-    +	PyObject_HEAD_INIT(&PyType_Type)
+-            0,			/*ob_size*/
+-            "KQueue",			/*tp_name*/
+-            sizeof(KQueueObject),	/*tp_basicsize*/
++A complete repo with the change is available at:
++U{http://bitbucket.org/psykidellic/select26/}
+ 
+ """
+ 
+@@ -62,9 +54,11 @@
+ 
+ from zope.interface import implements
+ 
+-from kqsyscall import EVFILT_READ, EVFILT_WRITE, EV_DELETE, EV_ADD
+-from kqsyscall import kqueue, kevent
+-
++try:
++    import select26 as select
++except ImportError:
++    import select
++    
+ from twisted.internet.interfaces import IReactorFDSet
+ 
+ from twisted.python import log, failure
+@@ -102,7 +96,7 @@
+         Initialize kqueue object, file descriptor tracking dictionaries, and the
+         base class.
+         """
+-        self._kq = kqueue()
++        self._kq = select.kqueue()
+         self._reads = {}
+         self._writes = {}
+         self._selectables = {}
+@@ -110,7 +104,7 @@
+ 
+ 
+     def _updateRegistration(self, *args):
+-        self._kq.kevent([kevent(*args)], 0, 0)
++        self._kq.control([select.kevent(*args)], 0, 0)
+ 
+     def addReader(self, reader):
+         """Add a FileDescriptor for notification of data available to read.
+@@ -119,7 +113,7 @@
+         if fd not in self._reads:
+             self._selectables[fd] = reader
+             self._reads[fd] = 1
+-            self._updateRegistration(fd, EVFILT_READ, EV_ADD)
++            self._updateRegistration(fd, select.KQ_FILTER_READ, select.KQ_EV_ADD)
+ 
+     def addWriter(self, writer):
+         """Add a FileDescriptor for notification of data available to write.
+@@ -128,7 +122,7 @@
+         if fd not in self._writes:
+             self._selectables[fd] = writer
+             self._writes[fd] = 1
+-            self._updateRegistration(fd, EVFILT_WRITE, EV_ADD)
++            self._updateRegistration(fd, select.KQ_FILTER_WRITE, select.KQ_EV_ADD)
+ 
+     def removeReader(self, reader):
+         """Remove a Selectable for notification of data available to read.
+@@ -138,7 +132,7 @@
+             del self._reads[fd]
+             if fd not in self._writes:
+                 del self._selectables[fd]
+-            self._updateRegistration(fd, EVFILT_READ, EV_DELETE)
++            self._updateRegistration(fd, select.KQ_FILTER_READ, select.KQ_EV_DELETE)
+ 
+     def removeWriter(self, writer):
+         """Remove a Selectable for notification of data available to write.
+@@ -148,7 +142,7 @@
+             del self._writes[fd]
+             if fd not in self._reads:
+                 del self._selectables[fd]
+-            self._updateRegistration(fd, EVFILT_WRITE, EV_DELETE)
++            self._updateRegistration(fd, select.KQ_FILTER_WRITE, select.KQ_EV_DELETE)
+ 
+     def removeAll(self):
+         """
+@@ -169,13 +163,13 @@
+ 
+     def doKEvent(self, timeout):
+         """Poll the kqueue for new events."""
+-        if timeout is None:
+-            timeout = 1000
+-        else:
+-            timeout = int(timeout * 1000) # convert seconds to milliseconds
++        #if timeout is None:
++        #    timeout = 1000
++        #else:
++        #    timeout = int(timeout * 1000) # convert seconds to milliseconds
+ 
+         try:
+-            l = self._kq.kevent([], len(self._selectables), timeout)
++            l = self._kq.control([], len(self._selectables), timeout)
+         except OSError, e:
+             if e[0] == errno.EINTR:
+                 return
+@@ -195,9 +189,9 @@
+ 
+     def _doWriteOrRead(self, selectable, fd, filter):
+         try:
+-            if filter == EVFILT_READ:
++            if filter == select.KQ_FILTER_READ:
+                 why = selectable.doRead()
+-            if filter == EVFILT_WRITE:
++            if filter == select.KQ_FILTER_WRITE:
+                 why = selectable.doWrite()
+             if not selectable.fileno() == fd:
+                 why = main.CONNECTION_LOST

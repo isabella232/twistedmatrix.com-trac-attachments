@@ -1,0 +1,278 @@
+# Bazaar merge directive format 2 (Bazaar 0.90)
+# revision_id: esteve@fluidinfo.com-20090331192619-j7gwbw96irvmsyqq
+# target_branch: ../trunk/
+# testament_sha1: 27792133b71a691a8c3b15dfd81dff9ca3164b69
+# timestamp: 2009-03-31 22:07:46 +0200
+# base_revision_id: svn-v4:bbbe8e31-12d6-0310-92fd-\
+#   ac37d47ddeeb:trunk:26540
+# 
+# Begin patch
+=== modified file 'twisted/web/resource.py'
+--- twisted/web/resource.py	2009-01-25 20:40:09 +0000
++++ twisted/web/resource.py	2009-03-31 19:26:19 +0000
+@@ -43,10 +43,13 @@
+         Render a request. This is called on the leaf resource for
+         a request. Render must return either a string, which will
+         be sent to the browser as the HTML for the request, or
+-        server.NOT_DONE_YET. If NOT_DONE_YET is returned,
++        a Deferred containing a string as its resoult value.
++        Render can also return server.NOT_DONE_YET, but
+         at some point later (in a Deferred callback, usually)
+         call request.write("<html>") to write data to the request,
+         and request.finish() to send the data to the browser.
++        The latter behavior is deprecated in favor of returning
++        Deferreds.
+         """
+ 
+ 
+
+=== modified file 'twisted/web/server.py'
+--- twisted/web/server.py	2009-01-28 21:46:48 +0000
++++ twisted/web/server.py	2009-03-30 15:45:31 +0000
+@@ -127,76 +127,86 @@
+ 
+ 
+     def render(self, resrc):
+-        try:
+-            body = resrc.render(self)
+-        except UnsupportedMethod, e:
+-            allowedMethods = e.allowedMethods
+-            if (self.method == "HEAD") and ("GET" in allowedMethods):
+-                # We must support HEAD (RFC 2616, 5.1.1).  If the
+-                # resource doesn't, fake it by giving the resource
+-                # a 'GET' request and then return only the headers,
+-                # not the body.
+-                log.msg("Using GET to fake a HEAD request for %s" %
+-                        (resrc,))
+-                self.method = "GET"
+-                body = resrc.render(self)
++        def _cbRender(body):
++            if body == NOT_DONE_YET:
++                warnings.warn(
++                    "Returning NOT_DONE_YET is deprecated, return a Deferred instead.",
++                    DeprecationWarning, stacklevel=2)
++                return
++            if type(body) is not types.StringType:
++                body = resource.ErrorPage(
++                    http.INTERNAL_SERVER_ERROR,
++                    "Request did not return a string",
++                    "Request: " + html.PRE(reflect.safe_repr(self)) + "<br />" +
++                    "Resource: " + html.PRE(reflect.safe_repr(resrc)) + "<br />" +
++                    "Value: " + html.PRE(reflect.safe_repr(body))).render(self)
+ 
+-                if body is NOT_DONE_YET:
+-                    log.msg("Tried to fake a HEAD request for %s, but "
+-                            "it got away from me." % resrc)
+-                    # Oh well, I guess we won't include the content length.
+-                else:
++            if self.method == "HEAD":
++                if len(body) > 0:
++                    # This is a Bad Thing (RFC 2616, 9.4)
++                    log.msg("Warning: HEAD request %s for resource %s is"
++                            " returning a message body."
++                            "  I think I'll eat it."
++                            % (self, resrc))
+                     self.setHeader('content-length', str(len(body)))
+-
+                 self.write('')
+-                self.finish()
+-                return
+-
+-            if self.method in (supportedMethods):
+-                # We MUST include an Allow header
+-                # (RFC 2616, 10.4.6 and 14.7)
+-                self.setHeader('Allow', allowedMethods)
+-                s = ('''Your browser approached me (at %(URI)s) with'''
+-                     ''' the method "%(method)s".  I only allow'''
+-                     ''' the method%(plural)s %(allowed)s here.''' % {
+-                    'URI': self.uri,
+-                    'method': self.method,
+-                    'plural': ((len(allowedMethods) > 1) and 's') or '',
+-                    'allowed': string.join(allowedMethods, ', ')
+-                    })
+-                epage = resource.ErrorPage(http.NOT_ALLOWED,
+-                                           "Method Not Allowed", s)
+-                body = epage.render(self)
+             else:
+-                epage = resource.ErrorPage(http.NOT_IMPLEMENTED, "Huh?",
+-                                           "I don't know how to treat a"
+-                                           " %s request." % (self.method,))
+-                body = epage.render(self)
+-        # end except UnsupportedMethod
+-
+-        if body == NOT_DONE_YET:
+-            return
+-        if type(body) is not types.StringType:
+-            body = resource.ErrorPage(
+-                http.INTERNAL_SERVER_ERROR,
+-                "Request did not return a string",
+-                "Request: " + html.PRE(reflect.safe_repr(self)) + "<br />" +
+-                "Resource: " + html.PRE(reflect.safe_repr(resrc)) + "<br />" +
+-                "Value: " + html.PRE(reflect.safe_repr(body))).render(self)
+-
+-        if self.method == "HEAD":
+-            if len(body) > 0:
+-                # This is a Bad Thing (RFC 2616, 9.4)
+-                log.msg("Warning: HEAD request %s for resource %s is"
+-                        " returning a message body."
+-                        "  I think I'll eat it."
+-                        % (self, resrc))
+                 self.setHeader('content-length', str(len(body)))
+-            self.write('')
+-        else:
+-            self.setHeader('content-length', str(len(body)))
+-            self.write(body)
+-        self.finish()
++                self.write(body)
++            self.finish()
++
++        def _ebRender(fail):
++            r = fail.trap(UnsupportedMethod)
++            if r == UnsupportedMethod:
++                allowedMethods = fail.value.allowedMethods
++
++                if (self.method == "HEAD") and ("GET" in allowedMethods):
++                    # We must support HEAD (RFC 2616, 5.1.1).  If the
++                    # resource doesn't, fake it by giving the resource
++                    # a 'GET' request and then return only the headers,
++                    # not the body.
++                    log.msg("Using GET to fake a HEAD request for %s" %
++                            (resrc,))
++                    self.method = "GET"
++                    body = resrc.render(self)
++
++                    if body is NOT_DONE_YET:
++                        log.msg("Tried to fake a HEAD request for %s, but "
++                                "it got away from me." % resrc)
++                        # Oh well, I guess we won't include the content length.
++                    else:
++                        self.setHeader('content-length', str(len(body)))
++
++                    self.write('')
++                    self.finish()
++                    return
++
++                if self.method in (supportedMethods):
++                    # We MUST include an Allow header
++                    # (RFC 2616, 10.4.6 and 14.7)
++                    self.setHeader('Allow', allowedMethods)
++                    s = ('''Your browser approached me (at %(URI)s) with'''
++                         ''' the method "%(method)s".  I only allow'''
++                         ''' the method%(plural)s %(allowed)s here.''' % {
++                        'URI': self.uri,
++                        'method': self.method,
++                        'plural': ((len(allowedMethods) > 1) and 's') or '',
++                        'allowed': string.join(allowedMethods, ', ')
++                        })
++                    epage = resource.ErrorPage(http.NOT_ALLOWED,
++                                               "Method Not Allowed", s)
++                    body = epage.render(self)
++                else:
++                    epage = resource.ErrorPage(http.NOT_IMPLEMENTED, "Huh?",
++                                               "I don't know how to treat a"
++                                               " %s request." % (self.method,))
++                    body = epage.render(self)
++                # end except UnsupportedMethod
++                return _cbRender(body)
++
++        d = defer.maybeDeferred(resrc.render, self)
++        d.addCallbacks(_cbRender, _ebRender)
++        return d
+ 
+     def processingFailed(self, reason):
+         log.err(reason)
+
+=== modified file 'twisted/web/test/test_web.py'
+--- twisted/web/test/test_web.py	2009-01-28 21:46:48 +0000
++++ twisted/web/test/test_web.py	2009-03-30 19:51:26 +0000
+@@ -181,6 +181,15 @@
+         else:
+             return "correct"
+ 
++class SimpleDeferredResource(resource.Resource):
++    def render(self, request):
++        d = defer.Deferred()
++        if http.CACHED in (request.setLastModified(10),
++                           request.setETag('MatchingTag')):
++            reactor.callLater(0, d.callback, '')
++        else:
++            reactor.callLater(0, d.callback, "correct")
++        return d
+ 
+ class DummyChannel:
+     class TCP:
+@@ -231,6 +240,18 @@
+             site.getResourceFor(DummyRequest([''])),
+             sres2, "Got the wrong resource.")
+ 
++    def test_simplestSiteDeferred(self):
++        """
++        L{Site.getResourceFor} returns the C{""} child of the root resource it
++        is constructed with when processing a request for I{/}.
++        """
++        sres1 = SimpleDeferredResource()
++        sres2 = SimpleDeferredResource()
++        sres1.putChild("",sres2)
++        site = server.Site(sres1)
++        self.assertIdentical(
++            site.getResourceFor(DummyRequest([''])),
++            sres2, "Got the wrong resource.")
+ 
+ 
+ class SessionTest(unittest.TestCase):
+
+# Begin bundle
+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
+FGI5m1CrgCbRwdPjiSr1P8XckU4UJBytVwKA

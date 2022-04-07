@@ -1,0 +1,111 @@
+Index: twisted/test/test_amp.py
+===================================================================
+--- twisted/test/test_amp.py	(revision 20397)
++++ twisted/test/test_amp.py	(working copy)
+@@ -1195,19 +1195,22 @@
+             InheritedError, AddedCommandProtocol, AddErrorsCommand, other=False)
+ 
+ 
+-
+ def _loseAndPass(err, proto):
+     # be specific, pass on the error to the client.
+     err.trap(error.ConnectionLost, error.ConnectionDone)
+     del proto.connectionLost
+     proto.connectionLost(err)
+ 
++
+ class LiveFireBase:
+     """
+     Utility for connected reactor-using tests.
+     """
+ 
+     def setUp(self):
++        """
++        Create an amp server and connect a client to it.
++        """
+         from twisted.internet import reactor
+         self.serverFactory = protocol.ServerFactory()
+         self.serverFactory.protocol = self.serverProto
+@@ -1216,9 +1219,11 @@
+         self.clientFactory.onMade = defer.Deferred()
+         self.serverFactory.onMade = defer.Deferred()
+         self.serverPort = reactor.listenTCP(0, self.serverFactory)
++        self.addCleanup(self.serverPort.stopListening)
+         self.clientConn = reactor.connectTCP(
+             '127.0.0.1', self.serverPort.getHost().port,
+             self.clientFactory)
++        self.addCleanup(self.clientConn.disconnect)
+         def getProtos(rlst):
+             self.cli = self.clientFactory.theProto
+             self.svr = self.serverFactory.theProto
+@@ -1227,6 +1232,10 @@
+         return dl.addCallback(getProtos)
+ 
+     def tearDown(self):
++        """
++        Cleanup client and server connections, and check the error got at
++        C{connectionLost}.
++        """
+         L = []
+         for conn in self.cli, self.svr:
+             if conn.transport is not None:
+@@ -1235,17 +1244,16 @@
+                 conn.connectionLost = d.errback
+                 conn.transport.loseConnection()
+                 L.append(d)
+-        if self.serverPort is not None:
+-            L.append(defer.maybeDeferred(self.serverPort.stopListening))
+-        if self.clientConn is not None:
+-            self.clientConn.disconnect()
+-        return defer.DeferredList(L)
++        return defer.gatherResults(L
++            ).addErrback(lambda first: first.value.subFailure)
+ 
++
+ def show(x):
+     import sys
+     sys.stdout.write(x+'\n')
+     sys.stdout.flush()
+ 
++
+ def tempSelfSigned():
+     from twisted.internet import ssl
+ 
+@@ -1295,9 +1303,18 @@
+                                    tls_verifyAuthorities=[cert]).addCallback(secured)
+ 
+ class SlightlySmartTLS(SimpleSymmetricCommandProtocol):
+-    def tlisfy(self):
++    """
++    Specific implementation of the protocol user server side with different
++    management of TLS.
++    """
++    def getTLSVars(self):
++        """
++        @return: the global L{tempcert] certificate as local certificate.
++        """
+         return dict(tls_localCertificate=tempcert)
++    amp.StartTLS.responder(getTLSVars)
+ 
++
+ class PlainVanillaLiveFire(LiveFireBase, unittest.TestCase):
+ 
+     clientProto = SimpleSymmetricCommandProtocol
+@@ -1312,6 +1329,7 @@
+             return self.cli.callRemote(SecuredPing)
+         return self.cli.callRemote(amp.StartTLS).addCallback(secured)
+ 
++
+ class WithServerTLSVerification(LiveFireBase, unittest.TestCase):
+     clientProto = SimpleSymmetricCommandProtocol
+     serverProto = SlightlySmartTLS
+@@ -1323,7 +1341,8 @@
+         def secured(result):
+             return self.cli.callRemote(SecuredPing)
+         return self.cli.callRemote(amp.StartTLS,
+-                                   tls_verifyAuthorities=[tempcert])
++                                   tls_verifyAuthorities=[tempcert]
++            ).addCallback(secured)
+ 
+ 
+ 

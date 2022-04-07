@@ -1,0 +1,66 @@
+--- twisted\internet\iocpreactor\abstract_orig.py	2006-09-16 17:14:03.468750000 -0700
++++ twisted\internet\iocpreactor\abstract.py	2006-09-16 17:21:11.046875000 -0700
+@@ -19,7 +19,9 @@
+     __metaclass__ = StateEventMachineType
+     implements(interfaces.ITransport, interfaces.IProducer, interfaces.IConsumer)
+     events = ["write", "loseConnection", "writeDone", "writeErr", "readDone", "readErr", "shutdown"]
+-    bufferSize = 2**2**2**2
++    bufferSize = 2**9
++    maxBufferSize = 2**16
++    writeBufferSize = 2**16
+     producer = None
+     writing = False
+     reading = False
+@@ -43,6 +45,13 @@
+         self.read_op = ReadFileOp(self)
+         self.write_op = WriteFileOp(self) # XXX: these two should be specified like before, with a class field
+ 
++    def _resizeBuffer(self):
++        newBufferSize = min(self.maxBufferSize, self.bufferSize * 2)
++        if newBufferSize != self.bufferSize:
++            from twisted.internet import reactor
++            self.bufferSize = newBufferSize
++            self.readbuf = reactor.AllocateReadBuffer(self.bufferSize)
++
+     def addBufferCallback(self, handler, event):
+         self.bufferEvents[event].add(handler)
+ 
+@@ -54,12 +63,12 @@
+             i(*a, **kw)
+ 
+     def handle_connected_write(self, data):
+-        if self.writebuf and len(self.writebuf[-1]) < self.bufferSize: # mmmhhh silly heuristics
++        if self.writebuf and len(self.writebuf[-1]) < self.writeBufferSize: # mmmhhh silly heuristics
+             self.writebuf[-1] += data
+         else:
+             self.writebuf.append(data)
+         self.writeBufferedSize += len(data)
+-        if self.writeBufferedSize >= self.bufferSize:
++        if self.writeBufferedSize >= self.writeBufferSize:
+             self.callBufferHandlers(event = "buffer full")
+         if not self.writing:
+             self.startWriting()
+@@ -155,11 +164,20 @@
+         self.reading = False
+ 
+     def handle_connected_readDone(self, bytes):
++        # painful copy
++        buffer = self.readbuf[:bytes]
++        
++        if bytes == len(self.readbuf):
++            self._resizeBuffer()
++        
+         if self.reading:
+-            self.protocol.dataReceived(self.readbuf[:bytes])
+-            self.startReading()
++            self.protocol.dataReceived(buffer)
++            # we have to check again here, because we just called a handler that
++            # might have called pauseProducing
++            if self.reading:
++                self.startReading()
+         else:
+-            self.producerBuffer.append(self.readbuf[:bytes])
++            self.producerBuffer.append(buffer)
+ 
+     def handle_disconnecting_readDone(self, bytes):
+         pass # a leftover read op from before we began disconnecting

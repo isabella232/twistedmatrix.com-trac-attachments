@@ -1,0 +1,108 @@
+diff --git docs/core/man/twistd.1 docs/core/man/twistd.1
+index c5c4c3c..0b5201d 100644
+--- docs/core/man/twistd.1
++++ docs/core/man/twistd.1
+@@ -95,6 +95,9 @@ Use the variable "application" from the given Python file. This option overrides
+ \fB\--syslog\fR
+ Log to syslog instead of a file.
+ .TP
++\fB\--syslog-facility\fR \fI<syslog-facility code>\fR
++The facility to use when syslog is enabled. Defaults to twisted.python.syslog.DEFAULT_FACILITY
++.TP
+ \fB\--version\fR
+ Print version information and exit.
+ .TP
+diff --git twisted/scripts/_twistd_unix.py twisted/scripts/_twistd_unix.py
+index 10507be..430ad04 100644
+--- twisted/scripts/_twistd_unix.py
++++ twisted/scripts/_twistd_unix.py
+@@ -8,7 +8,7 @@ import errno
+ import os
+ import sys
+ 
+-from twisted.python import log, logfile, usage
++from twisted.python import log, logfile, usage, syslog
+ from twisted.python.compat import intToBytes
+ from twisted.python.util import (
+     switchUID, uidFromString, gidFromString, untilConcludes)
+@@ -53,6 +53,8 @@ class ServerOptions(app.ServerOptions):
+                      ['gid', 'g', None, "The gid to run as.", gidFromString],
+                      ['umask', None, None,
+                       "The (octal) file creation mask to apply.", _umask],
++                     ['syslog-facility', None, syslog.DEFAULT_FACILITY, 
++                     "The facility to use when syslog is enabled."],
+                     ]
+ 
+     compData = usage.Completions(
+@@ -126,6 +128,8 @@ class UnixAppLogger(app.AppLogger):
+         app.AppLogger.__init__(self, options)
+         self._syslog = options.get("syslog", False)
+         self._syslogPrefix = options.get("prefix", "")
++        self._syslogFacility = int(options.get("syslog-facility", 
++            syslog.DEFAULT_FACILITY))
+         self._nodaemon = options.get("nodaemon", False)
+ 
+ 
+@@ -144,7 +148,8 @@ class UnixAppLogger(app.AppLogger):
+             # FIXME: Requires twisted.python.syslog to be ported to Py3
+             # https://twistedmatrix.com/trac/ticket/7957
+             from twisted.python import syslog
+-            return syslog.SyslogObserver(self._syslogPrefix).emit
++            return syslog.SyslogObserver(self._syslogPrefix, 
++                facility=self._syslogFacility).emit
+ 
+         if self._logfilename == '-':
+             if not self._nodaemon:
+diff --git twisted/test/test_twistd.py twisted/test/test_twistd.py
+index 343b0a8..659c097 100644
+--- twisted/test/test_twistd.py
++++ twisted/test/test_twistd.py
+@@ -1121,8 +1121,9 @@ def _setupSyslog(testCase):
+     logMessages = []
+ 
+     class fakesyslogobserver(object):
+-        def __init__(self, prefix):
++        def __init__(self, prefix, facility=None):
+             logMessages.append(prefix)
++            logMessages.append(facility)
+ 
+         def emit(self, eventDict):
+             logMessages.append(eventDict)
+@@ -1457,12 +1458,27 @@ class UnixAppLoggerTests(unittest.TestCase):
+         logs = _setupSyslog(self)
+         logger = UnixAppLogger({"syslog": True, "prefix": "test-prefix"})
+         observer = logger._getLogObserver()
+-        self.assertEqual(logs, ["test-prefix"])
++        self.assertEqual(logs, ["test-prefix", syslog.DEFAULT_FACILITY])
+         observer({"a": "b"})
+-        self.assertEqual(logs, ["test-prefix", {"a": "b"}])
++        self.assertEqual(logs, ["test-prefix", syslog.DEFAULT_FACILITY, {"a": "b"}])
++
++    def test_getLogObserverSyslogCustomFacility(self):
++        """
++        If C{syslog} is set to C{True} and facility is not C{None}, 
++        L{UnixAppLogger._getLogObserver} starts
++        a L{syslog.SyslogObserver} with given C{prefix} and C{facility}.
++        """
++        logs = _setupSyslog(self)
++        logger = UnixAppLogger({"syslog": True, "prefix": "test-prefix", "facility": 152})
++        self.assertNotEqual(syslog.DEFAULT_FACILITY, logger._syslogFacility)
++        observer = logger._getLogObserver()
++        self.assertEqual(logs, ["test-prefix", 152])
++        observer({"a": "b"})
++        self.assertEqual(logs, ["test-prefix", 152, {"a": "b"}])
+ 
+     if syslog is None:
+         test_getLogObserverSyslog.skip = "Syslog not available"
++        test_getLogObserverSyslogCustomFacility.skip = "Syslog not available"
+ 
+ 
+ 
+diff --git twisted/topfiles/8127.feature twisted/topfiles/8127.feature
+new file mode 100644
+index 0000000..aae9108
+--- /dev/null
++++ twisted/topfiles/8127.feature
+@@ -0,0 +1 @@
++Added a --syslog-facility parameter to the twistd script so the caller can specify the facilty to log to
+\ No newline at end of file

@@ -1,0 +1,313 @@
+diff --git a/twisted/python/syslog.py b/twisted/python/syslog.py
+index 53b8a96..a136c92 100644
+--- a/twisted/python/syslog.py
++++ b/twisted/python/syslog.py
+@@ -1,40 +1,106 @@
+-# Copyright (c) 2001-2004 Twisted Matrix Laboratories.
++# -*- test-case-name: twisted.python.test.test_syslog -*-
++# Copyright (c) 2001-2008 Twisted Matrix Laboratories.
+ # See LICENSE for details.
+ 
+-#
++"""
++Classes and utility functions for integrating Twisted and syslog.
++
++You probably want to call L{startLogging}.
++"""
++
+ syslog = __import__('syslog')
+ 
+-import log
++from twisted.python import log
++
++# These defaults come from the Python 2.3 syslog docs.
++DEFAULT_OPTIONS = 0
++DEFAULT_FACILITY = syslog.LOG_USER
++
+ 
+ class SyslogObserver:
+-    def __init__(self, prefix):
+-        syslog.openlog(prefix)
++    """
++    A log observer for logging to syslog.
++
++    See L{twisted.python.log} for context.
++
++    This logObserver will automatically use LOG_ALERT priority for logged
++    failures (such as from C{log.err()}), but you can use any priority and
++    facility by setting the 'C{syslogPriority}' and 'C{syslogFacility}' keys in
++    the event dict.
++    """
++    openlog = syslog.openlog
++    syslog = syslog.syslog
++
++    def __init__(self, prefix, options=DEFAULT_OPTIONS,
++                 facility=DEFAULT_FACILITY):
++        """
++        @type prefix: C{str}
++        @param prefix: The syslog prefix to use.
++
++        @type options: C{int}
++        @param options: A bitvector represented as an integer of the syslog
++            options to use.
++
++        @type facility: C{int}
++        @param facility: An indication to the syslog daemon of what sort of
++            program this is (essentially, an additional arbitrary metadata
++            classification for messages sent to syslog by this observer).
++        """
++        self.openlog(prefix, options, facility)
++
+ 
+     def emit(self, eventDict):
+-        edm = eventDict['message']
+-        if not edm:
+-            if eventDict['isError'] and eventDict.has_key('failure'):
+-                text = eventDict['failure'].getTraceback()
+-            elif eventDict.has_key('format'):
+-                text = eventDict['format'] % eventDict
+-            else:
+-                # we don't know how to log this
+-                return
+-        else:
+-            text = ' '.join(map(str, edm))
++        """
++        Send a message event to the I{syslog}.
++
++        @param eventDict: The event to send.  If it has no C{'message'} key, it
++            will be ignored.  Otherwise, if it has C{'syslogPriority'} and/or
++            C{'syslogFacility'} keys, these will be used as the syslog priority
++            and facility.  If it has no C{'syslogPriority'} key but a true
++            value for the C{'isError'} key, the B{LOG_ALERT} priority will be
++            used; if it has a false value for C{'isError'}, B{LOG_INFO} will be
++            used.  If the C{'message'} key is multiline, each line will be sent
++            to the syslog separately.
++        """
++        # Figure out what the message-text is.
++        text = log.textFromEventDict(eventDict)
++        if text is None:
++            return
+ 
++        # Figure out what syslog parameters we might need to use.
++        priority = syslog.LOG_INFO
++        facility = 0
++        if eventDict['isError']:
++            priority = syslog.LOG_ALERT
++        if 'syslogPriority' in eventDict:
++            priority = int(eventDict['syslogPriority'])
++        if 'syslogFacility' in eventDict:
++            facility = int(eventDict['syslogFacility'])
++
++        # Break the message up into lines and send them.
+         lines = text.split('\n')
+         while lines[-1:] == ['']:
+             lines.pop()
+ 
+-        firstLine = 1
++        firstLine = True
+         for line in lines:
+             if firstLine:
+-                firstLine=0
++                firstLine = False
+             else:
+-                line = '\t%s' % line
+-            syslog.syslog('[%s] %s' % (eventDict['system'], line))
++                line = '\t' + line
++            self.syslog(priority | facility,
++                        '[%s] %s' % (eventDict['system'], line))
++
++
++
++def startLogging(prefix='Twisted', options=DEFAULT_OPTIONS,
++                 facility=DEFAULT_FACILITY, setStdout=1):
++    """
++    Send all Twisted logging output to syslog from now on.
+ 
+-def startLogging(prefix='Twisted', setStdout=1):
+-    obs = SyslogObserver(prefix)
++    The prefix, options and facility arguments are passed to
++    C{syslog.openlog()}, see the Python syslog documentation for details. For
++    other parameters, see L{twisted.python.log.startLoggingWithObserver}.
++    """
++    obs = SyslogObserver(prefix, options, facility)
+     log.startLoggingWithObserver(obs.emit, setStdout=setStdout)
+diff --git a/twisted/python/test/test_syslog.py b/twisted/python/test/test_syslog.py
+new file mode 100644
+index 0000000..d95d554
+--- /dev/null
++++ b/twisted/python/test/test_syslog.py
+@@ -0,0 +1,148 @@
++from twisted.trial import unittest
++from twisted.python.failure import Failure
++
++try:
++    import syslog as stdsyslog
++    from twisted.python import syslog
++except ImportError:
++    syslog = None
++    stdsyslog = None
++
++
++class SyslogObserverTests(unittest.TestCase):
++    """
++    Tests for L{SyslogObserver} which sends Twisted log events to the syslog.
++    """
++    events = None
++
++    if stdsyslog is None:
++        skip = "syslog is not supported on this platform"
++
++    def setUp(self):
++        self.patch(syslog.SyslogObserver, 'openlog', self.openlog)
++        self.patch(syslog.SyslogObserver, 'syslog', self.syslog)
++        self.observer = syslog.SyslogObserver('SyslogObserverTests')
++
++
++    def openlog(self, prefix, options, facility):
++        self.logOpened = (prefix, options, facility)
++        self.events = []
++
++
++    def syslog(self, options, message):
++        self.events.append((options, message))
++
++
++    def test_emitWithoutMessage(self):
++        """
++        L{SyslogObserver.emit} ignores events with an empty value for the
++        C{'message'} key.
++        """
++        self.observer.emit({'message': (), 'isError': False, 'system': '-'})
++        self.assertEqual(self.events, [])
++
++
++    def test_emitCustomPriority(self):
++        """
++        L{SyslogObserver.emit} uses the value of the C{'syslogPriority'} as the
++        syslog priority, if that key is present in the event dictionary.
++        """
++        self.observer.emit({
++                'message': ('hello, world',), 'isError': False, 'system': '-',
++                'syslogPriority': stdsyslog.LOG_DEBUG})
++        self.assertEqual(
++            self.events,
++            [(stdsyslog.LOG_DEBUG, '[-] hello, world')])
++
++
++    def test_emitErrorPriority(self):
++        """
++        L{SyslogObserver.emit} uses C{LOG_ALERT} if the event represents an
++        error.
++        """
++        self.observer.emit({
++                'message': ('hello, world',), 'isError': True, 'system': '-',
++                'failure': Failure(Exception("foo"))})
++        self.assertEqual(
++            self.events,
++            [(stdsyslog.LOG_ALERT, '[-] hello, world')])
++
++
++    def test_emitCustomPriorityOverridesError(self):
++        """
++        L{SyslogObserver.emit} uses the value of the C{'syslogPriority'} key if
++        it is specified even if the event dictionary represents an error.
++        """
++        self.observer.emit({
++                'message': ('hello, world',), 'isError': True, 'system': '-',
++                'syslogPriority': stdsyslog.LOG_NOTICE,
++                'failure': Failure(Exception("bar"))})
++        self.assertEqual(
++            self.events,
++            [(stdsyslog.LOG_NOTICE, '[-] hello, world')])
++
++
++    def test_emitCustomFacility(self):
++        """
++        L{SyslogObserver.emit} uses the value of the C{'syslogPriority'} as the
++        syslog priority, if that key is present in the event dictionary.
++        """
++        self.observer.emit({
++                'message': ('hello, world',), 'isError': False, 'system': '-',
++                'syslogFacility': stdsyslog.LOG_CRON})
++        self.assertEqual(
++            self.events,
++            [(stdsyslog.LOG_INFO | stdsyslog.LOG_CRON, '[-] hello, world')])
++
++    def test_emitCustomSystem(self):
++        """
++        L{SyslogObserver.emit} uses the value of the C{'system'} key to prefix
++        the logged message.
++        """
++        self.observer.emit({'message': ('hello, world',), 'isError': False,
++            'system': 'nonDefaultSystem'})
++        self.assertEqual(
++            self.events,
++            [(stdsyslog.LOG_INFO, "[nonDefaultSystem] hello, world")])
++
++
++    def test_emitMessage(self):
++        """
++        L{SyslogObserver.emit} logs the value of the C{'message'} key of the
++        event dictionary it is passed to the syslog.
++        """
++        self.observer.emit({
++                'message': ('hello, world',), 'isError': False,
++                'system': '-'})
++        self.assertEqual(
++            self.events,
++            [(stdsyslog.LOG_INFO, "[-] hello, world")])
++
++
++    def test_emitMultilineMessage(self):
++        """
++        Each line of a multiline message is emitted separately to the syslog.
++        """
++        self.observer.emit({
++                'message': ('hello,\nworld',), 'isError': False,
++                'system': '-'})
++        self.assertEqual(
++            self.events,
++            [(stdsyslog.LOG_INFO, '[-] hello,'),
++             (stdsyslog.LOG_INFO, '[-] \tworld')])
++
++
++    def test_emitStripsTrailingEmptyLines(self):
++        """
++        Trailing empty lines of a multiline message are omitted from the
++        messages sent to the syslog.
++        """
++        self.observer.emit({
++                'message': ('hello,\nworld\n\n',), 'isError': False,
++                'system': '-'})
++        self.assertEqual(
++            self.events,
++            [(stdsyslog.LOG_INFO, '[-] hello,'),
++             (stdsyslog.LOG_INFO, '[-] \tworld')])
++
++
+diff --git a/twisted/test/test_twistd.py b/twisted/test/test_twistd.py
+index 9ff48c0..9cc49d1 100644
+--- a/twisted/test/test_twistd.py
++++ b/twisted/test/test_twistd.py
+@@ -1345,14 +1345,15 @@ class UnixAppLoggerTestCase(unittest.TestCase):
+         If C{syslog} is set to C{True}, L{UnixAppLogger._getLogObserver} starts
+         a L{syslog.SyslogObserver} with given C{prefix}.
+         """
+-        class fakesyslog(object):
+-            def openlog(self, prefix):
+-                self.prefix = prefix
+-        syslogModule = fakesyslog()
+-        self.patch(syslog, "syslog", syslogModule)
++        class fakesyslogobserver(object):
++			def __init__(self, prefix):
++				fakesyslogobserver.prefix = prefix
++			def emit(self, eventDict):
++				pass
++        self.patch(syslog, "SyslogObserver", fakesyslogobserver)
+         logger = UnixAppLogger({"syslog": True, "prefix": "test-prefix"})
+         observer = logger._getLogObserver()
+-        self.assertEquals(syslogModule.prefix, "test-prefix")
++        self.assertEquals(fakesyslogobserver.prefix, "test-prefix")
+ 
+     if syslog is None:
+         test_getLogObserverSyslog.skip = "Syslog not available"

@@ -1,0 +1,719 @@
+Index: twisted/internet/gthreadless.py
+===================================================================
+--- twisted/internet/gthreadless.py	(revision 0)
++++ twisted/internet/gthreadless.py	(revision 0)
+@@ -0,0 +1,211 @@
++# ----------------------------------------------------
++# gthreadless.py
++# Stefano Masini 2005
++# Based on work originally by Chris Armstrong
++# ----------------------------------------------------
++# See test_gthreadless/README for usage details
++# test_gthreadless/ contains also test code for
++# various aspects of the implemented semantics.
++# ----------------------------------------------------
++
++
++import greenlet
++from twisted.internet import defer, reactor
++from twisted.python import failure
++from twisted.spread import pb
++
++
++debug = False
++
++debugDict = {}
++
++
++def _desc(g):
++    if g.parent is None:
++        name = '(main)'
++    else:
++        name = debugDict.get(id(g), None)
++    if name is not None:
++        desc = "<%s %s" % (name, hex(id(g)))
++    else:
++        desc = "<??? %s" % (hex(id(g)),)
++    desc += ">"
++    return desc
++
++
++def logDebug(msg):
++    print 'greenlet %s: %s' % (_desc(greenlet.getcurrent()), msg)
++
++
++def switchGreenlet(g, *args, **kwargs):
++    if debug:
++        logDebug('switch --> %s' % _desc(g))
++    return g.switch(*args, **kwargs)
++
++
++class BlockOnDeferred(object):
++    def __init__(self, d):
++        self.d = d
++        
++
++class BlockOnFailure(Exception):
++    def __init__(self, f):
++        Exception.__init__(self)
++        self.f = f
++    def __str__(self):
++        return '\n--- <exception in greenlet> ---\n%s' % self.f.getTraceback(elideFrameworkCode=1)
++
++
++class gthreadlessGreenlet(greenlet.greenlet):
++    pass
++
++
++class GreenletExecutor(object):
++    def __init__(self, greenletDyingCallback):
++        self.greenletDyingCallback = greenletDyingCallback
++
++    def greenletBody(self):
++        try:
++            result = self.func(*self.args, **self.kwargs)
++            if debug:
++                logDebug('Execution of %r complete.' % self.func)
++            return result
++        except greenlet.GreenletExit:
++            if self.greenletDyingCallback is not None:
++                self.greenletDyingCallback()
++            if debug:
++                logDebug('Greenlet for %r being killed.' % self.func)
++            #print 'Greenlet being killed. Traceback:'
++            #import traceback
++            #traceback.print_exc()
++            raise
++        except:
++            if debug:
++                logDebug('Exception while running %r' % self.func)
++            raise
++            
++
++    def execute(self, func, args, kwargs):
++        if debug:
++            logDebug('GreenletExecutor.execute() for %r' % func)
++        g = greenlet.getcurrent()
++        if isinstance(g, gthreadlessGreenlet):
++            if debug:
++                logDebug('GreenletExecutor is already inside another gthreadlessGreenlet. Running %r straight away.' % func)
++            return func(*args, **kwargs)
++        self.func = func
++        self.args = args
++        self.kwargs = kwargs
++        self.funcGreenlet = gthreadlessGreenlet(self.greenletBody)
++        if debug:
++            debugDict[id(self.funcGreenlet)] = self.func.__name__
++        try:
++            if debug:
++                logDebug('GreenletExecutor: Switching greenlet in order to execute %r.' % self.func)
++            result = switchGreenlet(self.funcGreenlet)
++        except:
++            result = failure.Failure()
++        if debug:
++            logDebug('GreenletExecutor.execute() %s switched back from executing, with value %r' % (self.func, result))
++        if isinstance(result, BlockOnDeferred):
++            if debug:
++                logDebug('GreenletExecutor.execute() blocking on callback')
++            self.resultDeferred = defer.Deferred()
++            result.d.addBoth(self.keepExecutingGreenlet)
++            return self.resultDeferred
++        else:
++            if isinstance(result, defer.Deferred):
++                if debug:
++                    logDebug('%r returning to caller with a deferred.' % self.func)
++                return result
++            elif isinstance(result, failure.Failure):
++                if debug:
++                    logDebug('%r returning to caller with a failed deferred.' % self.func)
++                return defer.fail(result)
++            else:
++                if debug:
++                    logDebug('%r returning to caller with a succeeded deferred.' % self.func)
++                return defer.succeed(result)
++    
++    def keepExecutingGreenlet(self, blockOnResult):
++        if debug:
++            logDebug('GreenletExecutor.keepExecutingGreenlet() %s continuing executing' % self.func)
++        try:
++            self.funcGreenlet.parent = greenlet.getcurrent()
++            result = switchGreenlet(self.funcGreenlet, blockOnResult)
++        except:
++            result = failure.Failure()
++        if debug:
++            logDebug('GreenletExecutor.keepExecutingGreenlet() %s switched back from executing, with value %r' % (self.func, result))
++        if isinstance(result, BlockOnDeferred):
++            if debug:
++                logDebug('GreenletExecutor.keepExecutingGreenlet() blocking on callback')
++            result.d.addBoth(self.keepExecutingGreenlet)
++        else:
++            if debug:
++                logDebug('GreenletExecutor.keepExecutingGreenlet() returning to caller')
++            #if isinstance(result, failure.Failure):
++            #    self.resultDeferred.errback(result)
++            #    print 'Exception while executing greenlet.'
++            #    print result.getTraceback()
++            self.resultDeferred.callback(result)
++
++
++def deferredGreenlet(func):
++    """
++    I am a function decorator for functions that call blockOn.  The
++    function I return will call the original function inside of a
++    greenlet, and return a Deferred.
++
++    TODO: Do a hack so the name of 'GreenletExecutor.execute' is the name of 'func'.
++    """
++    def replacement(*args, **kwargs):
++        greenletDyingCallback = kwargs.get('greenletDyingCallback', None)
++        if greenletDyingCallback is not None:
++            del kwargs['greenletDyingCallback']
++        return GreenletExecutor(greenletDyingCallback).execute(func, args, kwargs)
++    return replacement
++
++
++def blockOn(d):
++    """
++    Use me in non-main greenlets to wait for a Deferred to fire.
++    
++    If d is not a callback, then it is considered as the value for the operations described below.
++    If d is a callback that's been fired already, then its result is considered as the value.
++    If d is a callback that's not been fired yet, then switch the execution to the parent
++    greenlet and wait to be switched back with the callback result as value.
++    
++    Now, if the value is a failure, then raise a BlockOnFailure exception, which is a wrapper 
++    to the original failure, that prints the original failure's traceback when printed.
++    If the value is not a failure, return it as the result to blockOn().
++                              
++    Note that, because of the BlockOnFailure, failures go back to being exceptions, like when 
++    deferred didn't exist. Therefore they're handled with try/except construct. Note though,
++    that blockOn may raise BlockOnFailure, and the original exception (or failure) is simply
++    wrapped within. Therefore it's not possible to discriminate among different types of exceptions
++    using the except clause, but it has to be done inside with an if statement.
++    """
++    g = greenlet.getcurrent()
++    while not isinstance(g, gthreadlessGreenlet):
++        if g is None:
++            raise RuntimeError, 'blockOn outside a gthreadlessGreenlet'
++        g = g.parent
++
++    if not isinstance(d, defer.Deferred):
++        value = d
++    elif d.called:
++        value = d.result
++        # Swallow both result and error.
++        # This implies that after wrapping a deferred with blockOn(), it makes no sense to
++        # add further callbacks or errbacks, because they won't fire anything useful.
++        # blockOn() is meant to be the last handler for a deferred
++        d.addCallback(lambda v: None)
++        d.addErrback(lambda f: None)
++    else:
++        value = switchGreenlet(g.parent, BlockOnDeferred(d))
++
++    if isinstance(value, failure.Failure):
++        raise BlockOnFailure(value)
++    else:
++        return value
+Index: twisted/internet/test_gthreadless/test_10_error.py
+===================================================================
+--- twisted/internet/test_gthreadless/test_10_error.py	(revision 0)
++++ twisted/internet/test_gthreadless/test_10_error.py	(revision 0)
+@@ -0,0 +1,23 @@
++from test_util import *
++
++log = Logger()
++
++@deferredGreenlet
++def funcC():
++    nonsense
++    raise Exception('exc')
++
++@deferredGreenlet
++def funcB():
++    log.write(blockOn(funcC()))
++
++@deferredGreenlet
++def funcA():
++    log.write(blockOn(funcB()))
++
++def eb(f):
++    log.write(f.getErrorMessage())
++
++funcA().addErrback(eb)
++
++assert log.lines == ["global name 'nonsense' is not defined"]
+Index: twisted/internet/test_gthreadless/test_11_error.py
+===================================================================
+--- twisted/internet/test_gthreadless/test_11_error.py	(revision 0)
++++ twisted/internet/test_gthreadless/test_11_error.py	(revision 0)
+@@ -0,0 +1,26 @@
++from test_util import *
++
++log = Logger()
++
++@deferredGreenlet
++def funcC():
++    log.write(blockOn(timeConsumingFunc(log, "1st timer")))
++    nonsense
++    raise Exception('exc')
++
++@deferredGreenlet
++def funcB():
++    log.write(blockOn(funcC()))
++
++@deferredGreenlet
++def funcA():
++    log.write(blockOn(funcB()))
++
++def eb(f):
++    log.write(f.getErrorMessage())
++
++funcA().addErrback(eb).addCallback(lambda r: reactor.stop())
++
++reactor.run()
++
++assert log.lines == ['start', 'stop', '1st timer', "global name 'nonsense' is not defined"]
+Index: twisted/internet/test_gthreadless/test_09_callWithinCall.py
+===================================================================
+--- twisted/internet/test_gthreadless/test_09_callWithinCall.py	(revision 0)
++++ twisted/internet/test_gthreadless/test_09_callWithinCall.py	(revision 0)
+@@ -0,0 +1,19 @@
++from test_util import *
++
++log = Logger()
++
++@deferredGreenlet
++def funcB():
++    log.write(blockOn(timeConsumingFunc(log, "1st timer")))
++    log.write(blockOn(timeConsumingFunc(log, "2nd timer")))
++    return 'foo'
++
++@deferredGreenlet
++def funcA():
++    log.write(blockOn(funcB()))
++
++funcA().addCallback(lambda r: reactor.stop())
++
++reactor.run()
++
++assert log.lines == ['start', 'stop', '1st timer', 'start', 'stop', '2nd timer', 'foo']
+Index: twisted/internet/test_gthreadless/test_05_externalCallback.py
+===================================================================
+--- twisted/internet/test_gthreadless/test_05_externalCallback.py	(revision 0)
++++ twisted/internet/test_gthreadless/test_05_externalCallback.py	(revision 0)
+@@ -0,0 +1,17 @@
++from test_util import *
++
++log = Logger()
++
++externalDeferred = defer.Deferred()
++
++@deferredGreenlet
++def func():
++    result = blockOn(externalDeferred)
++    log.write(result)
++
++reactor.callLater(0.1, externalDeferred.callback, 'callback')
++func().addCallback(lambda r: reactor.stop())
++    
++reactor.run()
++
++assert log.lines == ['callback']
+Index: twisted/internet/test_gthreadless/README
+===================================================================
+--- twisted/internet/test_gthreadless/README	(revision 0)
++++ twisted/internet/test_gthreadless/README	(revision 0)
+@@ -0,0 +1,115 @@
++gthreadless.py
++--------------
++Stefano Masini 2005
++Based on work originally by Chris Armstrong
++
++
++gthreadless makes use of greenlets to implement the very nice primitive 
++blockOn(d), that suspends the execution in the current stack frame while waiting 
++for the deferred to fire. This way you can use a synchronous blocking-style 
++programming model while still using twisted, all nicely integrated.
++In order to being able to use blockOn() from within a function (or method)
++you must decorate it with @deferredGreenlet.
++
++
++Here's an example of usage:
++
++
++@deferredGreenlet
++def func(backend, idList):
++   dataList = [ blockOn(backend.callRemote('getDataFromId', elementId)) 
++                  for elementId in idList]
++   return return 'The result is: %s' % dataList
++
++
++Without gthreadless:
++
++
++def func(backend, idList):
++   dataList = []
++   def fetchDataRemotely(elementList):
++       def cbFetch(elementData):
++           dataList.append(elementData)
++           if len(elementList) > 0:
++               return fetchDataRemotely(elementList[1:])
++       return backend.callRemote('getDataFromId', elementId).addCallback(cbFetch)
++   def cb(crap):
++       return 'The result is: %s' % dataList
++   return fetchDataRemotely(idList).addCallback(cb)
++
++
++This example simply shows the way to use gthreadless, but does not explain in which
++way gthreadless is different than waitForDeferred/deferredGenerator (for example).
++
++Therefore let's elaborate a bit: the example basically builds a list of values 
++obtained by performing subsequent calls to callRemote(), everytime passing a 
++parameter from a list.
++
++Let's say that instead of a list of parameters we have a list of
++objects, and we build the list of values by calling a method on each of
++these objects. Like so:
++
++
++def renderPage(self):
++ dataList = [ element.getData() for element in self.elementList ]
++ return T.html[ T.body [ 'The result:', T.br, [ (txt, T.br) for txt
++in dataList ] ] ]
++
++
++We took out @deferredGreenlet for now, because it's not needed.
++Let's say that self.elementList is made of objects defined like this:
++
++
++class ElementObject(object):
++  def getData(self):
++      return 1
++
++
++Indeed @deferredGreenlet is not needed because we're not even using pb.
++
++Now, let's say that in a new version of the software we introduce
++objects that in order to obtain the result of getData() have to go and
++query a remote server through pb. Things get more complicated now
++because getData() would return a deferred, while other objects would
++return a straight result. This difference is very uncomfortable to
++live with because you don't know how to treat the result. The are two
++ways out, and in both cases you have to change code you've already
++written:
++1) return defer.succeed(1) instead of return 1
++2) defer.maybeDeferred(element.getData()) instead of element.getData()
++
++In other words, as soon as a blocking method pops up among your
++methods, you're forced to change and treat all of them as blocking,
++even by making up deferred if needed.
++In any case, you're also compelled to change the code of renderPage()
++from synchronos style to asynchronous, unless you use waitForDeferred.
++
++I often found myself propagating maybeDeferred's back up several
++levels in my code, and I didn't like it, to tell the truth.
++
++On the other hand, if you use greenlets, you can keep renderPage the
++same exact way as we wrote it the first time, you just need to decorate
++it with @deferredGreenlet. And those methods that perform blocking
++calls, simply need to wrap the deferreds with blockOn, and that's it.
++
++
++-------
++WARNING
++-------
++
++Handle gthreadless with care.
++It's not meant to be a revolutionary piece of library that turns the whole 
++asynchronous paradigm upside down but always masking deferreds and pretending
++they don't exist.
++
++DEFERREDS ALWAYS EXIST (make sure you understand them)
++
++Following is the key concept in gthreadless you should always keep in mind:
++a @deferredGreenlet decorated function is a normal function that simply keeps an 
++eye on calls to blockOn(). When blockOn() is called, the decorated function 
++*instantiates a deferred and returns it*. Such deferred will fire with the final 
++result of your function. This "under the cover" instatiation of a deferred 
++doesn't happen every time though: it only happens when the decorated function 
++calls blockOn, if it does at all.
++
++Always keep this in mind, and you'll be happy using gthreadless.
+Index: twisted/internet/test_gthreadless/test_02_order.py
+===================================================================
+--- twisted/internet/test_gthreadless/test_02_order.py	(revision 0)
++++ twisted/internet/test_gthreadless/test_02_order.py	(revision 0)
+@@ -0,0 +1,27 @@
++from test_util import *
++
++log = Logger()
++
++@deferredGreenlet
++def funcToCallSooner():
++    log.write('a')
++
++def funcToCallLater():
++    log.write('b')
++
++@deferredGreenlet
++def funcToCallReallyLater():
++    blockOn(sleepDeferred(0.1))
++    log.write('c')
++
++@deferredGreenlet
++def funcMain():
++    reactor.callLater(0, funcToCallLater)
++    blockOn(funcToCallSooner())
++    blockOn(funcToCallReallyLater())
++
++funcMain().addCallback(lambda r: reactor.stop())
++    
++reactor.run()
++
++assert log.lines == ['a', 'b', 'c']
+Index: twisted/internet/test_gthreadless/test_03_order.py
+===================================================================
+--- twisted/internet/test_gthreadless/test_03_order.py	(revision 0)
++++ twisted/internet/test_gthreadless/test_03_order.py	(revision 0)
+@@ -0,0 +1,17 @@
++from test_util import *
++
++log = Logger()
++
++@deferredGreenlet
++def funcMain():
++    log.write('a')
++    log.write(blockOn(timeConsumingFunc(log, "1st timer")))
++    log.write('b')
++    log.write(blockOn(timeConsumingFunc(log, "2nd timer")))
++    log.write('c')
++
++funcMain().addCallback(lambda r: reactor.stop())
++    
++reactor.run()
++
++assert log.lines == ['a', 'start', 'stop', '1st timer', 'b', 'start', 'stop', '2nd timer', 'c']
+Index: twisted/internet/test_gthreadless/test_util.py
+===================================================================
+--- twisted/internet/test_gthreadless/test_util.py	(revision 0)
++++ twisted/internet/test_gthreadless/test_util.py	(revision 0)
+@@ -0,0 +1,28 @@
++from twisted.internet import reactor, defer
++defer.setDebugging(True)
++from twisted.python import failure
++from gthreadless import deferredGreenlet, blockOn
++
++
++class Logger(object):
++    def __init__(self):
++        self.lines = []
++        
++    def write(self, line):
++        self.lines.append(line)
++
++
++def sleepDeferred(delay):
++    d = defer.Deferred()
++    reactor.callLater(delay, d.callback, None)
++    return d
++
++
++def timeConsumingFunc(log, value, delay=0.2):
++    d = defer.Deferred()
++    log.write('start')
++    def delayedCall():
++        log.write('stop')
++        d.callback(value)
++    reactor.callLater(delay, delayedCall)
++    return d
+Index: twisted/internet/test_gthreadless/test_04_order.py
+===================================================================
+--- twisted/internet/test_gthreadless/test_04_order.py	(revision 0)
++++ twisted/internet/test_gthreadless/test_04_order.py	(revision 0)
+@@ -0,0 +1,20 @@
++from test_util import *
++
++log = Logger()
++
++def funcMain():
++    class C(object):
++        @deferredGreenlet
++        def func(self):
++            log.write('a')
++            log.write(blockOn(timeConsumingFunc(log, "1st timer")))
++            log.write('b')
++            log.write(blockOn(timeConsumingFunc(log, "2nd timer")))
++            log.write('c')
++    return C().func()
++
++funcMain().addCallback(lambda r: reactor.stop())
++    
++reactor.run()
++
++assert log.lines == ['a', 'start', 'stop', '1st timer', 'b', 'start', 'stop', '2nd timer', 'c']
+Index: twisted/internet/test_gthreadless/test_01_basic.py
+===================================================================
+--- twisted/internet/test_gthreadless/test_01_basic.py	(revision 0)
++++ twisted/internet/test_gthreadless/test_01_basic.py	(revision 0)
+@@ -0,0 +1,37 @@
++from test_util import *
++
++
++@deferredGreenlet
++def func():
++    return 1
++
++d = func()
++assert isinstance(d, defer.Deferred)
++assert d.called
++assert d.result == 1
++
++
++# -------------------------------------------------
++
++@deferredGreenlet
++def func():
++    return defer.succeed(1)
++
++d = func()
++assert isinstance(d, defer.Deferred)
++assert d.called
++assert d.result == 1
++    
++
++# -------------------------------------------------
++
++@deferredGreenlet
++def func():
++    return blockOn(defer.succeed(1))
++
++d = func()
++assert isinstance(d, defer.Deferred)
++assert d.called
++assert d.result == 1
++    
++
+Index: twisted/internet/test_gthreadless/test_06_externalErrback.py
+===================================================================
+--- twisted/internet/test_gthreadless/test_06_externalErrback.py	(revision 0)
++++ twisted/internet/test_gthreadless/test_06_externalErrback.py	(revision 0)
+@@ -0,0 +1,20 @@
++from test_util import *
++
++log = Logger()
++
++externalDeferred = defer.Deferred()
++
++@deferredGreenlet
++def func():
++    result = blockOn(externalDeferred)
++    log.write(result)
++
++def eb(f):
++    log.write('failure')
++
++reactor.callLater(0.1, externalDeferred.errback, failure.Failure(Exception('fail')))
++func().addErrback(eb).addCallback(lambda r: reactor.stop())
++    
++reactor.run()
++
++assert log.lines == ['failure']
+Index: twisted/internet/test_gthreadless/test_07_externalErrback.py
+===================================================================
+--- twisted/internet/test_gthreadless/test_07_externalErrback.py	(revision 0)
++++ twisted/internet/test_gthreadless/test_07_externalErrback.py	(revision 0)
+@@ -0,0 +1,21 @@
++from test_util import *
++
++log = Logger()
++
++externalDeferred = defer.Deferred()
++
++@deferredGreenlet
++def func():
++    blockOn(sleepDeferred(0.1))
++    result = blockOn(externalDeferred)
++    log.write(result)
++
++def eb(f):
++    log.write('failure')
++
++reactor.callLater(0.5, externalDeferred.errback, failure.Failure(Exception('fail')))
++func().addErrback(eb).addCallback(lambda r: reactor.stop())
++    
++reactor.run()
++
++assert log.lines == ['failure']
+Index: twisted/internet/test_gthreadless/test_08_externalErrback.py
+===================================================================
+--- twisted/internet/test_gthreadless/test_08_externalErrback.py	(revision 0)
++++ twisted/internet/test_gthreadless/test_08_externalErrback.py	(revision 0)
+@@ -0,0 +1,23 @@
++from test_util import *
++
++log = Logger()
++
++externalDeferred = defer.Deferred()
++
++@deferredGreenlet
++def func():
++    blockOn(sleepDeferred(0.1))
++    result = blockOn(externalDeferred)
++    log.write(result)
++
++def eb(f):
++    log.write('failure')
++
++reactor.callLater(0.05, externalDeferred.errback, failure.Failure(Exception('fail')))
++func().addErrback(eb).addCallback(lambda r: reactor.stop())
++
++# This test should not generate an "Unhandled error in Deferred" warning.
++    
++reactor.run()
++
++assert log.lines == ['failure']
+Index: twisted/internet/test_gthreadless/test_12_raiseWithinCall.py
+===================================================================
+--- twisted/internet/test_gthreadless/test_12_raiseWithinCall.py	(revision 0)
++++ twisted/internet/test_gthreadless/test_12_raiseWithinCall.py	(revision 0)
+@@ -0,0 +1,25 @@
++from test_util import *
++
++log = Logger()
++
++@deferredGreenlet
++def funcC():
++    log.write(blockOn(timeConsumingFunc(log, "1st timer")))
++    raise Exception('exc')
++
++@deferredGreenlet
++def funcB():
++    log.write(blockOn(funcC()))
++
++@deferredGreenlet
++def funcA():
++    log.write(blockOn(funcB()))
++
++def eb(f):
++    log.write('failure')
++
++funcA().addErrback(eb).addCallback(lambda r: reactor.stop())
++
++reactor.run()
++
++assert log.lines == ['start', 'stop', '1st timer', 'failure']
+Index: twisted/internet/test_gthreadless/test_13_blockFromMain.py
+===================================================================
+--- twisted/internet/test_gthreadless/test_13_blockFromMain.py	(revision 0)
++++ twisted/internet/test_gthreadless/test_13_blockFromMain.py	(revision 0)
+@@ -0,0 +1,10 @@
++from test_util import *
++
++log = Logger()
++
++try:
++    blockOn(1)
++except RuntimeError, e:
++    log.write(str(e))
++
++assert log.lines == ['blockOn outside a gthreadlessGreenlet']

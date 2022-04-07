@@ -1,0 +1,558 @@
+diff -r 0bf8fc09142b .hgignore
+--- a/.hgignore	Wed Mar 28 20:40:51 2012 -0700
++++ b/.hgignore	Wed Apr 04 23:33:37 2012 -0700
+@@ -3,3 +3,6 @@
+ ^_trial_temp
+ ^Twisted\.egg-info
+ ^twisted/plugins/dropin\.cache
++^tunnelproxy-\d+\.patch
++^htmlcov
++^\.coverage$
+diff -r 0bf8fc09142b example_tunnel_proxy.py
+--- /dev/null	Thu Jan 01 00:00:00 1970 +0000
++++ b/example_tunnel_proxy.py	Wed Apr 04 23:33:37 2012 -0700
+@@ -0,0 +1,11 @@
++#! /usr/bin/env python
++
++from twisted.web import proxy
++from twisted.internet import reactor
++from twisted.python import log
++import sys
++log.startLogging(sys.stdout)
++
++ 
++reactor.listenTCP(8181, proxy.TunnelProxyFactory())
++reactor.run()
+diff -r 0bf8fc09142b twisted/web/proxy.py
+--- a/twisted/web/proxy.py	Wed Mar 28 20:40:51 2012 -0700
++++ b/twisted/web/proxy.py	Wed Apr 04 23:33:37 2012 -0700
+@@ -23,10 +23,10 @@
+ from urllib import quote as urlquote
+ 
+ from twisted.internet import reactor
+-from twisted.internet.protocol import ClientFactory
++from twisted.internet.protocol import ClientFactory, Protocol
+ from twisted.web.resource import Resource
+ from twisted.web.server import NOT_DONE_YET
+-from twisted.web.http import HTTPClient, Request, HTTPChannel
++from twisted.web.http import HTTPClient, Request, HTTPChannel, HTTPFactory
+ 
+ 
+ 
+@@ -165,7 +165,7 @@
+ 
+ class Proxy(HTTPChannel):
+     """
+-    This class implements a simple web proxy.
++    This class implements a simple web proxy without CONNECT support.
+ 
+     Since it inherits from L{twisted.web.http.HTTPChannel}, to use it you
+     should do something like this::
+@@ -182,6 +182,160 @@
+ 
+ 
+ 
++class TunnelProxyRequest (ProxyRequest):
++    """
++    A request processor which supports the TUNNEL method.
++    """
++    def process(self):
++        if self.method.upper() == 'CONNECT':
++            self._process_connect()
++        else:
++            return ProxyRequest.process(self)
++
++    def _process_connect(self):
++        try:
++            host, portStr = self.uri.split(':', 1)
++            port = int(portStr)
++        except ValueError:
++            # Either the connect parameter is not HOST:PORT or PORT is
++            # not an integer, in which case this request is invalid.
++            self.setResponseCode(400)
++            self.finish()
++        else:
++            restrictedToPort = self.channel.factory.restrictedToPort
++            if (restrictedToPort is not None) and (port != restrictedToPort):
++                self.setResponseCode(403, 'Forbidden port')
++                self.finish()
++            else:
++                self.reactor.connectTCP(host, port, TunnelProtocolFactory(self, host, port))
++
++
++
++class TunnelProxy (Proxy):
++    """
++    This class implements a simple web proxy with CONNECT support.
++
++    It inherits from L{Proxy} and expects
++    L{twisted.web.proxy.TunnelProxyFactory} as a factory.
++
++        f = TunnelProxyFactory()
++
++    Make the TunnelProxyFactory a listener on a port as per usual,
++    and you have a fully-functioning web proxy which supports CONNECT.
++    This should support typical web usage with common browsers.
++
++    @ivar _tunnelproto: This is part of a private interface between
++        TunnelProxy and TunnelProtocol. This is either None or a
++        TunnelProtocol connected to a server due to a CONNECT request.
++        If this is set, then the stream from the user agent is forwarded
++        to the target HOST:PORT of the CONNECT request.
++    """
++    requestFactory = TunnelProxyRequest
++
++    def __init__(self):
++        self._tunnelproto = None
++        Proxy.__init__(self)
++
++    def _registerTunnel(self, tunnelproto):
++        """
++        This is a private interface for L{TunnelProtocol}.  This sets
++        L{_tunnelproto} to which to forward the stream from the user
++        agent.  This should only be set after the tunnel to the target
++        HOST:PORT is established.
++        """
++        assert self._tunnelproto is None, 'Precondition failure: Multiple TunnelProtocols set: self._tunnelproto == %r; new tunnelproto == %r' % (self._tunnelproto, tunnelproto)
++        self._tunnelproto = tunnelproto
++
++    def dataReceived(self, data):
++        """
++        If there is a tunnel connection, forward the stream; otherwise
++        behave just like Proxy.
++        """
++        if self._tunnelproto is None:
++            Proxy.dataReceived(self, data)
++        else:
++            self._tunnelproto.transport.write(data)
++
++
++
++class TunnelProxyFactory (HTTPFactory):
++    """
++    Factory for an HTTP proxy.
++
++    @ivar restrictedToPort: Only CONNECT requests to this port number
++        are allowed.  This may be None, in which case any port is allowed.
++    @type restrictedToPort: L{int} or None
++    """
++
++    protocol = TunnelProxy
++
++    def __init__(self, logPath=None, timeout=60*60*12, restrictedToPort=443):
++        """
++        @param logPath: The same as for HTTPFactory.
++        @param timeout: The same as for HTTPFactory.
++
++        @param restrictedToPort: Only CONNECT requests to this port number
++            are allowed.  This may be None, in which case any port
++            is allowed.
++        @type restrictedToPort: C{int} or None
++        """
++        assert restrictedToPort is None or type(restrictedToPort) is int, \
++            'Invalid restrictedToPort value: %r' % (restrictedToPort,)
++
++        self.restrictedToPort = restrictedToPort
++        HTTPFactory.__init__(self, logPath, timeout)
++
++
++
++class TunnelProtocol (Protocol):
++    """
++    When a user agent makes a CONNECT request to a TunnelProxy, this
++    protocol implements the proxy's client logic.
++
++    When the proxy connects to the target host, it responds to the user
++    agent's request with an HTTP 200.  After that, it relays the stream
++    from the target host back through the connection to the user agent.
++
++    BUG: Verify that the 200 response meets the RFCs (or the common
++    practice if it deviates from the specification).
++    """
++    # BUG: Handle early disconnects and other edge cases.
++
++    def __init__(self, request):
++        self._request = request
++        self._channel = request.channel
++        self._peertransport = request.channel.transport
++    
++    def connectionMade(self):
++        # BUG: Check this against RFCs or common implementation:
++
++        self._channel._registerTunnel(self)
++        self._request.setResponseCode(200, 'Connected')
++
++        # Write nothing to trigger sending the response headers, but do
++        # not call finish, which may close the connection:
++        self._request.write('')
++
++    def dataReceived(self, data):
++        self._peertransport.write(data)
++
++
++
++class TunnelProtocolFactory (ClientFactory):
++    protocol = TunnelProtocol
++
++    def __init__(self, request, host, port):
++        self._request = request
++
++    def buildProtocol(self, addr):
++        return self.protocol(self._request)
++
++    def clientConnectionFailed(self, connector, reason):
++        self._request.setResponseCode(501, 'Gateway error')
++        self._request.finish()
++
++
++
+ class ReverseProxyRequest(Request):
+     """
+     Used by ReverseProxy to implement a simple reverse proxy.
+diff -r 0bf8fc09142b twisted/web/test/test_proxy.py
+--- a/twisted/web/test/test_proxy.py	Wed Mar 28 20:40:51 2012 -0700
++++ b/twisted/web/test/test_proxy.py	Wed Apr 04 23:33:37 2012 -0700
+@@ -4,6 +4,7 @@
+ """
+ Test for L{twisted.web.proxy}.
+ """
++from cStringIO import StringIO
+ 
+ from twisted.trial.unittest import TestCase
+ from twisted.test.proto_helpers import StringTransportWithDisconnection
+@@ -13,6 +14,8 @@
+ from twisted.web.server import Site
+ from twisted.web.proxy import ReverseProxyResource, ProxyClientFactory
+ from twisted.web.proxy import ProxyClient, ProxyRequest, ReverseProxyRequest
++from twisted.web.proxy import TunnelProtocolFactory, TunnelProtocol
++from twisted.web.proxy import TunnelProxyFactory, TunnelProxy, TunnelProxyRequest
+ from twisted.web.test.test_web import DummyRequest
+ 
+ 
+@@ -420,9 +423,11 @@
+ 
+ class ProxyRequestTestCase(TestCase):
+     """
+-    Tests for L{ProxyRequest}.
++    Tests for L{ProxyRequest} or subclasses.
+     """
+ 
++    requestClass = ProxyRequest
++
+     def _testProcess(self, uri, expectedURI, method="GET", data=""):
+         """
+         Build a request pointing at C{uri}, and check that a proxied request
+@@ -431,7 +436,7 @@
+         transport = StringTransportWithDisconnection()
+         channel = DummyChannel(transport)
+         reactor = MemoryReactor()
+-        request = ProxyRequest(channel, False, reactor)
++        request = self.requestClass(channel, False, reactor)
+         request.gotLength(len(data))
+         request.handleContentChunk(data)
+         request.requestReceived(method, 'http://example.com%s' % (uri,),
+@@ -490,7 +495,7 @@
+         transport = StringTransportWithDisconnection()
+         channel = DummyChannel(transport)
+         reactor = MemoryReactor()
+-        request = ProxyRequest(channel, False, reactor)
++        request = self.requestClass(channel, False, reactor)
+         request.gotLength(0)
+         request.requestReceived('GET', 'http://example.com:1234/foo/bar',
+                                 'HTTP/1.0')
+@@ -502,6 +507,295 @@
+ 
+ 
+ 
++class DummyTunnelProxyFactory (object):
++    def __init__(self, restrictedToPort):
++        self.restrictedToPort = restrictedToPort
++
++        # Stored calls to log for test verification:
++        self._logCalls = []
++
++    def log(self, *a, **kw):
++        # Save the arguments for later test verification:
++        self._logCalls.append((a,kw))
++
++
++
++class DummyTunnelChannel (DummyChannel):
++    def __init__(self, transport, factory):
++        DummyChannel.__init__(self, transport)
++        self.factory = factory
++        self._requestDoneCalls = []
++        self._registerTunnelCalls = []
++
++    def _registerTunnel(self, *a, **kw):
++        self._registerTunnelCalls.append((a,kw))
++
++    def requestDone(self, *a, **kw):
++        self._requestDoneCalls.append((a,kw))
++
++
++
++class TunnelProxyRequestTestCase(ProxyRequestTestCase):
++    """
++    Tests for L{TunnelProxyRequest} including all tests in base class
++    for L{ProxyRequest}.
++    """
++
++    requestClass = TunnelProxyRequest
++
++    def _buildRequestAndConnect(self, restrictedToPort, hostPort):
++        """
++        Set up a transport, factory, and request, then call
++        requestReceived with CONNECT method.
++        """
++        self.transport = StringTransportWithDisconnection()
++        self.factory = DummyTunnelProxyFactory(restrictedToPort)
++        self.channel = DummyTunnelChannel(self.transport, self.factory)
++
++        self.reactor = MemoryReactor()
++        self.request = self.requestClass(self.channel, False, self.reactor)
++
++        self.request.gotLength(0)
++        self.request.requestReceived('CONNECT', hostPort, 'HTTP/1.0')
++
++    def _testSuccessfulConnect(self, restrictedToPort):
++        """
++        Check that L{TunnelProxyRequest.process} handles the CONNECT method
++        to port 443.  This takes a restrictedToPort parameter which
++        should be either None or 443.
++        """
++        expectedHost = 'example.com'
++        expectedPort = 443
++
++        hostPort = '%s:%d' % (expectedHost, expectedPort)
++
++        self._buildRequestAndConnect(restrictedToPort, hostPort)
++
++        self.assertEqual(len(self.reactor.tcpClients), 1)
++
++        tcpClients = self.reactor.tcpClients
++        [ (actualHost, actualPort, actualFactory, _, _) ] = tcpClients
++
++        self.assertEqual(expectedHost, actualHost)
++        self.assertEqual(expectedPort, actualPort)
++        self.assertIsInstance(actualFactory, TunnelProtocolFactory)
++
++    def test_connectWithoutPortRestriction(self):
++        """
++        Check that L{TunnelProxyRequest.process} handles the CONNECT method
++        to port 443 when restrictedToPort is None (no port restriction).
++        """
++        self._testSuccessfulConnect(restrictedToPort=None)
++
++    def test_connectToAllowedPort(self):
++        """
++        Check that L{TunnelProxyRequest.process} handles the CONNECT method
++        to port 443 when restrictedToPort is 443.
++        """
++        self._testSuccessfulConnect(restrictedToPort=443)
++
++    def _verifyResponseWithoutConnect(self, expectedResponseCode):
++        """
++        Verify cases where processing a CONNECT method returns an response
++        without attempting any tcp connections.
++        """
++        # No TCP connections attempted:
++        self.assertEqual(len(self.reactor.tcpClients), 0)
++
++        # Request finished with a 403 status code:
++        self.failUnless(self.request.finished)
++        self.assertEqual(expectedResponseCode, self.request.code)
++
++        # Request played nicely with the channel and factory:
++        self.assertEqual([((self.request,), {})], self.factory._logCalls)
++        self.assertEqual([((self.request,), {})], self.channel._requestDoneCalls)
++
++    def test_connectToRestrictedPort(self):
++        """
++        Check that L{TunnelProxyRequest.process} handles the CONNECT method
++        to a port which is not the restrictedToPort by sending a 403
++        response and *without* attempting a new tcp connection.
++        """
++        restrictedToPort = 9999
++        givenHost = 'example.com'
++        givenPort = 1234
++        hostPort = '%s:%d' % (givenHost, givenPort)
++        
++        self._buildRequestAndConnect(restrictedToPort, hostPort)
++        self._verifyResponseWithoutConnect(403)
++
++    def test_connectToMalformedAuthority(self):
++        """
++        Check that L{TunnelProxyRequest.process} handles the CONNECT method
++        with a malformed authority (ie HOST:PORT).
++        """
++        # Missing a port:
++        # BUG: Is the following request valid? Are implicit ports standard?
++        self._buildRequestAndConnect(None, 'foo')
++        self._verifyResponseWithoutConnect(400)
++
++        # Non-integer port:
++        self._buildRequestAndConnect(None, 'foo:bar')
++        self._verifyResponseWithoutConnect(400)
++
++        # Too many colons:
++        self._buildRequestAndConnect(None, 'foo:42:59')
++        self._verifyResponseWithoutConnect(400)
++
++
++
++class TunnelProxyFactoryTestCase(TestCase):
++    """
++    Tests for L{TunnelProxyFactory}.
++    """
++    def test_withoutPortRestriction(self):
++        factory = TunnelProxyFactory(restrictedToPort=None)
++        self.assertEqual(None, factory.restrictedToPort)
++
++    def test_withPortRestriction(self):
++        factory = TunnelProxyFactory(restrictedToPort=42)
++        self.assertEqual(42, factory.restrictedToPort)
++
++    def test_withInvalidPortRestriction(self):
++        invalidParam = 'this has the wrong type'
++        try:
++            TunnelProxyFactory(restrictedToPort=invalidParam)
++        except AssertionError:
++            pass
++        else:
++            self.fail('TunnelProxyFactory() accepted invalid restrictedToPort parameter: %r' % (invalidParam,))
++
++
++
++class DummyTunnelProtocol(object):
++    def __init__(self, transport):
++        self.transport = transport
++
++
++
++class TunnelProxyTestCase(TestCase):
++    """
++    Tests for L{TunnelProxy}.
++    """
++    def test_nonTunneledDataReceived(self):
++        """
++        Verify that a TunnelProxy processes incoming data just like a
++        Proxy when there is no established tunnel.
++        """
++        # We don't test a complete line or more to exercise less of the underlying stack:
++        data = 'GET '
++
++        proxy = TunnelProxy()
++        proxy.dataReceived(data)
++
++        # We awkwardly verify by inspecting behind private interfaces:
++        self.assertEqual(data, getattr(proxy, '_LineReceiver__buffer'))
++
++    def test_tunneledDataReceived(self):
++        """
++        Verify that a TunnelProxy forwards any input from the user-agent
++        to any established tunnel directly.
++        """
++        data = 'Stuff in a tunnel with \r\n to tickle any invalid http processing.\r\n\r\n'
++
++        # We only need .write so no need for more sophisticated dummy transports:
++        transport = StringIO()
++        tunnel = DummyTunnelProtocol(transport)
++
++        proxy = TunnelProxy()
++        proxy._registerTunnel(tunnel)
++        proxy.dataReceived(data)
++
++        self.assertEqual(data, transport.getvalue())
++
++
++
++class DummyTunnelRequest(object):
++    def __init__(self, channel):
++        self.channel = channel
++        self._setResponseCodeCalls = []
++        self._writeCalls = []
++        self._finishCalls = []
++
++    def setResponseCode(self, *a, **kw):
++        self._setResponseCodeCalls.append((a,kw))
++
++    def write(self, *a, **kw):
++        self._writeCalls.append((a,kw))
++
++    def finish(self, *a, **kw):
++        self._finishCalls.append((a,kw))
++
++
++
++class TunnelProtocolFactoryTestCase(TestCase):
++    """
++    Tests for L{TunnelProtocolFactory}.
++    """
++    def _buildFactory(self, request):
++        return TunnelProtocolFactory(request, 'ignored host', 'ignored port')
++
++    def test_buildProtocol(self):
++        dummyProtocolClass = lambda *a, **kw: (a, kw)
++        dummyRequestSingleton = object()
++
++        factory = self._buildFactory(dummyRequestSingleton)
++
++        # Some finagling under the hood to test the buildProtocol method:
++        factory.protocol = dummyProtocolClass
++
++        dummyProtocolResult = factory.buildProtocol('ignored address')
++
++        self.assertEqual(((dummyRequestSingleton,), {}), dummyProtocolResult)
++
++    def test_clientConnectionFailed(self):
++        dummyRequest = DummyTunnelRequest(None)
++
++        factory = self._buildFactory(dummyRequest)
++        factory.clientConnectionFailed('ignored connector', 'ignored reason')
++
++        self.assertEqual([((501, 'Gateway error'), {})], dummyRequest._setResponseCodeCalls)
++        self.assertEqual([((), {})], dummyRequest._finishCalls)
++
++
++
++class TunnelProtocolTestCase(TestCase):
++    """
++    Tests for L{TunnelProtocol}.
++    """
++    def test_connectionMade(self):
++        """
++        Verify that when a connection is made a 200 response is sent
++        and a tunnel is established.
++        """
++        channel = DummyTunnelChannel(transport=None, factory=None)
++        request = DummyTunnelRequest(channel)
++
++        tunnelproto = TunnelProtocol(request)
++        tunnelproto.connectionMade()
++
++        self.assertEqual([((tunnelproto,), {})], channel._registerTunnelCalls) 
++        self.assertEqual([((200, 'Connected'), {})], request._setResponseCodeCalls) 
++        self.assertEqual([(('',), {})], request._writeCalls) 
++
++    def test_dataReceived(self):
++        """
++        Verify that the stream from the server is forwarded to the
++        user-agent.
++        """
++        data = 'Hello World of Test!'
++
++        transport = StringIO() # We expect only .write
++        channel = DummyTunnelChannel(transport=transport, factory=None)
++        request = DummyTunnelRequest(channel)
++
++        tunnelproto = TunnelProtocol(request)
++        tunnelproto.dataReceived(data)
++
++        self.assertEqual(data, transport.getvalue()) 
++
++
++
+ class DummyFactory(object):
+     """
+     A simple holder for C{host} and C{port} information.

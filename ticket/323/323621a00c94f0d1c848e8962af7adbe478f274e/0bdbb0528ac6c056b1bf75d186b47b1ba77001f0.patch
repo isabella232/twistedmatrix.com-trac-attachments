@@ -1,0 +1,226 @@
+Index: test/test_webclient.py
+===================================================================
+--- test/test_webclient.py	(revision 23811)
++++ test/test_webclient.py	(working copy)
+@@ -77,8 +77,21 @@
+         request.write('abc')
+         return ''
+ 
++class CountingRedirect(util.Redirect):
++    """
++    A L{util.Redirect} resource that keeps track of the number of times the
++    resource has been accessed.
++    """
++    def __init__(self, *a, **kw):
++        util.Redirect.__init__(self, *a, **kw)
++        self.count = 0
+ 
++    def render(self, request):
++        self.count += 1
++        return util.Redirect.render(self, request)
+ 
++
++
+ class ParseUrlTestCase(unittest.TestCase):
+     """
+     Test URL parsing facility and defaults values.
+@@ -117,7 +130,6 @@
+         self.assertTrue(isinstance(path, str))
+ 
+ 
+-
+ class WebClientTestCase(unittest.TestCase):
+     def _listen(self, site):
+         return reactor.listenTCP(0, site, interface="127.0.0.1")
+@@ -128,6 +140,8 @@
+         FilePath(name).child("file").setContent("0123456789")
+         r = static.File(name)
+         r.putChild("redirect", util.Redirect("/file"))
++        self.infiniteRedirectResource = CountingRedirect("/infiniteRedirect")
++        r.putChild("infiniteRedirect", self.infiniteRedirectResource)
+         r.putChild("wait", LongTimeTakingResource())
+         r.putChild("error", ErrorResource())
+         r.putChild("nolength", NoLengthResource())
+@@ -300,6 +314,25 @@
+     def _cbCheckLocation(self, exc):
+         self.assertEquals(exc.location, "/file")
+ 
++    def test_infiniteRedirection(self):
++        """
++        Test that endless HTTP redirection results in an
++        L{error.InfiniteRedirection} failure after the redirection limit has
++        been reached.
++        """
++
++        def checkRedirectCount(*a):
++            self.assertEquals(f._redirectCount, 20)
++            self.assertEquals(self.infiniteRedirectResource.count, 20)
++
++        f = client.makeGetterFactory(
++            self.getURL('infiniteRedirect'),
++            client.HTTPClientFactory,
++            redirectLimit=20)
++        d = self.assertFailure(f.deferred, error.InfiniteRedirection)
++        d.addCallback(checkRedirectCount)
++        return d
++
+     def testPartial(self):
+         name = self.mktemp()
+         f = open(name, "wb")
+Index: error.py
+===================================================================
+--- error.py	(revision 23811)
++++ error.py	(working copy)
+@@ -21,12 +21,23 @@
+         return '%s %s' % (self[0], self[1])
+ 
+ class PageRedirect(Error):
+-    """A request that resulted in a http redirect """
++    """
++    A request resulted in an HTTP redirect.
++    """
+     def __init__(self, code, message = None, response = None, location = None):
+         message = message or ("%s to %s" % (http.responses.get(code), location))
+         Error.__init__(self, code, message, response)
+         self.location = location
+ 
++class InfiniteRedirection(Error):
++    """
++    HTTP redirection is occuring endlessly.
++    """
++    def __init__(self, code, message = None, response = None, location = None):
++        message = message or ("%s to %s" % (http.responses.get(code), location))
++        Error.__init__(self, code, message, response)
++        self.location = location
++
+ class ErrorPage(resource.Resource):
+     def __init__(self, status, brief, detail):
+         resource.Resource.__init__(self)
+Index: client.py
+===================================================================
+--- client.py	(revision 23811)
++++ client.py	(working copy)
+@@ -84,6 +84,18 @@
+         if self.followRedirect:
+             scheme, host, port, path = \
+                 _parse(url, defaultPort=self.transport.getPeer().port)
++
++            self.factory._redirectCount += 1
++            if self.factory._redirectCount >= self.factory.redirectLimit:
++                err = error.InfiniteRedirection(
++                    self.status,
++                    'Infinite redirection detected',
++                    location=url)
++                self.factory.noPage(failure.Failure(err))
++                self.quietLoss = 1
++                self.transport.loseConnection()
++                return
++
+             self.factory.setURL(url)
+ 
+             if self.factory.scheme == 'https':
+@@ -190,6 +202,13 @@
+     @type response_headers: dict
+     @ivar response_headers: The headers that were specified in the
+           response from the server.
++
++    @type redirectLimit: int
++    @ivar redirectLimit: The maximum number of HTTP redirects that can occur
++          before it is assumed that the redirection is endless.
++
++    @type _redirectCount: int
++    @ivar _redirectCount: The current number of HTTP redirects encountered.
+     """
+ 
+     protocol = HTTPPageGetter
+@@ -202,8 +221,10 @@
+ 
+     def __init__(self, url, method='GET', postdata=None, headers=None,
+                  agent="Twisted PageGetter", timeout=0, cookies=None,
+-                 followRedirect=1):
++                 followRedirect=1, redirectLimit=20):
+         self.protocol.followRedirect = followRedirect
++        self.redirectLimit = redirectLimit
++        self._redirectCount = 0
+         self.timeout = timeout
+         self.agent = agent
+ 
+@@ -395,16 +416,23 @@
+     return scheme, host, port, path
+ 
+ 
+-def getPage(url, contextFactory=None, *args, **kwargs):
+-    """Download a web page as a string.
++def makeGetterFactory(url, factoryFactory, contextFactory=None, *args, **kwargs):
++    """
++    Create and connect an HTTP page getting factory.
+ 
+-    Download a page. Return a deferred, which will callback with a
+-    page (as a string) or errback with a description of the error.
++    Any additional positional or keyword arguments are used when calling
++    C{factoryFactory}.
+ 
+-    See HTTPClientFactory to see what extra args can be passed.
++    @param factoryFactory: Factory factory that is called with C{url}, C{args}
++    and C{kwargs} to produce the getter
++
++    @param contextFactory: Context factory to use when creating a secure
++    connection, defaulting to C{None}
++
++    @returns: The factory created by C{factoryFactory}
+     """
+     scheme, host, port, path = _parse(url)
+-    factory = HTTPClientFactory(url, *args, **kwargs)
++    factory = factoryFactory(url, *args, **kwargs)
+     if scheme == 'https':
+         from twisted.internet import ssl
+         if contextFactory is None:
+@@ -412,23 +440,36 @@
+         reactor.connectSSL(host, port, factory, contextFactory)
+     else:
+         reactor.connectTCP(host, port, factory)
+-    return factory.deferred
++    return factory
+ 
+ 
++def getPage(url, contextFactory=None, *args, **kwargs):
++    """
++    Download a web page as a string.
++
++    Download a page. Return a deferred, which will callback with a
++    page (as a string) or errback with a description of the error.
++
++    See HTTPClientFactory to see what extra args can be passed.
++    """
++    return makeGetterFactory(
++        url,
++        HTTPClientFactory,
++        contextFactory=contextFactory,
++        *args, **kwargs).deferred
++
++
+ def downloadPage(url, file, contextFactory=None, *args, **kwargs):
+-    """Download a web page to a file.
++    """
++    Download a web page to a file.
+ 
+     @param file: path to file on filesystem, or file-like object.
+ 
+     See HTTPDownloader to see what extra args can be passed.
+     """
+-    scheme, host, port, path = _parse(url)
+-    factory = HTTPDownloader(url, file, *args, **kwargs)
+-    if scheme == 'https':
+-        from twisted.internet import ssl
+-        if contextFactory is None:
+-            contextFactory = ssl.ClientContextFactory()
+-        reactor.connectSSL(host, port, factory, contextFactory)
+-    else:
+-        reactor.connectTCP(host, port, factory)
+-    return factory.deferred
++    factoryFactory = lambda url, *a, **kw: HTTPDownloader(url, file, *a, **kw)
++    return makeGetterFactory(
++        url,
++        factoryFactory,
++        contextFactory=contextFactory,
++        *args, **kwargs).deferred

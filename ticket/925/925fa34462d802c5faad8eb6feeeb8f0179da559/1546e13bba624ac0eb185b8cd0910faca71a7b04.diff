@@ -1,0 +1,135 @@
+Index: twisted/web2/test/test_server.py
+===================================================================
+--- twisted/web2/test/test_server.py	(revision 23462)
++++ twisted/web2/test/test_server.py	(working copy)
+@@ -735,19 +735,43 @@
+             http.HTTPError)
+ 
+ 
+-    def test_wrongContentType(self):
++    def test_genericContentType(self):
+         """
+-        Check that a content-type not handled raise a C{http.HTTPError}.
++        If Content-Type is not 'multipart/form-data' or
++        'application/x-www-form-urlencoded', request content is available
++        on attribute C{content}, and attributes C{args} and C{files}
++        are emtpy.
+         """
+         ctype = http_headers.MimeType('application', 'foobar')
+         content = "key=value&multiple=two+words&multiple=more%20words"
+         root = resource.Resource()
+-        request = SimpleRequest(server.Site(root), "GET", "/",
+-                http_headers.Headers({'content-type': ctype}), content)
+-        return self.assertFailure(server.parsePOSTData(request),
+-            http.HTTPError)
++        request = SimpleRequest(server.Site(root), "POST", "/",
++            http_headers.Headers({'content-type': ctype}), content)
++        def cb(ign):
++            self.assertEquals(request.args, {})
++            self.assertEquals(request.files, {})
++            self.assertEquals(request.content, content)
++        return server.parsePOSTData(request).addCallback(cb)
+ 
+ 
++    def test_genericContentTypeMaxMem(self):
++        """
++        Check that the C{maxMem} parameter makes the parsing raise an
++        exception if the value is reached.
++        """
++        ctype = http_headers.MimeType('text', 'ascii')
++        content = 'foo foo foo'
++        maxMem = len(content) / 2
++        root = resource.Resource()
++        request = SimpleRequest(server.Site(root), 'POST', '/',
++            http_headers.Headers({'content-type': ctype}), content)
++        def cb(res):
++            self.assertEquals(res.response.description,
++                "Maximum length of %d bytes exceeded." % maxMem)
++        return self.assertFailure(server.parsePOSTData(request, maxMem=maxMem),
++            http.HTTPError).addCallback(cb)
++
++
+     def test_mimeParsingError(self):
+         """
+         A malformed content should result in a C{http.HTTPError}.
+Index: twisted/web2/server.py
+===================================================================
+--- twisted/web2/server.py	(revision 23462)
++++ twisted/web2/server.py	(working copy)
+@@ -24,6 +24,7 @@
+ from twisted.web2 import http_headers
+ from twisted.web2.filter.range import rangefilter
+ from twisted.web2 import error
++from twisted.web2 import stream
+ 
+ from twisted.web2 import version as web2_version
+ from twisted import __version__ as twisted_version
+@@ -98,6 +99,9 @@
+         request.args.update(args)
+         request.files.update(files)
+ 
++    def updateContent(data):
++        request.content = data
++
+     def error(f):
+         f.trap(fileupload.MimeFormatError)
+         raise http.HTTPError(
+@@ -121,11 +125,9 @@
+         d.addCallbacks(updateArgsAndFiles, error)
+         return d
+     else:
+-        return defer.fail(http.HTTPError(
+-            http.StatusResponse(
+-                responsecode.BAD_REQUEST,
+-                "Invalid content-type: %s/%s" % (
+-                    ctype.mediaType, ctype.mediaSubtype))))
++        d = fileupload.parseGeneric(request.stream, maxMem)
++        d.addCallbacks(updateContent, error)
++        return d
+ 
+ 
+ class StopTraversal(object):
+Index: twisted/web2/fileupload.py
+===================================================================
+--- twisted/web2/fileupload.py	(revision 23462)
++++ twisted/web2/fileupload.py	(working copy)
+@@ -362,6 +362,33 @@
+ parse_urlencoded = defer.deferredGenerator(parse_urlencoded)
+ 
+ 
++def parseGeneric(stream, maxMem=100*1024):
++    if stream.length is not None and stream.length > maxMem:
++        raise MimeFormatError("Maximum length of %d bytes exceeded." % maxMem)
++
++    content = []
++    while 1:
++        data = stream.read()
++        if isinstance(data, defer.Deferred):
++            data = defer.waitForDeferred(data)
++            yield data
++            data = data.getResult()
++        if data is None:
++            break
++
++        l = len(data)
++        if l > maxMem:
++            raise MimeFormatError("Maximum length of %d bytes exceeded." % maxMem)
++
++        content.append(str(data))
++        maxMem -= l
++
++    content = ''.join(content)
++    yield content
++    return
++parseGeneric = defer.deferredGenerator(parseGeneric)
++
++
+ if __name__ == '__main__':
+     d = parseMultipartFormData(
+         FileStream(open("upload.txt")), "----------0xKhTmLbOuNdArY")
+@@ -371,4 +398,4 @@
+         print s
+     d.addCallback(pr)
+ 
+-__all__ = ['parseMultipartFormData', 'parse_urlencoded', 'parse_urlencoded_stream', 'MultipartMimeStream', 'MimeFormatError']
++__all__ = ['parseMultipartFormData', 'parseGeneric', 'parse_urlencoded', 'parse_urlencoded_stream', 'MultipartMimeStream', 'MimeFormatError']

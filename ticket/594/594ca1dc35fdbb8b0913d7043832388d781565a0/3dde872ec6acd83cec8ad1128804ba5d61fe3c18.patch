@@ -1,0 +1,192 @@
+=== modified file 'twisted/protocols/basic.py'
+--- twisted/protocols/basic.py	2013-04-18 13:15:14 +0000
++++ twisted/protocols/basic.py	2013-06-01 01:46:21 +0000
+@@ -21,7 +21,7 @@
+ from twisted.python.compat import _PY3
+ from twisted.internet import protocol, defer, interfaces, error
+ from twisted.python import log
+-
++from twisted.python import stringchain
+ 
+ # Unfortunately we cannot use regular string formatting on Python 3; see
+ # http://bugs.python.org/issue3982 for details.
+@@ -431,7 +431,7 @@
+                       sent line is longer than this, the connection is dropped).
+                       Default is 16384.
+     """
+-    _buffer = b''
++    _buffer = None
+     delimiter = b'\r\n'
+     MAX_LENGTH = 16384
+ 
+@@ -439,21 +439,27 @@
+         """
+         Translates bytes into lines, and calls lineReceived.
+         """
+-        lines  = (self._buffer+data).split(self.delimiter)
+-        self._buffer = lines.pop(-1)
+-        for line in lines:
+-            if self.transport.disconnecting:
+-                # this is necessary because the transport may be told to lose
+-                # the connection by a line within a larger packet, and it is
+-                # important to disregard all the lines in that packet following
+-                # the one that told it to close.
+-                return
+-            if len(line) > self.MAX_LENGTH:
+-                return self.lineLengthExceeded(line)
+-            else:
++        if self._buffer is None:
++            self._buffer = stringchain.StringChain()
++        self._buffer.append(data)
++        while True:
++            next_chunk = self._buffer.popleft(self.MAX_LENGTH)
++            lines = next_chunk.split(self.delimiter)
++            if (len(lines) == 1) and (len(line) > self.MAX_LENGTH):
++                # the docstring of lineLengthExceeded() says it'll get
++                # the remainder of the buffer...
++                remainder = self._buffer.popleft_all()
++                return self.lineLengthExceeded(next_chunk + remainder)
++
++            self._buffer.appendleft(lines.pop(-1))
++            for line in lines:
++                if self.transport.disconnecting:
++                    # this is necessary because the transport may be told to lose
++                    # the connection by a line within a larger packet, and it is
++                    # important to disregard all the lines in that packet following
++                    # the one that told it to close.
++                    return
+                 self.lineReceived(line)
+-        if len(self._buffer) > self.MAX_LENGTH:
+-            return self.lineLengthExceeded(self._buffer)
+ 
+ 
+     def lineReceived(self, line):
+@@ -505,6 +511,10 @@
+ 
+ 
+ 
++xxxlog = open('xxxlog.txt', 'w')
++
++xxxlog = open('xxxlog.txt', 'w')
++
+ class LineReceiver(protocol.Protocol, _PauseableMixin):
+     """
+     A protocol that receives lines and/or raw data, depending on mode.
+@@ -523,7 +533,7 @@
+                       Default is 16384.
+     """
+     line_mode = 1
+-    _buffer = b''
++    _buffer = None
+     _busyReceiving = False
+     delimiter = b'\r\n'
+     MAX_LENGTH = 16384
+@@ -532,11 +542,12 @@
+         """
+         Clear buffered data.
+ 
+-        @return: All of the cleared buffered data.
++        @return: All of the cleared buffered data 
+         @rtype: C{bytes}
+         """
+-        b, self._buffer = self._buffer, b""
+-        return b
++        if self._buffer is not None:
++            return self._buffer.popleft(len(self._buffer))
++        return b''
+ 
+ 
+     def dataReceived(self, data):
+@@ -545,37 +556,38 @@
+         Translates bytes into lines, and calls lineReceived (or
+         rawDataReceived, depending on mode.)
+         """
++        import traceback
++        xxxlog.write("<<< %r\n" % (data,))
++        xxxlog.write("<<< %s\n" % (traceback.extract_stack(),))
++        if self._buffer is None:
++            self._buffer = stringchain.StringChain()
++        self._buffer.append(data)
++
+         if self._busyReceiving:
+-            self._buffer += data
+             return
+ 
+         try:
+             self._busyReceiving = True
+-            self._buffer += data
+-            while self._buffer and not self.paused:
++            while len(self._buffer) > 0 and not self.paused:
+                 if self.line_mode:
+-                    try:
+-                        line, self._buffer = self._buffer.split(
+-                            self.delimiter, 1)
+-                    except ValueError:
+-                        if len(self._buffer) > self.MAX_LENGTH:
+-                            line, self._buffer = self._buffer, b''
+-                            return self.lineLengthExceeded(line)
+-                        return
+-                    else:
+-                        lineLength = len(line)
+-                        if lineLength > self.MAX_LENGTH:
+-                            exceeded = line + self._buffer
+-                            self._buffer = b''
+-                            return self.lineLengthExceeded(exceeded)
++                    next_chunk = self._buffer.popleft(self.MAX_LENGTH)
++                    lines = next_chunk.split(self.delimiter)
++                    if (len(lines) == 1) and (len(next_chunk) >= self.MAX_LENGTH):
++                        # the docstring of lineLengthExceeded() says it'll get
++                        # the remainder of the buffer...
++                        remainder = self._buffer.popleft_all()
++                        xxxlog.write(">LLE %r\n" % (next_chunk + remainder,))
++                        return self.lineLengthExceeded(next_chunk + remainder)
++
++                    self._buffer.appendleft(lines.pop(-1))
++                    for line in lines:
++                        xxxlog.write("> %r\n" % (line,))
+                         why = self.lineReceived(line)
+                         if (why or self.transport and
+                             self.transport.disconnecting):
+                             return why
+                 else:
+-                    data = self._buffer
+-                    self._buffer = b''
+-                    why = self.rawDataReceived(data)
++                    why = self.rawDataReceived(self._buffer.pop_all())
+                     if why:
+                         return why
+         finally:
+
+=== modified file 'twisted/protocols/test/test_basic.py'
+--- twisted/protocols/test/test_basic.py	2013-04-18 13:15:14 +0000
++++ twisted/protocols/test/test_basic.py	2013-06-01 02:57:36 +0000
+@@ -326,6 +326,28 @@
+         self.assertTrue(transport.disconnecting)
+ 
+ 
++    def test_lineLengthExceeded(self):
++        """
++        C{LineReceiver} calls C{lineLengthExceeded} with the entire
++        remaining contents of its buffer.
++        """
++        caught_line = []
++        class ExcessivelyLargeLineCatcher(basic.LineReceiver):
++            def lineLengthExceeded(self, line):
++                print "wheeeee"
++                sys.stderr.write("wheee\n")
++                sys.stdout.write("wheee\n")
++                open("foo", "w").write("wheee\n")
++                caught_line.append(line)
++
++        proto = ExcessivelyLargeLineCatcher()
++        proto.MAX_LENGTH=6
++        transport = proto_helpers.StringTransport()
++        proto.makeConnection(transport)
++        excessive_input = b'x' * (proto.MAX_LENGTH * 2 + 2)
++        proto.dataReceived(excessive_input)
++        self.assertEqual(caught_line[0], excessive_input)
++
+     def test_rawDataError(self):
+         """
+         C{LineReceiver.dataReceived} forwards errors returned by
+

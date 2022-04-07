@@ -1,0 +1,149 @@
+commit 99e02f7e0ef33487af526d2b03e7a7b97f6b29e9
+Author: Wolfgang Rohdewald <wolfgang@rohdewald.de>
+Date:   Sat Oct 4 00:05:01 2014 +0200
+
+    Ticket 7662: twisted.spread.banana now raises NotImplementedError when receiving pb messages without pb being the selected dialect
+
+diff --git docs/core/specifications/banana.rst docs/core/specifications/banana.rst
+index 670a816..6373f36 100644
+--- docs/core/specifications/banana.rst
++++ docs/core/specifications/banana.rst
+@@ -188,8 +188,16 @@ A profile is specified by a unique string. This specification defines two profil
+ profile that should be supported by all Banana implementations.
+ Additional profiles may be added in the future.
+ 
++
++
++
++
++
++Extensions defined by a profile may only be used if that profile has been selected by
++client and server.
+     
+-    
++
++
+ 
+ 
+ 
+diff --git twisted/spread/banana.py twisted/spread/banana.py
+index 0b215eb..02193c6 100644
+--- twisted/spread/banana.py
++++ twisted/spread/banana.py
+@@ -87,6 +87,11 @@ SIZE_LIMIT = 640 * 1024   # 640k is all you'll ever need :-)
+ 
+ class Banana(protocol.Protocol, styles.Ephemeral):
+     knownDialects = ["pb", "none"]
++    """
++    Those are the profiles Banana supports.
++    While the specification defines profiles, the implementation
++    names them dialects.
++    """
+ 
+     prefixLimit = None
+     sizeLimit = SIZE_LIMIT
+@@ -213,7 +218,12 @@ class Banana(protocol.Protocol, styles.Ephemeral):
+             elif typebyte == VOCAB:
+                 buffer = rest
+                 num = b1282int(num)
+-                gotItem(self.incomingVocabulary[num])
++                item = self.incomingVocabulary[num]
++                if self.currentDialect == b'pb':
++                    # the sender issues VOCAB only for dialect pb
++                    gotItem(item)
++                else:
++                    raise NotImplementedError("Invalid item for pb protocol %r" % (item,))
+             elif typebyte == FLOAT:
+                 if len(rest) >= 8:
+                     buffer = rest[8:]
+diff --git twisted/test/test_banana.py twisted/test/test_banana.py
+index d914f47..c1ed6dd 100644
+--- twisted/test/test_banana.py
++++ twisted/test/test_banana.py
+@@ -21,8 +21,11 @@ class MathTestCase(unittest.TestCase):
+             y = banana.b1282int(v)
+             assert y == i, "y = %s; i = %s" % (y,i)
+ 
+-class BananaTestCase(unittest.TestCase):
+-
++class BananaTestBase(unittest.TestCase):
++    """
++    The base for test classes. It defines commonly used things
++    and sets up a connection for testing.
++    """
+     encClass = banana.Banana
+ 
+     def setUp(self):
+@@ -39,6 +42,13 @@ class BananaTestCase(unittest.TestCase):
+         self.enc.connectionLost(failure.Failure(main.CONNECTION_DONE))
+         del self.enc
+ 
++
++
++class BananaTestCase(BananaTestBase):
++    """
++    general banana tests
++    """
++
+     def testString(self):
+         self.enc.sendEncoded("hello")
+         l = []
+@@ -270,6 +280,51 @@ class BananaTestCase(unittest.TestCase):
+         self.assertEqual(encoded(baseNegIn - 3), '\x03' + baseLongNegOut)
+ 
+ 
++class DialectTests(BananaTestBase):
++    """
++    Tests for handling dialects
++    """
++    legalPbItem = chr(banana.Banana.outgoingVocabulary['remote']) + banana.VOCAB
++    illegalPbItem = chr(122) + banana.VOCAB
++
++    def test_dialectNotSet(self):
++        """
++        Dialect must be pb when receiving pb vocabulary
++        """
++        self.assertRaises(NotImplementedError,
++            self.enc.dataReceived, self.legalPbItem)
++
++
++    def test_receivePb(self):
++        """
++        if pb dialect is selected, the receiver must accept things
++        in that dialect.
++        """
++        self.enc._selectDialect(b'pb')
++        self.enc.dataReceived(self.legalPbItem)
++        self.assertEqual(self.result, b'remote')
++
++
++    def test_receiveIllegalPb(self):
++        """
++        if pb dialect is selected, the receiver must accept things
++        in that dialect unless they are illegal.
++        """
++        self.enc._selectDialect(b'pb')
++        self.assertRaises(KeyError, self.enc.dataReceived, self.illegalPbItem)
++
++
++    def test_sendPb(self):
++        """
++        if pb dialect is selected, the sender must be able
++        to send things in that dialect.
++        """
++        self.enc._selectDialect(b'pb')
++        self.enc.sendEncoded(b'lcache')
++        self.enc.dataReceived(self.io.getvalue())
++        self.assertEqual(self.result, b'lcache')
++
++
+ 
+ class GlobalCoderTests(unittest.TestCase):
+     """
+diff --git twisted/topfiles/7662.bugfix twisted/topfiles/7662.bugfix
+new file mode 100644
+index 0000000..1659606
+--- /dev/null
++++ twisted/topfiles/7662.bugfix
+@@ -0,0 +1 @@
++twisted.spread.banana.Banana now raises NotImplementedError when receiving pb messages without pb being the selected dialect

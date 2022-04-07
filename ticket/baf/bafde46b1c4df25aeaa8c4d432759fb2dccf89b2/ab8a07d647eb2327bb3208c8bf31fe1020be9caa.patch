@@ -1,0 +1,225 @@
+Index: test/test_pb.py
+===================================================================
+--- test/test_pb.py	(revision 33657)
++++ test/test_pb.py	(working copy)
+@@ -1167,6 +1167,27 @@
+ 
+ 
+ 
++def DummyHash(salt, secret):
++    return salt + secret
++
++class HashMethodCredential(credentials.UsernamePassword):
++    implements(pb.IHashMethod)
++    def hashMethod(self, salt, secret):
++        return DummyHash(salt, secret)
++
++class DummyChallengerChecker(checkers.InMemoryUsernamePasswordDatabaseDontUse):
++    implements(pb.IChallenger)
++    def challengeFor(self, username):
++        return str(len(username))
++
++    def hashMethod(self, salt, secret):
++        return DummyHash(salt, secret)
++
++class DummyCrdentialWithBadHashMethod(credentials.UsernamePassword):
++    implements(pb.IHashMethod)
++    def hashMethod(self, salt, secret):
++        return "salt"
++
+ class NewCredLeakTests(unittest.TestCase):
+     """
+     Tests to try to trigger memory leaks.
+@@ -1405,7 +1426,61 @@
+         self.addCleanup(connector.disconnect)
+         return d
+ 
++    def test_loginLogoutWithIHashMethod(self):
++        """
++        Test that login can be performed with IUsernamePassword and IHashMethod
++        credentials and that when the connection is dropped the avatar is
++        logged out
++        """
+ 
++        self.portal.registerChecker(
++            DummyChallengerChecker(user='pass'))
++        factory = pb.PBClientFactory()
++        creds = HashMethodCredential("user", "pass")
++
++        mind = "BRAINS!"
++
++        d = factory.login(creds, mind)
++        def cbLogin(perspective):
++            self.assertTrue(self.realm.lastPerspective.loggedIn)
++            self.assertIsInstance(perspective, pb.RemoteReference)
++            return self._disconnect(None, factory)
++        d.addCallback(cbLogin)
++
++        def cbLogout(ignored):
++            self.assertTrue(self.realm.lastPerspective.loggedOut)
++        d.addCallback(cbLogout)
++
++        connector = reactor.connectTCP("127.0.0.1", self.portno, factory)
++        self.addCleanup(connector.disconnect)
++        return d
++
++    def test_loginWithBadHashMethod(self):
++        """ Test that we cannot login if client and server do not use the
++        same hashMethod
++        """
++        self.portal.registerChecker(
++            DummyChallengerChecker(user='pass'))
++        factory = pb.PBClientFactory()
++        creds = DummyCrdentialWithBadHashMethod("user", "pass")
++
++        mind = "BRAINS!"
++        d = factory.login(creds, mind)
++        self.assertFailure(d, UnauthorizedLogin, u"tete")
++
++        d = gatherResults([d])
++
++        def cleanup(ignore):
++            errors = self.flushLoggedErrors(UnauthorizedLogin)
++            self.assertEqual(len(errors), 1)
++            return self._disconnect(None, factory)
++        d.addCallback(cleanup)
++
++        connector = reactor.connectTCP("127.0.0.1", self.portno, factory)
++        self.addCleanup(connector.disconnect)
++        
++        return d
++
+     def test_logoutAfterDecref(self):
+         """
+         If a L{RemoteReference} to an L{IPerspective} avatar is decrefed and
+Index: spread/pb.py
+===================================================================
+--- spread/pb.py	(revision 33657)
++++ spread/pb.py	(working copy)
+@@ -37,7 +37,7 @@
+ from twisted.python.hashlib import md5
+ from twisted.internet import defer, protocol
+ from twisted.cred.portal import Portal
+-from twisted.cred.credentials import IAnonymous, ICredentials
++from twisted.cred.credentials import IAnonymous, ICredentials, IUsernamePassword
+ from twisted.cred.credentials import IUsernameHashedPassword, Anonymous
+ from twisted.persisted import styles
+ from twisted.python.components import registerAdapter
+@@ -1041,8 +1041,16 @@
+ ##         obj.__del__ = reallyDel
+         del self.locallyCachedObjects[objectID]
+ 
++# let users defined hash method and challenge (?salt).
++class IHashMethod(Interface):
++    def hashMethod(salt, data):
++        """ return hashed data using salf """
+ 
++class IChallenger(IHashMethod):
++    def challengeFor(data):
++        """ get challenge (salt) for data """
+ 
++
+ def respond(challenge, password):
+     """Respond to a challenge.
+ 
+@@ -1155,12 +1163,14 @@
+         if self._broker:
+             self._broker.transport.loseConnection()
+ 
+-    def _cbSendUsername(self, root, username, password, client):
++    def _cbSendUsername(self, root, username, password, client, hashMethod=None):
+         return root.callRemote("login", username).addCallback(
+-            self._cbResponse, password, client)
++            self._cbResponse, password, client, hashMethod)
+ 
+-    def _cbResponse(self, (challenge, challenger), password, client):
+-        return challenger.callRemote("respond", respond(challenge, password), client)
++    def _cbResponse(self, (challenge, challenger), password, client, hashMethod=None):
++        if not hashMethod:
++            hashMethod = respond
++        return challenger.callRemote("respond", hashMethod(challenge, password), client)
+ 
+ 
+     def _cbLoginAnonymous(self, root, client):
+@@ -1200,6 +1210,10 @@
+ 
+         if IAnonymous.providedBy(credentials):
+             d.addCallback(self._cbLoginAnonymous, client)
++        elif IHashMethod.providedBy(credentials):
++            d.addCallback(
++                self._cbSendUsername, credentials.username,
++                credentials.password, client, credentials.hashMethod)
+         else:
+             d.addCallback(
+                 self._cbSendUsername, credentials.username,
+@@ -1360,8 +1374,15 @@
+         """
+         Start of username/password login.
+         """
+-        c = challenge()
+-        return c, _PortalAuthChallenger(self.portal, self.broker, username, c)
++        checker = self.portal.checkers.get(IUsernamePassword, None)
++        if checker and IChallenger.providedBy(checker):
++            c = checker.challengeFor(username)
++            hashMethod = checker.hashMethod
++        else:
++            c = challenge()
++            hashMethod = respond
++        return c, _PortalAuthChallenger(self.portal, self.broker, username, c,
++                                        hashMethod)
+ 
+ 
+     def remote_loginAnonymous(self, mind):
+@@ -1385,17 +1406,20 @@
+     """
+     Called with response to password challenge.
+     """
+-    implements(IUsernameHashedPassword, IUsernameMD5Password)
++    implements(IUsernameHashedPassword, IUsernamePassword)
+ 
+-    def __init__(self, portal, broker, username, challenge):
++    def __init__(self, portal, broker, username, challenge, hashMethod):
+         self.portal = portal
+         self.broker = broker
+         self.username = username
+         self.challenge = challenge
++        self.hashMethod = hashMethod
+ 
+ 
+     def remote_respond(self, response, mind):
+         self.response = response
++        # IUsernamePassword
++        self.password = response
+         d = self.portal.login(self, mind, IPerspective)
+         d.addCallback(self._cbLogin)
+         return d
+@@ -1403,18 +1427,13 @@
+ 
+     # IUsernameHashedPassword:
+     def checkPassword(self, password):
+-        return self.checkMD5Password(md5(password).digest())
++        return self.checkHashedPassword(self.hashMethod(self.challenge, password))
++        #return self.checkMD5Password(md5(password).digest())
+ 
+ 
+-    # IUsernameMD5Password
+-    def checkMD5Password(self, md5Password):
+-        md = md5()
+-        md.update(md5Password)
+-        md.update(self.challenge)
+-        correct = md.digest()
+-        return self.response == correct
++    def checkHashedPassword(self, hashed):
++        return hashed == self.response
+ 
+-
+ __all__ = [
+     # Everything from flavors is exposed publically here.
+     'IPBRoot', 'Serializable', 'Referenceable', 'NoSuchMethod', 'Root',
+@@ -1430,5 +1449,5 @@
+     'RemoteMethod', 'IPerspective', 'Avatar', 'AsReferenceable',
+     'RemoteReference', 'CopyableFailure', 'CopiedFailure', 'failure2Copyable',
+     'Broker', 'respond', 'challenge', 'PBClientFactory', 'PBServerFactory',
+-    'IUsernameMD5Password',
++    'IUsernameMD5Password', 'IHashMethod', 'IChallenger',
+     ]

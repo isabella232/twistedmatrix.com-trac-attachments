@@ -1,0 +1,92 @@
+diff --git a/twisted/web/http.py b/twisted/web/http.py
+index cac1767..1fb10a7 100644
+--- a/twisted/web/http.py
++++ b/twisted/web/http.py
+@@ -798,7 +798,16 @@ class Request:
+         # cache the client and server information, we'll need this later to be
+         # serialized and sent with the request so CGIs will work remotely
+         self.client = self.channel.transport.getPeer()
+-        self.host = self.channel.transport.getHost()
++        # The expectation for a IP address is sprinkled throughout the
++        # implementation of twisted.web, klein and no doubt other
++        # libraries. Therefore if the address isn't IP-based then just use
++        # a fake address; a e.g. UNIXAddress is not particularly
++        # meaningful to HTTP, whose specifications presume TCP, so there's
++        # no headers or whatnot that will benefit from real information.
++        host = self.channel.transport.getHost()
++        if not isinstance(host, (address.IPv4Address, address.IPv6Address)):
++            host = address.IPv4Address("TCP", "127.0.0.1", 0)
++        self.host = host
+ 
+         # Argument processing
+         args = self.args
+diff --git a/twisted/web/test/test_http.py b/twisted/web/test/test_http.py
+index a90ffd2..431402b 100644
+--- a/twisted/web/test/test_http.py
++++ b/twisted/web/test/test_http.py
+@@ -21,6 +21,7 @@ from twisted.trial.unittest import TestCase
+ from twisted.web import http, http_headers
+ from twisted.web.http import PotentialDataLoss, _DataLoss
+ from twisted.web.http import _IdentityTransferDecoder
++from twisted.internet.address import IPv4Address, UNIXAddress, IPv6Address
+ from twisted.internet.task import Clock
+ from twisted.internet.error import ConnectionLost
+ from twisted.protocols import loopback
+@@ -1533,6 +1534,57 @@ class RequestTests(unittest.TestCase, ResponseTestMixin):
+             req.requestHeaders.getRawHeaders(b"host"), [b"example.com:81"])
+ 
+ 
++    def getRequestHost(self, transport):
++        """
++        @param transport: A transport for a L{http.Request}.
++
++        @return: The result of L{http.Request.getHost} for a request with
++            the given transport.
++        """
++        channel = DummyChannel()
++        channel.transport = transport
++        req = http.Request(channel, False)
++        req.gotLength(123)
++        req.requestReceived(b"GET", b"/", b"HTTP/1.1")
++        return req.getHost()
++
++    def test_getHostNotIPAddress(self):
++        """
++        L{http.Request.getHost} returns a fake L{IPv4Address} if a non-IP
++        address was used, to pacify various internal and external code
++        that assumes IP addresses only.
++        """
++        class Unix(DummyChannel.TCP):
++            """
++            Fake UNIX transport.
++            """
++            def getHost(self):
++                return UNIXAddress(b"/path/to/sock")
++
++        host = self.getRequestHost(Unix())
++        self.assertEqual(host, IPv4Address("TCP", "127.0.0.1", 0))
++
++
++    def test_getHostIPAddress(self):
++        """
++        L{http.Request.getHost} returns the transport address for
++        L{IPv4Address} and L{IPv6Address} addresses.
++        """
++        class TCP6(DummyChannel.TCP):
++            """
++            Fake IPv6 transport.
++            """
++            def getHost(self):
++                return IPv6Address("TCP", "::1", 1234)
++
++        tcp4 = DummyChannel.TCP()
++        tcp6 = TCP6()
++        self.assertEqual(dict(address4=tcp4.getHost(),
++                              address6=tcp6.getHost()),
++                         dict(address4=self.getRequestHost(tcp4),
++                              address6=self.getRequestHost(tcp6)))
++
++
+     def test_setHeader(self):
+         """
+         L{http.Request.setHeader} sets the value of the given response header.

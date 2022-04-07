@@ -1,0 +1,246 @@
+Index: twisted/names/test/test_dns.py
+===================================================================
+--- twisted/names/test/test_dns.py	(revision 30364)
++++ twisted/names/test/test_dns.py	(working copy)
+@@ -423,8 +423,80 @@
+         d = self.proto.query([dns.Query('foo')])
+         return self.assertFailure(d, RuntimeError)
+ 
++    def test_toStrReturnValueIsString(self):
++        """
++        Test that the message is not split if a query type is AXFR and the
++        number of answers is less then or equal to AXFR_PART_SIZE.
++        """
++        m = dns.Message()
++        m.id = 12345
++        m.queries = [dns.Query('foo.bar', dns.AXFR, dns.IN)]
++        m.answers = [dns.RRHeader(payload=dns.Record_A(address='1.2.3.4'))]
++        s = m.toStr()
++        self.assertTrue(isinstance(s, (str, unicode)))
+ 
++    def test_toStrReturnValueIsList(self):
++        """
++        Test that the response is split in 3 messages if a query type is AXFR
++        and the number of answers is 3 * dns.AXFR_PART_SIZE.
++        """
++        answers = []
++        for i in range(0,  3 * dns.AXFR_PART_SIZE):
++            answers.append(dns.RRHeader(payload=dns.Record_A(address='1.2.3.%s'
++                                                             % (str(i)))))
++        m = dns.Message()
++        m.id = 12346
++        m.queries = [dns.Query('foo.bar', dns.AXFR, dns.IN)]
++        m.answers = answers
++        s = m.toStr()
++        self.assertTrue(isinstance(s, list))
++        self.assertEqual(len(s), 3)
+ 
++    def test_ResponseIsNotSplitIfQueryTypeIsNotAxfr(self):
++        """
++        Test that the response is not split if number of answers is >
++        AXFR_PART_SIZE, but the query type is not AXFR.
++        """
++        answers = []
++        for i in range(0,  3 * dns.AXFR_PART_SIZE):
++            answers.append(dns.RRHeader(payload=dns.Record_A(address='1.2.3.%s'
++                                                             % (str(i)))))
++        m = dns.Message()
++        m.id = 12347
++        m.queries = [dns.Query('foo.bar', dns.A, dns.IN)]
++        m.answers = answers
++        s = m.toStr()
++        self.assertTrue(isinstance(s, (str, unicode)))
++
++    def test_encodeParts(self):
++        """
++        Test that the result from the encodeParts method is the same as the
++        result from the encode method.
++        """
++        answers = []
++        for i in range(0,  3 * dns.AXFR_PART_SIZE):
++            answers.append(dns.RRHeader(payload=dns.Record_A(address='1.2.3.%s'
++                                                             % (str(i)))))
++        m = dns.Message()
++        m.id = 12348
++        m.queries = [dns.Query('foo.bar', dns.AXFR, dns.IN)]
++        m.answers = answers
++        parts = m.encodeParts()
++
++        self.assertTrue(isinstance(parts, list))
++        self.assertEqual(len(parts), 3)
++
++        for i in range(0, 3, dns.AXFR_PART_SIZE):
++            m = dns.Message(maxSize = 0)
++            m.id = 12348
++            m.queries = [dns.Query('foo.bar', dns.AXFR, dns.IN)]
++            m.answers = answers[i : i + dns.AXFR_PART_SIZE]
++            strio = StringIO()
++            m.encode(strio)
++            self.assertEqual(parts[i], strio.getvalue())
++
++
++
+ class ReprTests(unittest.TestCase):
+     """
+     Tests for the C{__repr__} implementation of record classes.
+@@ -1229,7 +1301,7 @@
+     def test_spf(self):
+         """
+         L{dns.Record_SPF} records are structurally similar to L{dns.Record_TXT}
+-        records, so they are equal if and only if they have the same data and ttl. 
++        records, so they are equal if and only if they have the same data and ttl.
+         """
+         # Vary the length of the data
+         self._equalityTest(
+Index: twisted/names/dns.py
+===================================================================
+--- twisted/names/dns.py	(revision 30364)
++++ twisted/names/dns.py	(working copy)
+@@ -39,6 +39,8 @@
+     'OK', 'OP_INVERSE', 'OP_NOTIFY', 'OP_QUERY', 'OP_STATUS', 'OP_UPDATE',
+     'PORT',
+ 
++    'AXFR_PART_SIZE',
++
+     'AuthoritativeDomainError', 'DNSQueryTimeoutError', 'DomainError',
+     ]
+ 
+@@ -153,6 +155,9 @@
+ # Response Codes
+ OK, EFORMAT, ESERVER, ENAME, ENOTIMP, EREFUSED = range(6)
+ 
++# How many answers should each AXFR response packet contain
++AXFR_PART_SIZE = 50
++
+ class IRecord(Interface):
+     """
+     An single entry in a zone of authority.
+@@ -1422,7 +1427,7 @@
+ 
+     @type data: C{list} of C{str}
+     @ivar data: Freeform text which makes up this record.
+-    
++
+     @type ttl: C{int}
+     @ivar ttl: The maximum number of seconds which this record should be cached.
+     """
+@@ -1468,10 +1473,10 @@
+     """
+     Structurally, freeform text. Semantically, a policy definition, formatted
+     as defined in U{rfc 4408<http://www.faqs.org/rfcs/rfc4408.html>}.
+-    
++
+     @type data: C{list} of C{str}
+     @ivar data: Freeform text which makes up this record.
+-    
++
+     @type ttl: C{int}
+     @ivar ttl: The maximum number of seconds which this record should be cached.
+     """
+@@ -1553,7 +1558,65 @@
+                                 len(self.authority), len(self.additional)))
+         strio.write(body)
+ 
++    def encodeParts(self):
++        """
++        Encode response into multiple parts (this is used when encoding AXFR
++        response with number of answers > AXFR_PART_SIZE).
+ 
++        Note: Part of the response is never truncated.
++
++        @return: A list of strings where each member contains encoded part of
++                 the response.
++        @rtype: L{list}
++        """
++        parts = []
++
++        # queries, authority and additional are only encoded once, because
++        # they are the same across all the messages.
++        to_encode = {
++                      'queries': self.queries,
++                      'authority': self.authority,
++                      'additional': self.additional
++                    }
++        encoded = {}
++        for key, value in to_encode.iteritems():
++            strio_tmp = StringIO.StringIO()
++
++            for q in value:
++                q.encode(strio_tmp, compDict = None)
++            encoded[key] = strio_tmp.getvalue()
++
++        answerCount = len(self.answers)
++        # Split answers into multiple parts
++        for i in range(0, answerCount, AXFR_PART_SIZE):
++            strio_part = StringIO.StringIO()
++
++            strio_answers = StringIO.StringIO()
++            answersCurrent = self.answers[i : i + AXFR_PART_SIZE]
++            answersCurrentCount = len(answersCurrent)
++
++            for answer in answersCurrent:
++                answer.encode(strio_answers, compDict = None)
++
++            body = encoded['queries'] + strio_answers.getvalue() + \
++                   encoded['authority'] + encoded['additional']
++            size = len(body) + self.headerSize
++            byte3 = (( ( self.answer & 1 ) << 7 )
++                     | ((self.opCode & 0xf ) << 3 )
++                     | ((self.auth & 1 ) << 2 )
++                     | ((self.trunc & 1 ) << 1 )
++                     | ( self.recDes & 1 ) )
++            byte4 = ( ( (self.recAv & 1 ) << 7 )
++                     | (self.rCode & 0xf ) )
++
++            strio_part.write(struct.pack(self.headerFmt, self.id, byte3, byte4,
++                                    len(self.queries), answersCurrentCount,
++                                    len(self.authority), len(self.additional)))
++            strio_part.write(body)
++            parts.append(strio_part.getvalue())
++
++        return parts
++
+     def decode(self, strio, length=None):
+         self.maxSize = 0
+         header = readPrecisely(strio, self.headerSize)
+@@ -1628,11 +1691,24 @@
+ 
+ 
+     def toStr(self):
+-        strio = StringIO.StringIO()
+-        self.encode(strio)
+-        return strio.getvalue()
++        # Special case for AXFR response messages
++        if len(self.queries) > 0:
++            query = self.queries[0]
++        else:
++            query = None
+ 
++        if query and EXT_QUERIES.get(query.type, 'unknown') == 'AXFR' and \
++           len(self.answers) > AXFR_PART_SIZE:
++            print query.type
++            print 'yeah'
++            result = self.encodeParts()
++            return result
++        else:
++            strio = StringIO.StringIO()
++            self.encode(strio)
++            return strio.getvalue()
+ 
++
+     def fromStr(self, str):
+         strio = StringIO.StringIO(str)
+         self.decode(strio)
+@@ -1838,7 +1914,11 @@
+         @type message: L{Message}
+         """
+         s = message.toStr()
+-        self.transport.write(struct.pack('!H', len(s)) + s)
++        if isinstance(s, list):
++            for part in s:
++               self.transport.write(struct.pack('!H', len(part)) + part)
++        else:
++            self.transport.write(struct.pack('!H', len(s)) + s)
+ 
+     def connectionMade(self):
+         """

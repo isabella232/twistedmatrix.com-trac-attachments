@@ -1,0 +1,128 @@
+--- soap.py	2003-07-05 09:40:12.000000000 -0700
++++ soap_new.py	2003-11-18 10:38:03.000000000 -0800
+@@ -30,11 +30,14 @@
+ 
+ # SOAPpy
+ import SOAPpy
++import urlparse
+ 
+ # twisted imports
+ from twisted.web import server, resource
+ from twisted.internet import defer
+ from twisted.python import log, failure
++from twisted.protocols import http
++from twisted.internet import defer, protocol, reactor
+ 
+ 
+ class SOAPPublisher(resource.Resource):
+@@ -123,3 +126,110 @@
+         request.setHeader("Content-length", str(len(response)))
+         request.write(response)
+         request.finish()
++
++
++class QueryProtocol(http.HTTPClient):
++
++    def connectionMade(self):
++        self.sendCommand('POST', self.factory.url)
++        self.sendHeader('User-Agent', 'Twisted/SOAPpy')
++        self.sendHeader('Host', self.factory.host)
++        self.sendHeader('Content-type', 'text/xml')
++        self.sendHeader('Content-length', str(len(self.factory.payload)))
++        self.endHeaders()
++        self.transport.write(self.factory.payload)
++
++    def handleStatus(self, version, status, message):
++        if status != '200':
++            self.factory.badStatus(status, message)
++
++    def handleResponse(self, contents):
++        self.factory.parseResponse(contents)
++
++
++class QueryFactory(protocol.ClientFactory):
++
++    deferred = None
++    protocol = QueryProtocol
++
++    def __init__(self, url, host, method, verbose, *args):
++        self.verbose = verbose
++        self.url, self.host = url, host
++        self.payload = SOAPpy.buildSOAP(args=args, method=method)
++        if self.verbose:
++            log.msg('\n=============================================\n%s\n' % self.payload)
++        self.deferred = defer.Deferred()
++
++    def parseResponse(self, contents):
++        if not self.deferred:
++            return
++        try:
++            if self.verbose:
++                log.msg('\n=============================================\n%s\n' % contents)
++            response = SOAPpy.parseSOAPRPC(contents)
++        except Exception, error:
++            self.deferred.errback(error)
++            self.deferred = None
++        else:
++            response = self.unwrap_response(response)
++            self.deferred.callback(response)
++            self.deferred = None
++
++    # Unwrap the result.
++    def unwrap_response(self, response):
++        try:
++            count = 0
++            for key in response.__dict__.keys():
++                if key[0] != "_":  # don't move the private stuff
++                    count += 1
++                    t = getattr(response, key)
++            if count == 1:
++                response = t # Only one piece of data, bubble it up
++        except:
++            pass
++        return response
++
++    def clientConnectionLost(self, _, reason):
++        if self.deferred is not None:
++            self.deferred.errback(reason)
++            self.deferred = None
++
++    clientConnectionFailed = clientConnectionLost
++
++    def badStatus(self, status, message):
++        self.deferred.errback(ValueError(status, message))
++        self.deferred = None
++
++
++class SOAPProxy:
++    """A Proxy for making remote SOAP calls.
++
++    Pass the URL of the remote SOAP server to the constructor.
++
++    Use proxy.callRemote('foobar', *args) to call remote method
++    'foobar' with *args.
++    """
++
++    def __init__(self, url, verbose=0):
++        self.verbose = verbose
++        parts = urlparse.urlparse(url)
++        self.url = urlparse.urlunparse(('', '')+parts[2:])
++        if self.url == "":
++            self.url = "/"
++        if ':' in parts[1]:
++            self.host, self.port = parts[1].split(':')
++            self.port = int(self.port)
++        else:
++            self.host, self.port = parts[1], None
++        self.secure = parts[0] == 'https'
++
++    def callRemote(self, method, *args):
++        factory = QueryFactory(self.url, self.host, method, self.verbose, *args)
++        if self.secure:
++            from twisted.internet import ssl
++            reactor.connectSSL(self.host, self.port or 443,
++                               factory, ssl.ClientContextFactory())
++        else:
++            reactor.connectTCP(self.host, self.port or 80, factory)
++        return factory.deferred
++

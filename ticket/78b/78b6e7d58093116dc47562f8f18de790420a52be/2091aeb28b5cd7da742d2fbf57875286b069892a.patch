@@ -1,0 +1,125 @@
+diff --git a/twisted/internet/task.py b/twisted/internet/task.py
+index 593636f..9ae4845 100644
+--- a/twisted/internet/task.py
++++ b/twisted/internet/task.py
+@@ -11,6 +11,7 @@ Scheduling utility methods and classes.
+ __metaclass__ = type
+ 
+ import time
++import warnings
+ 
+ from zope.interface import implements
+ 
+@@ -490,7 +491,9 @@ class Cooperator(object):
+ 
+         @param scheduler: A one-argument callable which takes a no-argument
+         callable and should invoke it at some future point.  This will be used
+-        to schedule each step of this Cooperator.
++        to schedule each step of this Cooperator. The scheduler must return
++        an L{IDelayedCall}, or at the very least an object which emulates the
++        L{IDelayedCall.cancel} method.
+ 
+         @param started: A boolean which indicates whether iterators should be
+         stepped as soon as they are added, or if they will be queued up until
+@@ -585,6 +588,10 @@ class Cooperator(object):
+             return
+         if self._delayedCall is None and self._tasks:
+             self._delayedCall = self._scheduler(self._tick)
++            if self._delayedCall is None:
++                warnings.warn('scheduler must not return None', category=RuntimeWarning)
++            elif not callable(getattr(self._delayedCall, 'cancel', None)):
++                warnings.warn('scheduler must return an object with a .cancel() method', category=RuntimeWarning)
+ 
+ 
+     def start(self):
+diff --git a/twisted/test/test_cooperator.py b/twisted/test/test_cooperator.py
+index 0a28a85..e87bb4e 100644
+--- a/twisted/test/test_cooperator.py
++++ b/twisted/test/test_cooperator.py
+@@ -6,6 +6,8 @@ This module contains tests for L{twisted.internet.task.Cooperator} and
+ related functionality.
+ """
+ 
++import warnings
++
+ from twisted.internet import reactor, defer, task
+ from twisted.trial import unittest
+ 
+@@ -226,6 +228,9 @@ class TestCooperator(unittest.TestCase):
+             def __repr__(self):
+                 return '<FakeCall %r>' % (self.func,)
+ 
++            def cancel(self):
++                return
++
+         def sched(f):
+             self.failIf(calls, repr(calls))
+             calls.append(FakeCall(f))
+@@ -249,7 +254,67 @@ class TestCooperator(unittest.TestCase):
+             if work > 50:
+                 self.fail("Cooperator took too long")
+ 
++    def testBadSchedulerNone(self):
++        """
++        The scheduler object is expected to return an object with a .cancel()
++        method i.e. an L{IDelayedCall}. Warn if it doesn't, and certainly if
++        it returns None
++        """
++        def badsched(work):
++            reactor.callLater(0, work)
++            return
++        def thework():
++            yield 1
++            return
++        def finish(ignore):
++            warns = self.flushWarnings()
++            if len(warns)!=1:
++                self.fail('bad scheduler raises no or too many warnings')
++                return
++            self.assertEqual(
++                    warns[0]['message'],
++                    'scheduler must not return None',
++                    )
++            self.assertEqual(
++                    warns[0]['category'],
++                    RuntimeWarning,
++                    )
++
++        c = task.Cooperator(scheduler=badsched)
++        d = c.coiterate(thework())
++        d.addCallback(finish)
++        return d
+ 
++    def testBadScheduler(self):
++        """
++        The scheduler object is expected to return an object with a .cancel()
++        method i.e. an L{IDelayedCall}. Warn if it doesn't, and certainly if
++        it returns None
++        """
++        def badsched(work):
++            reactor.callLater(0, work)
++            return True
++        def thework():
++            yield 1
++            return
++        def finish(ignore):
++            warns = self.flushWarnings()
++            if len(warns)!=1:
++                self.fail('bad scheduler raises no or too many warnings')
++                return
++            self.assertEqual(
++                    warns[0]['message'],
++                    'scheduler must return an object with a .cancel() method',
++                    )
++            self.assertEqual(
++                    warns[0]['category'],
++                    RuntimeWarning,
++                    )
++
++        c = task.Cooperator(scheduler=badsched)
++        d = c.coiterate(thework())
++        d.addCallback(finish)
++        return d
+ 
+ class UnhandledException(Exception):
+     """

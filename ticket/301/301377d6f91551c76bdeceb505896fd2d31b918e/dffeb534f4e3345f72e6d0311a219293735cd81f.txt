@@ -1,0 +1,233 @@
+Index: twisted/test/test_defer.py
+===================================================================
+--- twisted/test/test_defer.py	(revision 12847)
++++ twisted/test/test_defer.py	(working copy)
+@@ -14,6 +14,7 @@
+ from twisted.internet import reactor, defer
+ from twisted.python import failure, log
+ 
++import gc, weakref
+ 
+ class GenericError(Exception): pass
+ 
+@@ -379,6 +380,7 @@
+ 
+     def _check(self, e, caller, invoker1, invoker2):
+         # make sure the debugging information is vaguely correct
++        self.failUnless(e.args, "e: %s" % e)
+         lines = e.args[0].split("\n")
+         # the creator should list the creator (testAlreadyCalledDebug) but not
+         # _call_1 or _call_2 or other invokers
+@@ -466,7 +468,7 @@
+ ##        d.callback(1)
+ ##        del d
+         c2 = [e for e in c if e["isError"]]
+-        self.assertEquals(len(c2), 2)
++        self.assertEquals(len(c2), 2, c2)
+         c2[1]["failure"].trap(ZeroDivisionError)
+         log.flushErrors(ZeroDivisionError)
+ 
+@@ -486,3 +488,17 @@
+ 
+     def tearDown(self):
+         self.failUnless(self.callbackRan, "Callback was never run.")
++
++class DeferredTestCaseGC(unittest.TestCase):
++    def testGenerateRefCycle(self):
++        d1 = defer.Deferred()
++        d2 = defer.Deferred()
++        weakreftod1 = weakref.ref(d1)
++        d1.callback([d2])
++        d2.callback([d1])
++        d1 = None
++        d2 = None
++        gc.collect()
++        f = weakreftod1()
++        self.failUnless(f is None, f)
++ 
+Index: twisted/internet/defer.py
+===================================================================
+--- twisted/internet/defer.py	(revision 12847)
++++ twisted/internet/defer.py	(working copy)
+@@ -144,6 +144,25 @@
+ def passthru(arg):
+     return arg
+ 
++class Reprer:
++    """This class is to make objects that will return the right thing from
++    __repr__(), but which doesn't hold references.
++    """
++    def __init__(self, o):
++        self.reprstr = repr(o)
++
++    def __repr__(self):
++        return self.reprstr
++
++def make_reprer(o):
++    if isinstance(o, Exception):
++        o = failure.Failure(o)
++    if isinstance(o, failure.Failure):
++        o.cleanFailure()
++        return o
++    else:
++        return Reprer(o)
++
+ class Deferred:
+     """This is a callback which will be put off until later.
+ 
+@@ -159,7 +178,6 @@
+     For more information about Deferreds, see doc/howto/defer.html or
+     U{http://www.twistedmatrix.com/documents/howto/defer}
+     """
+-    called = 0
+     default = 0
+     paused = 0
+     timeoutCall = None
+@@ -167,10 +185,38 @@
+     # will be added to any AlreadyCalledErrors we raise
+     debug = False
+ 
++    class PostMortemExecutor:
++        """Post-Mortem Finalization idiom -- we want to print out useful diagnostics
++        when the Deferred gets garbage collected, but do so without holding onto a
++        reference cycle that contains a __del__() method.
++
++        So we store in this separate object all the things necessary for those
++        diagnostics: self.called, self._debugInfo, and self.resultreprer.
++        """
++        def __init__(self):
++            self.called = None
++            self.resultreprer = None
++            self._debugInfo = ''
++
++        def __del__(self):
++            """Print tracebacks and die.
++
++            If the *last* (and I do mean *last*) callback leaves me in an error
++            state, print a traceback (if said errback is a Failure).
++            """
++            if (self.called and
++                isinstance(self.resultreprer, failure.Failure)):
++                log.msg("Unhandled error in Deferred:", isError=True)
++                if Deferred.debug:
++                    log.msg("(debug: " + self._debugInfo + ")", isError=True)
++                log.err(self.resultreprer)
++
+     def __init__(self):
+         self.callbacks = []
+-        if self.debug:
++        self.pmx = Deferred.PostMortemExecutor()
++        if Deferred.debug:
+             self.creator = traceback.format_stack()[:-1]
++            self.pmx._debugInfo = self._debugInfo()
+ 
+     def addCallbacks(self, callback, errback=None,
+                      callbackArgs=None, callbackKeywords=None,
+@@ -190,9 +236,9 @@
+         if asDefaults:
+             # what the heck is this crappy argument for?
+             warnings.warn("The 'asDefaults' argument will be going away soon. Has anyone ever actually used it?", DeprecationWarning, stacklevel=2)
+-                
++
+         self.default = asDefaults
+-        if self.called:
++        if self.pmx.called:
+             self._runCallbacks()
+         return self
+ 
+@@ -277,23 +323,26 @@
+         self.paused = self.paused - 1
+         if self.paused:
+             return
+-        if self.called:
++        if self.pmx.called:
+             self._runCallbacks()
+ 
+     def _continue(self, result):
+         self.result = result
++        self.pmx.resultreprer = make_reprer(self.result)
+         self.unpause()
+ 
+     def _startRunCallbacks(self, result):
+-        if self.called:
+-            if not self.debug:
++        if self.pmx.called:
++            if not Deferred.debug:
+                 raise AlreadyCalledError
+-            extra = "\n" + self._debugInfo()
++            extra = "\n" + self.pmx._debugInfo
+             raise AlreadyCalledError(extra)
+-        if self.debug:
++        if Deferred.debug:
+             self.invoker = traceback.format_stack()[:-2]
+-        self.called = True
++            self.pmx._debugInfo = self._debugInfo()
++        self.pmx.called = True
+         self.result = result
++        self.pmx.resultreprer = make_reprer(self.result)
+         if self.timeoutCall:
+             try:
+                 self.timeoutCall.cancel()
+@@ -327,6 +376,7 @@
+                 kw = kw or {}
+                 try:
+                     self.result = callback(self.result, *args, **kw)
++                    self.pmx.resultreprer = make_reprer(self.result)
+                     if isinstance(self.result, Deferred):
+                         self.callbacks = cb
+ 
+@@ -341,6 +391,7 @@
+                         break
+                 except:
+                     self.result = failure.Failure()
++                    self.pmx.resultreprer = make_reprer(self.result)
+         if isinstance(self.result, failure.Failure):
+             self.result.cleanFailure()
+ 
+@@ -366,14 +417,14 @@
+         YOU HAVE BEEN WARNED!
+         """
+ 
+-        if self.called:
++        if self.pmx.called:
+             return
+         assert not self.timeoutCall, "Don't call setTimeout twice on the same Deferred."
+ 
+         from twisted.internet import reactor
+         self.timeoutCall = reactor.callLater(
+             seconds,
+-            lambda: self.called or timeoutFunc(self, *args, **kw))
++            lambda: self.pmx.called or timeoutFunc(self, *args, **kw))
+         return self.timeoutCall
+ 
+     def armAndErrback(self, fail=None):
+@@ -397,20 +448,6 @@
+     __repr__ = __str__
+ 
+ 
+-    def __del__(self):
+-        """Print tracebacks and die.
+-
+-        If the *last* (and I do mean *last*) callback leaves me in an error
+-        state, print a traceback (if said errback is a Failure).
+-        """
+-        if (self.called and
+-            isinstance(self.result, failure.Failure)):
+-            log.msg("Unhandled error in Deferred:", isError=True)
+-            if self.debug:
+-                log.msg("(debug: " + self._debugInfo() + ")", isError=True)
+-            log.err(self.result)
+-
+-
+ class DeferredList(Deferred):
+     """I combine a group of deferreds into one callback.
+ 
+@@ -481,7 +518,7 @@
+         self.resultList[index] = (succeeded, result)
+ 
+         self.finishedCount += 1
+-        if not self.called:
++        if not self.pmx.called:
+             if succeeded == SUCCESS and self.fireOnOneCallback:
+                 self.callback((result, index))
+             elif succeeded == FAILURE and self.fireOnOneErrback:

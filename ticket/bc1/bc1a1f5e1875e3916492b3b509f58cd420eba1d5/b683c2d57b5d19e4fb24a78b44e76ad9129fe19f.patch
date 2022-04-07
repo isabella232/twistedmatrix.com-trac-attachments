@@ -1,0 +1,989 @@
+Index: twisted/conch/client/default.py
+===================================================================
+--- twisted/conch/client/default.py	(revision 38158)
++++ twisted/conch/client/default.py	(working copy)
+@@ -13,6 +13,7 @@
+ 
+ from twisted.python import log
+ from twisted.python.filepath import FilePath
++from twisted.python.runtime import platform
+ 
+ from twisted.conch.error import ConchError
+ from twisted.conch.ssh import common, keys, userauth
+@@ -32,6 +33,27 @@
+ # This name is bound so that the unit tests can use 'patch' to override it.
+ _open = open
+ 
++
++class fakePTY(object):
++    def __init__(self, fname, mode):
++        pass
++
++    def close(self):
++        pass
++
++    def read(self):
++        pass
++
++    def readline(self):
++        return raw_input()
++
++    def write(self, data):
++        sys.stdout.write(data)
++
++if platform.isWindows():
++    _open = fakePTY
++
++
+ def verifyHostKey(transport, host, pubKey, fingerprint):
+     """
+     Verify a host's key.
+@@ -154,10 +176,13 @@
+ 
+     def _getPassword(self, prompt):
+         try:
+-            oldout, oldin = sys.stdout, sys.stdin
+-            sys.stdin = sys.stdout = open('/dev/tty','r+')
+-            p=getpass.getpass(prompt)
+-            sys.stdout,sys.stdin=oldout,oldin
++            if platform.isWindows():
++                p = getpass.getpass(prompt)
++            else:
++                oldout, oldin = sys.stdout, sys.stdin
++                sys.stdin = sys.stdout = open('/dev/tty','r+')
++                p = getpass.getpass(prompt)
++                sys.stdout, sys.stdin = oldout, oldin
+             return p
+         except (KeyboardInterrupt, IOError):
+             print
+@@ -244,8 +269,9 @@
+     def getGenericAnswers(self, name, instruction, prompts):
+         responses = []
+         try:
+-            oldout, oldin = sys.stdout, sys.stdin
+-            sys.stdin = sys.stdout = open('/dev/tty','r+')
++            if not platform.isWindows():
++                oldout, oldin = sys.stdout, sys.stdin
++                sys.stdin = sys.stdout = open('/dev/tty','r+')
+             if name:
+                 print name
+             if instruction:
+@@ -256,5 +282,7 @@
+                 else:
+                     responses.append(getpass.getpass(prompt))
+         finally:
+-            sys.stdout,sys.stdin=oldout,oldin
++            if not platform.isWindows():
++                sys.stdout,sys.stdin=oldout,oldin
+         return defer.succeed(responses)
++
+Index: twisted/conch/scripts/cftp.py
+===================================================================
+--- twisted/conch/scripts/cftp.py	(revision 38158)
++++ twisted/conch/scripts/cftp.py	(working copy)
+@@ -6,15 +6,24 @@
+ Implementation module for the I{cftp} command.
+ """
+ 
+-import os, sys, getpass, struct, tty, fcntl, stat
+-import fnmatch, pwd, glob
++import os, sys, getpass, struct, stat
++from twisted.python.win32 import tty, fcntl
+ 
++try:
++    import pwd
++except ImportError:
++    pwd = None
++
++import fnmatch, glob
++import posixpath
++
+ from twisted.conch.client import connect, default, options
+ from twisted.conch.ssh import connection, common
+ from twisted.conch.ssh import channel, filetransfer
+ from twisted.protocols import basic
+ from twisted.internet import reactor, stdio, defer, utils
+ from twisted.python import log, usage, failure
++from twisted.python.runtime import platform
+ 
+ class ClientOptions(options.ConchOptions):
+ 
+@@ -124,12 +133,13 @@
+     def __getattr__(self, attr):
+         return getattr(self.f, attr)
+ 
++
+ class StdioClient(basic.LineReceiver):
+ 
+     _pwd = pwd
+ 
+     ps = 'cftp> '
+-    delimiter = '\n'
++    from os import linesep as delimiter
+ 
+     reactor = reactor
+ 
+@@ -140,8 +150,13 @@
+         self.useProgressBar = (not f and 1) or 0
+ 
+     def connectionMade(self):
+-        self.client.realPath('').addCallback(self._cbSetCurDir)
++        d = self.client.realPath('')
++        d.addCallback(self._cbSetCurDir)
++        d.addErrback(self._ebSetCurDir)
+ 
++    def _ebSetCurDir(self, f):
++        self._printFailure(f)
++
+     def _cbSetCurDir(self, path):
+         self.currentDirectory = path
+         self._newLine()
+@@ -164,7 +179,6 @@
+             d.addCallback(self._cbCommand)
+             d.addErrback(self._ebCommand)
+ 
+-
+     def _dispatchCommand(self, line):
+         if ' ' in line:
+             command, rest = line.split(' ', 1)
+@@ -175,20 +189,20 @@
+             f = self.cmd_EXEC
+             rest = (command[1:] + ' ' + rest).strip()
+         else:
+-            command = command.upper()
+-            log.msg('looking up cmd %s' % command)
+-            f = getattr(self, 'cmd_%s' % command, None)
++            cmd = command.upper()
++            log.msg('looking up cmd %s' % cmd)
++            f = getattr(self, 'cmd_%s' % cmd, None)
+         if f is not None:
+             return defer.maybeDeferred(f, rest)
+         else:
+             self._ebCommand(failure.Failure(NotImplementedError(
+                 "No command called `%s'" % command)))
+-            self._newLine()
+ 
+     def _printFailure(self, f):
+         log.msg(f)
+         e = f.trap(NotImplementedError, filetransfer.SFTPError, OSError, IOError)
+         if e == NotImplementedError:
++            self.transport.write(f.getErrorMessage()+os.linesep)
+             self.transport.write(self.cmd_HELP(''))
+         elif e == filetransfer.SFTPError:
+             self.transport.write("remote error %i: %s\n" %
+@@ -227,7 +241,7 @@
+         path, rest = self._getFilename(path)
+         if not path.endswith('/'):
+             path += '/'
+-        newPath = path and os.path.join(self.currentDirectory, path) or ''
++        newPath = path and posixpath.join(self.currentDirectory, path) or ''
+         d = self.client.openDirectory(newPath)
+         d.addCallback(self._cbCd)
+         d.addErrback(self._ebCommand)
+@@ -283,6 +297,9 @@
+                     return "Wildcard get with non-directory target."
+             else:
+                 local = ''
++            head, tail = os.path.split(remote)
++            if not head:
++                remote = posixpath.join(self.currentDirectory, remote)
+             d = self._remoteGlob(remote)
+             d.addCallback(self._cbGetMultiple, local)
+             return d
+@@ -291,8 +308,8 @@
+         else:
+             local = os.path.split(remote)[1]
+         log.msg((remote, local))
+-        lf = file(local, 'w', 0)
+-        path = os.path.join(self.currentDirectory, remote)
++        lf = file(local, 'wb', 0)
++        path = posixpath.join(self.currentDirectory, remote)
+         d = self.client.openFile(path, filetransfer.FXF_READ, {})
+         d.addCallback(self._cbGetOpenFile, lf)
+         d.addErrback(self._ebCloseLf, lf)
+@@ -313,8 +330,8 @@
+         if not files:
+             return
+         f = files.pop(0)[0]
+-        lf = file(os.path.join(local, os.path.split(f)[1]), 'w', 0)
+-        path = os.path.join(self.currentDirectory, f)
++        lf = file(os.path.join(local, os.path.split(f)[1]), 'wb', 0)
++        path = posixpath.join(self.currentDirectory, f)
+         d = self.client.openFile(path, filetransfer.FXF_READ, {})
+         d.addCallback(self._cbGetOpenFile, lf)
+         d.addErrback(self._ebCloseLf, lf)
+@@ -405,7 +422,7 @@
+         if '*' in local or '?' in local: # wildcard
+             if rest:
+                 remote, rest = self._getFilename(rest)
+-                path = os.path.join(self.currentDirectory, remote)
++                path = posixpath.join(self.currentDirectory, remote)
+                 d = self.client.getAttrs(path)
+                 d.addCallback(self._cbPutTargetAttrs, remote, local)
+                 return d
+@@ -417,8 +434,8 @@
+             remote, rest = self._getFilename(rest)
+         else:
+             remote = os.path.split(local)[1]
+-        lf = file(local, 'r')
+-        path = os.path.join(self.currentDirectory, remote)
++        lf = file(local, 'rb')
++        path = posixpath.join(self.currentDirectory, remote)
+         flags = filetransfer.FXF_WRITE|filetransfer.FXF_CREAT|filetransfer.FXF_TRUNC
+         d = self.client.openFile(path, flags, {})
+         d.addCallback(self._cbPutOpenFile, lf)
+@@ -441,14 +458,14 @@
+         while files and not f:
+             try:
+                 f = files.pop(0)
+-                lf = file(f, 'r')
++                lf = file(f, 'rb')
+             except:
+                 self._printFailure(failure.Failure())
+                 f = None
+         if not f:
+             return
+         name = os.path.split(f)[1]
+-        remote = os.path.join(self.currentDirectory, path, name)
++        remote = posixpath.join(self.currentDirectory, path, name)
+         log.msg((name, remote, path))
+         flags = filetransfer.FXF_WRITE|filetransfer.FXF_CREAT|filetransfer.FXF_TRUNC
+         d = self.client.openFile(remote, flags, {})
+@@ -501,7 +518,7 @@
+         linkpath, rest = self._getFilename(rest)
+         targetpath, rest = self._getFilename(rest)
+         linkpath, targetpath = map(
+-                lambda x: os.path.join(self.currentDirectory, x),
++                lambda x: posixpath.join(self.currentDirectory, x),
+                 (linkpath, targetpath))
+         return self.client.makeLink(linkpath, targetpath).addCallback(_ignore)
+ 
+@@ -525,9 +542,10 @@
+         if not path:
+             fullPath = self.currentDirectory + '/'
+         else:
+-            fullPath = os.path.join(self.currentDirectory, path)
++            fullPath = posixpath.join(self.currentDirectory, path)
+         d = self._remoteGlob(fullPath)
+         d.addCallback(self._cbDisplayFiles, options)
++        d.addErrback(self._ebCommand)
+         return d
+ 
+     def _cbDisplayFiles(self, files, options):
+@@ -545,20 +563,23 @@
+ 
+     def cmd_MKDIR(self, path):
+         path, rest = self._getFilename(path)
+-        path = os.path.join(self.currentDirectory, path)
++        path = posixpath.join(self.currentDirectory, path)
+         return self.client.makeDirectory(path, {}).addCallback(_ignore)
+ 
+     def cmd_RMDIR(self, path):
+         path, rest = self._getFilename(path)
+-        path = os.path.join(self.currentDirectory, path)
++        path = posixpath.join(self.currentDirectory, path)
+         return self.client.removeDirectory(path).addCallback(_ignore)
+ 
+     def cmd_LMKDIR(self, path):
+-        os.system("mkdir %s" % path)
++        if platform.isWindows():
++            os.mkdir(path)
++        else:
++            os.system("mkdir %s" % path)
+ 
+     def cmd_RM(self, path):
+         path, rest = self._getFilename(path)
+-        path = os.path.join(self.currentDirectory, path)
++        path = posixpath.join(self.currentDirectory, path)
+         return self.client.removeFile(path).addCallback(_ignore)
+ 
+     def cmd_LLS(self, rest):
+@@ -568,7 +589,7 @@
+         oldpath, rest = self._getFilename(rest)
+         newpath, rest = self._getFilename(rest)
+         oldpath, newpath = map (
+-                lambda x: os.path.join(self.currentDirectory, x),
++                lambda x: posixpath.join(self.currentDirectory, x),
+                 (oldpath, newpath))
+         return self.client.renameFile(oldpath, newpath).addCallback(_ignore)
+ 
+@@ -622,14 +643,31 @@
+         Run C{rest} using the user's shell (or /bin/sh if they do not have
+         one).
+         """
+-        shell = self._pwd.getpwnam(getpass.getuser())[6]
+-        if not shell:
+-            shell = '/bin/sh'
+-        if rest:
+-            cmds = ['-c', rest]
+-            return utils.getProcessOutput(shell, cmds, errortoo=1)
++        if not platform.isWindows():
++            shell = self._pwd.getpwnam(getpass.getuser())[6]
++            if not shell:
++                shell = '/bin/sh'
++            if rest:
++                cmds = ['-c', rest]
++                return utils.getProcessOutput(shell, cmds, errortoo=1)
+         else:
+-            os.system(shell)
++            # The tests do a lot of monkey business so this is messier than
++            # it needs to be in real-life. On Linux the '-c' flag works for
++            # bash and python. Sadly 'cmd.exe' only accepts '/c' and 'python.exe'
++            # only accepts '-c'.
++            shell = None
++            if self._pwd:
++                shell = self._pwd.getpwnam(getpass.getuser())[6]
++            if not shell:
++                shell = os.environ['COMSPEC']
++            if rest:
++                if shell == os.environ['COMSPEC']:
++                    opt = '/c'  # for cmd.exe
++                else:
++                    opt = '-c'  # for python.exe
++                cmds = [opt, rest]
++                return utils.getProcessOutput(shell, cmds, errortoo=1)
++        os.system(shell)
+ 
+     # accessory functions
+ 
+@@ -798,7 +836,7 @@
+         if self.conn.options['batchfile']:
+             fn = self.conn.options['batchfile']
+             if fn != '-':
+-                f = file(fn)
++                f = file(fn, "rb")
+         self.stdio = stdio.StandardIO(StdioClient(self.client, f))
+ 
+     def extReceived(self, t, data):
+Index: twisted/conch/scripts/conch.py
+===================================================================
+--- twisted/conch/scripts/conch.py	(revision 38158)
++++ twisted/conch/scripts/conch.py	(working copy)
+@@ -4,7 +4,7 @@
+ # See LICENSE for details.
+ 
+ #
+-# $Id: conch.py,v 1.65 2004/03/11 00:29:14 z3p Exp $
++# $Id: conch.py,v 1.3 2013/04/17 06:05:26 jfp Exp $
+ 
+ #""" Implementation module for the `conch` command.
+ #"""
+@@ -14,8 +14,10 @@
+ from twisted.conch.ssh import session, forwarding, channel
+ from twisted.internet import reactor, stdio, task
+ from twisted.python import log, usage
++from twisted.python.runtime import platform
+ 
+-import os, sys, getpass, struct, tty, fcntl, signal
++import os, sys, getpass, struct, signal
++from twisted.python.win32 import tty, fcntl
+ 
+ class ClientOptions(options.ConchOptions):
+ 
+@@ -36,6 +38,8 @@
+                  ['noshell', 'N', 'Do not execute a shell or command.'],
+                  ['subsystem', 's', 'Invoke command (mandatory) as SSH2 subsystem.'],
+                 ]
++    if platform.isWindows():
++        del optFlags[1]
+ 
+     compData = usage.Completions(
+         mutuallyExclusive=[("tty", "notty")],
+@@ -139,7 +143,10 @@
+         if oldUSR1:
+             signal.signal(signal.SIGUSR1, oldUSR1)
+         if (options['command'] and options['tty']) or not options['notty']:
+-            signal.signal(signal.SIGWINCH, signal.SIG_DFL)
++            try:
++                signal.signal(signal.SIGWINCH, signal.SIG_DFL)
++            except AttributeError:
++                pass
+     if sys.stdout.isatty() and not options['command']:
+         print 'Connection to %s closed.' % options['host']
+     sys.exit(exitStatus)
+@@ -361,25 +368,28 @@
+                 common.NS(options['command']))
+         elif options['command']:
+             if options['tty']:
+-                term = os.environ['TERM']
+                 winsz = fcntl.ioctl(fd, tty.TIOCGWINSZ, '12345678')
+                 winSize = struct.unpack('4H', winsz)
++                if platform.isWindows():
++                    term = "dumb"
++                else:
++                    term = os.environ['TERM']
++                    signal.signal(signal.SIGWINCH, self._windowResized)
+                 ptyReqData = session.packRequest_pty_req(term, winSize, '')
+                 self.conn.sendRequest(self, 'pty-req', ptyReqData)
+-                signal.signal(signal.SIGWINCH, self._windowResized)
+-            self.conn.sendRequest(self, 'exec', \
+-                common.NS(options['command']))
++            self.conn.sendRequest(self, 'exec', common.NS(options['command']))
+         else:
+             if not options['notty']:
+-                term = os.environ['TERM']
+                 winsz = fcntl.ioctl(fd, tty.TIOCGWINSZ, '12345678')
+                 winSize = struct.unpack('4H', winsz)
++                if platform.isWindows():
++                    term = "dumb"
++                else:
++                    term = os.environ['TERM']
++                    signal.signal(signal.SIGWINCH, self._windowResized)
+                 ptyReqData = session.packRequest_pty_req(term, winSize, '')
+                 self.conn.sendRequest(self, 'pty-req', ptyReqData)
+-                signal.signal(signal.SIGWINCH, self._windowResized)
+             self.conn.sendRequest(self, 'shell', '')
+-            #if hasattr(conn.transport, 'transport'):
+-            #    conn.transport.transport.setTcpNoDelay(1)
+ 
+     def handleInput(self, char):
+         #log.msg('handling %s' % repr(char))
+@@ -455,6 +465,8 @@
+         self.stdio.resumeProducing()
+ 
+     def _windowResized(self, *args):
++        if not fcntl:
++            return
+         winsz = fcntl.ioctl(0, tty.TIOCGWINSZ, '12345678')
+         winSize = struct.unpack('4H', winsz)
+         newSize = winSize[1], winSize[0], winSize[2], winSize[3]
+Index: twisted/conch/ssh/filetransfer.py
+===================================================================
+--- twisted/conch/ssh/filetransfer.py	(revision 38158)
++++ twisted/conch/ssh/filetransfer.py	(working copy)
+@@ -8,6 +8,8 @@
+ 
+ from twisted.internet import defer, protocol
+ from twisted.python import failure, log
++from twisted.python.runtime import platform
++from twisted.python.win32 import WindowsError
+ 
+ from common import NS, getNS
+ from twisted.conch.interfaces import ISFTPServer, ISFTPFile
+@@ -415,11 +417,28 @@
+     def _ebStatus(self, reason, requestId, msg = "request failed"):
+         code = FX_FAILURE
+         message = msg
+-        if reason.type in (IOError, OSError):
++        if reason.type is WindowsError:
++            if reason.value.winerror == 2: # no such file
++                code = FX_NO_SUCH_FILE
++                message = reason.value.strerror
++            elif reason.value.winerror == 123: # invalid filename
++                code = FX_NO_SUCH_FILE
++                message = reason.value.strerror
++            elif reason.value.winerror == 267: # invalid directory name
++                code = FX_NOT_A_DIRECTORY
++                message = reason.value.strerror
++            elif reason.value.winerror == 183: # directory already exists
++                code = FX_FILE_ALREADY_EXISTS
++            else:
++                log.err(reason)
++        elif reason.type in (IOError, OSError):
++            if reason.value.errno in (errno.ENOTEMPTY, errno.EINVAL):
++                code = FX_FAILURE
++                message = reason.value.strerror
+             if reason.value.errno == errno.ENOENT: # no such file
+                 code = FX_NO_SUCH_FILE
+                 message = reason.value.strerror
+-            elif reason.value.errno == errno.EACCES: # permission denied
++            elif reason.value.errno in (errno.EACCES, errno.EPERM): # permission denied
+                 code = FX_PERMISSION_DENIED
+                 message = reason.value.strerror
+             elif reason.value.errno == errno.EEXIST:
+@@ -472,14 +491,14 @@
+         to be sent to the server.
+         """
+         FileTransferBase.__init__(self)
+-        self.extData = {}
++        self.extData = extData
+         self.counter = 0
+         self.openRequests = {} # id -> Deferred
+         self.wasAFile = {} # Deferred -> 1 TERRIBLE HACK
+ 
+     def connectionMade(self):
+         data = struct.pack('!L', max(self.versions))
+-        for k,v in self.extData.itervalues():
++        for k,v in self.extData.iteritems():
+             data += NS(k) + NS(v)
+         self.sendPacket(FXP_INIT, data)
+ 
+Index: twisted/conch/stdio.py
+===================================================================
+--- twisted/conch/stdio.py	(revision 38158)
++++ twisted/conch/stdio.py	(working copy)
+@@ -8,7 +8,11 @@
+ @author: Jp Calderone
+ """
+ 
+-import os, tty, sys, termios
++import os, sys
++try:
++    import tty, termios
++except ImportError:
++    tty = termios = None
+ 
+ from twisted.internet import reactor, stdio, protocol, defer
+ from twisted.python import failure, reflect, log
+@@ -43,7 +47,10 @@
+ 
+     def childConnectionLost(self, childFD):
+         if self.proto is not None:
+-            self.proto.childConnectionLost(childFD)
++            try:
++                self.proto.childConnectionLost(childFD)
++            except:
++                pass
+ 
+     def processEnded(self, reason):
+         if self.proto is not None:
+@@ -66,21 +73,23 @@
+ 
+ 
+ def runWithProtocol(klass):
+-    fd = sys.__stdin__.fileno()
+-    oldSettings = termios.tcgetattr(fd)
+-    tty.setraw(fd)
++    if termios:
++        fd = sys.__stdin__.fileno()
++        oldSettings = termios.tcgetattr(fd)
++        tty.setraw(fd)
+     try:
+         p = ServerProtocol(klass)
+         stdio.StandardIO(p)
+         reactor.run()
+     finally:
+-        termios.tcsetattr(fd, termios.TCSANOW, oldSettings)
+-        os.write(fd, "\r\x1bc\r")
++        if termios:
++            termios.tcsetattr(fd, termios.TCSANOW, oldSettings)
++            os.write(fd, "\r\x1bc\r")
+ 
+ 
+ 
+ def main(argv=None):
+-    log.startLogging(file('child.log', 'w'))
++    log.startLogging(file('child.log', 'wb'))
+ 
+     if argv is None:
+         argv = sys.argv[1:]
+Index: twisted/conch/tap.py
+===================================================================
+--- twisted/conch/tap.py	(revision 38158)
++++ twisted/conch/tap.py	(working copy)
+@@ -5,8 +5,14 @@
+ """
+ Support module for making SSH servers with twistd.
+ """
++import sys
++from twisted.python.runtime import platform
+ 
+-from twisted.conch import unix
++if platform.isWindows():
++    from twisted.conch.windows import WindowsSSHRealm as SSHRealm
++else:
++    from twisted.conch.unix import UnixSSHRealm as SSHRealm
++
+ from twisted.conch import checkers as conch_checkers
+ from twisted.conch.openssh_compat import factory
+ from twisted.cred import portal, checkers, strcred
+@@ -80,7 +86,7 @@
+ 
+     t = factory.OpenSSHFactory()
+ 
+-    r = unix.UnixSSHRealm()
++    r = SSHRealm()
+     t.portal = portal.Portal(r, config.get('credCheckers', []))
+     t.dataRoot = config['data']
+     t.moduliRoot = config['moduli'] or config['data']
+Index: twisted/python/win32.py
+===================================================================
+--- twisted/python/win32.py	(revision 38158)
++++ twisted/python/win32.py	(working copy)
+@@ -15,6 +15,7 @@
+ 
+ import re
+ import os
++import struct
+ 
+ try:
+     import win32api
+@@ -22,6 +23,11 @@
+ except ImportError:
+     pass
+ 
++try:
++    from twisted.internet import win32conio
++except ImportError:
++    pass
++
+ from twisted.python.runtime import platform
+ 
+ # http://msdn.microsoft.com/library/default.asp?url=/library/en-us/debug/base/system_error_codes.asp
+@@ -167,3 +173,366 @@
+         return os.strerror(errorcode)
+ 
+ formatError = _ErrorFormatter.fromEnvironment().formatError
++
++class FakeFcntl(object):
++    """This *fake* module is for windows only
++    """
++    DN_ACCESS       = 1
++    DN_ATTRIB       = 32
++    DN_CREATE       = 4
++    DN_DELETE       = 8
++    DN_MODIFY       = 2
++    DN_MULTISHOT    = -2147483648
++    DN_RENAME       = 16
++    FASYNC          = 8192
++    FD_CLOEXEC      = 1
++    F_DUPFD         = 0
++    F_EXLCK         = 4
++    F_GETFD         = 1
++    F_GETFL         = 3
++    F_GETLEASE      = 1025
++    F_GETLK         = 12
++    F_GETLK64       = 12
++    F_GETOWN        = 9
++    F_GETSIG        = 11
++    F_NOTIFY        = 1026
++    F_RDLCK         = 0
++    F_SETFD         = 2
++    F_SETFL         = 4
++    F_SETLEASE      = 1024
++    F_SETLK         = 13
++    F_SETLK64       = 13
++    F_SETLKW        = 14
++    F_SETLKW64      = 14
++    F_SETOWN        = 8
++    F_SETSIG        = 10
++    F_SHLCK         = 8
++    F_UNLCK         = 2
++    F_WRLCK         = 1
++    I_ATMARK        = 21279
++    I_CANPUT        = 21282
++    I_CKBAND        = 21277
++    I_FDINSERT      = 21264
++    I_FIND          = 21259
++    I_FLUSH         = 21253
++    I_FLUSHBAND     = 21276
++    I_GETBAND       = 21278
++    I_GETCLTIME     = 21281
++    I_GETSIG        = 21258
++    I_GRDOPT        = 21255
++    I_GWROPT        = 21268
++    I_LINK          = 21260
++    I_LIST          = 21269
++    I_LOOK          = 21252
++    I_NREAD         = 21249
++    I_PEEK          = 21263
++    I_PLINK         = 21270
++    I_POP           = 21251
++    I_PUNLINK       = 21271
++    I_PUSH          = 21250
++    I_RECVFD        = 21262
++    I_SENDFD        = 21265
++    I_SETCLTIME     = 21280
++    I_SETSIG        = 21257
++    I_SRDOPT        = 21254
++    I_STR           = 21256
++    I_SWROPT        = 21267
++    I_UNLINK        = 21261
++    LOCK_EX         = 2
++    LOCK_MAND       = 32
++    LOCK_NB         = 4
++    LOCK_READ       = 64
++    LOCK_RW         = 192
++    LOCK_SH         = 1
++    LOCK_UN         = 8
++    LOCK_WRITE      = 128
++
++    def fcntl(self, fd, op, arg=0):
++        raise NotImplementedError
++    def ioctl(self, fd, op, arg=0, mutate_flag=True):
++        if op == tty.TIOCGWINSZ:
++            width, height = win32conio.getWindowSize()
++            return struct.pack("4H", height, width, 0, 0)
++        else:
++            raise NotImplementedError
++    def flock(self, fd, op):
++        raise NotImplementedError
++    def lockf(self, fd, op, length=0, start=0, whence=0):
++        raise NotImplementedError
++
++
++class FakeTermios(object):
++    B0                  = 0
++    B110                = 3
++    B115200             = 4098
++    B1200               = 9
++    B134                = 4
++    B150                = 5
++    B1800               = 10
++    B19200              = 14
++    B200                = 6
++    B230400             = 4099
++    B2400               = 11
++    B300                = 7
++    B38400              = 15
++    B460800             = 4100
++    B4800               = 12
++    B50                 = 1
++    B57600              = 4097
++    B600                = 8
++    B75                 = 2
++    B9600               = 13
++    BRKINT              = 2
++    BS0                 = 0
++    BS1                 = 8192
++    BSDLY               = 8192
++    CBAUD               = 4111
++    CBAUDEX             = 4096
++    CDSUSP              = 25
++    CEOF                = 4
++    CEOL                = 0
++    CEOT                = 4
++    CERASE              = 127
++    CFLUSH              = 15
++    CIBAUD              = 269418496
++    CINTR               = 3
++    CKILL               = 21
++    CLNEXT              = 22
++    CLOCAL              = 2048
++    CQUIT               = 28
++    CR0                 = 0
++    CR1                 = 512
++    CR2                 = 1024
++    CR3                 = 1536
++    CRDLY               = 1536
++    CREAD               = 128
++    CRPRNT              = 18
++    CRTSCTS             = -2147483648
++    CS5                 = 0
++    CS6                 = 16
++    CS7                 = 32
++    CS8                 = 48
++    CSIZE               = 48
++    CSTART              = 17
++    CSTOP               = 19
++    CSTOPB              = 64
++    CSUSP               = 26
++    CWERASE             = 23
++    ECHO                = 8
++    ECHOCTL             = 512
++    ECHOE               = 16
++    ECHOK               = 32
++    ECHOKE              = 2048
++    ECHONL              = 64
++    ECHOPRT             = 1024
++    EXTA                = 14
++    EXTB                = 15
++    FF0                 = 0
++    FF1                 = 32768
++    FFDLY               = 32768
++    FIOASYNC            = 21586
++    FIOCLEX             = 21585
++    FIONBIO             = 21537
++    FIONCLEX            = 21584
++    FIONREAD            = 21531
++    FLUSHO              = 4096
++    HUPCL               = 1024
++    ICANON              = 2
++    ICRNL               = 256
++    IEXTEN              = 32768
++    IGNBRK              = 1
++    IGNCR               = 128
++    IGNPAR              = 4
++    IMAXBEL             = 8192
++    INLCR               = 64
++    INPCK               = 16
++    IOCSIZE_MASK        = 1073676288
++    IOCSIZE_SHIFT       = 16
++    ISIG                = 1
++    ISTRIP              = 32
++    IUCLC               = 512
++    IXANY               = 2048
++    IXOFF               = 4096
++    IXON                = 1024
++    NCC                 = 8
++    NCCS                = 32
++    NL0                 = 0
++    NL1                 = 256
++    NLDLY               = 256
++    NOFLSH              = 128
++    N_MOUSE             = 2
++    N_PPP               = 3
++    N_SLIP              = 1
++    N_STRIP             = 4
++    N_TTY               = 0
++    OCRNL               = 8
++    OFDEL               = 128
++    OFILL               = 64
++    OLCUC               = 2
++    ONLCR               = 4
++    ONLRET              = 32
++    ONOCR               = 16
++    OPOST               = 1
++    PARENB              = 256
++    PARMRK              = 8
++    PARODD              = 512
++    PENDIN              = 16384
++    TAB0                = 0
++    TAB1                = 2048
++    TAB2                = 4096
++    TAB3                = 6144
++    TABDLY              = 6144
++    TCFLSH              = 21515
++    TCGETA              = 21509
++    TCGETS              = 21505
++    TCIFLUSH            = 0
++    TCIOFF              = 2
++    TCIOFLUSH           = 2
++    TCION               = 3
++    TCOFLUSH            = 1
++    TCOOFF              = 0
++    TCOON               = 1
++    TCSADRAIN           = 1
++    TCSAFLUSH           = 2
++    TCSANOW             = 0
++    TCSBRK              = 21513
++    TCSBRKP             = 21541
++    TCSETA              = 21510
++    TCSETAF             = 21512
++    TCSETAW             = 21511
++    TCSETS              = 21506
++    TCSETSF             = 21508
++    TCSETSW             = 21507
++    TCXONC              = 21514
++    TIOCCONS            = 21533
++    TIOCEXCL            = 21516
++    TIOCGETD            = 21540
++    TIOCGICOUNT         = 21597
++    TIOCGLCKTRMIOS      = 21590
++    TIOCGPGRP           = 21519
++    TIOCGSERIAL         = 21534
++    TIOCGSOFTCAR        = 21529
++    TIOCGWINSZ          = 21523
++    TIOCINQ             = 21531
++    TIOCLINUX           = 21532
++    TIOCMBIC            = 21527
++    TIOCMBIS            = 21526
++    TIOCMGET            = 21525
++    TIOCMIWAIT          = 21596
++    TIOCMSET            = 21528
++    TIOCM_CAR           = 64
++    TIOCM_CD            = 64
++    TIOCM_CTS           = 32
++    TIOCM_DSR           = 256
++    TIOCM_DTR           = 2
++    TIOCM_LE            = 1
++    TIOCM_RI            = 128
++    TIOCM_RNG           = 128
++    TIOCM_RTS           = 4
++    TIOCM_SR            = 16
++    TIOCM_ST            = 8
++    TIOCNOTTY           = 21538
++    TIOCNXCL            = 21517
++    TIOCOUTQ            = 21521
++    TIOCPKT             = 21536
++    TIOCPKT_DATA        = 0
++    TIOCPKT_DOSTOP      = 32
++    TIOCPKT_FLUSHREAD   = 1
++    TIOCPKT_FLUSHWRITE  = 2
++    TIOCPKT_NOSTOP      = 16
++    TIOCPKT_START       = 8
++    TIOCPKT_STOP        = 4
++    TIOCSCTTY           = 21518
++    TIOCSERCONFIG       = 21587
++    TIOCSERGETLSR       = 21593
++    TIOCSERGETMULTI     = 21594
++    TIOCSERGSTRUCT      = 21592
++    TIOCSERGWILD        = 21588
++    TIOCSERSETMULTI     = 21595
++    TIOCSERSWILD        = 21589
++    TIOCSER_TEMT        = 1
++    TIOCSETD            = 21539
++    TIOCSLCKTRMIOS      = 21591
++    TIOCSPGRP           = 21520
++    TIOCSSERIAL         = 21535
++    TIOCSSOFTCAR        = 21530
++    TIOCSTI             = 21522
++    TIOCSWINSZ          = 21524
++    TOSTOP              = 256
++    VDISCARD            = 13
++    VEOF                = 4
++    VEOL                = 11
++    VEOL2               = 16
++    VERASE              = 2
++    VINTR               = 0
++    VKILL               = 3
++    VLNEXT              = 15
++    VMIN                = 6
++    VQUIT               = 1
++    VREPRINT            = 12
++    VSTART              = 8
++    VSTOP               = 9
++    VSUSP               = 10
++    VSWTC               = 7
++    VSWTCH              = 7
++    VT0                 = 0
++    VT1                 = 16384
++    VTDLY               = 16384
++    VTIME               = 5
++    VWERASE             = 14
++    XCASE               = 4
++    XTABS               = 6144
++
++    class error(Exception):
++        pass
++
++    def tcdrain(self, fd):
++        raise NotImplementedError
++
++    def tcflow(self, fd, action):
++        raise NotImplementedError
++
++    def tcflush(self, fd, queue):
++        raise NotImplementedError
++
++    def tcgetattr(self, fd):
++        raise NotImplementedError
++
++    def tcsendbreak(self, fd, duration):
++        raise NotImplementedError
++
++    def tcsetattr(self, fd, when, attributes):
++        raise NotImplementedError
++
++
++class FakeTTY(FakeTermios):
++    IFLAG   = 0
++    OFLAG   = 1
++    CFLAG   = 2
++    LFLAG   = 3
++    ISPEED  = 4
++    OSPEED  = 5
++    CC      = 6
++
++    def setcbreak(self, fd, when=FakeTermios.TCSAFLUSH):
++        raise NotImplementedError
++
++    def setraw(self, fd, when=FakeTermios.TCSAFLUSH):
++        raise NotImplementedError
++
++
++try:
++    import fcntl
++except ImportError:
++    fcntl = FakeFcntl()
++
++try:
++    import termios
++except ImportError:
++    termios = FakeTermios()
++
++try:
++    import tty
++except ImportError:
++    tty = FakeTTY()
++

@@ -1,0 +1,444 @@
+diff -r a0c2086fc31a twisted/internet/selectreactor.py
+--- a/twisted/internet/selectreactor.py	Sun Nov 02 07:33:10 2008 +0100
++++ b/twisted/internet/selectreactor.py	Sun Nov 02 16:02:31 2008 +0100
+@@ -116,6 +116,9 @@
+                 # select(2) encountered an error
+                 if se.args[0] in (0, 2):
+                     # windows does this if it got an empty list
++                    # XXX: Is this still needed? win32select already handles
++                    # empty lists, and in any case, the error set by select
++                    # is WSAEINVAL (=10022), not ENOENT.
+                     if (not self._reads) and (not self._writes):
+                         return
+                     else:
+diff -r a0c2086fc31a twisted/internet/test/interrupts_helper.py
+--- /dev/null	Thu Jan 01 00:00:00 1970 +0000
++++ b/twisted/internet/test/interrupts_helper.py	Sun Nov 02 16:02:31 2008 +0100
+@@ -0,0 +1,71 @@
++# Copyright (c) 2008 Twisted Matrix Laboratories.
++# See LICENSE for details.
++
++"""
++A program that helps testing that a reactor can be interrupted by signals.
++
++It expects three command line arguments; the first is the module name of
++the reactor to test, the second is the ip adress and the third is the
++port of a listening TCP socket.
++
++The program first starts the appropriate reactor and then connects to
++the specified server.
++"""
++
++import sys
++import signal
++
++from twisted.internet import protocol
++from twisted.protocols import basic
++from twisted.python import reflect, runtime
++
++
++if runtime.platformType == "win32":
++    # restore signal handling
++    import win32api
++    win32api.SetConsoleCtrlHandler(None, False)
++
++
++class SignalEchoer(basic.LineReceiver):
++
++    def connectionMade(self):
++        self.sendLine("START")
++
++    def handleSigInt(self, *args):
++        self.sendLine("INT")
++
++    def handleSigTerm(self, *args):
++        self.sendLine("TERM")
++
++
++proto = SignalEchoer()
++
++
++signal.signal(signal.SIGINT, proto.handleSigInt)
++if runtime.platformType == "win32":
++    signal.signal(signal.SIGBREAK, proto.handleSigTerm)
++else:
++    signal.signal(signal.SIGTERM, proto.handleSigTerm)
++
++
++class SignalEchoerFactory(protocol.ClientFactory):
++
++    def buildProtocol(self, addr):
++        return proto
++
++
++def main(reactorModule, host, port):
++    """
++    This has to based on sockets, because they are the only interprocess
++    communication mechanism supported by Twisted on Windows that doesn't
++    perform a busy wait.
++    """
++    port = int(port)
++    reflect.namedAny(reactorModule).install()
++    from twisted.internet import reactor
++    reactor.connectTCP(host, port, SignalEchoerFactory())
++    reactor.run(installSignalHandlers=False)
++
++
++if __name__ == "__main__":
++    main(*sys.argv[1:])
+diff -r a0c2086fc31a twisted/internet/test/test_interrupts.py
+--- /dev/null	Thu Jan 01 00:00:00 1970 +0000
++++ b/twisted/internet/test/test_interrupts.py	Sun Nov 02 16:02:31 2008 +0100
+@@ -0,0 +1,256 @@
++# Copyright (c) 2008 Twisted Matrix Laboratories.
++# See LICENSE for details.
++
++"""
++Tests for reactors' interruptability by signals.
++"""
++
++import sys
++import signal
++
++from twisted.internet import defer, error, interfaces, protocol, reactor
++from twisted.python import failure, filepath, runtime
++from twisted.protocols import basic
++from twisted.trial import unittest
++
++win32process = None
++
++if runtime.platformType == "win32":
++    try:
++        import win32process
++        import win32api
++        import win32con
++    except ImportError:
++        pass
++
++SIGKILL = getattr(signal, "SIGKILL", object())
++
++
++def signalsSupported():
++    """
++    Return True if the current platform supports signals, or if signal support
++    can be at least monkeypatched into Twisted.
++    """
++    if not interfaces.IReactorProcess.providedBy(reactor):
++        return False
++    if runtime.platformType == "posix":
++        return True
++    elif runtime.platform.isWinNT():
++        if win32process is None:
++            return False
++        try:
++            console = open("CONOUT$", "wb")
++        except IOError:
++            # not attached to a console, can't generate console control events
++            return False
++        else:
++            console.close()
++            return True
++    return False
++
++
++def patchedSignalProcess(self, signalID):
++    """
++    Add real support for sending signals on Windows.
++    """
++    if self.pid is None:
++        raise error.ProcessExitedAlready()
++    if signalID == "INT":
++        win32api.GenerateConsoleCtrlEvent(win32con.CTRL_C_EVENT, self.pid)
++    elif signalID == "TERM":
++        win32api.GenerateConsoleCtrlEvent(win32con.CTRL_BREAK_EVENT, self.pid)
++    elif signalID == "KILL":
++        win32process.TerminateProcess(self.hProcess, 42)
++
++
++oldCreateProcess = getattr(win32process, "CreateProcess", None)
++
++def patchedCreateProcess(appName, commandLine, processAttributes,
++                         threadAttributes, bInheritHandles, dwCreationFlags,
++                         newEnvironment, currentDirectory, startupinfo):
++    """
++    Patch in the required flags for signal support on Windows.
++    """
++    dwCreationFlags = dwCreationFlags | win32process.CREATE_NEW_PROCESS_GROUP
++    return oldCreateProcess(appName, commandLine, processAttributes,
++                            threadAttributes, bInheritHandles, dwCreationFlags,
++                            newEnvironment, currentDirectory, startupinfo)
++
++
++
++class SignalFactory(protocol.ServerFactory):
++    """
++    A factory that listens for connections from chid processes.
++    """
++    def controlProcess(self, helper):
++        """
++        Make this factory responsible for controlling the helper process.
++        """
++        self.deferred = defer.Deferred()
++        self.helper = helper
++        return self.deferred
++
++    def buildProtocol(self, addr):
++        deferred, self.deferred = self.deferred, None
++        helper, self.helper = self.helper, None
++        protocol = SignalSender(deferred, helper)
++        if helper:
++            helper.setReporter(protocol)
++        return protocol
++
++
++
++class SignalSender(basic.LineReceiver):
++
++    MAX_DELAY = 3
++    states = {"START": "INT", "INT": "TERM", "TERM": "KILL"}
++
++    def __init__(self, deferred, helper):
++        self.deferred = deferred
++        self.helper = helper
++        self.events = []
++
++    def connectionMade(self):
++        self.delayedCall = reactor.callLater(self.MAX_DELAY, self.timeout)
++        self.state = "START"
++
++
++    def timeout(self):
++        self.fail(error.TimeoutError("Timed out in state: %r" % (self.state,)))
++
++
++    def fail(self, reason=None):
++        deferred = self.cleanup()
++        if deferred:
++            deferred.errback(reason)
++
++
++    def cleanup(self):
++        deferred, self.deferred = self.deferred, None
++        helper, self.helper = self.helper, None
++        transport, self.transport = self.transport, None
++        delayedCall, self.delayedCall = self.delayedCall, None
++        if delayedCall and delayedCall.active():
++            delayedCall.cancel()
++        if transport:
++            transport.loseConnection()
++        if helper and helper.active:
++            helper.sendSignal("KILL")
++        return deferred
++
++
++    def lineReceived(self, line):
++        if self.deferred:
++            if line != self.state:
++                self.fail(ValueError("Unexpected line in state %r: %r" %
++                                     (self.state, line)))
++                return
++            self.events.append(self.state)
++            self.delayedCall.delay(self.MAX_DELAY)
++            self.state = self.states[line]
++            self.helper.sendSignal(self.state)
++
++
++    def helperFinished(self, reason):
++        reason = failure.Failure(reason)
++        self.helper = None
++        deferred = self.cleanup()
++        if deferred:
++            if (self.state == "KILL" and reason.check(error.ProcessTerminated)
++                and (reason.value.signal == SIGKILL
++                     or reason.value.exitCode == 42)):
++                self.events.append(self.state)
++                deferred.callback(self.events)
++            else:
++                deferred.errback(reason)
++
++
++
++class InterruptsHelper(protocol.ProcessProtocol):
++    """
++    A process protocol that sends signals to the child process and reports
++    when the chid dies.
++    """
++    active = False
++
++    def setReporter(self, reporter):
++        """
++        Set the object whose C{helperFinished} method will be called when the
++        child terminates.
++        """
++        self.reporter = reporter
++
++
++    def connectionMade(self):
++        """
++        Mark this helper as active.
++        """
++        self.active = True
++
++
++    def sendSignal(self, signalID):
++        """
++        Send a signal to the child that is controlled by this protocol.
++        """
++        self.transport.signalProcess(signalID)
++
++
++    def processExited(self, reason):
++        """
++        Notify the reporter that the child has terminated.
++        """
++        self.active = False
++        self.reporter.helperFinished(reason)
++
++
++
++class InterruptsTests(unittest.TestCase):
++    """
++    Test that reactor can be interrupted by signals even when it isn't
++    processing any other events.
++    """
++
++    if not signalsSupported():
++        skip = "Requires signal support."
++
++    def setUp(self):
++        """
++        Monkeypatch some of the required support for signals on Windows.
++        """
++        if runtime.platformType == "win32":
++            self.patch(win32process, "CreateProcess", patchedCreateProcess)
++
++
++    def spawnProcess(self, processProtocol, executable, args):
++        """
++        Like reactor.spawnProcess, but with the required monkeypatches to
++        support signals on Windows.
++        """
++        process = reactor.spawnProcess(processProtocol, executable, args)
++        if runtime.platformType == "win32":
++            def signalProcess(signalID):
++                patchedSignalProcess(process, signalID)
++            self.patch(process, "signalProcess", signalProcess)
++        return process
++
++
++    def test_reactorInterruptable(self):
++        """
++        Test that the reactor can be interrupted even when it isn't processing
++        any network events (when it is waiting in a system call like select())
++        """
++        exe = sys.executable
++        path = filepath.FilePath(__file__).sibling('interrupts_helper.py').path
++        factory = SignalFactory()
++        helper = InterruptsHelper()
++        deferred = factory.controlProcess(helper)
++        port = reactor.listenTCP(0, factory, interface="127.0.0.1")
++        self.addCleanup(port.stopListening)
++        addr = port.getHost()
++        argv = [sys.executable, path,
++                reactor.__module__, addr.host, str(addr.port)]
++        process = self.spawnProcess(helper, sys.executable, argv)
++        def checkEvents(eventList):
++            self.assertEquals(eventList, ["START", "INT", "TERM", "KILL"])
++        return deferred.addCallback(checkEvents)
++
+diff -r a0c2086fc31a twisted/scripts/_twistw.py
+--- a/twisted/scripts/_twistw.py	Sun Nov 02 07:33:10 2008 +0100
++++ b/twisted/scripts/_twistw.py	Sun Nov 02 16:02:31 2008 +0100
+@@ -2,10 +2,11 @@
+ # Copyright (c) 2001-2008 Twisted Matrix Laboratories.
+ # See LICENSE for details.
+ 
+-from twisted.python import log
++import os
++import sys
++
+ from twisted.application import app, service, internet
+ from twisted import copyright
+-import sys, os
+ 
+ 
+ 
+@@ -43,8 +44,17 @@
+         """
+         Start the application and run the reactor.
+         """
+-        service.IService(self.application).privilegedStartService()
+-        app.startApplication(self.application, not self.config['no_save'])
+-        app.startApplication(internet.TimerService(0.1, lambda:None), 0)
++        self.startApplication(self.application)
+         self.startReactor(None, self.oldstdout, self.oldstderr)
+-        log.msg("Server Shut Down.")
++
++
++    def startApplication(self, application):
++        """
++        Configure global process state based on the given application and run
++        the application.
++
++        @param application: An object which can be adapted to
++            L{service.IService}.
++        """
++        service.IService(application).privilegedStartService()
++        app.startApplication(application, not self.config['no_save'])
+diff -r a0c2086fc31a twisted/test/test_twistd.py
+--- a/twisted/test/test_twistd.py	Sun Nov 02 07:33:10 2008 +0100
++++ b/twisted/test/test_twistd.py	Sun Nov 02 16:02:31 2008 +0100
+@@ -36,6 +36,11 @@
+ else:
+     from twisted.scripts._twistd_unix import UnixApplicationRunner
+     from twisted.scripts._twistd_unix import UnixAppLogger
++
++try:
++    from twisted.scripts import _twistw
++except ImportError:
++    _twistw = None
+ 
+ try:
+     import profile
+@@ -685,6 +690,41 @@
+ 
+ 
+ 
++class WindowsApplicationRunnerPostApplicationTests(unittest.TestCase):
++    """
++    Tests for L{_twistw.WindowsApplicationRunner.postApplication}.
++    """
++    if _twistw is None:
++        skip = "twistd windows not available"
++
++    def test_startedApplications(self):
++        """
++        Verify that twistd starts only one application.
++
++        L{_twistw.WindowsApplicationRunner.postApplication} used to always
++        start a L{twisted.application.internet.TimerService}. This is not
++        needed anymore, now that the select reactor has its own workaround
++        for noninterruptable C{select()}.
++        """
++        options = twistd.ServerOptions()
++        options.parseOptions([])
++        application = service.Application("test_startedApplications")
++        runner = _twistw.WindowsApplicationRunner(options)
++
++        apps = []
++        def fakeStartApplication(application, save):
++            apps.append(application)
++
++        self.assertEqual(inspect.getargspec(app.startApplication),
++                         inspect.getargspec(fakeStartApplication))
++
++        self.patch(app, 'startApplication', fakeStartApplication)
++
++        runner.startApplication(application)
++        self.assertEqual(apps, [application])
++
++
++
+ class DummyReactor(object):
+     """
+     A dummy reactor, only providing a C{run} method and checking that it

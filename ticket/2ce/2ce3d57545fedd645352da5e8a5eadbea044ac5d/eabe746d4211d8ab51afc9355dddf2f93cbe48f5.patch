@@ -1,0 +1,95 @@
+Index: twisted/web/template.py
+===================================================================
+--- twisted/web/template.py	(revision 34055)
++++ twisted/web/template.py	(working copy)
+@@ -29,7 +29,8 @@
+ from zope.interface import implements
+ 
+ from cStringIO import StringIO
+-from xml.sax import make_parser, handler
++from xml.sax import make_parser, handler , SAXException
++from xml.sax.handler import ErrorHandler
+ 
+ from twisted.web._stan import Tag, slot, Comment, CDATA, CharRef
+ from twisted.python.filepath import FilePath
+@@ -89,7 +90,34 @@
+         return self.nss.__getitem__(k)
+ 
+ 
++class _LocationReportingErrorHandler(ErrorHandler):
++    """
++    Define a SAX error handler which can report the location of fatal
++    errors.
+ 
++    This handler is same as that in twisted.lore.tree , but modified
++    for the content handler C{_ToStan}.
++    """
++    def __init__(self, contentHandler):
++        self.contentHandler = contentHandler
++
++    def fatalError(self, err):
++        """
++        This method will be called if an error occurred.
++        """
++        if err.getMessage() == 'mismatched tag':
++            tag =  self.contentHandler.stack[-1]
++            expect , begLine , begCol = tag.tagName , tag.lineNumber , tag.columnNumber
++            endLine, endCol = err.getLineNumber(), err.getColumnNumber()
++            raise SAXException(
++                "mismatched close tag at line %d, column %d; expected </%s> "
++                "(from line %d, column %d)" % (
++                    endLine, endCol, expect, begLine, begCol))
++        raise SAXException(
++            '%s at line %d, column %d' % (err.getMessage(),
++                                          err.getLineNumber(),
++                                          err.getColumnNumber()))
++
+ class _ToStan(handler.ContentHandler, handler.EntityResolver):
+     """
+     A SAX parser which converts an XML document to the Twisted STAN
+@@ -347,6 +375,7 @@
+     parser.setContentHandler(s)
+     parser.setEntityResolver(s)
+     parser.setProperty(handler.property_lexical_handler, s)
++    parser.setErrorHandler( _LocationReportingErrorHandler(s) )
+ 
+     parser.parse(fl)
+ 
+Index: twisted/web/test/test_template.py
+===================================================================
+--- twisted/web/test/test_template.py	(revision 34055)
++++ twisted/web/test/test_template.py	(working copy)
+@@ -21,6 +21,8 @@
+ from twisted.web.error import (FlattenerError, MissingTemplateLoader,
+     MissingRenderMethod)
+ 
++from xml.sax import SAXException
++
+ from twisted.web.template import renderElement
+ from twisted.web._element import UnexposedMethodError
+ from twisted.web.test._util import FlattenTestCase
+@@ -419,7 +421,22 @@
+             xmlns:t='http://twistedmatrix.com/ns/twisted.web.template/0.1'
+             >hello</t:attr></html>""")
+ 
++    def test_errorMismatchedTags(self):
++      """
++      The error handler of the parser will raise L{SAXException}
++      When a mismatched end tag is found.
+ 
++      The error message should provide detail information about the error.
++      """
++      try:
++        element = Element(loader=XMLString('<a></b>'))
++      except SAXException as err:
++        self.assertEqual(
++            err.getMessage(),
++            "mismatched close tag at line 1, column 5; "
++            "expected </a> (from line 1, column 0)")
++
++
+     def test_lenientPrefixBehavior(self):
+         """
+         If the parser sees a prefix it doesn't recognize on an attribute, it
+Index: twisted/web/topfiles/5220.misc
+===================================================================

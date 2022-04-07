@@ -1,0 +1,805 @@
+Index: twisted/names/authority.py
+===================================================================
+--- twisted/names/authority.py	(revision 41558)
++++ twisted/names/authority.py	(working copy)
+@@ -224,7 +224,7 @@
+                     if rec.TYPE != dns.SOA:
+                         results.append(dns.RRHeader(k, rec.TYPE, dns.IN, ttl, rec, auth=True))
+             results.append(results[0])
+-            return defer.succeed((results, (), ()))
++            return defer.succeed((results, [], []))
+         return defer.fail(failure.Failure(dns.DomainError(name)))
+ 
+     def _cbAllRecords(self, results):
+Index: twisted/names/client.py
+===================================================================
+--- twisted/names/client.py	(revision 41558)
++++ twisted/names/client.py	(working copy)
+@@ -451,7 +451,7 @@
+ 
+     def connectionMade(self, protocol):
+         # dig saids recursion-desired to 0, so I will too
+-        message = dns.Message(protocol.pickID(), recDes=0)
++        message = dns._EDNSMessage(protocol.pickID(), recDes=0)
+         message.queries = [dns.Query(self.name, dns.AXFR, dns.IN)]
+         protocol.writeMessage(message)
+ 
+Index: twisted/names/dns.py
+===================================================================
+--- twisted/names/dns.py	(revision 41585)
++++ twisted/names/dns.py	(working copy)
+@@ -2513,7 +2513,8 @@
+             # Assign the lower 4 bits to the message
+             rCode=self.rCode & 0xf,
+             authenticData=self.authenticData,
+-            checkingDisabled=self.checkingDisabled)
++            checkingDisabled=self.checkingDisabled,
++            maxSize=self.maxSize)
+ 
+         m.queries = self.queries[:]
+         m.answers = self.answers[:]
+@@ -2675,7 +2676,7 @@
+             query, or errbacked with any errors that could happen (exceptions
+             during writing of the query, timeout errors, ...).
+         """
+-        m = Message(id, recDes=1)
++        m = _EDNSMessage(id, recDes=1)
+         m.queries = queries
+ 
+         try:
+@@ -2737,7 +2738,7 @@
+         Read a datagram, extract the message in it and trigger the associated
+         Deferred.
+         """
+-        m = Message()
++        m = _EDNSMessage()
+         try:
+             m.fromStr(data)
+         except EOFError:
+@@ -2817,6 +2818,9 @@
+ 
+         @type message: L{Message}
+         """
++        # DNS messages should never be truncated over a stream transport.
++        # The way to prevent truncation (during encoding) is to set maxSize to 0
++        message.maxSize = 0
+         s = message.toStr()
+         self.transport.write(struct.pack('!H', len(s)) + s)
+ 
+@@ -2846,7 +2850,7 @@
+ 
+             if len(self.buffer) >= self.length:
+                 myChunk = self.buffer[:self.length]
+-                m = Message()
++                m = _EDNSMessage()
+                 m.fromStr(myChunk)
+ 
+                 try:
+Index: twisted/names/server.py
+===================================================================
+--- twisted/names/server.py	(revision 41585)
++++ twisted/names/server.py	(working copy)
+@@ -59,7 +59,7 @@
+ 
+     protocol = dns.DNSProtocol
+     cache = None
+-    _messageFactory = dns.Message
++    _messageFactory = dns._EDNSMessage
+ 
+ 
+     def __init__(self, authorities=None, caches=None, clients=None, verbose=0):
+@@ -147,7 +147,7 @@
+         @type protocol: L{dns.DNSDatagramProtocol} or L{dns.DNSProtocol}
+ 
+         @param message: The DNS message to be sent.
+-        @type message: L{dns.Message}
++        @type message: L{dns._EDNSMessage}
+ 
+         @param address: The address to which the message will be sent or L{None}
+             if C{protocol} is a stream protocol.
+@@ -248,6 +248,11 @@
+         # here until #6949 is resolved.
+         response.maxSize = message.maxSize
+ 
++        # Force EDNS off for now. This should mean that the server will behave
++        # exactly as before. Then in the future we can turn this to 1 and also
++        # set the maxSize appropriatly
++        response.ednsVersion = None
++
+         response.answers = answers
+         response.authority = authority
+         response.additional = additional
+@@ -284,7 +289,7 @@
+ 
+         @param message: The original DNS query message for which a response
+             message will be constructed.
+-        @type message: L{dns.Message}
++        @type message: L{dns._EDNSMessage}
+ 
+         @param address: The address to which the response message will be sent
+             or L{None} if C{protocol} is a stream protocol.
+@@ -324,7 +329,7 @@
+ 
+         @param message: The original DNS query message for which a response
+             message will be constructed.
+-        @type message: L{dns.Message}
++        @type message: L{dns._EDNSMessage}
+ 
+         @param address: The address to which the response message will be sent
+             or L{None} if C{protocol} is a stream protocol.
+@@ -365,7 +370,7 @@
+ 
+         @param message: The original DNS query message for which a response
+             message will be constructed.
+-        @type message: L{dns.Message}
++        @type message: L{dns._EDNSMessage}
+ 
+         @param address: The address to which the response message will be sent
+             or L{None} if C{protocol} is a stream protocol.
+@@ -401,7 +406,7 @@
+ 
+         @param message: The original DNS query message for which a response
+             message will be constructed.
+-        @type message: L{dns.Message}
++        @type message: L{dns._EDNSMessage}
+ 
+         @param address: The address to which the response message will be sent
+             or L{None} if C{protocol} is a stream protocol.
+@@ -429,7 +434,7 @@
+ 
+         @param message: The original DNS query message for which a response
+             message will be constructed.
+-        @type message: L{dns.Message}
++        @type message: L{dns._EDNSMessage}
+ 
+         @param address: The address to which the response message will be sent
+             or L{None} if C{protocol} is a stream protocol.
+@@ -457,7 +462,7 @@
+ 
+         @param message: The original DNS query message for which a response
+             message will be constructed.
+-        @type message: L{dns.Message}
++        @type message: L{dns._EDNSMessage}
+ 
+         @param address: The address to which the response message will be sent
+             or L{None} if C{protocol} is a stream protocol.
+@@ -485,7 +490,7 @@
+ 
+         @param message: The original DNS query message for which a response
+             message will be constructed.
+-        @type message: L{dns.Message}
++        @type message: L{dns._EDNSMessage}
+ 
+         @param address: The address to which the response message will be sent
+             or L{None} if C{protocol} is a stream protocol.
+@@ -518,7 +523,7 @@
+         logged in more or less detail depending on the value of C{verbose}.
+ 
+         @param message: The DNS message that was received.
+-        @type message: L{dns.Message}
++        @type message: L{dns._EDNSMessage}
+ 
+         @param proto: The DNS protocol instance which received the message
+         @type proto: L{dns.DNSDatagramProtocol} or L{dns.DNSProtocol}
+@@ -571,7 +576,7 @@
+         Override in a subclass to implement alternative policies.
+ 
+         @param message: The DNS message that was received.
+-        @type message: L{dns.Message}
++        @type message: L{dns._EDNSMessage}
+ 
+         @param protocol: The DNS protocol instance which received the message
+         @type protocol: L{dns.DNSDatagramProtocol} or L{dns.DNSProtocol}
+Index: twisted/names/test/test_client.py
+===================================================================
+--- twisted/names/test/test_client.py	(revision 41558)
++++ twisted/names/test/test_client.py	(working copy)
+@@ -379,7 +379,7 @@
+         # The response to the first query should be sent in response to both
+         # queries.
+         answer = object()
+-        response = dns.Message()
++        response = dns._EDNSMessage()
+         response.answers.append(answer)
+         queries.pop()[-1].callback(response)
+ 
+@@ -438,7 +438,7 @@
+         self.assertEqual(len(queries), 1)
+ 
+         # Deliver the response.
+-        queries.pop()[-1].callback(dns.Message())
++        queries.pop()[-1].callback(dns._EDNSMessage())
+ 
+         # Repeating the first query should touch the protocol again.
+         resolver.query(query)
+@@ -518,7 +518,7 @@
+ 
+             def query(self, address, query, timeout=10, id=None):
+                 protocols.append(self)
+-                return defer.succeed(dns.Message())
++                return defer.succeed(dns._EDNSMessage())
+ 
+         resolver._connectedProtocol = FakeProtocol
+         resolver.query(dns.Query(b'foo.example.com'))
+@@ -554,7 +554,7 @@
+         resolver = client.Resolver(servers=[('example.com', 53)])
+         protocols = []
+         results = [defer.fail(failure.Failure(DNSQueryTimeoutError(None))),
+-                   defer.succeed(dns.Message())]
++                   defer.succeed(dns._EDNSMessage())]
+ 
+         class FakeProtocol(object):
+             def __init__(self):
+@@ -591,7 +591,7 @@
+         resolver.query(dns.Query(b'foo.example.com'))
+ 
+         self.assertFalse(protocols[0].transport.disconnected)
+-        result.callback(dns.Message())
++        result.callback(dns._EDNSMessage())
+         self.assertTrue(protocols[0].transport.disconnected)
+ 
+ 
+@@ -619,7 +619,7 @@
+         resolver.query(dns.Query(b'foo.example.com'))
+ 
+         self.assertFalse(protocols[1].transport.disconnected)
+-        result.callback(dns.Message())
++        result.callback(dns._EDNSMessage())
+         self.assertTrue(protocols[1].transport.disconnected)
+ 
+ 
+@@ -1056,12 +1056,11 @@
+         Test that a truncated message results in an equivalent request made via
+         TCP.
+         """
+-        m = dns.Message(trunc=True)
+-        m.addQuery(b'example.com')
++        m = dns._EDNSMessage(trunc=True, queries=[dns.Query(b'example.com')])
+ 
+         def queryTCP(queries):
+             self.assertEqual(queries, m.queries)
+-            response = dns.Message()
++            response = dns._EDNSMessage()
+             response.answers = ['answer']
+             response.authority = ['authority']
+             response.additional = ['additional']
+@@ -1074,7 +1073,7 @@
+ 
+ 
+     def _rcodeTest(self, rcode, exc):
+-        m = dns.Message(rCode=rcode)
++        m = dns._EDNSMessage(rCode=rcode)
+         err = self.resolver.filterAnswers(m)
+         err.trap(exc)
+ 
+Index: twisted/names/test/test_dns.py
+===================================================================
+--- twisted/names/test/test_dns.py	(revision 41586)
++++ twisted/names/test/test_dns.py	(working copy)
+@@ -229,7 +229,7 @@
+             b'\x01\x02\x03\x04'      # 1.2.3.4
+             )
+ 
+-        msg = dns.Message()
++        msg = dns._EDNSMessage()
+         msg.fromStr(wire)
+ 
+         self.assertEqual(msg.queries, [
+@@ -1149,7 +1149,7 @@
+         """
+         d = self.proto.query(('127.0.0.1', 21345), [dns.Query(b'foo')])
+         self.assertEqual(len(self.proto.liveMessages.keys()), 1)
+-        m = dns.Message()
++        m = dns._EDNSMessage()
+         m.id = next(iter(self.proto.liveMessages.keys()))
+         m.answers = [dns.RRHeader(payload=dns.Record_A(address='1.2.3.4'))]
+         def cb(result):
+@@ -1207,7 +1207,7 @@
+         L{DNSDatagramProtocol.liveMessages} or L{DNSDatagramProtocol.resends},
+         the message will be received by L{DNSDatagramProtocol.controller}.
+         """
+-        message = dns.Message()
++        message = dns._EDNSMessage()
+         message.id = 1
+         message.answers = [dns.RRHeader(
+             payload=dns.Record_A(address='1.2.3.4'))]
+@@ -1285,7 +1285,7 @@
+         """
+         d = self.proto.query([dns.Query(b'foo')])
+         self.assertEqual(len(self.proto.liveMessages.keys()), 1)
+-        m = dns.Message()
++        m = dns._EDNSMessage()
+         m.id = next(iter(self.proto.liveMessages.keys()))
+         m.answers = [dns.RRHeader(payload=dns.Record_A(address='1.2.3.4'))]
+         def cb(result):
+@@ -1316,7 +1316,7 @@
+         When receiving a message whose id is not in L{DNSProtocol.liveMessages}
+         the message will be received by L{DNSProtocol.controller}.
+         """
+-        message = dns.Message()
++        message = dns._EDNSMessage()
+         message.id = 1
+         message.answers = [dns.RRHeader(
+             payload=dns.Record_A(address='1.2.3.4'))]
+Index: twisted/names/test/test_names.py
+===================================================================
+--- twisted/names/test/test_names.py	(revision 41558)
++++ twisted/names/test/test_names.py	(working copy)
+@@ -14,7 +14,7 @@
+ from twisted.internet import reactor, defer, error
+ from twisted.internet.defer import succeed
+ from twisted.names import client, server, common, authority, dns
+-from twisted.names.dns import Message
++from twisted.names.dns import _EDNSMessage
+ from twisted.names.error import DomainError
+ from twisted.names.client import Resolver
+ from twisted.names.secondary import (
+@@ -475,7 +475,7 @@
+ 
+     def _makeMessage(self):
+         # hooray they all have the same message format
+-        return dns.Message(id=999, answer=1, opCode=0, recDes=0, recAv=1, auth=1, rCode=0, trunc=0, maxSize=0)
++        return dns._EDNSMessage(id=999, answer=1, opCode=0, recDes=0, recAv=1, auth=1, rCode=0, trunc=0, maxSize=0)
+ 
+     def testBindAndTNamesStyle(self):
+         # Bind style = One big single message
+@@ -852,8 +852,8 @@
+                          auth=False,
+                          payload=dns.Record_NS(name='ns.twistedmatrix.com',
+                          ttl=700))]
+-        m = dns.Message(id=999, answer=1, opCode=0, recDes=0, recAv=1, auth=1,
+-                        rCode=0, trunc=0, maxSize=0)
++        m = dns._EDNSMessage(id=999, answer=1, opCode=0, recDes=0, recAv=1, auth=1,
++                             rCode=0, trunc=0, maxSize=0)
+         m.answers = records
+         messages.append(m)
+         return self.assertFailure(
+@@ -965,10 +965,10 @@
+         transport = StringTransport()
+         proto.makeConnection(transport)
+ 
+-        msg = Message()
++        msg = _EDNSMessage()
+         # DNSProtocol.writeMessage length encodes the message by prepending a
+         # 2 byte message length to the buffered value.
+-        msg.decode(StringIO(transport.value()[2:]))
++        msg.fromStr(transport.value()[2:])
+ 
+         self.assertEqual(
+             [dns.Query('example.com', dns.AXFR, dns.IN)], msg.queries)
+Index: twisted/names/test/test_rootresolve.py
+===================================================================
+--- twisted/names/test/test_rootresolve.py	(revision 41558)
++++ twisted/names/test/test_rootresolve.py	(working copy)
+@@ -21,7 +21,7 @@
+ from twisted.names.root import Resolver
+ from twisted.names.dns import (
+     IN, HS, A, NS, CNAME, OK, ENAME, Record_CNAME,
+-    Name, Query, Message, RRHeader, Record_A, Record_NS)
++    Name, Query, _EDNSMessage, RRHeader, Record_A, Record_NS)
+ from twisted.names.error import DNSNameError, ResolverError
+ 
+ 
+@@ -187,7 +187,7 @@
+         # And a DNS packet sent.
+         [(packet, address)] = transport._sentPackets
+ 
+-        msg = Message()
++        msg = _EDNSMessage()
+         msg.fromStr(packet)
+ 
+         # It should be a query with the parameters used above.
+@@ -230,7 +230,7 @@
+         L{Message} instance.
+         """
+         message = self._queryTest(False)
+-        self.assertIsInstance(message, Message)
++        self.assertIsInstance(message, _EDNSMessage)
+         self.assertEqual(message.queries, [])
+         self.assertEqual(
+             message.answers,
+@@ -254,7 +254,7 @@
+ 
+         @return: A new L{Message} initialized with the given values.
+         """
+-        response = Message(rCode=rCode)
++        response = _EDNSMessage(rCode=rCode)
+         for (section, data) in [(response.answers, answers),
+                                 (response.authority, authority),
+                                 (response.additional, additional)]:
+Index: twisted/names/test/test_server.py
+===================================================================
+--- twisted/names/test/test_server.py	(revision 41588)
++++ twisted/names/test/test_server.py	(working copy)
+@@ -436,7 +436,7 @@
+         L{server.DNSServerFactory.messageReceived} logs about an empty query if
+         the message had no queries and C{verbose} is C{>0}.
+         """
+-        m = dns.Message()
++        m = dns._EDNSMessage()
+         f = NoResponseDNSServerFactory(verbose=1)
+ 
+         assertLogMessage(
+@@ -451,9 +451,9 @@
+         L{server.DNSServerFactory.messageReceived} logs the query types of all
+         queries in the message if C{verbose} is set to C{1}.
+         """
+-        m = dns.Message()
+-        m.addQuery(name='example.com', type=dns.MX)
+-        m.addQuery(name='example.com', type=dns.AAAA)
++        m = dns._EDNSMessage(
++            queries= [dns.Query(name='example.com', type=dns.MX),
++                      dns.Query(name='example.com', type=dns.AAAA)])
+         f = NoResponseDNSServerFactory(verbose=1)
+ 
+         assertLogMessage(
+@@ -468,9 +468,9 @@
+         L{server.DNSServerFactory.messageReceived} logs the repr of all queries
+         in the message if C{verbose} is set to C{2}.
+         """
+-        m = dns.Message()
+-        m.addQuery(name='example.com', type=dns.MX)
+-        m.addQuery(name='example.com', type=dns.AAAA)
++        m = dns._EDNSMessage(
++            queries=[dns.Query(name='example.com', type=dns.MX),
++                     dns.Query(name='example.com', type=dns.AAAA)])
+         f = NoResponseDNSServerFactory(verbose=2)
+ 
+         assertLogMessage(
+@@ -486,7 +486,7 @@
+         L{server.DNSServerFactory.messageReceived} assigns a unix timestamp to
+         the received message.
+         """
+-        m = dns.Message()
++        m = dns._EDNSMessage()
+         f = NoResponseDNSServerFactory()
+         t = object()
+         self.patch(server.time, 'time', lambda: t)
+@@ -501,7 +501,7 @@
+         L{server.DNSServerFactory.allowQuery} along with the receiving protocol
+         and origin address.
+         """
+-        message = dns.Message()
++        message = dns._EDNSMessage()
+         dummyProtocol = object()
+         dummyAddress = object()
+ 
+@@ -535,7 +535,7 @@
+         e = self.assertRaises(
+             SendReplyException,
+             f.messageReceived,
+-            message=dns.Message(), proto=None, address=None)
++            message=dns._EDNSMessage(), proto=None, address=None)
+         (proto, message, address), kwargs = e.args
+ 
+         self.assertEqual(message.rCode, dns.EREFUSED)
+@@ -552,7 +552,7 @@
+ 
+         @param message: The message which is expected to be passed to the
+             C{methodName} method.
+-        @type message: L{dns.Message}
++        @type message: L{dns._EDNSMessage}
+         """
+         # Make it appear to have some queries so that
+         # DNSServerFactory.allowQuery allows it.
+@@ -575,7 +575,7 @@
+         C{OP_QUERY} on to L{DNSServerFactory.handleQuery}.
+         """
+         self._messageReceivedTest(
+-            'handleQuery', dns.Message(opCode=dns.OP_QUERY))
++            'handleQuery', dns._EDNSMessage(opCode=dns.OP_QUERY))
+ 
+ 
+     def test_inverseQueryMessageReceived(self):
+@@ -584,7 +584,7 @@
+         C{OP_INVERSE} on to L{DNSServerFactory.handleInverseQuery}.
+         """
+         self._messageReceivedTest(
+-            'handleInverseQuery', dns.Message(opCode=dns.OP_INVERSE))
++            'handleInverseQuery', dns._EDNSMessage(opCode=dns.OP_INVERSE))
+ 
+ 
+     def test_statusMessageReceived(self):
+@@ -593,7 +593,7 @@
+         C{OP_STATUS} on to L{DNSServerFactory.handleStatus}.
+         """
+         self._messageReceivedTest(
+-            'handleStatus', dns.Message(opCode=dns.OP_STATUS))
++            'handleStatus', dns._EDNSMessage(opCode=dns.OP_STATUS))
+ 
+ 
+     def test_notifyMessageReceived(self):
+@@ -602,7 +602,7 @@
+         C{OP_NOTIFY} on to L{DNSServerFactory.handleNotify}.
+         """
+         self._messageReceivedTest(
+-            'handleNotify', dns.Message(opCode=dns.OP_NOTIFY))
++            'handleNotify', dns._EDNSMessage(opCode=dns.OP_NOTIFY))
+ 
+ 
+     def test_updateMessageReceived(self):
+@@ -613,7 +613,7 @@
+         This may change if the implementation ever covers update messages.
+         """
+         self._messageReceivedTest(
+-            'handleOther', dns.Message(opCode=dns.OP_UPDATE))
++            'handleOther', dns._EDNSMessage(opCode=dns.OP_UPDATE))
+ 
+ 
+     def test_connectionTracking(self):
+@@ -640,9 +640,9 @@
+         supplied message and dispatches it to
+         L{server.DNSServerFactory.resolver.query}.
+         """
+-        m = dns.Message()
+-        m.addQuery(b'one.example.com')
+-        m.addQuery(b'two.example.com')
++        m = dns._EDNSMessage(
++            queries=[dns.Query(b'one.example.com'),
++                     dns.Query(b'two.example.com')])
+         f = server.DNSServerFactory()
+         f.resolver = RaisingResolver()
+ 
+@@ -675,8 +675,7 @@
+             gotResolverResponseArgs.append((args, kwargs))
+         f.gotResolverResponse = fakeGotResolverResponse
+ 
+-        m = dns.Message()
+-        m.addQuery(b'one.example.com')
++        m = dns._EDNSMessage(queries=[dns.Query(b'one.example.com')])
+         stubProtocol = NoopProtocol()
+         dummyAddress = object()
+ 
+@@ -711,8 +710,7 @@
+             gotResolverErrorArgs.append((args, kwargs))
+         f.gotResolverError = fakeGotResolverError
+ 
+-        m = dns.Message()
+-        m.addQuery(b'one.example.com')
++        m = dns._EDNSMessage(queries=[dns.Query(b'one.example.com')])
+         stubProtocol = NoopProtocol()
+         dummyAddress = object()
+ 
+@@ -740,7 +738,7 @@
+             RaisingProtocol.WriteMessageArguments,
+             f.gotResolverResponse,
+             (answers, authority, additional),
+-            protocol=RaisingProtocol(), message=dns.Message(), address=None)
++            protocol=RaisingProtocol(), message=dns._EDNSMessage(), address=None)
+         (message,), kwargs = e.args
+ 
+         self.assertIs(message.answers, answers)
+@@ -756,7 +754,7 @@
+         f = NoResponseDNSServerFactory()
+         f._responseFromMessage = raiser
+ 
+-        m = dns.Message()
++        m = dns._EDNSMessage()
+         m.timeReceived = 1
+ 
+         e = self.assertRaises(
+@@ -778,7 +776,7 @@
+         message which is a copy of the request message.
+         """
+         f = server.DNSServerFactory()
+-        request = dns.Message(answer=False, recAv=False)
++        request = dns._EDNSMessage(answer=False, recAv=False)
+         response = f._responseFromMessage(message=request),
+ 
+         self.assertIsNot(request, response)
+@@ -792,9 +790,9 @@
+         """
+         f = server.DNSServerFactory()
+         f.canRecurse = True
+-        response1 = f._responseFromMessage(message=dns.Message(recAv=False))
++        response1 = f._responseFromMessage(message=dns._EDNSMessage(recAv=False))
+         f.canRecurse = False
+-        response2 = f._responseFromMessage(message=dns.Message(recAv=True))
++        response2 = f._responseFromMessage(message=dns._EDNSMessage(recAv=True))
+         self.assertEqual(
+             (True, False),
+             (response1.recAv, response2.recAv))
+@@ -807,7 +805,7 @@
+         on the request.
+         """
+         f = server.DNSServerFactory()
+-        request = dns.Message()
++        request = dns._EDNSMessage()
+         request.timeReceived = 1234
+         response = f._responseFromMessage(message=request)
+ 
+@@ -824,7 +822,7 @@
+         on the request.
+         """
+         f = server.DNSServerFactory()
+-        request = dns.Message()
++        request = dns._EDNSMessage()
+         request.maxSize = 0
+         response = f._responseFromMessage(message=request)
+ 
+@@ -837,9 +835,9 @@
+     def test_messageFactory(self):
+         """
+         L{server.DNSServerFactory} has a C{_messageFactory} attribute which is
+-        L{dns.Message} by default.
++        L{dns._EDNSMessage} by default.
+         """
+-        self.assertIs(dns.Message, server.DNSServerFactory._messageFactory)
++        self.assertIs(dns._EDNSMessage, server.DNSServerFactory._messageFactory)
+ 
+ 
+     def test_responseFromMessageCallsMessageFactory(self):
+@@ -854,7 +852,7 @@
+         self.patch(
+             f._messageFactory, '_responseFromMessage', staticmethod(raiser))
+ 
+-        requestMessage = dns.Message()
++        requestMessage = dns._EDNSMessage()
+         e = self.assertRaises(
+             RaisedArguments,
+             f._responseFromMessage,
+@@ -873,9 +871,9 @@
+         message as authoritative if any of the answer records are authoritative.
+         """
+         f = server.DNSServerFactory()
+-        response1 = f._responseFromMessage(message=dns.Message(),
++        response1 = f._responseFromMessage(message=dns._EDNSMessage(),
+                                            answers=[dns.RRHeader(auth=True)])
+-        response2 = f._responseFromMessage(message=dns.Message(),
++        response2 = f._responseFromMessage(message=dns._EDNSMessage(),
+                                            answers=[dns.RRHeader(auth=False)])
+         self.assertEqual(
+             (True, False),
+@@ -898,7 +896,7 @@
+             ["Lookup found 3 records"],
+             f.gotResolverResponse,
+             (answers, authority, additional),
+-            protocol=NoopProtocol(), message=dns.Message(), address=None)
++            protocol=NoopProtocol(), message=dns._EDNSMessage(), address=None)
+ 
+ 
+     def test_gotResolverResponseCaching(self):
+@@ -908,8 +906,7 @@
+         """
+         f = NoResponseDNSServerFactory(caches=[RaisingCache()])
+ 
+-        m = dns.Message()
+-        m.addQuery(b'example.com')
++        m = dns._EDNSMessage(queries=[dns.Query(b'example.com')])
+         expectedAnswers = [dns.RRHeader()]
+         expectedAuthority = []
+         expectedAdditional = []
+@@ -935,7 +932,7 @@
+         f = NoResponseDNSServerFactory()
+         f._responseFromMessage = raiser
+ 
+-        m = dns.Message()
++        m = dns._EDNSMessage()
+         m.timeReceived = 1
+ 
+         e = self.assertRaises(
+@@ -971,7 +968,7 @@
+             RaisingProtocol.WriteMessageArguments,
+             f.gotResolverError,
+             failure.Failure(responseError),
+-            protocol=RaisingProtocol(), message=dns.Message(), address=None)
++            protocol=RaisingProtocol(), message=dns._EDNSMessage(), address=None)
+         (message,), kwargs = e.args
+ 
+         self.assertEqual(message.rCode, expectedMessageCode)
+@@ -1016,7 +1013,7 @@
+             ["Lookup failed"],
+             f.gotResolverError,
+             failure.Failure(error.DomainError()),
+-            protocol=NoopProtocol(), message=dns.Message(), address=None)
++            protocol=NoopProtocol(), message=dns._EDNSMessage(), address=None)
+ 
+ 
+     def test_sendReplyWithAddress(self):
+@@ -1025,7 +1022,7 @@
+         *and* an address tuple it will supply that address to
+         C{protocol.writeMessage}.
+         """
+-        m = dns.Message()
++        m = dns._EDNSMessage()
+         dummyAddress = object()
+         f = server.DNSServerFactory()
+         e = self.assertRaises(
+@@ -1045,7 +1042,7 @@
+         no address tuple it will supply only a message to
+         C{protocol.writeMessage}.
+         """
+-        m = dns.Message()
++        m = dns._EDNSMessage()
+         f = server.DNSServerFactory()
+         e = self.assertRaises(
+             RaisingProtocol.WriteMessageArguments,
+@@ -1064,7 +1061,7 @@
+         the supplied message has no answers.
+         """
+         self.patch(server.time, 'time', lambda: 2)
+-        m = dns.Message()
++        m = dns._EDNSMessage()
+         m.timeReceived = 1
+         f = server.DNSServerFactory(verbose=2)
+         assertLogMessage(
+@@ -1083,7 +1080,7 @@
+         those sections.
+         """
+         self.patch(server.time, 'time', lambda: 2)
+-        m = dns.Message()
++        m = dns._EDNSMessage()
+         m.answers.append(dns.RRHeader(payload=dns.Record_A('127.0.0.1')))
+         m.authority.append(dns.RRHeader(payload=dns.Record_A('127.0.0.1')))
+         m.additional.append(dns.RRHeader(payload=dns.Record_A('127.0.0.1')))
+@@ -1110,7 +1107,7 @@
+         e = self.assertRaises(
+             RaisingProtocol.WriteMessageArguments,
+             f.handleInverseQuery,
+-            message=dns.Message(), protocol=RaisingProtocol(), address=None)
++            message=dns._EDNSMessage(), protocol=RaisingProtocol(), address=None)
+         (message,), kwargs = e.args
+ 
+         self.assertEqual(message.rCode, dns.ENOTIMP)
+@@ -1126,7 +1123,7 @@
+             self,
+             ["Inverse query from ('::1', 53)"],
+             f.handleInverseQuery,
+-            message=dns.Message(),
++            message=dns._EDNSMessage(),
+             protocol=NoopProtocol(),
+             address=('::1', 53))
+ 
+@@ -1140,7 +1137,7 @@
+         e = self.assertRaises(
+             RaisingProtocol.WriteMessageArguments,
+             f.handleStatus,
+-            message=dns.Message(), protocol=RaisingProtocol(), address=None)
++            message=dns._EDNSMessage(), protocol=RaisingProtocol(), address=None)
+         (message,), kwargs = e.args
+ 
+         self.assertEqual(message.rCode, dns.ENOTIMP)
+@@ -1156,7 +1153,7 @@
+             self,
+             ["Status request from ('::1', 53)"],
+             f.handleStatus,
+-            message=dns.Message(),
++            message=dns._EDNSMessage(),
+             protocol=NoopProtocol(),
+             address=('::1', 53))
+ 
+@@ -1170,7 +1167,7 @@
+         e = self.assertRaises(
+             RaisingProtocol.WriteMessageArguments,
+             f.handleNotify,
+-            message=dns.Message(), protocol=RaisingProtocol(), address=None)
++            message=dns._EDNSMessage(), protocol=RaisingProtocol(), address=None)
+         (message,), kwargs = e.args
+ 
+         self.assertEqual(message.rCode, dns.ENOTIMP)
+@@ -1186,7 +1183,7 @@
+             self,
+             ["Notify message from ('::1', 53)"],
+             f.handleNotify,
+-            message=dns.Message(),
++            message=dns._EDNSMessage(),
+             protocol=NoopProtocol(),
+             address=('::1', 53))
+ 
+@@ -1200,7 +1197,7 @@
+         e = self.assertRaises(
+             RaisingProtocol.WriteMessageArguments,
+             f.handleOther,
+-            message=dns.Message(), protocol=RaisingProtocol(), address=None)
++            message=dns._EDNSMessage(), protocol=RaisingProtocol(), address=None)
+         (message,), kwargs = e.args
+ 
+         self.assertEqual(message.rCode, dns.ENOTIMP)
+@@ -1216,6 +1213,6 @@
+             self,
+             ["Unknown op code (0) from ('::1', 53)"],
+             f.handleOther,
+-            message=dns.Message(),
++            message=dns._EDNSMessage(),
+             protocol=NoopProtocol(),
+             address=('::1', 53))

@@ -1,0 +1,425 @@
+Index: twisted/names/test/test_dns.py
+===================================================================
+--- twisted/names/test/test_dns.py	(revision 30364)
++++ twisted/names/test/test_dns.py	(working copy)
+@@ -12,6 +12,7 @@
+     from StringIO import StringIO
+ 
+ import struct
++import re
+ 
+ from twisted.python.failure import Failure
+ from twisted.internet import address, task
+@@ -1246,3 +1247,167 @@
+             dns.Record_SPF('foo', 'bar', ttl=10),
+             dns.Record_SPF('foo', 'bar', ttl=10),
+             dns.Record_SPF('foo', 'bar', ttl=100))
++
++
++
++class DnssecTests(unittest.TestCase):
++    """
++    Tests for the DNSSEC records & functions - RRSIG, NSEC, DNSKEY, DS
++    """
++
++    def _mk_rrsig(self, signame, signature, type=dns.A, algorithm=5, labels=1, original_ttl=2, expiration=0, inception=1, keytag=2):
++        rrsig = struct.pack('!HBBIIIH', type, algorithm, labels, original_ttl, expiration, inception, keytag)
++        for label in signame.split('.'):
++            rrsig += struct.pack('!B', len(label))
++            rrsig += label
++        rrsig += '\x00'
++        rrsig += signature
++
++        return rrsig
++
++    def test_rrsig_decode(self):
++        fields = {
++                'signame': 'foo.bar',
++                'signature': 'thesignature',
++                'type': dns.A,
++                'algorithm': 5,
++                'labels': 3,
++                'original_ttl': 300,
++                'expiration': 100000,
++                'inception': 200000,
++                'keytag': 5678,
++                }
++
++        rrsig = self._mk_rrsig(**fields)
++
++        rr = dns.Record_RRSIG()
++        rr.decode(StringIO(rrsig), len(rrsig))
++
++        self.assertEqual(
++                rr,
++                dns.Record_RRSIG(**fields)
++                )
++
++    def test_rrsig_encode(self):
++        rr = dns.Record_RRSIG(
++                signame='foo.bar',
++                signature='thesig',
++                type=dns.A,
++                algorithm=5,
++                labels=3,
++                original_ttl=0xbbbb,
++                expiration=0xaaaaaaaa,
++                inception=0xcccccccc,
++                keytag=0xfffe,
++                )
++        strio = StringIO()
++        rr.encode(strio)
++        val = strio.getvalue()
++
++        expect = str(
++                '\x00\x01'  # A
++                '\x05'      # algo=5
++                '\x03'      # labels=3
++                '\x00\x00\xbb\xbb'  # ttl
++                '\xaa\xaa\xaa\xaa'  # expiration
++                '\xcc\xcc\xcc\xcc'  # inception
++                '\xff\xfe'          # keytag
++                '\x03foo\x03bar\x00'    # foo.bar
++                'thesig'
++                )
++
++
++        self.assertEqual(
++                val,
++                expect,
++                )
++
++    def _mk_dnskey(self, flags=0, protocol=0, algorithm=0, key=''):
++        dnskey = struct.pack('!HBB', flags, protocol, algorithm)
++        dnskey += key
++        return dnskey
++
++    def test_dnskey_decode(self):
++        key = str(
++                'AwEAAcdYhgqRE+Z5NkzrKGl3fE6aTAtzMJfxWo8fK02j'
++                'niePZIEOmG75pGZAjUHh29iyfYHU394VewgNXQYjhryi'
++                'j4pdZ7U9DN/kpu6RNvcwPn6F+y/Hz5qsNTFZ/GIjU83J'
++                'RrVsU8fTpCY27pik6S5JRJ5l1nHVwptaTlSiLEL+FgQj'
++                )   # keytag==51561 - depends exactly on "fields" below!
++        key = key.decode('base64')
++
++        fields = {
++                'flags': 256,
++                'protocol': 3,
++                'algorithm': 5,
++                'key': key,
++                }
++
++        dnskey = self._mk_dnskey(**fields)
++
++        rr = dns.Record_DNSKEY()
++        rr.decode(StringIO(dnskey), len(dnskey))
++
++        self.assertEqual(
++                rr,
++                dns.Record_DNSKEY(**fields),
++                )
++        self.assertEqual(
++                rr.tag(),
++                51561,
++                )
++
++    def test_dnskey_encode(self):
++        rr = dns.Record_DNSKEY(flags=257, protocol=3, algorithm=5, key='thekey')
++        strio = StringIO()
++        rr.encode(strio)
++        val = strio.getvalue()
++
++        self.assertEqual(
++                val,
++                '\x01\x01\x03\x05thekey',
++                )
++
++    def _keytime2sec(self):
++        # convert 20100702204922 into seconds since 1970
++        m = re.match('(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})')
++        y,m,d,h,m,s = [int(g) for g in m.groups()]
++        retu
++
++
++    def test_rrsig_validate(self):
++        # check that Record_RRSIG can validate signatures given the original RRs and the key
++        # FIXME: should really generate ourselves some test data, not using (old) public data
++
++        original = [
++                dns.RRHeader('www.ic.ac.uk', type=dns.A, cls=dns.IN, ttl=3600, payload=dns.Record_A('155.198.140.14'))
++                ]
++
++        key = str(
++                'AwEAAcdYhgqRE+Z5NkzrKGl3fE6aTAtzMJfxWo8fK02j'
++                'niePZIEOmG75pGZAjUHh29iyfYHU394VewgNXQYjhryi'
++                'j4pdZ7U9DN/kpu6RNvcwPn6F+y/Hz5qsNTFZ/GIjU83J'
++                'RrVsU8fTpCY27pik6S5JRJ5l1nHVwptaTlSiLEL+FgQj'
++                )   # keytag==51561
++        key = key.decode('base64')
++        keyrr = dns.Record_DNSKEY(flags=256, protocol=3, algorithm=5, key=key)
++
++        sigval = str(
++                'h574y3uK6FAWZcN5YdAiuZ8E4VOoZf0np7Fkd6kxzoj0'
++                'vLROww2MBERn66OyOZ+nWEojr3YyuVk04E0MUKe915Py'
++                'GY9dC49RoX/vwM5l25ScgtUJo7K4CgE9X8/7pIXMZ2Xn'
++                '/CNAPkqKSKywzLgZkENwOSVn3WSZdW6weqJ5e+k='
++                )
++        sigval = sigval.decode('base64')
++
++        sig = dns.Record_RRSIG(type=dns.A, algorithm=5, labels=4, original_ttl=3600,
++                expiration=1280695879,  # Aug  1, 2010 21:51:19
++                inception=1278103762,   # Jul  2, 2010 21:49:22
++                keytag=51561,
++                signature=sigval,
++                signame='ic.ac.uk',
++                )
++
++        isvalid = sig.validate(keyrr, original)
++        self.assertEqual(isvalid, True)
++
+Index: twisted/names/dns.py
+===================================================================
+--- twisted/names/dns.py	(revision 30364)
++++ twisted/names/dns.py	(working copy)
+@@ -47,8 +47,20 @@
+ import warnings
+ 
+ import struct, random, types, socket
++import time
++try:
++    import hashlib
++except:
++    hashlib = None
+ 
+ try:
++    import Crypto.Util
++    import Crypto.PublicKey.RSA
++    _has_crypto = True
++except:
++    _has_crypto = False
++
++try:
+     import cStringIO as StringIO
+ except ImportError:
+     import StringIO
+@@ -82,6 +94,9 @@
+ NAPTR = 35
+ A6 = 38
+ DNAME = 39
++RRSIG = 46
++NSEC = 47
++DNSKEY = 48
+ SPF = 99
+ 
+ QUERY_TYPES = {
+@@ -111,6 +126,9 @@
+     NAPTR: 'NAPTR',
+     A6: 'A6',
+     DNAME: 'DNAME',
++    RRSIG: 'RRSIG',
++    NSEC: 'NSEC',
++    DNSKEY: 'DNSKEY',
+     SPF: 'SPF'
+ }
+ 
+@@ -547,12 +565,14 @@
+     def encode(self, strio, compDict = None):
+         self.name.encode(strio, compDict)
+ 
++    def canonical(self, strio):
++        n = Name(self.name.lower())
++        n.encode(strio)
+ 
+     def decode(self, strio, length = None):
+         self.name = Name()
+         self.name.decode(strio)
+ 
+-
+     def __hash__(self):
+         return hash(self.name)
+ 
+@@ -1414,7 +1434,183 @@
+         return hash((self.preference, self.name))
+ 
+ 
++class Record_RRSIG(tputil.FancyEqMixin, tputil.FancyStrMixin):
++    implements(IEncodable, IRecord)
+ 
++    TYPE = RRSIG
++
++    fancybasename = 'RRSIG'
++    showAttributes = compareAttributes = ('type', 'algorithm', 'labels', 'original_ttl', 'expiration', 'inception', 'keytag', 'signame', 'signature')
++
++    def __init__(self, signame='', signature='', type=A, algorithm=5, labels=0, original_ttl=0, expiration=None, inception=None, keytag=0):
++        self.signame = Name(signame)
++        self.signature = signature
++        self.type = type
++        self.algorithm = algorithm
++        self.labels = labels
++        self.original_ttl = original_ttl
++        if inception is None:
++            inception = int(time.time())
++        self.inception = inception
++        if expiration is None:
++            expiration = self.inception + 3600
++        self.expiration = expiration
++        self.keytag = keytag
++
++    _fmt = '!HBBIIIH'
++    _fmt_size = struct.calcsize(_fmt)
++
++    def encode(self, strio, compDict=None):
++        strio.write(struct.pack(self._fmt, self.type, self.algorithm, self.labels, self.original_ttl, self.expiration, self.inception, self.keytag))
++        self.signame.encode(strio, compDict)
++        strio.write(self.signature)
++
++    def decode(self, strio, length):
++        if length < self._fmt_size + 1:
++            raise Exception('payload too short')
++        hdr = readPrecisely(strio, self._fmt_size)
++        self.type, self.algorithm, self.labels, self.original_ttl, self.expiration, self.inception, self.keytag = struct.unpack(self._fmt, hdr)
++
++        length -= self._fmt_size
++
++        start = strio.tell()
++        self.signame = Name()
++        self.signame.decode(strio, length)
++        end = strio.tell()
++
++        length -= end - start
++
++        self.signature = readPrecisely(strio, length)
++
++    def validate(self, key, original):
++        # build the payload to validate
++        strio = StringIO.StringIO()
++        strio.write(struct.pack(self._fmt, self.type, self.algorithm, self.labels, self.original_ttl, self.expiration, self.inception, self.keytag))
++        self.signame.encode(strio)
++
++        canon = []
++
++        for rr in original:
++            if not rr.type==self.type:
++                continue
++            payload = rr.payload
++
++            # FIXME: assert rr.type=self.type?
++            # FIXME: assert rr.name==self.rrheader.name?
++
++            # RFC4034 section 6.2
++            io = StringIO.StringIO()
++
++            if hasattr(payload, 'canonical'):
++                payload.canonical(io)
++            else:
++                payload.encode(io)
++
++            val = io.getvalue()
++            canon.append((val, rr.name, rr.cls))
++
++        for payload,name,cls in sorted(canon):
++            name.encode(strio)
++            strio.write(struct.pack('!HHIH', self.type, cls, self.original_ttl, len(payload)))
++            strio.write(payload)
++            
++        sigvalue = strio.getvalue()
++        return key.verify(sigvalue, self.signature)
++
++class Record_DNSKEY(tputil.FancyEqMixin, tputil.FancyStrMixin):
++    implements(IEncodable, IRecord)
++
++    TYPE = DNSKEY
++
++    fancybasename = 'DNSKEY'
++    showAttributes = compareAttributes = ('flags', 'protocol', 'algorithm', 'key')
++
++    def __init__(self, flags=0, protocol=3, algorithm=5, key=''):
++        self.flags = flags
++        self.protocol = protocol
++        self.algorithm = algorithm
++        self.key = key
++
++    def tag(self):
++        data = struct.pack('!HBB', self.flags, self.protocol, self.algorithm) + self.key
++        v = 0
++        for i in range(len(data)):
++            if i & 1:
++                v += ord(data[i])
++            else:
++                v += ord(data[i]) << 8
++        v += (v >> 16) & 0xffff
++        return v & 0xffff
++
++    _fmt = '!HBB'
++    _fmt_size = struct.calcsize(_fmt)
++
++    def decode(self, strio, length):
++        if length < self._fmt_size:
++            raise Exception('too short')
++        hdr = readPrecisely(strio, self._fmt_size)
++        self.flags, self.protocol, self.algorithm = struct.unpack(self._fmt, hdr)
++        length -= self._fmt_size
++
++        self.key = readPrecisely(strio, length)
++
++    def encode(self, strio, compDict=None):
++        strio.write(struct.pack(self._fmt, self.flags, self.protocol, self.algorithm))
++        strio.write(self.key)
++
++    def verify(self, body, sig):
++        if self.algorithm==5:
++            return self.verify_rsa_sha1(body, sig)
++        raise Exception('unhandled algorithm')
++
++    def verify_rsa_sha1(self, data, sigvalue):
++        # key is either:
++        # 1-255=N (exponent len)
++        # N bytes exponent
++        # rest modulus
++        #
++        # or
++        #
++        # \x00
++        # 2 bytes exponent len
++        # N bytes exponent
++        # rest modulus
++        key = self.key
++        if key[0]=='\x00':
++            _ignore, explen = struct.unpack('!BH', key[3:])
++            key = key[3:]
++        else:
++            explen = ord(key[0])
++            key = key[1:]
++
++        exponent = Crypto.Util.number.bytes_to_long(key[:explen])
++        modbytes = key[explen:]
++        modlen = len(modbytes)
++        modulus = Crypto.Util.number.bytes_to_long(modbytes)
++
++        # RSA-SHA1
++        # RFC3110 section 3
++        hash = hashlib.new('sha1', data).digest()
++        prefix = '\x30\x21\x30\x09\x06\x05\x2B\x0E\x03\x02\x1A\x05\x00\x04\x14'
++        padlen = modlen - len(hash) - len(prefix) - 3
++        hash = '\x01' + '\xff'*padlen + '\x00' + prefix + hash
++
++        #print "verifying"
++        #print self.tag()
++        #print exponent
++        #for k in ('modbytes', 'data', 'hash', 'sigvalue'):
++        #    v = locals()[k]
++        #    print "%10s %4d %r" % (k, len(v), v)
++
++        # signature -> number
++        sig = Crypto.Util.number.bytes_to_long(sigvalue)
++
++        # verify
++        key = Crypto.PublicKey.RSA.construct((modulus, exponent))
++
++        return key.verify(hash, (sig,''))
++        
++
+ # Oh god, Record_TXT how I hate thee.
+ class Record_TXT(tputil.FancyEqMixin, tputil.FancyStrMixin):
+     """

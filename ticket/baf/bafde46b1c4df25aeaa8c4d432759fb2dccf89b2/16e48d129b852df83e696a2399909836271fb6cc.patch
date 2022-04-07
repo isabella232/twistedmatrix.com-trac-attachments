@@ -1,0 +1,505 @@
+Index: test/test_pb.py
+===================================================================
+--- test/test_pb.py	(révision 35015)
++++ test/test_pb.py	(copie de travail)
+@@ -12,13 +12,14 @@
+ # Clean up warning suppression.
+ 
+ import sys, os, time, gc, weakref
++import hashlib, crypt
+ 
+ from cStringIO import StringIO
+ from zope.interface import implements, Interface
+ 
+ from twisted.trial import unittest
+ from twisted.spread import pb, util, publish, jelly
+-from twisted.internet import protocol, main, reactor
++from twisted.internet import protocol, main, reactor, defer
+ from twisted.internet.error import ConnectionRefusedError
+ from twisted.internet.defer import Deferred, gatherResults, succeed
+ from twisted.protocols.policies import WrappingFactory
+@@ -1166,7 +1167,66 @@
+         return (pb.IPerspective, persp, lambda : (mind, persp.logout()))
+ 
+ 
++class InMemoryUsernameMD5PasswordDatabaseDontUse(checkers.InMemoryUsernamePasswordDatabaseDontUse):
++    """
++    Checker used to test L{spread.pb.IUsernameMD5Password}.
+ 
++    It is identical to L{checkers.InMemoryUsernamePasswordDatabaseDontUse},
++    excepted that password is stored hashed (md5, no salt).
++    """
++    implements(checkers.ICredentialsChecker)
++    credentialInterfaces = (
++        pb.IUsernameMD5Password,
++    )
++    def requestAvatarId(self, credentials):
++        if credentials.username in self.users:
++            return defer.maybeDeferred(
++                credentials.checkMD5Password,
++                self.users[credentials.username]).addCallback(
++                self._cbPasswordMatch, str(credentials.username))
++        else:
++            return defer.fail(error.UnauthorizedLogin())
++
++def dummyHash(secret, salt):
++    return secret + salt
++def dummyGetSalt(username, hashed_password):
++    return str(len(username))
++
++class HashMethodCredential(pb.UsernameHashPassword):
++    """A dummy credential."""
++    def pwHashMethod(self, secret, salt):
++        return dummyHash(secret, salt)
++
++class DummyChallengerChecker(checkers.InMemoryUsernamePasswordDatabaseDontUse):
++    """
++    A checker used to test different hash methods.
++
++    It takes as argument the method used to retrieve the salt, given the
++    username and hashed password.
++    """
++    implements(checkers.IChallenger)
++
++    def __init__(self, getSalt, *args, **kwargs):
++        self._getsalt = getSalt
++        checkers.InMemoryUsernamePasswordDatabaseDontUse.__init__(self,
++                *args, **kwargs)
++    def challengeHashMethod(self, challenge, data):
++        """
++        Hash method used for the challenge part of authentication: we use
++        the default one used by PB.
++        """
++        return pb.challengeHash(challenge, data)
++    def getSalt(self, username):
++        """
++        Return the salt used to hash the password of the given username.
++        """
++        return self._getsalt(username, self.users[username])
++
++class DummyCredentialWithBadHashMethod(pb.UsernameHashPassword):
++    """Another dummy credential."""
++    def pwHashMethod(self, secret, salt):
++        return "salt"
++
+ class NewCredLeakTests(unittest.TestCase):
+     """
+     Tests to try to trigger memory leaks.
+@@ -1375,7 +1435,7 @@
+ 
+     def test_loginLogout(self):
+         """
+-        Test that login can be performed with IUsernamePassword credentials and
++        Test that login can be performed with L{cred.credentials.IUsernamePassword} credentials and
+         that when the connection is dropped the avatar is logged out.
+         """
+         self.portal.registerChecker(
+@@ -1405,7 +1465,123 @@
+         self.addCleanup(connector.disconnect)
+         return d
+ 
++    def test_loginLogoutWithLegacyMD5Hash(self):
++        """
++        Test that login can be performed with legacy
++        L{spread.pb.IUsernameMD5Password} credentials and that when the
++        connection is dropped the avatar is logged out.
++        """
++        self.portal.registerChecker(
++            InMemoryUsernameMD5PasswordDatabaseDontUse(LOGIN=hashlib.md5("PASSWORD").digest()))
++        factory = pb.PBClientFactory()
+ 
++        mind = "BRAINS!"
++
++        d = factory.login(
++                credentials.UsernamePassword("LOGIN", "PASSWORD"),
++                mind)
++        def cbLogin(perspective):
++            self.assertTrue(self.realm.lastPerspective.loggedIn)
++            self.assertIsInstance(perspective, pb.RemoteReference)
++            return self._disconnect(None, factory)
++        d.addCallback(cbLogin)
++
++        def cbLogout(ignored):
++            self.assertTrue(self.realm.lastPerspective.loggedOut)
++        d.addCallback(cbLogout)
++
++        connector = reactor.connectTCP("127.0.0.1", self.portno, factory)
++        self.addCleanup(connector.disconnect)
++        return d
++
++    def genericTest_loginLogoutWithIHashMethod(self, checker, credential):
++        """
++        Test that login can be performed with
++        L{cred.credentials.IUsernamePassword} and L{spread.pb.IHashMethod}
++        credentials, and an implementation of the L{cred.checkers.IChallenger}
++        checker, and that when the connection is dropped the avatar is logged
++        out.
++
++        It takes as arguments a checker and a credential, which are to be
++        tested.
++        """
++        self.portal.registerChecker(checker)
++        factory = pb.PBClientFactory()
++
++        mind = "BRAINS!"
++
++        d = factory.login(credential, mind)
++        def cbLogin(perspective):
++            self.assertTrue(self.realm.lastPerspective.loggedIn)
++            self.assertIsInstance(perspective, pb.RemoteReference)
++            return self._disconnect(None, factory)
++        d.addCallback(cbLogin)
++
++        def cbLogout(ignored):
++            self.assertTrue(self.realm.lastPerspective.loggedOut)
++        d.addCallback(cbLogout)
++
++        connector = reactor.connectTCP("127.0.0.1", self.portno, factory)
++        self.addCleanup(connector.disconnect)
++        return d
++
++    def test_loginLogoutWithHashlibIHashMethod(self):
++        """
++        Test of the L{pb.UsernameHashlibPassword} credentials with a
++        L{cred.checkers.IChallenger} checker.
++        """
++        return self.genericTest_loginLogoutWithIHashMethod(
++                checker = DummyChallengerChecker(lambda u, p:"", 
++                    LOGIN = hashlib.sha384("PASSWORD").digest()),
++                credential = pb.UsernameHashlibPassword(
++                    hashlib.sha384, "LOGIN", "PASSWORD"))
++
++    def test_loginLogoutWithCryptIHashMethod(self):
++        """
++        Test of the L{pb.UsernameCryptPassword} credential with a
++        L{cred.checkers.IChallenger} checker.
++        """
++        return self.genericTest_loginLogoutWithIHashMethod(
++                checker = DummyChallengerChecker(lambda u, p:p,
++                    LOGIN = crypt.crypt("PASSWORD", "someSalt")),
++                credential = pb.UsernameCryptPassword("LOGIN", "PASSWORD"))
++
++    def test_loginLogoutWithCustomIHashMethod(self):
++        """
++        Test of a custom credential with a L{cred.checkers.IChallenger}
++        checker.
++        """
++        return self.genericTest_loginLogoutWithIHashMethod(
++                checker = DummyChallengerChecker(dummyGetSalt, LOGIN = dummyHash("PASSWORD", str(len("LOGIN")))),
++                credential = HashMethodCredential("LOGIN", "PASSWORD"))
++
++    def test_loginWithBadHashMethod(self):
++        """
++        Test that we cannot login if client and server do not use the same
++        hashMethod
++        """
++        self.portal.registerChecker(
++            DummyChallengerChecker(dummyGetSalt, user='pass'))
++        factory = pb.PBClientFactory()
++        creds = DummyCredentialWithBadHashMethod("user", "pass")
++
++        mind = "BRAINS!"
++        d = factory.login(creds, mind)
++        self.assertFailure(d, UnauthorizedLogin, u"tete")
++
++        d = gatherResults([d])
++
++        def cleanup(ignore):
++            errors = self.flushLoggedErrors(UnauthorizedLogin)
++            self.assertEqual(len(errors), 1)
++            return self._disconnect(None, factory)
++        d.addCallback(cleanup)
++
++        connector = reactor.connectTCP("127.0.0.1", self.portno, factory)
++        self.addCleanup(connector.disconnect)
++
++        return d
++
+     def test_logoutAfterDecref(self):
+         """
+         If a L{RemoteReference} to an L{IPerspective} avatar is decrefed and
+@@ -1555,7 +1731,7 @@
+     def test_anonymousLoginWithMultipleCheckers(self):
+         """
+         Like L{test_anonymousLogin} but against a portal with a checker for
+-        both IAnonymous and IUsernamePassword.
++        both IAnonymous and L{cred.credentials.IUsernamePassword}.
+         """
+         self.portal.registerChecker(checkers.AllowAnonymousAccess())
+         self.portal.registerChecker(
+Index: cred/checkers.py
+===================================================================
+--- cred/checkers.py	(révision 35015)
++++ cred/checkers.py	(copie de travail)
+@@ -261,8 +261,25 @@
+             d.addCallback(lambda x: credentials.username)
+             return d
+ 
++class IChallenger(ICredentialsChecker):
++    """
++    Implements me to have a checker that can be used with
++    L{spread.pb.IHashMethod.challengeHashMethod}.
++    """
++    def challengeHashMethod(self, challenge, hashed_password):
++        """
++        Hash method used for the challenge part of authentication
+ 
++        Returns a hash of the challenge and the hashed_password. It must be
++        coherent with the corresponding
++        L{spread.pb.IHashMethod.challengeHashMethod}.
++        """
++    def getSalt(self, username):
++        """
++        Return the salt used to hash the password of username.
++        """
+ 
++
+ # For backwards compatibility
+ # Allow access as the old name.
+ OnDiskUsernamePasswordDatabase = FilePasswordDB
+Index: spread/pb.py
+===================================================================
+--- spread/pb.py	(révision 35015)
++++ spread/pb.py	(copie de travail)
+@@ -27,6 +27,7 @@
+ @author: Glyph Lefkowitz
+ """
+ 
++import crypt
+ import random
+ import types
+ 
+@@ -39,6 +40,8 @@
+ from twisted.cred.portal import Portal
+ from twisted.cred.credentials import IAnonymous, ICredentials
+ from twisted.cred.credentials import IUsernameHashedPassword, Anonymous
++from twisted.cred.credentials import UsernamePassword, IUsernamePassword
++from twisted.cred.checkers import IChallenger
+ from twisted.persisted import styles
+ from twisted.python.components import registerAdapter
+ 
+@@ -1041,7 +1044,17 @@
+ ##         obj.__del__ = reallyDel
+         del self.locallyCachedObjects[objectID]
+ 
++def challengeHash(challenge, hashed_password):
++    """
++    Build the response to a challenge.
+ 
++    This is a part of the challenge/response authentication (see method
++    L{respond}).
++    """
++    m = md5()
++    m.update(hashed_password)
++    m.update(challenge)
++    return m.digest()
+ 
+ def respond(challenge, password):
+     """Respond to a challenge.
+@@ -1051,11 +1064,7 @@
+     m = md5()
+     m.update(password)
+     hashedPassword = m.digest()
+-    m = md5()
+-    m.update(hashedPassword)
+-    m.update(challenge)
+-    doubleHashedPassword = m.digest()
+-    return doubleHashedPassword
++    return challengeHash(challenge, hashedPassword)
+ 
+ def challenge():
+     """I return some random data."""
+@@ -1155,12 +1164,14 @@
+         if self._broker:
+             self._broker.transport.loseConnection()
+ 
+-    def _cbSendUsername(self, root, username, password, client):
++    def _cbSendUsername(self, root, username, password, client, hashMethod=None):
+         return root.callRemote("login", username).addCallback(
+-            self._cbResponse, password, client)
++            self._cbResponse, password, client, hashMethod)
+ 
+-    def _cbResponse(self, (challenge, challenger), password, client):
+-        return challenger.callRemote("respond", respond(challenge, password), client)
++    def _cbResponse(self, (challenge, challenger), password, client, hashMethod=None):
++        if not hashMethod:
++            hashMethod = respond
++        return challenger.callRemote("respond", hashMethod(challenge, password), client)
+ 
+ 
+     def _cbLoginAnonymous(self, root, client):
+@@ -1200,6 +1211,25 @@
+ 
+         if IAnonymous.providedBy(credentials):
+             d.addCallback(self._cbLoginAnonymous, client)
++        elif IHashMethod.providedBy(credentials):
++            def hashed_respond(challenge, password):
++                """
++                Respond to a challenge.
++
++                @param password: Password used to answer the challenge.
++                @type password: C{str}
++                @param challenge: One time challenge sent by the server to
++                    authenticate the client.
++                @type challenge: Tuple of two C{str}:
++                    - the challenge itself;
++                    - the salt used to hash the password.
++                """
++                return credentials.challengeHashMethod(
++                        challenge[0],
++                        credentials.pwHashMethod(password, challenge[1]))
++            d.addCallback(
++                self._cbSendUsername, credentials.username,
++                credentials.password, client, hashed_respond)
+         else:
+             d.addCallback(
+                 self._cbSendUsername, credentials.username,
+@@ -1298,7 +1328,76 @@
+             be called back with one of these values.
+         """
+ 
++class IHashMethod(ICredentials):
++    """
++    I encapsulate a username and a password, and the necessary method to use a
++    custom, possibly salted, hash, both during the challenge part of the
++    authentication, and to compare the password to the one of the server if
++    this latter is also hashed.
++    """
++    def pwHashMethod(password, salt):
++        """
++        Return the password, hashed using the salt.
++        """
++    def challengeHashMethod(challenge, data):
++        """
++        Respond to the challenge (part of authentication), using C{data} as the
++        hashed password.
++        """
+ 
++class UsernameHashPassword(UsernamePassword):
++    """
++    I am a credentials used to authenticate against a hashed password.
++
++    The type of hash is implemented in my subclasses.
++    """
++    implements(IHashMethod)
++
++    def challengeHashMethod(self, challenge, data):
++        """
++        Respond to the challenge (part of authentication), using C{data} as the
++        hashed password.
++
++        This is a default method which can be overriden in subclasses.
++        """
++        return challengeHash(challenge, data)
++
++class UsernameHashlibPassword(UsernameHashPassword):
++    """
++    I am a credentials used to authenticate against a password hashed using the
++    Python hashlib library.
++
++    The type of hash is given in the constructor: C{hashmethod} is one of the
++    constructors of hash algorithms available in the U{Python hashlib
++    library<http://docs.python.org/library/hashlib.html>}.
++    """
++    def __init__(self, hashmethod, username, password):
++        self.hashmethod = hashmethod
++        self.username = username
++        self.password = password
++
++    def pwHashMethod(self, password, __ignored__salt):
++        """
++        Return the password, hashed using the method given in the class
++        constructor.
++
++        This credential does not salt the hash, so argument C{__ignored__salt},
++        present in the signature of the method of the parent of this class, is
++        ignored.
++        """
++        return self.hashmethod(password).digest()
++
++class UsernameCryptPassword(UsernameHashPassword):
++    """
++    I am a credentials used to authenticate against a password hashed using
++    C{crypt(3)}.
++    """
++    def pwHashMethod(self, password, salt):
++        """
++        Return the password, hashed using the C{crypt(3)} method, with the salt.
++        """
++        return crypt.crypt(password, salt)
++
+ class _PortalRoot:
+     """Root object, used to login to portal."""
+ 
+@@ -1360,8 +1459,20 @@
+         """
+         Start of username/password login.
+         """
++        checker = self.portal.checkers.get(IUsernamePassword, None)
+         c = challenge()
+-        return c, _PortalAuthChallenger(self.portal, self.broker, username, c)
++        if checker and IChallenger.providedBy(checker):
++            hashMethod = checker.challengeHashMethod
++            # As the salt may be contained in the username or hashed password
++            # (as for crypt(3)), we need to extract the hash here, and to send
++            # it to the client so that it can use it to authenticate.
++            client_challenge = (c, checker.getSalt(username))
++            server_challenge = c
++        else:
++            client_challenge = server_challenge = c
++            hashMethod = respond
++        return client_challenge, _PortalAuthChallenger(self.portal,
++                self.broker, username, server_challenge, hashMethod)
+ 
+ 
+     def remote_loginAnonymous(self, mind):
+@@ -1385,17 +1496,20 @@
+     """
+     Called with response to password challenge.
+     """
+-    implements(IUsernameHashedPassword, IUsernameMD5Password)
++    implements(IUsernameHashedPassword, IUsernamePassword, IUsernameMD5Password)
+ 
+-    def __init__(self, portal, broker, username, challenge):
++    def __init__(self, portal, broker, username, challenge, hashMethod):
+         self.portal = portal
+         self.broker = broker
+         self.username = username
+         self.challenge = challenge
++        self.hashMethod = hashMethod
+ 
+ 
+     def remote_respond(self, response, mind):
+         self.response = response
++        # IUsernamePassword
++        self.password = response
+         d = self.portal.login(self, mind, IPerspective)
+         d.addCallback(self._cbLogin)
+         return d
+@@ -1403,9 +1517,8 @@
+ 
+     # IUsernameHashedPassword:
+     def checkPassword(self, password):
+-        return self.checkMD5Password(md5(password).digest())
++        return self.checkHashedPassword(self.hashMethod(self.challenge, password))
+ 
+-
+     # IUsernameMD5Password
+     def checkMD5Password(self, md5Password):
+         md = md5()
+@@ -1414,6 +1527,8 @@
+         correct = md.digest()
+         return self.response == correct
+ 
++    def checkHashedPassword(self, hashed):
++        return hashed == self.response
+ 
+ __all__ = [
+     # Everything from flavors is exposed publically here.
+@@ -1430,5 +1545,5 @@
+     'RemoteMethod', 'IPerspective', 'Avatar', 'AsReferenceable',
+     'RemoteReference', 'CopyableFailure', 'CopiedFailure', 'failure2Copyable',
+     'Broker', 'respond', 'challenge', 'PBClientFactory', 'PBServerFactory',
+-    'IUsernameMD5Password',
++    'IUsernameMD5Password', 'IHashMethod',
+     ]

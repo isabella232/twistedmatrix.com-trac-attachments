@@ -1,0 +1,230 @@
+Index: twisted/test/test_paths.py
+===================================================================
+--- twisted/test/test_paths.py	(revision 28912)
++++ twisted/test/test_paths.py	(working copy)
+@@ -1006,15 +1006,18 @@
+ class URLPathTestCase(unittest.TestCase):
+     def setUp(self):
+         self.path = urlpath.URLPath.fromString("http://example.com/foo/bar?yes=no&no=yes#footer")
++        self.quotedpath = urlpath.URLPath.fromStringQuote("http://example.com/foo/hello there?yes=no&no=yes#footer")
++        self.assertEquals(len(URLPathTestCase.flushWarnings(self, None)), 1)
+ 
+-    def testStringConversion(self):
++    def test_stringConversion(self):
+         self.assertEquals(str(self.path), "http://example.com/foo/bar?yes=no&no=yes#footer")
+ 
+-    def testChildString(self):
++    def test_childString(self):
+         self.assertEquals(str(self.path.child('hello')), "http://example.com/foo/bar/hello")
+         self.assertEquals(str(self.path.child('hello').child('')), "http://example.com/foo/bar/hello/")
++        self.assertEquals(len(URLPathTestCase.flushWarnings(self, None)), 3)
+ 
+-    def testSiblingString(self):
++    def test_siblingString(self):
+         self.assertEquals(str(self.path.sibling('baz')), 'http://example.com/foo/baz')
+ 
+         # The sibling of http://example.com/foo/bar/
+@@ -1022,8 +1025,9 @@
+         # because really we are constructing a sibling of
+         # http://example.com/foo/bar/index.html
+         self.assertEquals(str(self.path.child('').sibling('baz')), 'http://example.com/foo/bar/baz')
++        self.assertEquals(len(URLPathTestCase.flushWarnings(self, None)), 3)
+ 
+-    def testParentString(self):
++    def test_parentString(self):
+         # parent should be equivalent to '..'
+         # 'foo' is the current directory, '/' is the parent directory
+         self.assertEquals(str(self.path.parent()), 'http://example.com/')
+@@ -1031,8 +1035,29 @@
+         self.assertEquals(str(self.path.child('baz').parent()), 'http://example.com/foo/')
+         self.assertEquals(str(self.path.parent().parent().parent().parent().parent()), 'http://example.com/')
+ 
+-    def testHereString(self):
++    def test_hereString(self):
+         # here should be equivalent to '.'
+         self.assertEquals(str(self.path.here()), 'http://example.com/foo/')
+         self.assertEquals(str(self.path.child('').here()), 'http://example.com/foo/bar/')
+-
++        
++    def test_fromStringQuote(self):
++        """
++        Test that an URLPath constructed using C{fromStringQuote} is properly escaped.
++        """
++        self.assertEquals(str(self.quotedpath), "http://example.com/foo/hello%20there?yes=no&no=yes#footer")
++        
++    def test_childQuotedString(self): 
++        """
++        This test checks if child path with spaces and slashes is handled in least surprising way:
++        properly escaped and result in single segment path amendment.
++        """ 
++        #child() with quotes (",') and slashes  should be properly escaped
++        self.assertEquals(str(self.path.childQuote("hello/ there")), 'http://example.com/foo/bar/hello%2F%20there') 
++        
++    def test_siblingQuotedString(self): 
++        """
++        This test checks if sibling path with spaces and slashes is handled in least surprising way:
++        properly escaped and result in single segment path amendment.
++        """ 
++        #child() with quotes (",') and slashes  should be properly escaped
++        self.assertEquals(str(self.path.siblingQuote("hello/ there")), 'http://example.com/foo/hello%2F%20there')
+Index: twisted/python/urlpath.py
+===================================================================
+--- twisted/python/urlpath.py	(revision 28912)
++++ twisted/python/urlpath.py	(working copy)
+@@ -6,6 +6,7 @@
+ 
+ import urlparse
+ import urllib
++import warnings
+ 
+ class URLPath:
+     def __init__(self, scheme='', netloc='localhost', path='',
+@@ -19,7 +20,7 @@
+     _qpathlist = None
+     _uqpathlist = None
+     
+-    def pathList(self, unquote=0, copy=1):
++    def pathList(self, unquote=False, copy=True):
+         if self._qpathlist is None:
+             self._qpathlist = self.path.split('/')
+             self._uqpathlist = map(urllib.unquote, self._qpathlist)
+@@ -33,11 +34,43 @@
+             return result
+ 
+     def fromString(klass, st):
++        """
++        Create a new URLPath from a url string.
++        
++        @param st: the url string.  Path segments should be quoted already.
++        @type st: C{str} 
++        
++        @return: A new L{URLPath} object 
++        @rtype: L{URLPath} 
++        """
++        warnings.warn("fromString will be deprecated.  Use fromStringQuote instead.", category=PendingDeprecationWarning)
+         t = urlparse.urlsplit(st)
+         u = klass(*t)
+         return u
+ 
+     fromString = classmethod(fromString)
++    
++    def fromStringQuote(klass, st):
++        """
++        Create a new URLPath from a url string.
++        
++        @param st: the url string.  Path segments should not be quoted.
++        @type st: C{str} 
++        
++        @return: A new L{URLPath} object 
++        @rtype: L{URLPath} 
++        """
++        t = urlparse.urlsplit(st)
++        
++        # Quote each path segment
++        quotedpathparts = [urllib.quote(segment, '') 
++                           for segment in t.path.split('/')]
++        newpath = '/'.join(quotedpathparts)
++        u = klass(scheme=t.scheme, netloc=t.netloc, path=newpath, 
++                  query=t.query, fragment=t.fragment)
++        return u
++    
++    fromStringQuote = classmethod(fromStringQuote)
+ 
+     def fromRequest(klass, request):
+         return klass.fromString(request.prePathURL())
+@@ -54,20 +87,83 @@
+                         '/'.join(newpathsegs),
+                         query)
+ 
+-    def sibling(self, path, keepQuery=0):
++    def sibling(self, path, keepQuery=False):
++        """ 
++        Create a new URLPath with the last path segment replaced.  
++     
++        @param path: new path segment. The path argument should be quoted already. 
++        @type path: C{str} 
++        @param keepQuery: if set to True, will keep the query part of URL,  
++                          else (and by default) will strip the query part. 
++        @type keepQuery: C{bool} 
++        @return: A new L{URLPath} object with the new last path segment
++        @rtype: L{URLPath} 
++        """ 
++        warnings.warn("sibling will be deprecated.  Use siblingQuote instead.", category=PendingDeprecationWarning)
+         l = self.pathList()
+         l[-1] = path
+         return self._pathMod(l, keepQuery)
++    
++    def siblingQuote(self, path, keepQuery=False):
++        """ 
++        Create a new URLPath with the last path segment replaced.  
++     
++        @param path: new path segment. The path argument should not be quoted. 
++        @type path: C{str} 
++        @param keepQuery: if set to True, will keep the query part of URL,  
++                          else (and by default) will strip the query part. 
++        @type keepQuery: C{bool} 
++        @return: A new L{URLPath} object with the new last path segment
++        @rtype: L{URLPath} 
++        """ 
++        #Clean up path with urlescaped version 
++        quotedPath = urllib.quote(path,'')
++        l = self.pathList()
++        l[-1] = quotedPath
++        return self._pathMod(l, keepQuery)
+ 
+-    def child(self, path, keepQuery=0):
++    def child(self, path, keepQuery=False):
++        """ 
++        Create a new URLPath with an added child segment.  
++     
++        @param path: path segment to add. The path argument should be quoted already. 
++        @type path: C{str} 
++        @param keepQuery: if set to True, will keep the query part of URL,  
++                          else (and by default) will strip the query part. 
++        @type keepQuery: C{bool} 
++        @return: A new L{URLPath} object with path appended to current object 
++        @rtype: L{URLPath} 
++        """ 
++        warnings.warn("child will be deprecated.  Use childQuote instead.", category=PendingDeprecationWarning)
+         l = self.pathList()
+         if l[-1] == '':
+             l[-1] = path
+         else:
+             l.append(path)
+         return self._pathMod(l, keepQuery)
++    
++    def childQuote(self, path, keepQuery=False):
++        """ 
++        Create a new URLPath with an added child segment.  
++     
++        @param path: path segment to add. The path argument should not be quoted. 
++        @type path: C{str} 
++        @param keepQuery: if set to True, will keep the query part of URL,  
++                          else (and by default) will strip the query part. 
++        @type keepQuery: C{bool} 
++        @return: A new L{URLPath} object with path appended to current object 
++        @rtype: L{URLPath} 
++        """ 
++        #Clean up path with urlescaped version 
++        quotedPath = urllib.quote(path,'')
++        l = self.pathList()
++        if l[-1] == '':
++            l[-1] = quotedPath
++        else:
++            l.append(quotedPath)
++        return self._pathMod(l, keepQuery)
+ 
+-    def parent(self, keepQuery=0):
++    def parent(self, keepQuery=False):
+         l = self.pathList()
+         if l[-1] == '':
+             del l[-2]
+@@ -78,7 +174,7 @@
+             l[-1] = ''
+         return self._pathMod(l, keepQuery)
+ 
+-    def here(self, keepQuery=0):
++    def here(self, keepQuery=False):
+         l = self.pathList()
+         if l[-1] != '':
+             l[-1] = ''

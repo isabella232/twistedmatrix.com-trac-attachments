@@ -1,0 +1,4330 @@
+From 532c645a26a8c535e38c7b666933fb4abab3c368 Mon Sep 17 00:00:00 2001
+From: Andrew Brown <brownan@gmail.com>
+Date: Sun, 3 Mar 2013 10:34:46 -0500
+Subject: [PATCH] Updated twisted.words.protocols.irc to Python 3.3
+
+All tests pass on Python 3.3. All trial tests pass on Python 2.6 and
+2.7.
+
+String encoding/decoding added to the boundries between the protocol
+objects and their underlying LineReceiver objects. Encoding defaults to
+ASCII. Text strings are used everywhere else within the module.
+---
+ admin/_twistedpython3.py       |    2 +
+ twisted/words/protocols/irc.py | 1198 +++++++++++++++++++++-------------------
+ twisted/words/test/test_irc.py | 1039 +++++++++++++++++-----------------
+ 3 files changed, 1141 insertions(+), 1098 deletions(-)
+
+diff --git admin/_twistedpython3.py admin/_twistedpython3.py
+index 9a70c00..949bd6a 100644
+--- admin/_twistedpython3.py
++++ admin/_twistedpython3.py
+@@ -111,6 +111,7 @@ modules = [
+     "twisted.web.test",
+     "twisted.web.test.requesthelper",
+     "twisted.web._version",
++    "twisted.words.protocols.irc",
+     ]
+ 
+ 
+@@ -197,6 +198,7 @@ testModules = [
+     "twisted.web.test.test_http_headers",
+     "twisted.web.test.test_resource",
+     "twisted.web.test.test_web",
++    "twisted.words.test.test_irc",
+     ]
+ 
+ # A list of any other modules which are needed by any of the modules in the
+diff --git twisted/words/protocols/irc.py twisted/words/protocols/irc.py
+index 65daa7a..121c4f9 100644
+--- twisted/words/protocols/irc.py
++++ twisted/words/protocols/irc.py
+@@ -31,28 +31,46 @@ Test coverage needs to be better.
+ <http://www.irchelp.org/irchelp/rfc/ctcpspec.html>}
+ """
+ 
++from __future__ import division, absolute_import
+ import errno, os, random, re, stat, struct, sys, time, types, traceback
+ import string, socket
+ import warnings
+ import textwrap
+ from os import path
++try:
++    from itertools import izip_longest as zip_longest
++except ImportError:
++    # PY3 version:
++    from itertools import zip_longest
+ 
++from twisted.python.compat import _PY3, unicode
+ from twisted.internet import reactor, protocol, task
+-from twisted.persisted import styles
+ from twisted.protocols import basic
+-from twisted.python import log, reflect, text
++from twisted.python import log, text
++from twisted.python._reflectpy3 import prefixedMethodNames
+ from twisted.python.compat import set
+ 
+-NUL = chr(0)
+-CR = chr(015)
+-NL = chr(012)
++# Remove this when styles is ported to Python 3
++if _PY3:
++    class Ephemeral:
++        pass
++else:
++    from twisted.persisted.styles import Ephemeral
++
++# xrange compatability with python 3:
++if _PY3:
++    xrange = range
++
++NUL = chr(0o00)
++CR = chr(0o15)
++NL = chr(0o12)
+ LF = NL
+-SPC = chr(040)
++SPC = chr(0o40)
+ 
+ # This includes the CRLF terminator characters.
+ MAX_COMMAND_LENGTH = 512
+ 
+-CHANNEL_PREFIXES = '&#!+'
++CHANNEL_PREFIXES = u'&#!+'
+ 
+ class IRCBadMessage(Exception):
+     pass
+@@ -72,14 +90,14 @@ class IRCBadModes(ValueError):
+ def parsemsg(s):
+     """Breaks a message from an IRC server into its prefix, command, and arguments.
+     """
+-    prefix = ''
++    prefix = u''
+     trailing = []
+     if not s:
+-        raise IRCBadMessage("Empty line.")
+-    if s[0] == ':':
+-        prefix, s = s[1:].split(' ', 1)
+-    if s.find(' :') != -1:
+-        s, trailing = s.split(' :', 1)
++        raise IRCBadMessage(u"Empty line.")
++    if s[0] == u':':
++        prefix, s = s[1:].split(u' ', 1)
++    if s.find(u' :') != -1:
++        s, trailing = s.split(u' :', 1)
+         args = s.split()
+         args.append(trailing)
+     else:
+@@ -106,7 +124,7 @@ def split(str, length=80):
+     @return: C{list} of C{str}
+     """
+     return [chunk
+-            for line in str.split('\n')
++            for line in str.split(u'\n')
+             for chunk in textwrap.wrap(line, length)]
+ 
+ 
+@@ -155,7 +173,7 @@ class _CommandDispatcherMixin(object):
+         Perform actual command dispatch.
+         """
+         def _getMethodName(command):
+-            return '%s_%s' % (self.prefix, command)
++            return u'%s_%s' % (self.prefix, command)
+ 
+         def _getMethod(name):
+             return getattr(self, _getMethodName(name), None)
+@@ -164,16 +182,16 @@ class _CommandDispatcherMixin(object):
+         if method is not None:
+             return method(*args)
+ 
+-        method = _getMethod('unknown')
++        method = _getMethod(u'unknown')
+         if method is None:
+-            raise UnhandledCommand("No handler for %r could be found" % (_getMethodName(commandName),))
++            raise UnhandledCommand(u"No handler for %r could be found" % (_getMethodName(commandName),))
+         return method(commandName, *args)
+ 
+ 
+ 
+ 
+ 
+-def parseModes(modes, params, paramModes=('', '')):
++def parseModes(modes, params, paramModes=(u'', u'')):
+     """
+     Parse an IRC mode string.
+ 
+@@ -197,10 +215,10 @@ def parseModes(modes, params, paramModes=('', '')):
+         C{(mode, param)}.
+     """
+     if len(modes) == 0:
+-        raise IRCBadModes('Empty mode string')
++        raise IRCBadModes(u'Empty mode string')
+ 
+     if modes[0] not in '+-':
+-        raise IRCBadModes('Malformed modes string: %r' % (modes,))
++        raise IRCBadModes(u'Malformed modes string: %r' % (modes,))
+ 
+     changes = ([], [])
+ 
+@@ -209,7 +227,7 @@ def parseModes(modes, params, paramModes=('', '')):
+     for ch in modes:
+         if ch in '+-':
+             if count == 0:
+-                raise IRCBadModes('Empty mode sequence: %r' % (modes,))
++                raise IRCBadModes(u'Empty mode sequence: %r' % (modes,))
+             direction = '+-'.index(ch)
+             count = 0
+         else:
+@@ -218,15 +236,15 @@ def parseModes(modes, params, paramModes=('', '')):
+                 try:
+                     param = params.pop(0)
+                 except IndexError:
+-                    raise IRCBadModes('Not enough parameters: %r' % (ch,))
++                    raise IRCBadModes(u'Not enough parameters: %r' % (ch,))
+             changes[direction].append((ch, param))
+             count += 1
+ 
+     if len(params) > 0:
+-        raise IRCBadModes('Too many parameters: %r %r' % (modes, params))
++        raise IRCBadModes(u'Too many parameters: %r %r' % (modes, params))
+ 
+     if count == 0:
+-        raise IRCBadModes('Empty mode sequence: %r' % (modes,))
++        raise IRCBadModes(u'Empty mode sequence: %r' % (modes,))
+ 
+     return changes
+ 
+@@ -237,10 +255,10 @@ class IRC(protocol.Protocol):
+     Internet Relay Chat server protocol.
+     """
+ 
+-    buffer = ""
++    buffer = u""
+     hostname = None
+ 
+-    encoding = None
++    encoding = u"ASCII"
+ 
+     def connectionMade(self):
+         self.channels = []
+@@ -249,10 +267,10 @@ class IRC(protocol.Protocol):
+ 
+ 
+     def sendLine(self, line):
+-        if self.encoding is not None:
+-            if isinstance(line, unicode):
+-                line = line.encode(self.encoding)
+-        self.transport.write("%s%s%s" % (line, CR, LF))
++        line = line + CR + LF
++        if isinstance(line, unicode):
++            line = line.encode(self.encoding)
++        self.transport.write(line)
+ 
+ 
+     def sendMessage(self, command, *parameter_list, **prefix):
+@@ -265,21 +283,21 @@ class IRC(protocol.Protocol):
+         """
+ 
+         if not command:
+-            raise ValueError, "IRC message requires a command."
++            raise ValueError(u"IRC message requires a command.")
+ 
+-        if ' ' in command or command[0] == ':':
++        if u' ' in command or command[0] == u':':
+             # Not the ONLY way to screw up, but provides a little
+             # sanity checking to catch likely dumb mistakes.
+-            raise ValueError, "Somebody screwed up, 'cuz this doesn't" \
+-                  " look like a command to me: %s" % command
++            raise ValueError(u"Somebody screwed up, 'cuz this doesn't" \
++                  u" look like a command to me: %s" % command)
+ 
+-        line = string.join([command] + list(parameter_list))
+-        if 'prefix' in prefix:
+-            line = ":%s %s" % (prefix['prefix'], line)
++        line = u" ".join([command] + list(parameter_list))
++        if u'prefix' in prefix:
++            line = u":%s %s" % (prefix['prefix'], line)
+         self.sendLine(line)
+ 
+         if len(parameter_list) > 15:
+-            log.msg("Message has %d parameters (RFC allows 15):\n%s" %
++            log.msg(u"Message has %d parameters (RFC allows 15):\n%s" %
+                     (len(parameter_list), line))
+ 
+ 
+@@ -289,6 +307,9 @@ class IRC(protocol.Protocol):
+         says CRLF.  (Also, the flexibility of LineReceiver to turn "line mode"
+         on and off was not required.)
+         """
++        if isinstance(data, bytes):
++            data = data.decode(self.encoding)
++
+         lines = (self.buffer + data).split(LF)
+         # Put the (possibly empty) element after the last LF back in the
+         # buffer
+@@ -347,7 +368,7 @@ class IRC(protocol.Protocol):
+         @type message: C{str} or C{unicode}
+         @param message: The message being sent.
+         """
+-        self.sendLine(":%s PRIVMSG %s :%s" % (sender, recip, lowQuote(message)))
++        self.sendLine(u":%s PRIVMSG %s :%s" % (sender, recip, lowQuote(message)))
+ 
+ 
+     def notice(self, sender, recip, message):
+@@ -369,7 +390,7 @@ class IRC(protocol.Protocol):
+         @type message: C{str} or C{unicode}
+         @param message: The message being sent.
+         """
+-        self.sendLine(":%s NOTICE %s :%s" % (sender, recip, message))
++        self.sendLine(u":%s NOTICE %s :%s" % (sender, recip, message))
+ 
+ 
+     def action(self, sender, recip, message):
+@@ -387,7 +408,7 @@ class IRC(protocol.Protocol):
+         @type message: C{str} or C{unicode}
+         @param message: The action being sent.
+         """
+-        self.sendLine(":%s ACTION %s :%s" % (sender, recip, message))
++        self.sendLine(u":%s ACTION %s :%s" % (sender, recip, message))
+ 
+ 
+     def topic(self, user, channel, topic, author=None):
+@@ -410,13 +431,13 @@ class IRC(protocol.Protocol):
+         """
+         if author is None:
+             if topic is None:
+-                self.sendLine(':%s %s %s %s :%s' % (
+-                    self.hostname, RPL_NOTOPIC, user, channel, 'No topic is set.'))
++                self.sendLine(u':%s %s %s %s :%s' % (
++                    self.hostname, RPL_NOTOPIC, user, channel, u'No topic is set.'))
+             else:
+-                self.sendLine(":%s %s %s %s :%s" % (
++                self.sendLine(u":%s %s %s %s :%s" % (
+                     self.hostname, RPL_TOPIC, user, channel, lowQuote(topic)))
+         else:
+-            self.sendLine(":%s TOPIC %s :%s" % (author, channel, lowQuote(topic)))
++            self.sendLine(u":%s TOPIC %s :%s" % (author, channel, lowQuote(topic)))
+ 
+ 
+     def topicAuthor(self, user, channel, author, date):
+@@ -441,7 +462,7 @@ class IRC(protocol.Protocol):
+         @param date: A POSIX timestamp (number of seconds since the epoch) at
+             which the topic was last set.
+         """
+-        self.sendLine(':%s %d %s %s %s %d' % (
++        self.sendLine(u':%s %d %s %s %s %d' % (
+             self.hostname, 333, user, channel, author, date))
+ 
+ 
+@@ -467,7 +488,7 @@ class IRC(protocol.Protocol):
+         count = 0
+         for n in names:
+             if count + len(n) + 1 > namesLength:
+-                self.sendLine(":%s %s %s = %s :%s" % (
++                self.sendLine(u":%s %s %s = %s :%s" % (
+                     self.hostname, RPL_NAMREPLY, user, channel, ' '.join(L)))
+                 L = [n]
+                 count = len(n)
+@@ -475,9 +496,9 @@ class IRC(protocol.Protocol):
+                 L.append(n)
+                 count += len(n) + 1
+         if L:
+-            self.sendLine(":%s %s %s = %s :%s" % (
++            self.sendLine(u":%s %s %s = %s :%s" % (
+                 self.hostname, RPL_NAMREPLY, user, channel, ' '.join(L)))
+-        self.sendLine(":%s %s %s %s :End of /NAMES list" % (
++        self.sendLine(u":%s %s %s %s :End of /NAMES list" % (
+             self.hostname, RPL_ENDOFNAMES, user, channel))
+ 
+ 
+@@ -501,12 +522,12 @@ class IRC(protocol.Protocol):
+         """
+         for info in memberInfo:
+             (username, hostmask, server, nickname, flag, hops, realName) = info
+-            assert flag in ("H", "G")
+-            self.sendLine(":%s %s %s %s %s %s %s %s %s :%d %s" % (
++            assert flag in (u"H", u"G")
++            self.sendLine(u":%s %s %s %s %s %s %s %s %s :%d %s" % (
+                 self.hostname, RPL_WHOREPLY, user, channel,
+                 username, hostmask, server, nickname, flag, hops, realName))
+ 
+-        self.sendLine(":%s %s %s %s :End of /WHO list." % (
++        self.sendLine(u":%s %s %s %s :End of /WHO list." % (
+             self.hostname, RPL_ENDOFWHO, user, channel))
+ 
+ 
+@@ -549,18 +570,18 @@ class IRC(protocol.Protocol):
+         @type channels: C{list} of C{str} or C{unicode}
+         @param channels: A list of the channels which the user is participating in
+         """
+-        self.sendLine(":%s %s %s %s %s %s * :%s" % (
++        self.sendLine(u":%s %s %s %s %s %s * :%s" % (
+             self.hostname, RPL_WHOISUSER, user, nick, username, hostname, realName))
+-        self.sendLine(":%s %s %s %s %s :%s" % (
++        self.sendLine(u":%s %s %s %s %s :%s" % (
+             self.hostname, RPL_WHOISSERVER, user, nick, server, serverInfo))
+         if oper:
+-            self.sendLine(":%s %s %s %s :is an IRC operator" % (
++            self.sendLine(u":%s %s %s %s :is an IRC operator" % (
+                 self.hostname, RPL_WHOISOPERATOR, user, nick))
+-        self.sendLine(":%s %s %s %s %d %d :seconds idle, signon time" % (
++        self.sendLine(u":%s %s %s %s %d %d :seconds idle, signon time" % (
+             self.hostname, RPL_WHOISIDLE, user, nick, idle, signOn))
+-        self.sendLine(":%s %s %s %s :%s" % (
+-            self.hostname, RPL_WHOISCHANNELS, user, nick, ' '.join(channels)))
+-        self.sendLine(":%s %s %s %s :End of WHOIS list." % (
++        self.sendLine(u":%s %s %s %s :%s" % (
++            self.hostname, RPL_WHOISCHANNELS, user, nick, u' '.join(channels)))
++        self.sendLine(u":%s %s %s %s :End of WHOIS list." % (
+             self.hostname, RPL_ENDOFWHOIS, user, nick))
+ 
+ 
+@@ -575,7 +596,7 @@ class IRC(protocol.Protocol):
+         @type where: C{str} or C{unicode}
+         @param where: The channel the user is joining.
+         """
+-        self.sendLine(":%s JOIN %s" % (who, where))
++        self.sendLine(u":%s JOIN %s" % (who, where))
+ 
+ 
+     def part(self, who, where, reason=None):
+@@ -594,9 +615,9 @@ class IRC(protocol.Protocol):
+             soul to depart.
+         """
+         if reason:
+-            self.sendLine(":%s PART %s :%s" % (who, where, reason))
++            self.sendLine(u":%s PART %s :%s" % (who, where, reason))
+         else:
+-            self.sendLine(":%s PART %s" % (who, where))
++            self.sendLine(u":%s PART %s" % (who, where))
+ 
+ 
+     def channelMode(self, user, channel, mode, *args):
+@@ -615,8 +636,8 @@ class IRC(protocol.Protocol):
+ 
+         @param args: Any additional arguments required by the modes.
+         """
+-        self.sendLine(":%s %s %s %s %s %s" % (
+-            self.hostname, RPL_CHANNELMODEIS, user, channel, mode, ' '.join(args)))
++        self.sendLine(u":%s %s %s %s %s %s" % (
++            self.hostname, RPL_CHANNELMODEIS, user, channel, mode, u' '.join(args)))
+ 
+ 
+ 
+@@ -633,16 +654,16 @@ class ServerSupportedFeatures(_CommandDispatcherMixin):
+ 
+     def __init__(self):
+         self._features = {
+-            'CHANNELLEN': 200,
+-            'CHANTYPES': tuple('#&'),
+-            'MODES': 3,
+-            'NICKLEN': 9,
+-            'PREFIX': self._parsePrefixParam('(ovh)@+%'),
++            u'CHANNELLEN': 200,
++            u'CHANTYPES': tuple(u'#&'),
++            u'MODES': 3,
++            u'NICKLEN': 9,
++            u'PREFIX': self._parsePrefixParam(u'(ovh)@+%'),
+             # The ISUPPORT draft explicitly says that there is no default for
+             # CHANMODES, but we're defaulting it here to handle the case where
+             # the IRC server doesn't send us any ISUPPORT information, since
+             # IRCClient.getChannelModeParams relies on this value.
+-            'CHANMODES': self._parseChanModesParam(['b', '', 'lk'])}
++            u'CHANMODES': self._parseChanModesParam([u'b', u'', u'lk'])}
+ 
+ 
+     def _splitParamArgs(cls, params, valueProcessor=None):
+@@ -670,9 +691,9 @@ class ServerSupportedFeatures(_CommandDispatcherMixin):
+ 
+         def _parse():
+             for param in params:
+-                if ':' not in param:
+-                    param += ':'
+-                a, b = param.split(':', 1)
++                if u':' not in param:
++                    param += u':'
++                a, b = param.split(u':', 1)
+                 yield a, valueProcessor(b)
+         return list(_parse())
+     _splitParamArgs = classmethod(_splitParamArgs)
+@@ -688,7 +709,7 @@ class ServerSupportedFeatures(_CommandDispatcherMixin):
+         @rtype: C{str}
+         """
+         def _unescape():
+-            parts = value.split('\\x')
++            parts = value.split(u'\\x')
+             # The first part can never be preceeded by the escape.
+             yield parts.pop(0)
+             for s in parts:
+@@ -696,12 +717,12 @@ class ServerSupportedFeatures(_CommandDispatcherMixin):
+                 try:
+                     octet = int(octet, 16)
+                 except ValueError:
+-                    raise ValueError('Invalid hex octet: %r' % (octet,))
++                    raise ValueError(u'Invalid hex octet: %r' % (octet,))
+                 yield chr(octet) + rest
+ 
+-        if '\\x' not in value:
++        if u'\\x' not in value:
+             return value
+-        return ''.join(_unescape())
++        return u''.join(_unescape())
+     _unescapeParamValue = classmethod(_unescapeParamValue)
+ 
+ 
+@@ -714,10 +735,10 @@ class ServerSupportedFeatures(_CommandDispatcherMixin):
+         @rtype: C{(str, list)}
+         @return C{(key, arguments)}
+         """
+-        if '=' not in param:
+-            param += '='
+-        key, value = param.split('=', 1)
+-        return key, map(cls._unescapeParamValue, value.split(','))
++        if u'=' not in param:
++            param += u'='
++        key, value = param.split(u'=', 1)
++        return key, list(map(cls._unescapeParamValue, value.split(u',')))
+     _splitParam = classmethod(_splitParam)
+ 
+ 
+@@ -735,9 +756,9 @@ class ServerSupportedFeatures(_CommandDispatcherMixin):
+         """
+         if not prefix:
+             return None
+-        if prefix[0] != '(' and ')' not in prefix:
+-            raise ValueError('Malformed PREFIX parameter')
+-        modes, symbols = prefix.split(')', 1)
++        if prefix[0] != u'(' and u')' not in prefix:
++            raise ValueError(u'Malformed PREFIX parameter')
++        modes, symbols = prefix.split(u')', 1)
+         symbols = zip(symbols, xrange(len(symbols)))
+         modes = modes[1:]
+         return dict(zip(modes, symbols))
+@@ -753,10 +774,9 @@ class ServerSupportedFeatures(_CommandDispatcherMixin):
+         names = ('addressModes', 'param', 'setParam', 'noParam')
+         if len(params) > len(names):
+             raise ValueError(
+-                'Expecting a maximum of %d channel mode parameters, got %d' % (
++                u'Expecting a maximum of %d channel mode parameters, got %d' % (
+                     len(names), len(params)))
+-        items = map(lambda key, value: (key, value or ''), names, params)
+-        return dict(items)
++        return dict(zip_longest(names, params, fillvalue=u''))
+     _parseChanModesParam = classmethod(_parseChanModesParam)
+ 
+ 
+@@ -800,7 +820,7 @@ class ServerSupportedFeatures(_CommandDispatcherMixin):
+         """
+         for param in params:
+             key, value = self._splitParam(param)
+-            if key.startswith('-'):
++            if key.startswith(u'-'):
+                 self._features.pop(key[1:], None)
+             else:
+                 self._features[key] = self.dispatch(key, value)
+@@ -841,14 +861,14 @@ class ServerSupportedFeatures(_CommandDispatcherMixin):
+         try:
+             return self._parseChanModesParam(params)
+         except ValueError:
+-            return self.getFeature('CHANMODES')
++            return self.getFeature(u'CHANMODES')
+ 
+ 
+     def isupport_CHANNELLEN(self, params):
+         """
+         Maximum length of a channel name a client may create.
+         """
+-        return _intOrDefault(params[0], self.getFeature('CHANNELLEN'))
++        return _intOrDefault(params[0], self.getFeature(u'CHANNELLEN'))
+ 
+ 
+     def isupport_CHANTYPES(self, params):
+@@ -865,7 +885,7 @@ class ServerSupportedFeatures(_CommandDispatcherMixin):
+         The presence of this parameter indicates that the server supports
+         this functionality.
+         """
+-        return params[0] or 'e'
++        return params[0] or u'e'
+ 
+ 
+     def isupport_IDCHAN(self, params):
+@@ -885,7 +905,7 @@ class ServerSupportedFeatures(_CommandDispatcherMixin):
+         The presence of this parameter indicates that the server supports
+         this functionality.
+         """
+-        return params[0] or 'I'
++        return params[0] or u'I'
+ 
+ 
+     def isupport_KICKLEN(self, params):
+@@ -923,7 +943,7 @@ class ServerSupportedFeatures(_CommandDispatcherMixin):
+         """
+         Maximum length of a nickname the client may use.
+         """
+-        return _intOrDefault(params[0], self.getFeature('NICKLEN'))
++        return _intOrDefault(params[0], self.getFeature(u'NICKLEN'))
+ 
+ 
+     def isupport_PREFIX(self, params):
+@@ -933,7 +953,7 @@ class ServerSupportedFeatures(_CommandDispatcherMixin):
+         try:
+             return self._parsePrefixParam(params[0])
+         except ValueError:
+-            return self.getFeature('PREFIX')
++            return self.getFeature(u'PREFIX')
+ 
+ 
+     def isupport_SAFELIST(self, params):
+@@ -1051,7 +1071,7 @@ class IRCClient(basic.LineReceiver):
+     """
+     hostname = None
+     motd = None
+-    nickname = 'irc'
++    nickname = u'irc'
+     password = None
+     realname = None
+     username = None
+@@ -1064,9 +1084,9 @@ class IRCClient(basic.LineReceiver):
+     versionNum = None
+     versionEnv = None
+ 
+-    sourceURL = "http://twistedmatrix.com/downloads/"
++    sourceURL = u"http://twistedmatrix.com/downloads/"
+ 
+-    dcc_destdir = '.'
++    dcc_destdir = u'.'
+     dcc_sessions = None
+ 
+     # If this is false, no attempt will be made to identify
+@@ -1077,20 +1097,34 @@ class IRCClient(basic.LineReceiver):
+     _queue = None
+     _queueEmptying = None
+ 
+-    delimiter = '\n' # '\r\n' will also work (see dataReceived)
++    delimiter = b'\n' # '\r\n' will also work (see dataReceived)
+ 
+-    __pychecker__ = 'unusednames=params,prefix,channel'
++    __pychecker__ = u'unusednames=params,prefix,channel'
+ 
+     _registered = False
+-    _attemptedNick = ''
+-    erroneousNickFallback = 'defaultnick'
++    _attemptedNick = u''
++    erroneousNickFallback = u'defaultnick'
+ 
+     _heartbeat = None
+     heartbeatInterval = 120
+ 
++    # The encoding to use for lines sent and received from the server. IRC does
++    # not specify an encoding, so we default to ASCII, but UTF-8 is probably a
++    # better choice.
++    # Strings are encoded and decoded at the interface to the
++    # basic.LineReceiver methods: sendLine() and lineReceived()
++    # All other strings handeled within this class are unicode strings
++    encoding = u"ASCII"
++
+ 
+     def _reallySendLine(self, line):
+-        return basic.LineReceiver.sendLine(self, lowQuote(line) + '\r')
++        # A subclass may override sendLine to do its own encoding, so line may
++        # actually already be a bytes instance here. If you do your own
++        # encoding by overriding sendLine, make sure to also call lowQuote().
++        if isinstance(line, unicode):
++            line = lowQuote(line)
++            line = line.encode(self.encoding)
++        return basic.LineReceiver.sendLine(self, line + b'\r')
+ 
+     def sendLine(self, line):
+         if self.lineRate is None:
+@@ -1125,7 +1159,7 @@ class IRCClient(basic.LineReceiver):
+         """
+         Send a I{PING} message to the IRC server as a form of keepalive.
+         """
+-        self.sendLine('PING ' + self.hostname)
++        self.sendLine(u'PING ' + self.hostname)
+ 
+ 
+     def stopHeartbeat(self):
+@@ -1391,7 +1425,7 @@ class IRCClient(basic.LineReceiver):
+         motd is a list of strings, where each string was sent as a seperate
+         message from the server. To display, you might want to use::
+ 
+-            '\\n'.join(motd)
++            u'\\n'.join(motd)
+ 
+         to get a nicely formatted string.
+         """
+@@ -1411,11 +1445,11 @@ class IRCClient(basic.LineReceiver):
+         @param key: If specified, the key used to join the channel.
+         """
+         if channel[0] not in CHANNEL_PREFIXES:
+-            channel = '#' + channel
++            channel = u'#' + channel
+         if key:
+-            self.sendLine("JOIN %s %s" % (channel, key))
++            self.sendLine(u"JOIN %s %s" % (channel, key))
+         else:
+-            self.sendLine("JOIN %s" % (channel,))
++            self.sendLine(u"JOIN %s" % (channel,))
+ 
+     def leave(self, channel, reason=None):
+         """
+@@ -1428,11 +1462,11 @@ class IRCClient(basic.LineReceiver):
+         @param reason: If given, the reason for leaving.
+         """
+         if channel[0] not in CHANNEL_PREFIXES:
+-            channel = '#' + channel
++            channel = u'#' + channel
+         if reason:
+-            self.sendLine("PART %s :%s" % (channel, reason))
++            self.sendLine(u"PART %s :%s" % (channel, reason))
+         else:
+-            self.sendLine("PART %s" % (channel,))
++            self.sendLine(u"PART %s" % (channel,))
+ 
+     def kick(self, channel, user, reason=None):
+         """
+@@ -1447,11 +1481,11 @@ class IRCClient(basic.LineReceiver):
+         @param reason: If given, the reason for kicking the user.
+         """
+         if channel[0] not in CHANNEL_PREFIXES:
+-            channel = '#' + channel
++            channel = u'#' + channel
+         if reason:
+-            self.sendLine("KICK %s %s :%s" % (channel, user, reason))
++            self.sendLine(u"KICK %s %s :%s" % (channel, user, reason))
+         else:
+-            self.sendLine("KICK %s %s" % (channel, user))
++            self.sendLine(u"KICK %s %s" % (channel, user))
+ 
+     part = leave
+ 
+@@ -1468,8 +1502,8 @@ class IRCClient(basic.LineReceiver):
+         @since: 11.0
+         """
+         if channel[0] not in CHANNEL_PREFIXES:
+-            channel = '#' + channel
+-        self.sendLine("INVITE %s %s" % (user, channel))
++            channel = u'#' + channel
++        self.sendLine(u"INVITE %s %s" % (user, channel))
+ 
+ 
+     def topic(self, channel, topic=None):
+@@ -1488,11 +1522,11 @@ class IRCClient(basic.LineReceiver):
+         """
+         # << TOPIC #xtestx :fff
+         if channel[0] not in CHANNEL_PREFIXES:
+-            channel = '#' + channel
++            channel = u'#' + channel
+         if topic != None:
+-            self.sendLine("TOPIC %s :%s" % (channel, topic))
++            self.sendLine(u"TOPIC %s :%s" % (channel, topic))
+         else:
+-            self.sendLine("TOPIC %s" % (channel,))
++            self.sendLine(u"TOPIC %s" % (channel,))
+ 
+ 
+     def mode(self, chan, set, modes, limit = None, user = None, mask = None):
+@@ -1518,15 +1552,15 @@ class IRCClient(basic.LineReceiver):
+             users to be banned from the channel.
+         """
+         if set:
+-            line = 'MODE %s +%s' % (chan, modes)
++            line = u'MODE %s +%s' % (chan, modes)
+         else:
+-            line = 'MODE %s -%s' % (chan, modes)
++            line = u'MODE %s -%s' % (chan, modes)
+         if limit is not None:
+-            line = '%s %d' % (line, limit)
++            line = u'%s %d' % (line, limit)
+         elif user is not None:
+-            line = '%s %s' % (line, user)
++            line = u'%s %s' % (line, user)
+         elif mask is not None:
+-            line = '%s %s' % (line, mask)
++            line = u'%s %s' % (line, mask)
+         self.sendLine(line)
+ 
+ 
+@@ -1548,7 +1582,7 @@ class IRCClient(basic.LineReceiver):
+             entire message is always send in one command.
+         """
+         if channel[0] not in CHANNEL_PREFIXES:
+-            channel = '#' + channel
++            channel = u'#' + channel
+         self.msg(channel, message, length)
+ 
+ 
+@@ -1563,12 +1597,12 @@ class IRCClient(basic.LineReceiver):
+         side) while the length is still being calculated.
+         """
+         # :nickname!realname@hostname COMMAND ...
+-        theoretical = ':%s!%s@%s %s' % (
+-            'a' * self.supported.getFeature('NICKLEN'),
++        theoretical = u':%s!%s@%s %s' % (
++            u'a' * self.supported.getFeature(u'NICKLEN'),
+             # This value is based on observation.
+-            'b' * 10,
++            u'b' * 10,
+             # See <http://tools.ietf.org/html/rfc2812#section-2.3.1>.
+-            'c' * 63,
++            u'c' * 63,
+             command)
+         # Fingers crossed.
+         fudge = 10
+@@ -1597,7 +1631,7 @@ class IRCClient(basic.LineReceiver):
+             value.
+         @type length: C{int}
+         """
+-        fmt = 'PRIVMSG %s :' % (user,)
++        fmt = u'PRIVMSG %s :' % (user,)
+ 
+         if length is None:
+             length = self._safeMaximumLineLength(fmt)
+@@ -1605,8 +1639,8 @@ class IRCClient(basic.LineReceiver):
+         # Account for the line terminator.
+         minimumLength = len(fmt) + 2
+         if length <= minimumLength:
+-            raise ValueError("Maximum length must exceed %d for message "
+-                             "to %s" % (minimumLength, user))
++            raise ValueError(u"Maximum length must exceed %d for message "
++                             u"to %s" % (minimumLength, user))
+         for line in split(message, length - minimumLength):
+             self.sendLine(fmt + line)
+ 
+@@ -1623,17 +1657,17 @@ class IRCClient(basic.LineReceiver):
+         @type message: C{str}
+         @param message: The contents of the notice to send.
+         """
+-        self.sendLine("NOTICE %s :%s" % (user, message))
++        self.sendLine(u"NOTICE %s :%s" % (user, message))
+ 
+ 
+-    def away(self, message=''):
++    def away(self, message=u''):
+         """
+         Mark this client as away.
+ 
+         @type message: C{str}
+         @param message: If specified, the away message.
+         """
+-        self.sendLine("AWAY :%s" % message)
++        self.sendLine(u"AWAY :%s" % message)
+ 
+ 
+     def back(self):
+@@ -1654,12 +1688,12 @@ class IRCClient(basic.LineReceiver):
+         @since: 8.2
+         """
+         if server is None:
+-            self.sendLine('WHOIS ' + nickname)
++            self.sendLine(u'WHOIS ' + nickname)
+         else:
+-            self.sendLine('WHOIS %s %s' % (server, nickname))
++            self.sendLine(u'WHOIS %s %s' % (server, nickname))
+ 
+ 
+-    def register(self, nickname, hostname='foo', servername='bar'):
++    def register(self, nickname, hostname=u'foo', servername=u'bar'):
+         """
+         Login to the server.
+ 
+@@ -1671,11 +1705,11 @@ class IRCClient(basic.LineReceiver):
+         @param servername: If specified, the servername to logon as.
+         """
+         if self.password is not None:
+-            self.sendLine("PASS %s" % self.password)
++            self.sendLine(u"PASS %s" % self.password)
+         self.setNick(nickname)
+         if self.username is None:
+             self.username = nickname
+-        self.sendLine("USER %s %s %s :%s" % (self.username, hostname, servername, self.realname))
++        self.sendLine(u"USER %s %s %s :%s" % (self.username, hostname, servername, self.realname))
+ 
+ 
+     def setNick(self, nickname):
+@@ -1686,10 +1720,10 @@ class IRCClient(basic.LineReceiver):
+         @param nickname: The nickname to change to.
+         """
+         self._attemptedNick = nickname
+-        self.sendLine("NICK %s" % nickname)
++        self.sendLine(u"NICK %s" % nickname)
+ 
+ 
+-    def quit(self, message = ''):
++    def quit(self, message = u''):
+         """
+         Disconnect from the server
+ 
+@@ -1698,7 +1732,7 @@ class IRCClient(basic.LineReceiver):
+         @param message: If specified, the message to give when quitting the
+             server.
+         """
+-        self.sendLine("QUIT :%s" % message)
++        self.sendLine(u"QUIT :%s" % message)
+ 
+     ### user input commands, client->client
+ 
+@@ -1713,7 +1747,7 @@ class IRCClient(basic.LineReceiver):
+         @param action: The action to preform.
+         @since: 9.0
+         """
+-        self.ctcpMakeQuery(channel, [('ACTION', action)])
++        self.ctcpMakeQuery(channel, [(u'ACTION', action)])
+ 
+ 
+     _pings = None
+@@ -1728,11 +1762,11 @@ class IRCClient(basic.LineReceiver):
+ 
+         if text is None:
+             chars = string.letters + string.digits + string.punctuation
+-            key = ''.join([random.choice(chars) for i in range(12)])
++            key = u''.join([random.choice(chars) for i in range(12)])
+         else:
+             key = str(text)
+         self._pings[(user, key)] = time.time()
+-        self.ctcpMakeQuery(user, [('PING', key)])
++        self.ctcpMakeQuery(user, [(u'PING', key)])
+ 
+         if len(self._pings) > self._MAX_PINGRING:
+             # Remove some of the oldest entries.
+@@ -1744,30 +1778,30 @@ class IRCClient(basic.LineReceiver):
+ 
+ 
+     def dccSend(self, user, file):
+-        if type(file) == types.StringType:
++        if isinstance(file, str):
+             file = open(file, 'r')
+ 
+         size = fileSize(file)
+ 
+-        name = getattr(file, "name", "file@%s" % (id(file),))
++        name = getattr(file, "name", u"file@%s" % (id(file),))
+ 
+         factory = DccSendFactory(file)
+         port = reactor.listenTCP(0, factory, 1)
+ 
+-        raise NotImplementedError,(
+-            "XXX!!! Help!  I need to bind a socket, have it listen, and tell me its address.  "
+-            "(and stop accepting once we've made a single connection.)")
++        raise NotImplementedError(
++            u"XXX!!! Help!  I need to bind a socket, have it listen, and tell me its address.  "
++            u"(and stop accepting once we've made a single connection.)")
+ 
+         my_address = struct.pack("!I", my_address)
+ 
+-        args = ['SEND', name, my_address, str(port)]
++        args = [u'SEND', name, my_address, str(port)]
+ 
+         if not (size is None):
+             args.append(size)
+ 
+-        args = string.join(args, ' ')
++        args = u' '.join(args)
+ 
+-        self.ctcpMakeQuery(user, [('DCC', args)])
++        self.ctcpMakeQuery(user, [(u'DCC', args)])
+ 
+ 
+     def dccResume(self, user, fileName, port, resumePos):
+@@ -1775,7 +1809,7 @@ class IRCClient(basic.LineReceiver):
+         Send a DCC RESUME request to another user.
+         """
+         self.ctcpMakeQuery(user, [
+-            ('DCC', ['RESUME', fileName, port, resumePos])])
++            (u'DCC', [u'RESUME', fileName, port, resumePos])])
+ 
+ 
+     def dccAcceptResume(self, user, fileName, port, resumePos):
+@@ -1783,7 +1817,7 @@ class IRCClient(basic.LineReceiver):
+         Send a DCC ACCEPT response to clients who have requested a resume.
+         """
+         self.ctcpMakeQuery(user, [
+-            ('DCC', ['ACCEPT', fileName, port, resumePos])])
++            (u'DCC', [u'ACCEPT', fileName, port, resumePos])])
+ 
+     ### server->client messages
+     ### You might want to fiddle with these,
+@@ -1809,7 +1843,7 @@ class IRCClient(basic.LineReceiver):
+         @returns: A string that is in some way different from the nickname.
+         @rtype: C{str}
+         """
+-        return nickname + '_'
++        return nickname + u'_'
+ 
+ 
+     def irc_ERR_ERRONEUSNICKNAME(self, prefix, params):
+@@ -1831,7 +1865,7 @@ class IRCClient(basic.LineReceiver):
+         """
+         Called when the login was incorrect.
+         """
+-        raise IRCPasswordMismatch("Password Incorrect.")
++        raise IRCPasswordMismatch(u"Password Incorrect.")
+ 
+ 
+     def irc_RPL_WELCOME(self, prefix, params):
+@@ -1849,7 +1883,7 @@ class IRCClient(basic.LineReceiver):
+         """
+         Called when a user joins a channel.
+         """
+-        nick = string.split(prefix,'!')[0]
++        nick = prefix.split(u"!")[0]
+         channel = params[-1]
+         if nick == self.nickname:
+             self.joined(channel)
+@@ -1860,7 +1894,7 @@ class IRCClient(basic.LineReceiver):
+         """
+         Called when a user leaves a channel.
+         """
+-        nick = string.split(prefix,'!')[0]
++        nick = prefix.split(u"!")[0]
+         channel = params[0]
+         if nick == self.nickname:
+             self.left(channel)
+@@ -1871,7 +1905,7 @@ class IRCClient(basic.LineReceiver):
+         """
+         Called when a user has quit.
+         """
+-        nick = string.split(prefix,'!')[0]
++        nick = prefix.split(u"!")[0]
+         self.userQuit(nick, params[0])
+ 
+ 
+@@ -1881,8 +1915,8 @@ class IRCClient(basic.LineReceiver):
+         """
+         channel, modes, args = params[0], params[1], params[2:]
+ 
+-        if modes[0] not in '-+':
+-            modes = '+' + modes
++        if modes[0] not in u'-+':
++            modes = u'+' + modes
+ 
+         if channel == self.nickname:
+             # This is a mode change to our individual user, not a channel mode
+@@ -1894,23 +1928,23 @@ class IRCClient(basic.LineReceiver):
+         try:
+             added, removed = parseModes(modes, args, paramModes)
+         except IRCBadModes:
+-            log.err(None, 'An error occured while parsing the following '
+-                          'MODE message: MODE %s' % (' '.join(params),))
++            log.err(None, u'An error occured while parsing the following '
++                          u'MODE message: MODE %s' % (u' '.join(params),))
+         else:
+             if added:
+                 modes, params = zip(*added)
+-                self.modeChanged(user, channel, True, ''.join(modes), params)
++                self.modeChanged(user, channel, True, u''.join(modes), params)
+ 
+             if removed:
+                 modes, params = zip(*removed)
+-                self.modeChanged(user, channel, False, ''.join(modes), params)
++                self.modeChanged(user, channel, False, u''.join(modes), params)
+ 
+ 
+     def irc_PING(self, prefix, params):
+         """
+         Called when some has pinged us.
+         """
+-        self.sendLine("PONG %s" % params[-1])
++        self.sendLine(u"PONG %s" % params[-1])
+ 
+     def irc_PRIVMSG(self, prefix, params):
+         """
+@@ -1926,13 +1960,13 @@ class IRCClient(basic.LineReceiver):
+ 
+         if message[0] == X_DELIM:
+             m = ctcpExtract(message)
+-            if m['extended']:
+-                self.ctcpQuery(user, channel, m['extended'])
++            if m[u'extended']:
++                self.ctcpQuery(user, channel, m[u'extended'])
+ 
+-            if not m['normal']:
++            if not m[u'normal']:
+                 return
+ 
+-            message = string.join(m['normal'], ' ')
++            message = u' '.join(m[u'normal'])
+ 
+         self.privmsg(user, channel, message)
+ 
+@@ -1946,13 +1980,13 @@ class IRCClient(basic.LineReceiver):
+ 
+         if message[0]==X_DELIM:
+             m = ctcpExtract(message)
+-            if m['extended']:
+-                self.ctcpReply(user, channel, m['extended'])
++            if m[u'extended']:
++                self.ctcpReply(user, channel, m[u'extended'])
+ 
+-            if not m['normal']:
++            if not m[u'normal']:
+                 return
+ 
+-            message = string.join(m['normal'], ' ')
++            message = u' '.join(m[u'normal'])
+ 
+         self.noticed(user, channel, message)
+ 
+@@ -1960,7 +1994,7 @@ class IRCClient(basic.LineReceiver):
+         """
+         Called when a user changes their nickname.
+         """
+-        nick = string.split(prefix,'!', 1)[0]
++        nick = prefix.split(u'!')[0]
+         if nick == self.nickname:
+             self.nickChanged(params[0])
+         else:
+@@ -1970,11 +2004,11 @@ class IRCClient(basic.LineReceiver):
+         """
+         Called when a user is kicked from a channel.
+         """
+-        kicker = string.split(prefix,'!')[0]
++        kicker = prefix.split(u'!')[0]
+         channel = params[0]
+         kicked = params[1]
+         message = params[-1]
+-        if string.lower(kicked) == string.lower(self.nickname):
++        if kicked.lower() == self.nickname.lower():
+             # Yikes!
+             self.kickedFrom(channel, kicker, message)
+         else:
+@@ -1984,7 +2018,7 @@ class IRCClient(basic.LineReceiver):
+         """
+         Someone in the channel set the topic.
+         """
+-        user = string.split(prefix, '!')[0]
++        user = prefix.split(u'!')[0]
+         channel = params[0]
+         newtopic = params[1]
+         self.topicUpdated(user, channel, newtopic)
+@@ -1994,24 +2028,24 @@ class IRCClient(basic.LineReceiver):
+         Called when the topic for a channel is initially reported or when it
+         subsequently changes.
+         """
+-        user = string.split(prefix, '!')[0]
++        user = prefix.split(u'!')[0]
+         channel = params[1]
+         newtopic = params[2]
+         self.topicUpdated(user, channel, newtopic)
+ 
+     def irc_RPL_NOTOPIC(self, prefix, params):
+-        user = string.split(prefix, '!')[0]
++        user = prefix.split(u'!')[0]
+         channel = params[1]
+-        newtopic = ""
++        newtopic = u""
+         self.topicUpdated(user, channel, newtopic)
+ 
+     def irc_RPL_MOTDSTART(self, prefix, params):
+-        if params[-1].startswith("- "):
++        if params[-1].startswith(u"- "):
+             params[-1] = params[-1][2:]
+         self.motd = [params[-1]]
+ 
+     def irc_RPL_MOTD(self, prefix, params):
+-        if params[-1].startswith("- "):
++        if params[-1].startswith(u"- "):
+             params[-1] = params[-1][2:]
+         if self.motd is None:
+             self.motd = []
+@@ -2102,19 +2136,19 @@ class IRCClient(basic.LineReceiver):
+         No CTCP I{ERRMSG} reply is made to remove a potential denial of service
+         avenue.
+         """
+-        log.msg('Unknown CTCP query from %r: %r %r' % (user, tag, data))
++        log.msg(u'Unknown CTCP query from %r: %r %r' % (user, tag, data))
+ 
+ 
+     def ctcpQuery_ACTION(self, user, channel, data):
+         self.action(user, channel, data)
+ 
+     def ctcpQuery_PING(self, user, channel, data):
+-        nick = string.split(user,"!")[0]
+-        self.ctcpMakeReply(nick, [("PING", data)])
++        nick = user.split(u"!")[0]
++        self.ctcpMakeReply(nick, [(u"PING", data)])
+ 
+     def ctcpQuery_FINGER(self, user, channel, data):
+         if data is not None:
+-            self.quirkyMessage("Why did %s send '%s' with a FINGER query?"
++            self.quirkyMessage(u"Why did %s send '%s' with a FINGER query?"
+                                % (user, data))
+         if not self.fingerReply:
+             return
+@@ -2124,41 +2158,41 @@ class IRCClient(basic.LineReceiver):
+         else:
+             reply = str(self.fingerReply)
+ 
+-        nick = string.split(user,"!")[0]
+-        self.ctcpMakeReply(nick, [('FINGER', reply)])
++        nick = user.split(u"!")[0]
++        self.ctcpMakeReply(nick, [(u'FINGER', reply)])
+ 
+     def ctcpQuery_VERSION(self, user, channel, data):
+         if data is not None:
+-            self.quirkyMessage("Why did %s send '%s' with a VERSION query?"
++            self.quirkyMessage(u"Why did %s send '%s' with a VERSION query?"
+                                % (user, data))
+ 
+         if self.versionName:
+-            nick = string.split(user,"!")[0]
+-            self.ctcpMakeReply(nick, [('VERSION', '%s:%s:%s' %
++            nick = user.split(u"!")[0]
++            self.ctcpMakeReply(nick, [(u'VERSION', u'%s:%s:%s' %
+                                        (self.versionName,
+-                                        self.versionNum or '',
+-                                        self.versionEnv or ''))])
++                                        self.versionNum or u'',
++                                        self.versionEnv or u''))])
+ 
+     def ctcpQuery_SOURCE(self, user, channel, data):
+         if data is not None:
+-            self.quirkyMessage("Why did %s send '%s' with a SOURCE query?"
++            self.quirkyMessage(u"Why did %s send '%s' with a SOURCE query?"
+                                % (user, data))
+         if self.sourceURL:
+-            nick = string.split(user,"!")[0]
++            nick = user.split(u"!")[0]
+             # The CTCP document (Zeuge, Rollo, Mesander 1994) says that SOURCE
+             # replies should be responded to with the location of an anonymous
+             # FTP server in host:directory:file format.  I'm taking the liberty
+             # of bringing it into the 21st century by sending a URL instead.
+-            self.ctcpMakeReply(nick, [('SOURCE', self.sourceURL),
+-                                      ('SOURCE', None)])
++            self.ctcpMakeReply(nick, [(u'SOURCE', self.sourceURL),
++                                      (u'SOURCE', None)])
+ 
+     def ctcpQuery_USERINFO(self, user, channel, data):
+         if data is not None:
+-            self.quirkyMessage("Why did %s send '%s' with a USERINFO query?"
++            self.quirkyMessage(u"Why did %s send '%s' with a USERINFO query?"
+                                % (user, data))
+         if self.userinfo:
+-            nick = string.split(user,"!")[0]
+-            self.ctcpMakeReply(nick, [('USERINFO', self.userinfo)])
++            nick = user.split(u"!")[0]
++            self.ctcpMakeReply(nick, [(u'USERINFO', self.userinfo)])
+ 
+     def ctcpQuery_CLIENTINFO(self, user, channel, data):
+         """
+@@ -2169,43 +2203,43 @@ class IRCClient(basic.LineReceiver):
+         the usage of that tag.
+         """
+ 
+-        nick = string.split(user,"!")[0]
++        nick = user.split(u"!")[0]
+         if not data:
+             # XXX: prefixedMethodNames gets methods from my *class*,
+             # but it's entirely possible that this *instance* has more
+             # methods.
+-            names = reflect.prefixedMethodNames(self.__class__,
+-                                                'ctcpQuery_')
++            names = prefixedMethodNames(self.__class__,
++                                        u'ctcpQuery_')
+ 
+-            self.ctcpMakeReply(nick, [('CLIENTINFO',
+-                                       string.join(names, ' '))])
++            self.ctcpMakeReply(nick, [(u'CLIENTINFO',
++                                       u' '.join(names))])
+         else:
+-            args = string.split(data)
+-            method = getattr(self, 'ctcpQuery_%s' % (args[0],), None)
++            args = data.split()
++            method = getattr(self, u'ctcpQuery_%s' % (args[0],), None)
+             if not method:
+-                self.ctcpMakeReply(nick, [('ERRMSG',
+-                                           "CLIENTINFO %s :"
+-                                           "Unknown query '%s'"
++                self.ctcpMakeReply(nick, [(u'ERRMSG',
++                                           u"CLIENTINFO %s :"
++                                           u"Unknown query '%s'"
+                                            % (data, args[0]))])
+                 return
+             doc = getattr(method, '__doc__', '')
+-            self.ctcpMakeReply(nick, [('CLIENTINFO', doc)])
++            self.ctcpMakeReply(nick, [(u'CLIENTINFO', doc)])
+ 
+ 
+     def ctcpQuery_ERRMSG(self, user, channel, data):
+         # Yeah, this seems strange, but that's what the spec says to do
+         # when faced with an ERRMSG query (not a reply).
+-        nick = string.split(user,"!")[0]
+-        self.ctcpMakeReply(nick, [('ERRMSG',
+-                                   "%s :No error has occoured." % data)])
++        nick = user.split(u"!")[0]
++        self.ctcpMakeReply(nick, [(u'ERRMSG',
++                                   u"%s :No error has occoured." % data)])
+ 
+     def ctcpQuery_TIME(self, user, channel, data):
+         if data is not None:
+-            self.quirkyMessage("Why did %s send '%s' with a TIME query?"
++            self.quirkyMessage(u"Why did %s send '%s' with a TIME query?"
+                                % (user, data))
+-        nick = string.split(user,"!")[0]
++        nick = user.split(u"!")[0]
+         self.ctcpMakeReply(nick,
+-                           [('TIME', ':%s' %
++                           [(u'TIME', u':%s' %
+                              time.asctime(time.localtime(time.time())))])
+ 
+     def ctcpQuery_DCC(self, user, channel, data):
+@@ -2221,18 +2255,18 @@ class IRCClient(basic.LineReceiver):
+             data = data[len(dcctype)+1:]
+             handler(user, channel, data)
+         else:
+-            nick = string.split(user,"!")[0]
+-            self.ctcpMakeReply(nick, [('ERRMSG',
+-                                       "DCC %s :Unknown DCC type '%s'"
++            nick = user.split(u"!")[0]
++            self.ctcpMakeReply(nick, [(u'ERRMSG',
++                                       u"DCC %s :Unknown DCC type '%s'"
+                                        % (data, dcctype))])
+-            self.quirkyMessage("%s offered unknown DCC type %s"
++            self.quirkyMessage(u"%s offered unknown DCC type %s"
+                                % (user, dcctype))
+ 
+     def dcc_SEND(self, user, channel, data):
+         # Use splitQuoted for those who send files with spaces in the names.
+         data = text.splitQuoted(data)
+         if len(data) < 3:
+-            raise IRCBadMessage, "malformed DCC SEND request: %r" % (data,)
++            raise IRCBadMessage(u"malformed DCC SEND request: %r" % (data,))
+ 
+         (filename, address, port) = data[:3]
+ 
+@@ -2240,7 +2274,7 @@ class IRCClient(basic.LineReceiver):
+         try:
+             port = int(port)
+         except ValueError:
+-            raise IRCBadMessage, "Indecipherable port %r" % (port,)
++            raise IRCBadMessage(u"Indecipherable port %r" % (port,))
+ 
+         size = -1
+         if len(data) >= 4:
+@@ -2255,7 +2289,7 @@ class IRCClient(basic.LineReceiver):
+     def dcc_ACCEPT(self, user, channel, data):
+         data = text.splitQuoted(data)
+         if len(data) < 3:
+-            raise IRCBadMessage, "malformed DCC SEND ACCEPT request: %r" % (data,)
++            raise IRCBadMessage(u"malformed DCC SEND ACCEPT request: %r" % (data,))
+         (filename, port, resumePos) = data[:3]
+         try:
+             port = int(port)
+@@ -2268,7 +2302,7 @@ class IRCClient(basic.LineReceiver):
+     def dcc_RESUME(self, user, channel, data):
+         data = text.splitQuoted(data)
+         if len(data) < 3:
+-            raise IRCBadMessage, "malformed DCC SEND RESUME request: %r" % (data,)
++            raise IRCBadMessage(u"malformed DCC SEND RESUME request: %r" % (data,))
+         (filename, port, resumePos) = data[:3]
+         try:
+             port = int(port)
+@@ -2280,7 +2314,7 @@ class IRCClient(basic.LineReceiver):
+     def dcc_CHAT(self, user, channel, data):
+         data = text.splitQuoted(data)
+         if len(data) < 3:
+-            raise IRCBadMessage, "malformed DCC CHAT request: %r" % (data,)
++            raise IRCBadMessage(u"malformed DCC CHAT request: %r" % (data,))
+ 
+         (filename, address, port) = data[:3]
+ 
+@@ -2288,7 +2322,7 @@ class IRCClient(basic.LineReceiver):
+         try:
+             port = int(port)
+         except ValueError:
+-            raise IRCBadMessage, "Indecipherable port %r" % (port,)
++            raise IRCBadMessage(u"Indecipherable port %r" % (port,))
+ 
+         self.dccDoChat(user, channel, address, port, data)
+ 
+@@ -2366,10 +2400,10 @@ class IRCClient(basic.LineReceiver):
+                 self.ctcpUnknownReply(user, channel, m[0], m[1])
+ 
+     def ctcpReply_PING(self, user, channel, data):
+-        nick = user.split('!', 1)[0]
+-        if (not self._pings) or (not self._pings.has_key((nick, data))):
+-            raise IRCBadMessage,\
+-                  "Bogus PING response from %s: %s" % (user, data)
++        nick = user.split(u'!', 1)[0]
++        if (not self._pings) or ((nick, data) not in self._pings):
++            raise IRCBadMessage(
++                  u"Bogus PING response from %s: %s" % (user, data))
+ 
+         t0 = self._pings[(nick, data)]
+         self.pong(user, time.time() - t0)
+@@ -2391,15 +2425,15 @@ class IRCClient(basic.LineReceiver):
+         """When I get a message that's so broken I can't use it.
+         """
+         log.msg(line)
+-        log.msg(string.join(traceback.format_exception(excType,
++        log.msg(u''.join(traceback.format_exception(excType,
+                                                         excValue,
+-                                                        tb),''))
++                                                        tb)))
+ 
+     def quirkyMessage(self, s):
+         """This is called when I receive a message which is peculiar,
+         but not wholly indecipherable.
+         """
+-        log.msg(s + '\n')
++        log.msg(s + u'\n')
+ 
+     ### Protocool methods
+ 
+@@ -2410,9 +2444,12 @@ class IRCClient(basic.LineReceiver):
+             self.register(self.nickname)
+ 
+     def dataReceived(self, data):
+-        basic.LineReceiver.dataReceived(self, data.replace('\r', ''))
++        # this is overriding a method of LineReceiver, and takes a byte string
++        basic.LineReceiver.dataReceived(self, data.replace(b'\r', b''))
+ 
+     def lineReceived(self, line):
++        if isinstance(line, bytes):
++            line = line.decode(self.encoding, "ignore")
+         line = lowDequote(line)
+         try:
+             prefix, command, params = parsemsg(line)
+@@ -2430,7 +2467,7 @@ class IRCClient(basic.LineReceiver):
+         @rtype: C{[str, str]}
+         @return C{[add, remove]}
+         """
+-        return ['', '']
++        return [u'', u'']
+ 
+ 
+     def getChannelModeParams(self):
+@@ -2442,16 +2479,16 @@ class IRCClient(basic.LineReceiver):
+         """
+         # PREFIX modes are treated as "type B" CHANMODES, they always take
+         # parameter.
+-        params = ['', '']
+-        prefixes = self.supported.getFeature('PREFIX', {})
+-        params[0] = params[1] = ''.join(prefixes.iterkeys())
++        params = [u'', u'']
++        prefixes = self.supported.getFeature(u'PREFIX', {})
++        params[0] = params[1] = u''.join(prefixes.keys())
+ 
+-        chanmodes = self.supported.getFeature('CHANMODES')
++        chanmodes = self.supported.getFeature(u'CHANMODES')
+         if chanmodes is not None:
+-            params[0] += chanmodes.get('addressModes', '')
+-            params[0] += chanmodes.get('param', '')
++            params[0] += chanmodes.get(u'addressModes', u'')
++            params[0] += chanmodes.get(u'param', u'')
+             params[1] = params[0]
+-            params[0] += chanmodes.get('setParam', '')
++            params[0] += chanmodes.get(u'setParam', u'')
+         return params
+ 
+ 
+@@ -2477,14 +2514,14 @@ class IRCClient(basic.LineReceiver):
+ 
+ 
+ def dccParseAddress(address):
+-    if '.' in address:
++    if u'.' in address:
+         pass
+     else:
+         try:
+             address = long(address)
+         except ValueError:
+-            raise IRCBadMessage,\
+-                  "Indecipherable address %r" % (address,)
++            raise IRCBadMessage(
++                  "uIndecipherable address %r" % (address,))
+         else:
+             address = (
+                 (address >> 24) & 0xFF,
+@@ -2492,11 +2529,11 @@ def dccParseAddress(address):
+                 (address >> 8) & 0xFF,
+                 address & 0xFF,
+                 )
+-            address = '.'.join(map(str,address))
++            address = u'.'.join(map(str,address))
+     return address
+ 
+ 
+-class DccFileReceiveBasic(protocol.Protocol, styles.Ephemeral):
++class DccFileReceiveBasic(protocol.Protocol, Ephemeral):
+     """Bare protocol to receive a Direct Client Connection SEND stream.
+ 
+     This does enough to keep the other guy talking, but you'll want to
+@@ -2520,7 +2557,7 @@ class DccFileReceiveBasic(protocol.Protocol, styles.Ephemeral):
+         self.transport.write(struct.pack('!i', self.bytesReceived))
+ 
+ 
+-class DccSendProtocol(protocol.Protocol, styles.Ephemeral):
++class DccSendProtocol(protocol.Protocol, Ephemeral):
+     """Protocol for an outgoing Direct Client Connection SEND.
+     """
+ 
+@@ -2531,7 +2568,7 @@ class DccSendProtocol(protocol.Protocol, styles.Ephemeral):
+     connected = 0
+ 
+     def __init__(self, file):
+-        if type(file) is types.StringType:
++        if isinstance(file, str):
+             self.file = open(file, 'r')
+ 
+     def connectionMade(self):
+@@ -2620,7 +2657,7 @@ def fileSize(file):
+ 
+     return size
+ 
+-class DccChat(basic.LineReceiver, styles.Ephemeral):
++class DccChat(basic.LineReceiver, Ephemeral):
+     """Direct Client Connection protocol type CHAT.
+ 
+     DCC CHAT is really just your run o' the mill basic.LineReceiver
+@@ -2638,7 +2675,7 @@ class DccChat(basic.LineReceiver, styles.Ephemeral):
+     delimiter = CR + NL
+     client = None
+     remoteParty = None
+-    buffer = ""
++    buffer = b""
+ 
+     def __init__(self, client, queryData=None):
+         """Initialize a new DCC CHAT session.
+@@ -2658,7 +2695,7 @@ class DccChat(basic.LineReceiver, styles.Ephemeral):
+ 
+     def dataReceived(self, data):
+         self.buffer = self.buffer + data
+-        lines = string.split(self.buffer, LF)
++        lines = self.buffer.split(LF)
+         # Put the (possibly empty) element after the last LF back in the
+         # buffer
+         self.buffer = lines.pop()
+@@ -2669,7 +2706,8 @@ class DccChat(basic.LineReceiver, styles.Ephemeral):
+             self.lineReceived(line)
+ 
+     def lineReceived(self, line):
+-        log.msg("DCC CHAT<%s> %s" % (self.remoteParty, line))
++        line = line.decode(self.client.encoding, "ignore")
++        log.msg(u"DCC CHAT<%s> %s" % (self.remoteParty, line))
+         self.client.privmsg(self.remoteParty,
+                             self.client.nickname, line)
+ 
+@@ -2700,13 +2738,13 @@ def dccDescribe(data):
+     """
+ 
+     orig_data = data
+-    data = string.split(data)
++    data = data.split()
+     if len(data) < 4:
+         return orig_data
+ 
+     (dcctype, arg, address, port) = data[:4]
+ 
+-    if '.' in address:
++    if u'.' in address:
+         pass
+     else:
+         try:
+@@ -2722,23 +2760,23 @@ def dccDescribe(data):
+                 )
+             # The mapping to 'int' is to get rid of those accursed
+             # "L"s which python 1.5.2 puts on the end of longs.
+-            address = string.join(map(str,map(int,address)), ".")
++            address = u".".join(map(str,map(int,address)))
+ 
+-    if dcctype == 'SEND':
++    if dcctype == u'SEND':
+         filename = arg
+ 
+-        size_txt = ''
++        size_txt = u''
+         if len(data) >= 5:
+             try:
+                 size = int(data[4])
+-                size_txt = ' of size %d bytes' % (size,)
++                size_txt = u' of size %d bytes' % (size,)
+             except ValueError:
+                 pass
+ 
+-        dcc_text = ("SEND for file '%s'%s at host %s, port %s"
++        dcc_text = (u"SEND for file '%s'%s at host %s, port %s"
+                     % (filename, size_txt, address, port))
+-    elif dcctype == 'CHAT':
+-        dcc_text = ("CHAT for host %s, port %s"
++    elif dcctype == u'CHAT':
++        dcc_text = (u"CHAT for host %s, port %s"
+                     % (address, port))
+     else:
+         dcc_text = orig_data
+@@ -2760,15 +2798,15 @@ class DccFileReceive(DccFileReceiveBasic):
+     XXX: I need to make sure the client understands if the file cannot be written.
+     """
+ 
+-    filename = 'dcc'
++    filename = u'dcc'
+     fileSize = -1
+-    destDir = '.'
++    destDir = u'.'
+     overwrite = 0
+     fromUser = None
+     queryData = None
+ 
+     def __init__(self, filename, fileSize=-1, queryData=None,
+-                 destDir='.', resumeOffset=0):
++                 destDir=u'.', resumeOffset=0):
+         DccFileReceiveBasic.__init__(self, resumeOffset=resumeOffset)
+         self.filename = filename
+         self.destDir = destDir
+@@ -2784,15 +2822,15 @@ class DccFileReceive(DccFileReceiveBasic):
+         May raise OSError if the supplied directory path is not suitable.
+         """
+         if not path.exists(directory):
+-            raise OSError(errno.ENOENT, "You see no directory there.",
++            raise OSError(errno.ENOENT, u"You see no directory there.",
+                           directory)
+         if not path.isdir(directory):
+-            raise OSError(errno.ENOTDIR, "You cannot put a file into "
+-                          "something which is not a directory.",
++            raise OSError(errno.ENOTDIR, u"You cannot put a file into "
++                          u"something which is not a directory.",
+                           directory)
+         if not os.access(directory, os.X_OK | os.W_OK):
+             raise OSError(errno.EACCES,
+-                          "This directory is too hard to write in to.",
++                          u"This directory is too hard to write in to.",
+                           directory)
+         self.destDir = directory
+ 
+@@ -2818,14 +2856,14 @@ class DccFileReceive(DccFileReceiveBasic):
+             # I have been told I want to resume, and a file already
+             # exists - Here we go
+             self.file = open(dst, 'ab')
+-            log.msg("Attempting to resume %s - starting from %d bytes" %
++            log.msg(u"Attempting to resume %s - starting from %d bytes" %
+                     (self.file, self.file.tell()))
+         elif self.overwrite or not exists:
+             self.file = open(dst, 'wb')
+         else:
+             raise OSError(errno.EEXIST,
+-                          "There's a file in the way.  "
+-                          "Perhaps that's why you cannot open it.",
++                          u"There's a file in the way.  "
++                          u"Perhaps that's why you cannot open it.",
+                           dst)
+ 
+     def dataReceived(self, data):
+@@ -2838,24 +2876,24 @@ class DccFileReceive(DccFileReceiveBasic):
+         """When the connection is lost, I close the file.
+         """
+         self.connected = 0
+-        logmsg = ("%s closed." % (self,))
++        logmsg = (u"%s closed." % (self,))
+         if self.fileSize > 0:
+-            logmsg = ("%s  %d/%d bytes received"
++            logmsg = (u"%s  %d/%d bytes received"
+                       % (logmsg, self.bytesReceived, self.fileSize))
+             if self.bytesReceived == self.fileSize:
+                 pass # Hooray!
+             elif self.bytesReceived < self.fileSize:
+-                logmsg = ("%s (Warning: %d bytes short)"
++                logmsg = (u"%s (Warning: %d bytes short)"
+                           % (logmsg, self.fileSize - self.bytesReceived))
+             else:
+-                logmsg = ("%s (file larger than expected)"
++                logmsg = (u"%s (file larger than expected)"
+                           % (logmsg,))
+         else:
+-            logmsg = ("%s  %d bytes received"
++            logmsg = (u"%s  %d bytes received"
+                       % (logmsg, self.bytesReceived))
+ 
+         if hasattr(self, 'file'):
+-            logmsg = "%s and written to %s.\n" % (logmsg, self.file.name)
++            logmsg = u"%s and written to %s.\n" % (logmsg, self.file.name)
+             if hasattr(self.file, 'close'): self.file.close()
+ 
+         # self.transport.log(logmsg)
+@@ -2878,7 +2916,7 @@ class DccFileReceive(DccFileReceiveBasic):
+ 
+ # CTCP constants and helper functions
+ 
+-X_DELIM = chr(001)
++X_DELIM = chr(0o01)
+ 
+ def ctcpExtract(message):
+     """
+@@ -2890,10 +2928,10 @@ def ctcpExtract(message):
+     """
+     extended_messages = []
+     normal_messages = []
+-    retval = {'extended': extended_messages,
+-              'normal': normal_messages }
++    retval = {u'extended': extended_messages,
++              u'normal': normal_messages }
+ 
+-    messages = string.split(message, X_DELIM)
++    messages = message.split(X_DELIM)
+     odd = 0
+ 
+     # X1 extended data X2 nomal data X3 extended data X4 normal...
+@@ -2909,7 +2947,7 @@ def ctcpExtract(message):
+ 
+     extended_messages[:] = map(ctcpDequote, extended_messages)
+     for i in xrange(len(extended_messages)):
+-        m = string.split(extended_messages[i], SPC, 1)
++        m = extended_messages[i].split(SPC, 1)
+         tag = m[0]
+         if len(m) > 1:
+             data = m[1]
+@@ -2922,12 +2960,12 @@ def ctcpExtract(message):
+ 
+ # CTCP escaping
+ 
+-M_QUOTE= chr(020)
++M_QUOTE= chr(0o20)
+ 
+ mQuoteTable = {
+-    NUL: M_QUOTE + '0',
+-    NL: M_QUOTE + 'n',
+-    CR: M_QUOTE + 'r',
++    NUL: M_QUOTE + u'0',
++    NL: M_QUOTE + u'n',
++    CR: M_QUOTE + u'r',
+     M_QUOTE: M_QUOTE + M_QUOTE
+     }
+ 
+@@ -2936,11 +2974,11 @@ for k, v in mQuoteTable.items():
+     mDequoteTable[v[-1]] = k
+ del k, v
+ 
+-mEscape_re = re.compile('%s.' % (re.escape(M_QUOTE),), re.DOTALL)
++mEscape_re = re.compile(u'%s.' % (re.escape(M_QUOTE),), re.DOTALL)
+ 
+ def lowQuote(s):
+     for c in (M_QUOTE, NUL, NL, CR):
+-        s = string.replace(s, c, mQuoteTable[c])
++        s = s.replace(c, mQuoteTable[c])
+     return s
+ 
+ def lowDequote(s):
+@@ -2954,10 +2992,10 @@ def lowDequote(s):
+ 
+     return mEscape_re.sub(sub, s)
+ 
+-X_QUOTE = '\\'
++X_QUOTE = u'\\'
+ 
+ xQuoteTable = {
+-    X_DELIM: X_QUOTE + 'a',
++    X_DELIM: X_QUOTE + u'a',
+     X_QUOTE: X_QUOTE + X_QUOTE
+     }
+ 
+@@ -2966,11 +3004,11 @@ xDequoteTable = {}
+ for k, v in xQuoteTable.items():
+     xDequoteTable[v[-1]] = k
+ 
+-xEscape_re = re.compile('%s.' % (re.escape(X_QUOTE),), re.DOTALL)
++xEscape_re = re.compile(u'%s.' % (re.escape(X_QUOTE),), re.DOTALL)
+ 
+ def ctcpQuote(s):
+     for c in (X_QUOTE, X_DELIM):
+-        s = string.replace(s, c, xQuoteTable[c])
++        s = s.replace(c, xQuoteTable[c])
+     return s
+ 
+ def ctcpDequote(s):
+@@ -2995,306 +3033,306 @@ def ctcpStringify(messages):
+     coded_messages = []
+     for (tag, data) in messages:
+         if data:
+-            if not isinstance(data, types.StringType):
++            if not isinstance(data, unicode):
+                 try:
+                     # data as list-of-strings
+-                    data = " ".join(map(str, data))
++                    data = u" ".join(map(unicode, data))
+                 except TypeError:
+-                    # No?  Then use it's %s representation.
++                    # No?  Then use its %s representation.
+                     pass
+-            m = "%s %s" % (tag, data)
++            m = u"%s %s" % (tag, data)
+         else:
+             m = str(tag)
+         m = ctcpQuote(m)
+-        m = "%s%s%s" % (X_DELIM, m, X_DELIM)
++        m = u"%s%s%s" % (X_DELIM, m, X_DELIM)
+         coded_messages.append(m)
+ 
+-    line = string.join(coded_messages, '')
++    line = u''.join(coded_messages)
+     return line
+ 
+ 
+ # Constants (from RFC 2812)
+-RPL_WELCOME = '001'
+-RPL_YOURHOST = '002'
+-RPL_CREATED = '003'
+-RPL_MYINFO = '004'
+-RPL_ISUPPORT = '005'
+-RPL_BOUNCE = '010'
+-RPL_USERHOST = '302'
+-RPL_ISON = '303'
+-RPL_AWAY = '301'
+-RPL_UNAWAY = '305'
+-RPL_NOWAWAY = '306'
+-RPL_WHOISUSER = '311'
+-RPL_WHOISSERVER = '312'
+-RPL_WHOISOPERATOR = '313'
+-RPL_WHOISIDLE = '317'
+-RPL_ENDOFWHOIS = '318'
+-RPL_WHOISCHANNELS = '319'
+-RPL_WHOWASUSER = '314'
+-RPL_ENDOFWHOWAS = '369'
+-RPL_LISTSTART = '321'
+-RPL_LIST = '322'
+-RPL_LISTEND = '323'
+-RPL_UNIQOPIS = '325'
+-RPL_CHANNELMODEIS = '324'
+-RPL_NOTOPIC = '331'
+-RPL_TOPIC = '332'
+-RPL_INVITING = '341'
+-RPL_SUMMONING = '342'
+-RPL_INVITELIST = '346'
+-RPL_ENDOFINVITELIST = '347'
+-RPL_EXCEPTLIST = '348'
+-RPL_ENDOFEXCEPTLIST = '349'
+-RPL_VERSION = '351'
+-RPL_WHOREPLY = '352'
+-RPL_ENDOFWHO = '315'
+-RPL_NAMREPLY = '353'
+-RPL_ENDOFNAMES = '366'
+-RPL_LINKS = '364'
+-RPL_ENDOFLINKS = '365'
+-RPL_BANLIST = '367'
+-RPL_ENDOFBANLIST = '368'
+-RPL_INFO = '371'
+-RPL_ENDOFINFO = '374'
+-RPL_MOTDSTART = '375'
+-RPL_MOTD = '372'
+-RPL_ENDOFMOTD = '376'
+-RPL_YOUREOPER = '381'
+-RPL_REHASHING = '382'
+-RPL_YOURESERVICE = '383'
+-RPL_TIME = '391'
+-RPL_USERSSTART = '392'
+-RPL_USERS = '393'
+-RPL_ENDOFUSERS = '394'
+-RPL_NOUSERS = '395'
+-RPL_TRACELINK = '200'
+-RPL_TRACECONNECTING = '201'
+-RPL_TRACEHANDSHAKE = '202'
+-RPL_TRACEUNKNOWN = '203'
+-RPL_TRACEOPERATOR = '204'
+-RPL_TRACEUSER = '205'
+-RPL_TRACESERVER = '206'
+-RPL_TRACESERVICE = '207'
+-RPL_TRACENEWTYPE = '208'
+-RPL_TRACECLASS = '209'
+-RPL_TRACERECONNECT = '210'
+-RPL_TRACELOG = '261'
+-RPL_TRACEEND = '262'
+-RPL_STATSLINKINFO = '211'
+-RPL_STATSCOMMANDS = '212'
+-RPL_ENDOFSTATS = '219'
+-RPL_STATSUPTIME = '242'
+-RPL_STATSOLINE = '243'
+-RPL_UMODEIS = '221'
+-RPL_SERVLIST = '234'
+-RPL_SERVLISTEND = '235'
+-RPL_LUSERCLIENT = '251'
+-RPL_LUSEROP = '252'
+-RPL_LUSERUNKNOWN = '253'
+-RPL_LUSERCHANNELS = '254'
+-RPL_LUSERME = '255'
+-RPL_ADMINME = '256'
+-RPL_ADMINLOC = '257'
+-RPL_ADMINLOC = '258'
+-RPL_ADMINEMAIL = '259'
+-RPL_TRYAGAIN = '263'
+-ERR_NOSUCHNICK = '401'
+-ERR_NOSUCHSERVER = '402'
+-ERR_NOSUCHCHANNEL = '403'
+-ERR_CANNOTSENDTOCHAN = '404'
+-ERR_TOOMANYCHANNELS = '405'
+-ERR_WASNOSUCHNICK = '406'
+-ERR_TOOMANYTARGETS = '407'
+-ERR_NOSUCHSERVICE = '408'
+-ERR_NOORIGIN = '409'
+-ERR_NORECIPIENT = '411'
+-ERR_NOTEXTTOSEND = '412'
+-ERR_NOTOPLEVEL = '413'
+-ERR_WILDTOPLEVEL = '414'
+-ERR_BADMASK = '415'
+-ERR_UNKNOWNCOMMAND = '421'
+-ERR_NOMOTD = '422'
+-ERR_NOADMININFO = '423'
+-ERR_FILEERROR = '424'
+-ERR_NONICKNAMEGIVEN = '431'
+-ERR_ERRONEUSNICKNAME = '432'
+-ERR_NICKNAMEINUSE = '433'
+-ERR_NICKCOLLISION = '436'
+-ERR_UNAVAILRESOURCE = '437'
+-ERR_USERNOTINCHANNEL = '441'
+-ERR_NOTONCHANNEL = '442'
+-ERR_USERONCHANNEL = '443'
+-ERR_NOLOGIN = '444'
+-ERR_SUMMONDISABLED = '445'
+-ERR_USERSDISABLED = '446'
+-ERR_NOTREGISTERED = '451'
+-ERR_NEEDMOREPARAMS = '461'
+-ERR_ALREADYREGISTRED = '462'
+-ERR_NOPERMFORHOST = '463'
+-ERR_PASSWDMISMATCH = '464'
+-ERR_YOUREBANNEDCREEP = '465'
+-ERR_YOUWILLBEBANNED = '466'
+-ERR_KEYSET = '467'
+-ERR_CHANNELISFULL = '471'
+-ERR_UNKNOWNMODE = '472'
+-ERR_INVITEONLYCHAN = '473'
+-ERR_BANNEDFROMCHAN = '474'
+-ERR_BADCHANNELKEY = '475'
+-ERR_BADCHANMASK = '476'
+-ERR_NOCHANMODES = '477'
+-ERR_BANLISTFULL = '478'
+-ERR_NOPRIVILEGES = '481'
+-ERR_CHANOPRIVSNEEDED = '482'
+-ERR_CANTKILLSERVER = '483'
+-ERR_RESTRICTED = '484'
+-ERR_UNIQOPPRIVSNEEDED = '485'
+-ERR_NOOPERHOST = '491'
+-ERR_NOSERVICEHOST = '492'
+-ERR_UMODEUNKNOWNFLAG = '501'
+-ERR_USERSDONTMATCH = '502'
++RPL_WELCOME = u'001'
++RPL_YOURHOST = u'002'
++RPL_CREATED = u'003'
++RPL_MYINFO = u'004'
++RPL_ISUPPORT = u'005'
++RPL_BOUNCE = u'010'
++RPL_USERHOST = u'302'
++RPL_ISON = u'303'
++RPL_AWAY = u'301'
++RPL_UNAWAY = u'305'
++RPL_NOWAWAY = u'306'
++RPL_WHOISUSER = u'311'
++RPL_WHOISSERVER = u'312'
++RPL_WHOISOPERATOR = u'313'
++RPL_WHOISIDLE = u'317'
++RPL_ENDOFWHOIS = u'318'
++RPL_WHOISCHANNELS = u'319'
++RPL_WHOWASUSER = u'314'
++RPL_ENDOFWHOWAS = u'369'
++RPL_LISTSTART = u'321'
++RPL_LIST = u'322'
++RPL_LISTEND = u'323'
++RPL_UNIQOPIS = u'325'
++RPL_CHANNELMODEIS = u'324'
++RPL_NOTOPIC = u'331'
++RPL_TOPIC = u'332'
++RPL_INVITING = u'341'
++RPL_SUMMONING = u'342'
++RPL_INVITELIST = u'346'
++RPL_ENDOFINVITELIST = u'347'
++RPL_EXCEPTLIST = u'348'
++RPL_ENDOFEXCEPTLIST = u'349'
++RPL_VERSION = u'351'
++RPL_WHOREPLY = u'352'
++RPL_ENDOFWHO = u'315'
++RPL_NAMREPLY = u'353'
++RPL_ENDOFNAMES = u'366'
++RPL_LINKS = u'364'
++RPL_ENDOFLINKS = u'365'
++RPL_BANLIST = u'367'
++RPL_ENDOFBANLIST = u'368'
++RPL_INFO = u'371'
++RPL_ENDOFINFO = u'374'
++RPL_MOTDSTART = u'375'
++RPL_MOTD = u'372'
++RPL_ENDOFMOTD = u'376'
++RPL_YOUREOPER = u'381'
++RPL_REHASHING = u'382'
++RPL_YOURESERVICE = u'383'
++RPL_TIME = u'391'
++RPL_USERSSTART = u'392'
++RPL_USERS = u'393'
++RPL_ENDOFUSERS = u'394'
++RPL_NOUSERS = u'395'
++RPL_TRACELINK = u'200'
++RPL_TRACECONNECTING = u'201'
++RPL_TRACEHANDSHAKE = u'202'
++RPL_TRACEUNKNOWN = u'203'
++RPL_TRACEOPERATOR = u'204'
++RPL_TRACEUSER = u'205'
++RPL_TRACESERVER = u'206'
++RPL_TRACESERVICE = u'207'
++RPL_TRACENEWTYPE = u'208'
++RPL_TRACECLASS = u'209'
++RPL_TRACERECONNECT = u'210'
++RPL_TRACELOG = u'261'
++RPL_TRACEEND = u'262'
++RPL_STATSLINKINFO = u'211'
++RPL_STATSCOMMANDS = u'212'
++RPL_ENDOFSTATS = u'219'
++RPL_STATSUPTIME = u'242'
++RPL_STATSOLINE = u'243'
++RPL_UMODEIS = u'221'
++RPL_SERVLIST = u'234'
++RPL_SERVLISTEND = u'235'
++RPL_LUSERCLIENT = u'251'
++RPL_LUSEROP = u'252'
++RPL_LUSERUNKNOWN = u'253'
++RPL_LUSERCHANNELS = u'254'
++RPL_LUSERME = u'255'
++RPL_ADMINME = u'256'
++RPL_ADMINLOC = u'257'
++RPL_ADMINLOC = u'258'
++RPL_ADMINEMAIL = u'259'
++RPL_TRYAGAIN = u'263'
++ERR_NOSUCHNICK = u'401'
++ERR_NOSUCHSERVER = u'402'
++ERR_NOSUCHCHANNEL = u'403'
++ERR_CANNOTSENDTOCHAN = u'404'
++ERR_TOOMANYCHANNELS = u'405'
++ERR_WASNOSUCHNICK = u'406'
++ERR_TOOMANYTARGETS = u'407'
++ERR_NOSUCHSERVICE = u'408'
++ERR_NOORIGIN = u'409'
++ERR_NORECIPIENT = u'411'
++ERR_NOTEXTTOSEND = u'412'
++ERR_NOTOPLEVEL = u'413'
++ERR_WILDTOPLEVEL = u'414'
++ERR_BADMASK = u'415'
++ERR_UNKNOWNCOMMAND = u'421'
++ERR_NOMOTD = u'422'
++ERR_NOADMININFO = u'423'
++ERR_FILEERROR = u'424'
++ERR_NONICKNAMEGIVEN = u'431'
++ERR_ERRONEUSNICKNAME = u'432'
++ERR_NICKNAMEINUSE = u'433'
++ERR_NICKCOLLISION = u'436'
++ERR_UNAVAILRESOURCE = u'437'
++ERR_USERNOTINCHANNEL = u'441'
++ERR_NOTONCHANNEL = u'442'
++ERR_USERONCHANNEL = u'443'
++ERR_NOLOGIN = u'444'
++ERR_SUMMONDISABLED = u'445'
++ERR_USERSDISABLED = u'446'
++ERR_NOTREGISTERED = u'451'
++ERR_NEEDMOREPARAMS = u'461'
++ERR_ALREADYREGISTRED = u'462'
++ERR_NOPERMFORHOST = u'463'
++ERR_PASSWDMISMATCH = u'464'
++ERR_YOUREBANNEDCREEP = u'465'
++ERR_YOUWILLBEBANNED = u'466'
++ERR_KEYSET = u'467'
++ERR_CHANNELISFULL = u'471'
++ERR_UNKNOWNMODE = u'472'
++ERR_INVITEONLYCHAN = u'473'
++ERR_BANNEDFROMCHAN = u'474'
++ERR_BADCHANNELKEY = u'475'
++ERR_BADCHANMASK = u'476'
++ERR_NOCHANMODES = u'477'
++ERR_BANLISTFULL = u'478'
++ERR_NOPRIVILEGES = u'481'
++ERR_CHANOPRIVSNEEDED = u'482'
++ERR_CANTKILLSERVER = u'483'
++ERR_RESTRICTED = u'484'
++ERR_UNIQOPPRIVSNEEDED = u'485'
++ERR_NOOPERHOST = u'491'
++ERR_NOSERVICEHOST = u'492'
++ERR_UMODEUNKNOWNFLAG = u'501'
++ERR_USERSDONTMATCH = u'502'
+ 
+ # And hey, as long as the strings are already intern'd...
+ symbolic_to_numeric = {
+-    "RPL_WELCOME": '001',
+-    "RPL_YOURHOST": '002',
+-    "RPL_CREATED": '003',
+-    "RPL_MYINFO": '004',
+-    "RPL_ISUPPORT": '005',
+-    "RPL_BOUNCE": '010',
+-    "RPL_USERHOST": '302',
+-    "RPL_ISON": '303',
+-    "RPL_AWAY": '301',
+-    "RPL_UNAWAY": '305',
+-    "RPL_NOWAWAY": '306',
+-    "RPL_WHOISUSER": '311',
+-    "RPL_WHOISSERVER": '312',
+-    "RPL_WHOISOPERATOR": '313',
+-    "RPL_WHOISIDLE": '317',
+-    "RPL_ENDOFWHOIS": '318',
+-    "RPL_WHOISCHANNELS": '319',
+-    "RPL_WHOWASUSER": '314',
+-    "RPL_ENDOFWHOWAS": '369',
+-    "RPL_LISTSTART": '321',
+-    "RPL_LIST": '322',
+-    "RPL_LISTEND": '323',
+-    "RPL_UNIQOPIS": '325',
+-    "RPL_CHANNELMODEIS": '324',
+-    "RPL_NOTOPIC": '331',
+-    "RPL_TOPIC": '332',
+-    "RPL_INVITING": '341',
+-    "RPL_SUMMONING": '342',
+-    "RPL_INVITELIST": '346',
+-    "RPL_ENDOFINVITELIST": '347',
+-    "RPL_EXCEPTLIST": '348',
+-    "RPL_ENDOFEXCEPTLIST": '349',
+-    "RPL_VERSION": '351',
+-    "RPL_WHOREPLY": '352',
+-    "RPL_ENDOFWHO": '315',
+-    "RPL_NAMREPLY": '353',
+-    "RPL_ENDOFNAMES": '366',
+-    "RPL_LINKS": '364',
+-    "RPL_ENDOFLINKS": '365',
+-    "RPL_BANLIST": '367',
+-    "RPL_ENDOFBANLIST": '368',
+-    "RPL_INFO": '371',
+-    "RPL_ENDOFINFO": '374',
+-    "RPL_MOTDSTART": '375',
+-    "RPL_MOTD": '372',
+-    "RPL_ENDOFMOTD": '376',
+-    "RPL_YOUREOPER": '381',
+-    "RPL_REHASHING": '382',
+-    "RPL_YOURESERVICE": '383',
+-    "RPL_TIME": '391',
+-    "RPL_USERSSTART": '392',
+-    "RPL_USERS": '393',
+-    "RPL_ENDOFUSERS": '394',
+-    "RPL_NOUSERS": '395',
+-    "RPL_TRACELINK": '200',
+-    "RPL_TRACECONNECTING": '201',
+-    "RPL_TRACEHANDSHAKE": '202',
+-    "RPL_TRACEUNKNOWN": '203',
+-    "RPL_TRACEOPERATOR": '204',
+-    "RPL_TRACEUSER": '205',
+-    "RPL_TRACESERVER": '206',
+-    "RPL_TRACESERVICE": '207',
+-    "RPL_TRACENEWTYPE": '208',
+-    "RPL_TRACECLASS": '209',
+-    "RPL_TRACERECONNECT": '210',
+-    "RPL_TRACELOG": '261',
+-    "RPL_TRACEEND": '262',
+-    "RPL_STATSLINKINFO": '211',
+-    "RPL_STATSCOMMANDS": '212',
+-    "RPL_ENDOFSTATS": '219',
+-    "RPL_STATSUPTIME": '242',
+-    "RPL_STATSOLINE": '243',
+-    "RPL_UMODEIS": '221',
+-    "RPL_SERVLIST": '234',
+-    "RPL_SERVLISTEND": '235',
+-    "RPL_LUSERCLIENT": '251',
+-    "RPL_LUSEROP": '252',
+-    "RPL_LUSERUNKNOWN": '253',
+-    "RPL_LUSERCHANNELS": '254',
+-    "RPL_LUSERME": '255',
+-    "RPL_ADMINME": '256',
+-    "RPL_ADMINLOC": '257',
+-    "RPL_ADMINLOC": '258',
+-    "RPL_ADMINEMAIL": '259',
+-    "RPL_TRYAGAIN": '263',
+-    "ERR_NOSUCHNICK": '401',
+-    "ERR_NOSUCHSERVER": '402',
+-    "ERR_NOSUCHCHANNEL": '403',
+-    "ERR_CANNOTSENDTOCHAN": '404',
+-    "ERR_TOOMANYCHANNELS": '405',
+-    "ERR_WASNOSUCHNICK": '406',
+-    "ERR_TOOMANYTARGETS": '407',
+-    "ERR_NOSUCHSERVICE": '408',
+-    "ERR_NOORIGIN": '409',
+-    "ERR_NORECIPIENT": '411',
+-    "ERR_NOTEXTTOSEND": '412',
+-    "ERR_NOTOPLEVEL": '413',
+-    "ERR_WILDTOPLEVEL": '414',
+-    "ERR_BADMASK": '415',
+-    "ERR_UNKNOWNCOMMAND": '421',
+-    "ERR_NOMOTD": '422',
+-    "ERR_NOADMININFO": '423',
+-    "ERR_FILEERROR": '424',
+-    "ERR_NONICKNAMEGIVEN": '431',
+-    "ERR_ERRONEUSNICKNAME": '432',
+-    "ERR_NICKNAMEINUSE": '433',
+-    "ERR_NICKCOLLISION": '436',
+-    "ERR_UNAVAILRESOURCE": '437',
+-    "ERR_USERNOTINCHANNEL": '441',
+-    "ERR_NOTONCHANNEL": '442',
+-    "ERR_USERONCHANNEL": '443',
+-    "ERR_NOLOGIN": '444',
+-    "ERR_SUMMONDISABLED": '445',
+-    "ERR_USERSDISABLED": '446',
+-    "ERR_NOTREGISTERED": '451',
+-    "ERR_NEEDMOREPARAMS": '461',
+-    "ERR_ALREADYREGISTRED": '462',
+-    "ERR_NOPERMFORHOST": '463',
+-    "ERR_PASSWDMISMATCH": '464',
+-    "ERR_YOUREBANNEDCREEP": '465',
+-    "ERR_YOUWILLBEBANNED": '466',
+-    "ERR_KEYSET": '467',
+-    "ERR_CHANNELISFULL": '471',
+-    "ERR_UNKNOWNMODE": '472',
+-    "ERR_INVITEONLYCHAN": '473',
+-    "ERR_BANNEDFROMCHAN": '474',
+-    "ERR_BADCHANNELKEY": '475',
+-    "ERR_BADCHANMASK": '476',
+-    "ERR_NOCHANMODES": '477',
+-    "ERR_BANLISTFULL": '478',
+-    "ERR_NOPRIVILEGES": '481',
+-    "ERR_CHANOPRIVSNEEDED": '482',
+-    "ERR_CANTKILLSERVER": '483',
+-    "ERR_RESTRICTED": '484',
+-    "ERR_UNIQOPPRIVSNEEDED": '485',
+-    "ERR_NOOPERHOST": '491',
+-    "ERR_NOSERVICEHOST": '492',
+-    "ERR_UMODEUNKNOWNFLAG": '501',
+-    "ERR_USERSDONTMATCH": '502',
++    u"RPL_WELCOME": u'001',
++    u"RPL_YOURHOST": u'002',
++    u"RPL_CREATED": u'003',
++    u"RPL_MYINFO": u'004',
++    u"RPL_ISUPPORT": u'005',
++    u"RPL_BOUNCE": u'010',
++    u"RPL_USERHOST": u'302',
++    u"RPL_ISON": u'303',
++    u"RPL_AWAY": u'301',
++    u"RPL_UNAWAY": u'305',
++    u"RPL_NOWAWAY": u'306',
++    u"RPL_WHOISUSER": u'311',
++    u"RPL_WHOISSERVER": u'312',
++    u"RPL_WHOISOPERATOR": u'313',
++    u"RPL_WHOISIDLE": u'317',
++    u"RPL_ENDOFWHOIS": u'318',
++    u"RPL_WHOISCHANNELS": u'319',
++    u"RPL_WHOWASUSER": u'314',
++    u"RPL_ENDOFWHOWAS": u'369',
++    u"RPL_LISTSTART": u'321',
++    u"RPL_LIST": u'322',
++    u"RPL_LISTEND": u'323',
++    u"RPL_UNIQOPIS": u'325',
++    u"RPL_CHANNELMODEIS": u'324',
++    u"RPL_NOTOPIC": u'331',
++    u"RPL_TOPIC": u'332',
++    u"RPL_INVITING": u'341',
++    u"RPL_SUMMONING": u'342',
++    u"RPL_INVITELIST": u'346',
++    u"RPL_ENDOFINVITELIST": u'347',
++    u"RPL_EXCEPTLIST": u'348',
++    u"RPL_ENDOFEXCEPTLIST": u'349',
++    u"RPL_VERSION": u'351',
++    u"RPL_WHOREPLY": u'352',
++    u"RPL_ENDOFWHO": u'315',
++    u"RPL_NAMREPLY": u'353',
++    u"RPL_ENDOFNAMES": u'366',
++    u"RPL_LINKS": u'364',
++    u"RPL_ENDOFLINKS": u'365',
++    u"RPL_BANLIST": u'367',
++    u"RPL_ENDOFBANLIST": u'368',
++    u"RPL_INFO": u'371',
++    u"RPL_ENDOFINFO": u'374',
++    u"RPL_MOTDSTART": u'375',
++    u"RPL_MOTD": u'372',
++    u"RPL_ENDOFMOTD": u'376',
++    u"RPL_YOUREOPER": u'381',
++    u"RPL_REHASHING": u'382',
++    u"RPL_YOURESERVICE": u'383',
++    u"RPL_TIME": u'391',
++    u"RPL_USERSSTART": u'392',
++    u"RPL_USERS": u'393',
++    u"RPL_ENDOFUSERS": u'394',
++    u"RPL_NOUSERS": u'395',
++    u"RPL_TRACELINK": u'200',
++    u"RPL_TRACECONNECTING": u'201',
++    u"RPL_TRACEHANDSHAKE": u'202',
++    u"RPL_TRACEUNKNOWN": u'203',
++    u"RPL_TRACEOPERATOR": u'204',
++    u"RPL_TRACEUSER": u'205',
++    u"RPL_TRACESERVER": u'206',
++    u"RPL_TRACESERVICE": u'207',
++    u"RPL_TRACENEWTYPE": u'208',
++    u"RPL_TRACECLASS": u'209',
++    u"RPL_TRACERECONNECT": u'210',
++    u"RPL_TRACELOG": u'261',
++    u"RPL_TRACEEND": u'262',
++    u"RPL_STATSLINKINFO": u'211',
++    u"RPL_STATSCOMMANDS": u'212',
++    u"RPL_ENDOFSTATS": u'219',
++    u"RPL_STATSUPTIME": u'242',
++    u"RPL_STATSOLINE": u'243',
++    u"RPL_UMODEIS": u'221',
++    u"RPL_SERVLIST": u'234',
++    u"RPL_SERVLISTEND": u'235',
++    u"RPL_LUSERCLIENT": u'251',
++    u"RPL_LUSEROP": u'252',
++    u"RPL_LUSERUNKNOWN": u'253',
++    u"RPL_LUSERCHANNELS": u'254',
++    u"RPL_LUSERME": u'255',
++    u"RPL_ADMINME": u'256',
++    u"RPL_ADMINLOC": u'257',
++    u"RPL_ADMINLOC": u'258',
++    u"RPL_ADMINEMAIL": u'259',
++    u"RPL_TRYAGAIN": u'263',
++    u"ERR_NOSUCHNICK": u'401',
++    u"ERR_NOSUCHSERVER": u'402',
++    u"ERR_NOSUCHCHANNEL": u'403',
++    u"ERR_CANNOTSENDTOCHAN": u'404',
++    u"ERR_TOOMANYCHANNELS": u'405',
++    u"ERR_WASNOSUCHNICK": u'406',
++    u"ERR_TOOMANYTARGETS": u'407',
++    u"ERR_NOSUCHSERVICE": u'408',
++    u"ERR_NOORIGIN": u'409',
++    u"ERR_NORECIPIENT": u'411',
++    u"ERR_NOTEXTTOSEND": u'412',
++    u"ERR_NOTOPLEVEL": u'413',
++    u"ERR_WILDTOPLEVEL": u'414',
++    u"ERR_BADMASK": u'415',
++    u"ERR_UNKNOWNCOMMAND": u'421',
++    u"ERR_NOMOTD": u'422',
++    u"ERR_NOADMININFO": u'423',
++    u"ERR_FILEERROR": u'424',
++    u"ERR_NONICKNAMEGIVEN": u'431',
++    u"ERR_ERRONEUSNICKNAME": u'432',
++    u"ERR_NICKNAMEINUSE": u'433',
++    u"ERR_NICKCOLLISION": u'436',
++    u"ERR_UNAVAILRESOURCE": u'437',
++    u"ERR_USERNOTINCHANNEL": u'441',
++    u"ERR_NOTONCHANNEL": u'442',
++    u"ERR_USERONCHANNEL": u'443',
++    u"ERR_NOLOGIN": u'444',
++    u"ERR_SUMMONDISABLED": u'445',
++    u"ERR_USERSDISABLED": u'446',
++    u"ERR_NOTREGISTERED": u'451',
++    u"ERR_NEEDMOREPARAMS": u'461',
++    u"ERR_ALREADYREGISTRED": u'462',
++    u"ERR_NOPERMFORHOST": u'463',
++    u"ERR_PASSWDMISMATCH": u'464',
++    u"ERR_YOUREBANNEDCREEP": u'465',
++    u"ERR_YOUWILLBEBANNED": u'466',
++    u"ERR_KEYSET": u'467',
++    u"ERR_CHANNELISFULL": u'471',
++    u"ERR_UNKNOWNMODE": u'472',
++    u"ERR_INVITEONLYCHAN": u'473',
++    u"ERR_BANNEDFROMCHAN": u'474',
++    u"ERR_BADCHANNELKEY": u'475',
++    u"ERR_BADCHANMASK": u'476',
++    u"ERR_NOCHANMODES": u'477',
++    u"ERR_BANLISTFULL": u'478',
++    u"ERR_NOPRIVILEGES": u'481',
++    u"ERR_CHANOPRIVSNEEDED": u'482',
++    u"ERR_CANTKILLSERVER": u'483',
++    u"ERR_RESTRICTED": u'484',
++    u"ERR_UNIQOPPRIVSNEEDED": u'485',
++    u"ERR_NOOPERHOST": u'491',
++    u"ERR_NOSERVICEHOST": u'492',
++    u"ERR_UMODEUNKNOWNFLAG": u'501',
++    u"ERR_USERSDONTMATCH": u'502',
+ }
+ 
+ numeric_to_symbolic = {}
+diff --git twisted/words/test/test_irc.py twisted/words/test/test_irc.py
+index ffda689..ca26bcd 100644
+--- twisted/words/test/test_irc.py
++++ twisted/words/test/test_irc.py
+@@ -20,14 +20,14 @@ class ModeParsingTests(unittest.TestCase):
+     """
+     Tests for L{twisted.words.protocols.irc.parseModes}.
+     """
+-    paramModes = ('klb', 'b')
++    paramModes = (u'klb', u'b')
+ 
+ 
+     def test_emptyModes(self):
+         """
+         Parsing an empty mode string raises L{irc.IRCBadModes}.
+         """
+-        self.assertRaises(irc.IRCBadModes, irc.parseModes, '', [])
++        self.assertRaises(irc.IRCBadModes, irc.parseModes, u'', [])
+ 
+ 
+     def test_emptyModeSequence(self):
+@@ -36,10 +36,10 @@ class ModeParsingTests(unittest.TestCase):
+         C{-} followed directly by another C{+} or C{-}, or not followed by
+         anything at all) raises L{irc.IRCBadModes}.
+         """
+-        self.assertRaises(irc.IRCBadModes, irc.parseModes, '++k', [])
+-        self.assertRaises(irc.IRCBadModes, irc.parseModes, '-+k', [])
+-        self.assertRaises(irc.IRCBadModes, irc.parseModes, '+', [])
+-        self.assertRaises(irc.IRCBadModes, irc.parseModes, '-', [])
++        self.assertRaises(irc.IRCBadModes, irc.parseModes, u'++k', [])
++        self.assertRaises(irc.IRCBadModes, irc.parseModes, u'-+k', [])
++        self.assertRaises(irc.IRCBadModes, irc.parseModes, u'+', [])
++        self.assertRaises(irc.IRCBadModes, irc.parseModes, u'-', [])
+ 
+ 
+     def test_malformedModes(self):
+@@ -47,8 +47,8 @@ class ModeParsingTests(unittest.TestCase):
+         Parsing a mode string that does not start with C{+} or C{-} raises
+         L{irc.IRCBadModes}.
+         """
+-        self.assertRaises(irc.IRCBadModes, irc.parseModes, 'foo', [])
+-        self.assertRaises(irc.IRCBadModes, irc.parseModes, '%', [])
++        self.assertRaises(irc.IRCBadModes, irc.parseModes, u'foo', [])
++        self.assertRaises(irc.IRCBadModes, irc.parseModes, u'%', [])
+ 
+ 
+     def test_nullModes(self):
+@@ -56,8 +56,8 @@ class ModeParsingTests(unittest.TestCase):
+         Parsing a mode string that contains no mode characters raises
+         L{irc.IRCBadModes}.
+         """
+-        self.assertRaises(irc.IRCBadModes, irc.parseModes, '+', [])
+-        self.assertRaises(irc.IRCBadModes, irc.parseModes, '-', [])
++        self.assertRaises(irc.IRCBadModes, irc.parseModes, u'+', [])
++        self.assertRaises(irc.IRCBadModes, irc.parseModes, u'-', [])
+ 
+ 
+     def test_singleMode(self):
+@@ -66,13 +66,13 @@ class ModeParsingTests(unittest.TestCase):
+         with no parameters, in the "added" direction and no modes in the
+         "removed" direction.
+         """
+-        added, removed = irc.parseModes('+s', [])
+-        self.assertEqual(added, [('s', None)])
++        added, removed = irc.parseModes(u'+s', [])
++        self.assertEqual(added, [(u's', None)])
+         self.assertEqual(removed, [])
+ 
+-        added, removed = irc.parseModes('-s', [])
++        added, removed = irc.parseModes(u'-s', [])
+         self.assertEqual(added, [])
+-        self.assertEqual(removed, [('s', None)])
++        self.assertEqual(removed, [(u's', None)])
+ 
+ 
+     def test_singleDirection(self):
+@@ -80,27 +80,27 @@ class ModeParsingTests(unittest.TestCase):
+         Parsing a single-direction mode setting with multiple modes and no
+         parameters, results in all modes falling into the same direction group.
+         """
+-        added, removed = irc.parseModes('+stn', [])
+-        self.assertEqual(added, [('s', None),
+-                                  ('t', None),
+-                                  ('n', None)])
++        added, removed = irc.parseModes(u'+stn', [])
++        self.assertEqual(added, [(u's', None),
++                                  (u't', None),
++                                  (u'n', None)])
+         self.assertEqual(removed, [])
+ 
+-        added, removed = irc.parseModes('-nt', [])
++        added, removed = irc.parseModes(u'-nt', [])
+         self.assertEqual(added, [])
+-        self.assertEqual(removed, [('n', None),
+-                                    ('t', None)])
++        self.assertEqual(removed, [(u'n', None),
++                                    (u't', None)])
+ 
+ 
+     def test_multiDirection(self):
+         """
+         Parsing a multi-direction mode setting with no parameters.
+         """
+-        added, removed = irc.parseModes('+s-n+ti', [])
+-        self.assertEqual(added, [('s', None),
+-                                  ('t', None),
+-                                  ('i', None)])
+-        self.assertEqual(removed, [('n', None)])
++        added, removed = irc.parseModes(u'+s-n+ti', [])
++        self.assertEqual(added, [(u's', None),
++                                  (u't', None),
++                                  (u'i', None)])
++        self.assertEqual(removed, [(u'n', None)])
+ 
+ 
+     def test_consecutiveDirection(self):
+@@ -109,11 +109,11 @@ class ModeParsingTests(unittest.TestCase):
+         sequences with the same direction results in the same result as if
+         there were only one mode sequence in the same direction.
+         """
+-        added, removed = irc.parseModes('+sn+ti', [])
+-        self.assertEqual(added, [('s', None),
+-                                  ('n', None),
+-                                  ('t', None),
+-                                  ('i', None)])
++        added, removed = irc.parseModes(u'+sn+ti', [])
++        self.assertEqual(added, [(u's', None),
++                                  (u'n', None),
++                                  (u't', None),
++                                  (u'i', None)])
+         self.assertEqual(removed, [])
+ 
+ 
+@@ -124,11 +124,11 @@ class ModeParsingTests(unittest.TestCase):
+         """
+         self.assertRaises(irc.IRCBadModes,
+                           irc.parseModes,
+-                          '+k', [],
++                          u'+k', [],
+                           self.paramModes)
+         self.assertRaises(irc.IRCBadModes,
+                           irc.parseModes,
+-                          '+kl', ['foo', '10', 'lulz_extra_param'],
++                          u'+kl', [u'foo', u'10', u'lulz_extra_param'],
+                           self.paramModes)
+ 
+ 
+@@ -139,44 +139,44 @@ class ModeParsingTests(unittest.TestCase):
+         the parameters.
+         """
+         added, removed = irc.parseModes(
+-            '+klbb',
+-            ['somekey', '42', 'nick!user@host', 'other!*@*'],
++            u'+klbb',
++            [u'somekey', u'42', u'nick!user@host', u'other!*@*'],
+             self.paramModes)
+-        self.assertEqual(added, [('k', 'somekey'),
+-                                  ('l', '42'),
+-                                  ('b', 'nick!user@host'),
+-                                  ('b', 'other!*@*')])
++        self.assertEqual(added, [(u'k', u'somekey'),
++                                  (u'l', u'42'),
++                                  (u'b', u'nick!user@host'),
++                                  (u'b', u'other!*@*')])
+         self.assertEqual(removed, [])
+ 
+         added, removed = irc.parseModes(
+-            '-klbb',
+-            ['nick!user@host', 'other!*@*'],
++            u'-klbb',
++            [u'nick!user@host', u'other!*@*'],
+             self.paramModes)
+         self.assertEqual(added, [])
+-        self.assertEqual(removed, [('k', None),
+-                                    ('l', None),
+-                                    ('b', 'nick!user@host'),
+-                                    ('b', 'other!*@*')])
++        self.assertEqual(removed, [(u'k', None),
++                                    (u'l', None),
++                                    (u'b', 'nick!user@host'),
++                                    (u'b', 'other!*@*')])
+ 
+         # Mix a no-argument mode in with argument modes.
+         added, removed = irc.parseModes(
+-            '+knbb',
+-            ['somekey', 'nick!user@host', 'other!*@*'],
++            u'+knbb',
++            [u'somekey', u'nick!user@host', u'other!*@*'],
+             self.paramModes)
+-        self.assertEqual(added, [('k', 'somekey'),
+-                                  ('n', None),
+-                                  ('b', 'nick!user@host'),
+-                                  ('b', 'other!*@*')])
++        self.assertEqual(added, [(u'k', u'somekey'),
++                                  (u'n', None),
++                                  (u'b', u'nick!user@host'),
++                                  (u'b', u'other!*@*')])
+         self.assertEqual(removed, [])
+ 
+ 
+ 
+ stringSubjects = [
+-    "Hello, this is a nice string with no complications.",
+-    "xargs%(NUL)smight%(NUL)slike%(NUL)sthis" % {'NUL': irc.NUL },
+-    "embedded%(CR)snewline%(CR)s%(NL)sFUN%(NL)s" % {'CR': irc.CR,
++    u"Hello, this is a nice string with no complications.",
++    u"xargs%(NUL)smight%(NUL)slike%(NUL)sthis" % {'NUL': irc.NUL },
++    u"embedded%(CR)snewline%(CR)s%(NL)sFUN%(NL)s" % {'CR': irc.CR,
+                                                     'NL': irc.NL},
+-    "escape!%(X)s escape!%(M)s %(X)s%(X)sa %(M)s0" % {'X': irc.X_QUOTE,
++    u"escape!%(X)s escape!%(M)s %(X)s%(X)sa %(M)s0" % {'X': irc.X_QUOTE,
+                                                       'M': irc.M_QUOTE}
+     ]
+ 
+@@ -203,7 +203,7 @@ class Dispatcher(irc._CommandDispatcherMixin):
+     """
+     A dispatcher that exposes one known command and handles unknown commands.
+     """
+-    prefix = 'disp'
++    prefix = u'disp'
+ 
+     def disp_working(self, a, b):
+         """
+@@ -230,7 +230,7 @@ class DispatcherTests(unittest.TestCase):
+         """
+         disp = Dispatcher()
+         args = (1, 2)
+-        res = disp.dispatch('working', *args)
++        res = disp.dispatch(u'working', *args)
+         self.assertEqual(res, args)
+ 
+ 
+@@ -239,7 +239,7 @@ class DispatcherTests(unittest.TestCase):
+         Dispatching an unknown command invokes the default handler.
+         """
+         disp = Dispatcher()
+-        name = 'missing'
++        name = u'missing'
+         args = (1, 2)
+         res = disp.dispatch(name, *args)
+         self.assertEqual(res, (name,) + args)
+@@ -252,7 +252,7 @@ class DispatcherTests(unittest.TestCase):
+         """
+         disp = Dispatcher()
+         disp.disp_unknown = None
+-        self.assertRaises(irc.UnhandledCommand, disp.dispatch, 'bar')
++        self.assertRaises(irc.UnhandledCommand, disp.dispatch, u'bar')
+ 
+ 
+ 
+@@ -267,9 +267,9 @@ class ServerSupportedFeatureTests(unittest.TestCase):
+         """
+         self.assertEqual(irc._intOrDefault(None), None)
+         self.assertEqual(irc._intOrDefault([]), None)
+-        self.assertEqual(irc._intOrDefault(''), None)
+-        self.assertEqual(irc._intOrDefault('hello', 5), 5)
+-        self.assertEqual(irc._intOrDefault('123'), 123)
++        self.assertEqual(irc._intOrDefault(u''), None)
++        self.assertEqual(irc._intOrDefault(u'hello', 5), 5)
++        self.assertEqual(irc._intOrDefault(u'123'), 123)
+         self.assertEqual(irc._intOrDefault(123), 123)
+ 
+ 
+@@ -280,14 +280,14 @@ class ServerSupportedFeatureTests(unittest.TestCase):
+         key and a list containing only the empty string. Escaped parameters
+         are unescaped.
+         """
+-        params = [('FOO',         ('FOO', [''])),
+-                  ('FOO=',        ('FOO', [''])),
+-                  ('FOO=1',       ('FOO', ['1'])),
+-                  ('FOO=1,2,3',   ('FOO', ['1', '2', '3'])),
+-                  ('FOO=A\\x20B', ('FOO', ['A B'])),
+-                  ('FOO=\\x5Cx',  ('FOO', ['\\x'])),
+-                  ('FOO=\\',      ('FOO', ['\\'])),
+-                  ('FOO=\\n',     ('FOO', ['\\n']))]
++        params = [(u'FOO',         (u'FOO', [u''])),
++                  (u'FOO=',        (u'FOO', [u''])),
++                  (u'FOO=1',       (u'FOO', [u'1'])),
++                  (u'FOO=1,2,3',   (u'FOO', [u'1', u'2', u'3'])),
++                  (u'FOO=A\\x20B', (u'FOO', [u'A B'])),
++                  (u'FOO=\\x5Cx',  (u'FOO', [u'\\x'])),
++                  (u'FOO=\\',      (u'FOO', [u'\\'])),
++                  (u'FOO=\\n',     (u'FOO', [u'\\n']))]
+ 
+         _splitParam = irc.ServerSupportedFeatures._splitParam
+ 
+@@ -295,10 +295,10 @@ class ServerSupportedFeatureTests(unittest.TestCase):
+             res = _splitParam(param)
+             self.assertEqual(res, expected)
+ 
+-        self.assertRaises(ValueError, _splitParam, 'FOO=\\x')
+-        self.assertRaises(ValueError, _splitParam, 'FOO=\\xNN')
+-        self.assertRaises(ValueError, _splitParam, 'FOO=\\xN')
+-        self.assertRaises(ValueError, _splitParam, 'FOO=\\x20\\x')
++        self.assertRaises(ValueError, _splitParam, u'FOO=\\x')
++        self.assertRaises(ValueError, _splitParam, u'FOO=\\xNN')
++        self.assertRaises(ValueError, _splitParam, u'FOO=\\xN')
++        self.assertRaises(ValueError, _splitParam, u'FOO=\\x20\\x')
+ 
+ 
+     def test_splitParamArgs(self):
+@@ -307,11 +307,11 @@ class ServerSupportedFeatureTests(unittest.TestCase):
+         arguments into key and value.  Arguments without a separator are
+         split into a key and an empty string.
+         """
+-        res = irc.ServerSupportedFeatures._splitParamArgs(['A:1', 'B:2', 'C:', 'D'])
+-        self.assertEqual(res, [('A', '1'),
+-                                ('B', '2'),
+-                                ('C', ''),
+-                                ('D', '')])
++        res = irc.ServerSupportedFeatures._splitParamArgs([u'A:1', u'B:2', u'C:', u'D'])
++        self.assertEqual(res, [(u'A', u'1'),
++                                (u'B', u'2'),
++                                (u'C', u''),
++                                (u'D', u'')])
+ 
+ 
+     def test_splitParamArgsProcessor(self):
+@@ -320,11 +320,11 @@ class ServerSupportedFeatureTests(unittest.TestCase):
+         passed to to convert ISUPPORT argument values to some more suitable
+         form.
+         """
+-        res = irc.ServerSupportedFeatures._splitParamArgs(['A:1', 'B:2', 'C'],
++        res = irc.ServerSupportedFeatures._splitParamArgs([u'A:1', u'B:2', u'C'],
+                                            irc._intOrDefault)
+-        self.assertEqual(res, [('A', 1),
+-                                ('B', 2),
+-                                ('C', None)])
++        self.assertEqual(res, [(u'A', 1),
++                                (u'B', 2),
++                                (u'C', None)])
+ 
+ 
+     def test_parsePrefixParam(self):
+@@ -335,11 +335,11 @@ class ServerSupportedFeatureTests(unittest.TestCase):
+         C{ValueError} if the prefix parameter is malformed.
+         """
+         _parsePrefixParam = irc.ServerSupportedFeatures._parsePrefixParam
+-        self.assertEqual(_parsePrefixParam(''), None)
+-        self.assertRaises(ValueError, _parsePrefixParam, 'hello')
+-        self.assertEqual(_parsePrefixParam('(ov)@+'),
+-                          {'o': ('@', 0),
+-                           'v': ('+', 1)})
++        self.assertEqual(_parsePrefixParam(u''), None)
++        self.assertRaises(ValueError, _parsePrefixParam, u'hello')
++        self.assertEqual(_parsePrefixParam(u'(ov)@+'),
++                          {u'o': (u'@', 0),
++                           u'v': (u'+', 1)})
+ 
+ 
+     def test_parseChanModesParam(self):
+@@ -353,28 +353,28 @@ class ServerSupportedFeatureTests(unittest.TestCase):
+         _parseChanModesParam = irc.ServerSupportedFeatures._parseChanModesParam
+         self.assertEqual(
+             _parseChanModesParam([]),
+-            {'addressModes': '',
+-             'param': '',
+-             'setParam': '',
+-             'noParam': ''})
++            {u'addressModes': u'',
++             u'param': u'',
++             u'setParam': u'',
++             u'noParam': u''})
+ 
+         self.assertEqual(
+-            _parseChanModesParam(['b', 'k', 'l', 'imnpst']),
+-            {'addressModes': 'b',
+-             'param': 'k',
+-             'setParam': 'l',
+-             'noParam': 'imnpst'})
++            _parseChanModesParam([u'b', u'k', u'l', u'imnpst']),
++            {u'addressModes': u'b',
++             u'param': u'k',
++             u'setParam': u'l',
++             u'noParam': u'imnpst'})
+ 
+         self.assertEqual(
+-            _parseChanModesParam(['b', 'k', 'l']),
+-            {'addressModes': 'b',
+-             'param': 'k',
+-             'setParam': 'l',
+-             'noParam': ''})
++            _parseChanModesParam([u'b', u'k', u'l']),
++            {u'addressModes': u'b',
++             u'param': u'k',
++             u'setParam': u'l',
++             u'noParam': u''})
+ 
+         self.assertRaises(
+             ValueError,
+-            _parseChanModesParam, ['a', 'b', 'c', 'd', 'e'])
++            _parseChanModesParam, [u'a', u'b', u'c', u'd', u'e'])
+ 
+ 
+     def test_parse(self):
+@@ -385,25 +385,25 @@ class ServerSupportedFeatureTests(unittest.TestCase):
+         parameters.
+         """
+         supported = irc.ServerSupportedFeatures()
+-        supported.parse(['MODES=4',
+-                        'CHANLIMIT=#:20,&:10',
+-                        'INVEX',
+-                        'EXCEPTS=Z',
+-                        'UNKNOWN=A,B,C'])
+-
+-        self.assertEqual(supported.getFeature('MODES'), 4)
+-        self.assertEqual(supported.getFeature('CHANLIMIT'),
+-                          [('#', 20),
+-                           ('&', 10)])
+-        self.assertEqual(supported.getFeature('INVEX'), 'I')
+-        self.assertEqual(supported.getFeature('EXCEPTS'), 'Z')
+-        self.assertEqual(supported.getFeature('UNKNOWN'), ('A', 'B', 'C'))
+-
+-        self.assertTrue(supported.hasFeature('INVEX'))
+-        supported.parse(['-INVEX'])
+-        self.assertFalse(supported.hasFeature('INVEX'))
++        supported.parse([u'MODES=4',
++                        u'CHANLIMIT=#:20,&:10',
++                        u'INVEX',
++                        u'EXCEPTS=Z',
++                        u'UNKNOWN=A,B,C'])
++
++        self.assertEqual(supported.getFeature(u'MODES'), 4)
++        self.assertEqual(supported.getFeature(u'CHANLIMIT'),
++                          [(u'#', 20),
++                           (u'&', 10)])
++        self.assertEqual(supported.getFeature(u'INVEX'), u'I')
++        self.assertEqual(supported.getFeature(u'EXCEPTS'), u'Z')
++        self.assertEqual(supported.getFeature(u'UNKNOWN'), (u'A', u'B', u'C'))
++
++        self.assertTrue(supported.hasFeature(u'INVEX'))
++        supported.parse([u'-INVEX'])
++        self.assertFalse(supported.hasFeature(u'INVEX'))
+         # Unsetting a previously unset parameter should not be a problem.
+-        supported.parse(['-INVEX'])
++        supported.parse([u'-INVEX'])
+ 
+ 
+     def _parse(self, features):
+@@ -416,7 +416,7 @@ class ServerSupportedFeatureTests(unittest.TestCase):
+         @rtype: L{irc.ServerSupportedFeatures}
+         """
+         supported = irc.ServerSupportedFeatures()
+-        features = ['%s=%s' % (name, value or '')
++        features = [u'%s=%s' % (name, value or u'')
+                     for name, value in features]
+         supported.parse(features)
+         return supported
+@@ -439,10 +439,10 @@ class ServerSupportedFeatureTests(unittest.TestCase):
+             self._parseFeature(name, None),
+             default)
+         self.assertEqual(
+-            self._parseFeature(name, 'notanint'),
++            self._parseFeature(name, u'notanint'),
+             default)
+         self.assertEqual(
+-            self._parseFeature(name, '42'),
++            self._parseFeature(name, u'42'),
+             42)
+ 
+ 
+@@ -455,7 +455,7 @@ class ServerSupportedFeatureTests(unittest.TestCase):
+         default = irc.ServerSupportedFeatures()._features[name]
+ 
+         if features is None:
+-            features = [('DEFINITELY_NOT', 'a_feature')]
++            features = [(u'DEFINITELY_NOT', u'a_feature')]
+ 
+         supported = self._parse(features)
+         self.assertTrue(supported.hasFeature(name))
+@@ -468,30 +468,30 @@ class ServerSupportedFeatureTests(unittest.TestCase):
+         four mode categories, C{'addressModes'}, C{'param'}, C{'setParam'}, and
+         C{'noParam'}.
+         """
+-        self._testFeatureDefault('CHANMODES')
+-        self._testFeatureDefault('CHANMODES', [('CHANMODES', 'b,,lk,')])
+-        self._testFeatureDefault('CHANMODES', [('CHANMODES', 'b,,lk,ha,ha')])
++        self._testFeatureDefault(u'CHANMODES')
++        self._testFeatureDefault(u'CHANMODES', [(u'CHANMODES', u'b,,lk,')])
++        self._testFeatureDefault(u'CHANMODES', [(u'CHANMODES', u'b,,lk,ha,ha')])
+ 
+         self.assertEqual(
+-            self._parseFeature('CHANMODES', ''),
+-            {'addressModes': '',
+-             'param': '',
+-             'setParam': '',
+-             'noParam': ''})
++            self._parseFeature(u'CHANMODES', u''),
++            {u'addressModes': u'',
++             u'param': u'',
++             u'setParam': u'',
++             u'noParam': u''})
+ 
+         self.assertEqual(
+-            self._parseFeature('CHANMODES', ',A'),
+-            {'addressModes': '',
+-             'param': 'A',
+-             'setParam': '',
+-             'noParam': ''})
++            self._parseFeature(u'CHANMODES', u',A'),
++            {u'addressModes': u'',
++             u'param': u'A',
++             u'setParam': u'',
++             u'noParam': u''})
+ 
+         self.assertEqual(
+-            self._parseFeature('CHANMODES', 'A,Bc,Def,Ghij'),
+-            {'addressModes': 'A',
+-             'param': 'Bc',
+-             'setParam': 'Def',
+-             'noParam': 'Ghij'})
++            self._parseFeature(u'CHANMODES', u'A,Bc,Def,Ghij'),
++            {u'addressModes': u'A',
++             u'param': u'Bc',
++             u'setParam': u'Def',
++             u'noParam': u'Ghij'})
+ 
+ 
+     def test_support_IDCHAN(self):
+@@ -500,8 +500,8 @@ class ServerSupportedFeatureTests(unittest.TestCase):
+         giving channel prefix and ID length pairs.
+         """
+         self.assertEqual(
+-            self._parseFeature('IDCHAN', '!:5'),
+-            [('!', '5')])
++            self._parseFeature(u'IDCHAN', u'!:5'),
++            [(u'!', u'5')])
+ 
+ 
+     def test_support_MAXLIST(self):
+@@ -510,15 +510,15 @@ class ServerSupportedFeatureTests(unittest.TestCase):
+         giving modes and their limits.
+         """
+         self.assertEqual(
+-            self._parseFeature('MAXLIST', 'b:25,eI:50'),
+-            [('b', 25), ('eI', 50)])
++            self._parseFeature(u'MAXLIST', u'b:25,eI:50'),
++            [(u'b', 25), (u'eI', 50)])
+         # A non-integer parameter argument results in None.
+         self.assertEqual(
+-            self._parseFeature('MAXLIST', 'b:25,eI:50,a:3.1415'),
+-            [('b', 25), ('eI', 50), ('a', None)])
++            self._parseFeature(u'MAXLIST', u'b:25,eI:50,a:3.1415'),
++            [(u'b', 25), (u'eI', 50), (u'a', None)])
+         self.assertEqual(
+-            self._parseFeature('MAXLIST', 'b:25,eI:50,a:notanint'),
+-            [('b', 25), ('eI', 50), ('a', None)])
++            self._parseFeature(u'MAXLIST', u'b:25,eI:50,a:notanint'),
++            [(u'b', 25), (u'eI', 50), (u'a', None)])
+ 
+ 
+     def test_support_NETWORK(self):
+@@ -527,8 +527,8 @@ class ServerSupportedFeatureTests(unittest.TestCase):
+         specified by the server.
+         """
+         self.assertEqual(
+-            self._parseFeature('NETWORK', 'IRCNet'),
+-            'IRCNet')
++            self._parseFeature(u'NETWORK', u'IRCNet'),
++            u'IRCNet')
+ 
+ 
+     def test_support_SAFELIST(self):
+@@ -537,7 +537,7 @@ class ServerSupportedFeatureTests(unittest.TestCase):
+         whether the safe "list" command is supported or not.
+         """
+         self.assertEqual(
+-            self._parseFeature('SAFELIST'),
++            self._parseFeature(u'SAFELIST'),
+             True)
+ 
+ 
+@@ -547,8 +547,8 @@ class ServerSupportedFeatureTests(unittest.TestCase):
+         status that support the exclusive channel notice method.
+         """
+         self.assertEqual(
+-            self._parseFeature('STATUSMSG', '@+'),
+-            '@+')
++            self._parseFeature(u'STATUSMSG', u'@+'),
++            u'@+')
+ 
+ 
+     def test_support_TARGMAX(self):
+@@ -558,20 +558,20 @@ class ServerSupportedFeatureTests(unittest.TestCase):
+         command.
+         """
+         self.assertEqual(
+-            self._parseFeature('TARGMAX', 'PRIVMSG:4,NOTICE:3'),
+-            {'PRIVMSG': 4,
+-             'NOTICE': 3})
++            self._parseFeature(u'TARGMAX', u'PRIVMSG:4,NOTICE:3'),
++            {u'PRIVMSG': 4,
++             u'NOTICE': 3})
+         # A non-integer parameter argument results in None.
+         self.assertEqual(
+-            self._parseFeature('TARGMAX', 'PRIVMSG:4,NOTICE:3,KICK:3.1415'),
+-            {'PRIVMSG': 4,
+-             'NOTICE': 3,
+-             'KICK': None})
++            self._parseFeature(u'TARGMAX', u'PRIVMSG:4,NOTICE:3,KICK:3.1415'),
++            {u'PRIVMSG': 4,
++             u'NOTICE': 3,
++             u'KICK': None})
+         self.assertEqual(
+-            self._parseFeature('TARGMAX', 'PRIVMSG:4,NOTICE:3,KICK:notanint'),
+-            {'PRIVMSG': 4,
+-             'NOTICE': 3,
+-             'KICK': None})
++            self._parseFeature(u'TARGMAX', u'PRIVMSG:4,NOTICE:3,KICK:notanint'),
++            {u'PRIVMSG': 4,
++             u'NOTICE': 3,
++             u'KICK': None})
+ 
+ 
+     def test_support_NICKLEN(self):
+@@ -581,8 +581,8 @@ class ServerSupportedFeatureTests(unittest.TestCase):
+         otherwise, if the parameter is missing or invalid, the default value
+         (as specified by RFC 1459) is used.
+         """
+-        default = irc.ServerSupportedFeatures()._features['NICKLEN']
+-        self._testIntOrDefaultFeature('NICKLEN', default)
++        default = irc.ServerSupportedFeatures()._features[u'NICKLEN']
++        self._testIntOrDefaultFeature(u'NICKLEN', default)
+ 
+ 
+     def test_support_CHANNELLEN(self):
+@@ -592,8 +592,8 @@ class ServerSupportedFeatureTests(unittest.TestCase):
+         parameter is missing or invalid, the default value (as specified by
+         RFC 1459) is used.
+         """
+-        default = irc.ServerSupportedFeatures()._features['CHANNELLEN']
+-        self._testIntOrDefaultFeature('CHANNELLEN', default)
++        default = irc.ServerSupportedFeatures()._features[u'CHANNELLEN']
++        self._testIntOrDefaultFeature(u'CHANNELLEN', default)
+ 
+ 
+     def test_support_CHANTYPES(self):
+@@ -601,11 +601,11 @@ class ServerSupportedFeatureTests(unittest.TestCase):
+         The CHANTYPES support parameter is parsed into a tuple of
+         valid channel prefix characters.
+         """
+-        self._testFeatureDefault('CHANTYPES')
++        self._testFeatureDefault(u'CHANTYPES')
+ 
+         self.assertEqual(
+-            self._parseFeature('CHANTYPES', '#&%'),
+-            ('#', '&', '%'))
++            self._parseFeature(u'CHANTYPES', u'#&%'),
++            (u'#', u'&', u'%'))
+ 
+ 
+     def test_support_KICKLEN(self):
+@@ -613,7 +613,7 @@ class ServerSupportedFeatureTests(unittest.TestCase):
+         The KICKLEN support parameter is parsed into an integer value
+         indicating the maximum length of a kick message a client may use.
+         """
+-        self._testIntOrDefaultFeature('KICKLEN')
++        self._testIntOrDefaultFeature(u'KICKLEN')
+ 
+ 
+     def test_support_PREFIX(self):
+@@ -621,22 +621,22 @@ class ServerSupportedFeatureTests(unittest.TestCase):
+         The PREFIX support parameter is parsed into a dictionary mapping
+         modes to two-tuples of status symbol and priority.
+         """
+-        self._testFeatureDefault('PREFIX')
+-        self._testFeatureDefault('PREFIX', [('PREFIX', 'hello')])
++        self._testFeatureDefault(u'PREFIX')
++        self._testFeatureDefault(u'PREFIX', [(u'PREFIX', u'hello')])
+ 
+         self.assertEqual(
+-            self._parseFeature('PREFIX', None),
++            self._parseFeature(u'PREFIX', None),
+             None)
+         self.assertEqual(
+-            self._parseFeature('PREFIX', '(ohv)@%+'),
+-            {'o': ('@', 0),
+-             'h': ('%', 1),
+-             'v': ('+', 2)})
++            self._parseFeature(u'PREFIX', u'(ohv)@%+'),
++            {u'o': (u'@', 0),
++             u'h': (u'%', 1),
++             u'v': (u'+', 2)})
+         self.assertEqual(
+-            self._parseFeature('PREFIX', '(hov)@%+'),
+-            {'o': ('%', 1),
+-             'h': ('@', 0),
+-             'v': ('+', 2)})
++            self._parseFeature(u'PREFIX', u'(hov)@%+'),
++            {u'o': (u'%', 1),
++             u'h': (u'@', 0),
++             u'v': (u'+', 2)})
+ 
+ 
+     def test_support_TOPICLEN(self):
+@@ -644,7 +644,7 @@ class ServerSupportedFeatureTests(unittest.TestCase):
+         The TOPICLEN support parameter is parsed into an integer value
+         indicating the maximum length of a topic a client may set.
+         """
+-        self._testIntOrDefaultFeature('TOPICLEN')
++        self._testIntOrDefaultFeature(u'TOPICLEN')
+ 
+ 
+     def test_support_MODES(self):
+@@ -655,7 +655,7 @@ class ServerSupportedFeatureTests(unittest.TestCase):
+         the C{CHANMODES} ISUPPORT parameter) which may by set on a channel
+         by a single MODE command from a client.
+         """
+-        self._testIntOrDefaultFeature('MODES')
++        self._testIntOrDefaultFeature(u'MODES')
+ 
+ 
+     def test_support_EXCEPTS(self):
+@@ -665,11 +665,11 @@ class ServerSupportedFeatureTests(unittest.TestCase):
+         then the character C{e} is assumed.
+         """
+         self.assertEqual(
+-            self._parseFeature('EXCEPTS', 'Z'),
+-            'Z')
++            self._parseFeature(u'EXCEPTS', u'Z'),
++            u'Z')
+         self.assertEqual(
+-            self._parseFeature('EXCEPTS'),
+-            'e')
++            self._parseFeature(u'EXCEPTS'),
++            u'e')
+ 
+ 
+     def test_support_INVEX(self):
+@@ -679,11 +679,11 @@ class ServerSupportedFeatureTests(unittest.TestCase):
+         the character C{I} is assumed.
+         """
+         self.assertEqual(
+-            self._parseFeature('INVEX', 'Z'),
+-            'Z')
++            self._parseFeature(u'INVEX', u'Z'),
++            u'Z')
+         self.assertEqual(
+-            self._parseFeature('INVEX'),
+-            'I')
++            self._parseFeature(u'INVEX'),
++            u'I')
+ 
+ 
+ 
+@@ -714,18 +714,18 @@ class CTCPTest(unittest.TestCase):
+         process.
+         """
+ 
+-        errQuery = (":nick!guy@over.there PRIVMSG #theChan :"
+-                    "%(X)cERRMSG t%(X)c%(EOL)s"
+-                    % {'X': irc.X_DELIM,
+-                       'EOL': irc.CR + irc.LF})
++        errQuery = (u":nick!guy@over.there PRIVMSG #theChan :"
++                    u"%(X)cERRMSG t%(X)c%(EOL)s"
++                    % {u'X': irc.X_DELIM,
++                       u'EOL': irc.CR + irc.LF})
+ 
+-        errReply = ("NOTICE nick :%(X)cERRMSG t :"
+-                    "No error has occoured.%(X)c%(EOL)s"
+-                    % {'X': irc.X_DELIM,
+-                       'EOL': irc.CR + irc.LF})
++        errReply = (u"NOTICE nick :%(X)cERRMSG t :"
++                    u"No error has occoured.%(X)c%(EOL)s"
++                    % {u'X': irc.X_DELIM,
++                       u'EOL': irc.CR + irc.LF})
+ 
+-        self.client.dataReceived(errQuery)
+-        reply = self.file.getvalue()
++        self.client.dataReceived(errQuery.encode("ASCII"))
++        reply = self.file.getvalue().decode("ASCII")
+ 
+         self.assertEqual(errReply, reply)
+ 
+@@ -736,14 +736,14 @@ class CTCPTest(unittest.TestCase):
+         C{None}, the parts of the CTCP VERSION response they correspond to
+         are omitted.
+         """
+-        self.client.versionName = "FrobozzIRC"
+-        self.client.ctcpQuery_VERSION("nick!guy@over.there", "#theChan", None)
+-        versionReply = ("NOTICE nick :%(X)cVERSION %(vname)s::"
+-                        "%(X)c%(EOL)s"
+-                        % {'X': irc.X_DELIM,
+-                           'EOL': irc.CR + irc.LF,
+-                           'vname': self.client.versionName})
+-        reply = self.file.getvalue()
++        self.client.versionName = u"FrobozzIRC"
++        self.client.ctcpQuery_VERSION(u"nick!guy@over.there", "#theChan", None)
++        versionReply = (u"NOTICE nick :%(X)cVERSION %(vname)s::"
++                        u"%(X)c%(EOL)s"
++                        % {u'X': irc.X_DELIM,
++                           u'EOL': irc.CR + irc.LF,
++                           u'vname': self.client.versionName})
++        reply = self.file.getvalue().decode("ASCII")
+         self.assertEqual(versionReply, reply)
+ 
+ 
+@@ -753,18 +753,18 @@ class CTCPTest(unittest.TestCase):
+         environment information, as specified by L{IRCClient.versionNum} and
+         L{IRCClient.versionEnv}.
+         """
+-        self.client.versionName = "FrobozzIRC"
+-        self.client.versionNum = "1.2g"
+-        self.client.versionEnv = "ZorkOS"
+-        self.client.ctcpQuery_VERSION("nick!guy@over.there", "#theChan", None)
+-        versionReply = ("NOTICE nick :%(X)cVERSION %(vname)s:%(vnum)s:%(venv)s"
+-                        "%(X)c%(EOL)s"
+-                        % {'X': irc.X_DELIM,
+-                           'EOL': irc.CR + irc.LF,
+-                           'vname': self.client.versionName,
+-                           'vnum': self.client.versionNum,
+-                           'venv': self.client.versionEnv})
+-        reply = self.file.getvalue()
++        self.client.versionName = u"FrobozzIRC"
++        self.client.versionNum = u"1.2g"
++        self.client.versionEnv = u"ZorkOS"
++        self.client.ctcpQuery_VERSION(u"nick!guy@over.there", u"#theChan", None)
++        versionReply = (u"NOTICE nick :%(X)cVERSION %(vname)s:%(vnum)s:%(venv)s"
++                        u"%(X)c%(EOL)s"
++                        % {u'X': irc.X_DELIM,
++                           u'EOL': irc.CR + irc.LF,
++                           u'vname': self.client.versionName,
++                           u'vnum': self.client.versionNum,
++                           u'venv': self.client.versionEnv})
++        reply = self.file.getvalue().decode("ASCII")
+         self.assertEqual(versionReply, reply)
+ 
+ 
+@@ -779,12 +779,12 @@ class CTCPTest(unittest.TestCase):
+         self.client.ctcpQuery_TESTTHIS = testCTCP
+ 
+         self.client.irc_PRIVMSG(
+-            'foo!bar@baz.quux', [
+-                '#chan',
+-                '%(X)sTESTTHIS%(X)sfoo%(X)sTESTTHIS%(X)s' % {'X': irc.X_DELIM}])
++            u'foo!bar@baz.quux', [
++                u'#chan',
++                u'%(X)sTESTTHIS%(X)sfoo%(X)sTESTTHIS%(X)s' % {u'X': irc.X_DELIM}])
+         self.assertEqual(
+-            self.file.getvalue(),
+-            '')
++            self.file.getvalue().decode("ASCII"),
++            u'')
+         self.assertEqual(self.called, 1)
+ 
+ 
+@@ -799,28 +799,30 @@ class CTCPTest(unittest.TestCase):
+         self.called = 0
+         self.patch(self.client, 'ctcpUnknownQuery', unknownQuery)
+         self.client.irc_PRIVMSG(
+-            'foo!bar@baz.quux', [
+-                '#chan',
+-                '%(X)sNOTREAL%(X)s' % {'X': irc.X_DELIM}])
++            u'foo!bar@baz.quux', [
++                u'#chan',
++                u'%(X)sNOTREAL%(X)s' % {u'X': irc.X_DELIM}])
+         self.assertEqual(
+-            self.file.getvalue(),
+-            '')
++            self.file.getvalue().decode("ASCII"),
++            u'')
+         self.assertEqual(
+             self.calledWith,
+-            ('foo!bar@baz.quux', '#chan', 'NOTREAL', None))
++            (u'foo!bar@baz.quux', u'#chan', u'NOTREAL', None))
+         self.assertEqual(self.called, 1)
+ 
+         # The fallback handler is not invoked for duplicate unknown CTCP
+         # messages.
+         self.client.irc_PRIVMSG(
+-            'foo!bar@baz.quux', [
+-                '#chan',
+-                '%(X)sNOTREAL%(X)sfoo%(X)sNOTREAL%(X)s' % {'X': irc.X_DELIM}])
++            u'foo!bar@baz.quux', [
++                u'#chan',
++                u'%(X)sNOTREAL%(X)sfoo%(X)sNOTREAL%(X)s' % {u'X': irc.X_DELIM}])
+         self.assertEqual(self.called, 2)
+ 
+ 
+ 
+ class NoticingClient(IRCClientWithoutLogin, object):
++    # Left as version-dependent strings since they are used as attributes of
++    # the object and function parameters
+     methods = {
+         'created': ('when',),
+         'yourHost': ('info',),
+@@ -874,17 +876,17 @@ class NoticingClient(IRCClientWithoutLogin, object):
+     def makeMethod(self, fname, args):
+         def method(*a, **kw):
+             if len(a) > len(args):
+-                raise TypeError("TypeError: %s() takes %d arguments "
+-                                "(%d given)" % (fname, len(args), len(a)))
++                raise TypeError(u"TypeError: %s() takes %d arguments "
++                                u"(%d given)" % (fname, len(args), len(a)))
+             for (name, value) in zip(args, a):
+                 if name in kw:
+-                    raise TypeError("TypeError: %s() got multiple values "
+-                                    "for keyword argument '%s'" % (fname, name))
++                    raise TypeError(u"TypeError: %s() got multiple values "
++                                    u"for keyword argument '%s'" % (fname, name))
+                 else:
+                     kw[name] = value
+             if len(kw) != len(args):
+-                raise TypeError("TypeError: %s() takes %d arguments "
+-                                "(%d given)" % (fname, len(args), len(a)))
++                raise TypeError(u"TypeError: %s() takes %d arguments "
++                                u"(%d given)" % (fname, len(args), len(a)))
+             self.calls.append((fname, kw))
+         return method
+ 
+@@ -911,68 +913,68 @@ class ClientImplementationTests(unittest.TestCase):
+ 
+ 
+     def _serverTestImpl(self, code, msg, func, **kw):
+-        host = pop(kw, 'host', 'server.host')
+-        nick = pop(kw, 'nick', 'nickname')
+-        args = pop(kw, 'args', '')
+-
+-        message = (":" +
+-                   host + " " +
+-                   code + " " +
+-                   nick + " " +
+-                   args + " :" +
+-                   msg + "\r\n")
+-
+-        self.client.dataReceived(message)
++        host = pop(kw, u'host', u'server.host')
++        nick = pop(kw, u'nick', u'nickname')
++        args = pop(kw, u'args', u'')
++
++        message = (u":" +
++                   host + u" " +
++                   code + u" " +
++                   nick + u" " +
++                   args + u" :" +
++                   msg + u"\r\n")
++
++        self.client.dataReceived(message.encode("ASCII"))
+         self.assertEqual(
+             self.client.calls,
+             [(func, kw)])
+ 
+ 
+     def testYourHost(self):
+-        msg = "Your host is some.host[blah.blah/6667], running version server-version-3"
+-        self._serverTestImpl("002", msg, "yourHost", info=msg)
++        msg = u"Your host is some.host[blah.blah/6667], running version server-version-3"
++        self._serverTestImpl(u"002", msg, "yourHost", info=msg)
+ 
+ 
+     def testCreated(self):
+-        msg = "This server was cobbled together Fri Aug 13 18:00:25 UTC 2004"
+-        self._serverTestImpl("003", msg, "created", when=msg)
++        msg = u"This server was cobbled together Fri Aug 13 18:00:25 UTC 2004"
++        self._serverTestImpl(u"003", msg, "created", when=msg)
+ 
+ 
+     def testMyInfo(self):
+-        msg = "server.host server-version abcDEF bcdEHI"
+-        self._serverTestImpl("004", msg, "myInfo",
+-                             servername="server.host",
+-                             version="server-version",
+-                             umodes="abcDEF",
+-                             cmodes="bcdEHI")
++        msg = u"server.host server-version abcDEF bcdEHI"
++        self._serverTestImpl(u"004", msg, "myInfo",
++                             servername=u"server.host",
++                             version=u"server-version",
++                             umodes=u"abcDEF",
++                             cmodes=u"bcdEHI")
+ 
+ 
+     def testLuserClient(self):
+-        msg = "There are 9227 victims and 9542 hiding on 24 servers"
+-        self._serverTestImpl("251", msg, "luserClient",
++        msg = u"There are 9227 victims and 9542 hiding on 24 servers"
++        self._serverTestImpl(u"251", msg, "luserClient",
+                              info=msg)
+ 
+ 
+     def _sendISUPPORT(self):
+-        args = ("MODES=4 CHANLIMIT=#:20 NICKLEN=16 USERLEN=10 HOSTLEN=63 "
+-                "TOPICLEN=450 KICKLEN=450 CHANNELLEN=30 KEYLEN=23 CHANTYPES=# "
+-                "PREFIX=(ov)@+ CASEMAPPING=ascii CAPAB IRCD=dancer")
+-        msg = "are available on this server"
+-        self._serverTestImpl("005", msg, "isupport", args=args,
+-                             options=['MODES=4',
+-                                      'CHANLIMIT=#:20',
+-                                      'NICKLEN=16',
+-                                      'USERLEN=10',
+-                                      'HOSTLEN=63',
+-                                      'TOPICLEN=450',
+-                                      'KICKLEN=450',
+-                                      'CHANNELLEN=30',
+-                                      'KEYLEN=23',
+-                                      'CHANTYPES=#',
+-                                      'PREFIX=(ov)@+',
+-                                      'CASEMAPPING=ascii',
+-                                      'CAPAB',
+-                                      'IRCD=dancer'])
++        args = (u"MODES=4 CHANLIMIT=#:20 NICKLEN=16 USERLEN=10 HOSTLEN=63 "
++                u"TOPICLEN=450 KICKLEN=450 CHANNELLEN=30 KEYLEN=23 CHANTYPES=# "
++                u"PREFIX=(ov)@+ CASEMAPPING=ascii CAPAB IRCD=dancer")
++        msg = u"are available on this server"
++        self._serverTestImpl(u"005", msg, "isupport", args=args,
++                             options=[u'MODES=4',
++                                      u'CHANLIMIT=#:20',
++                                      u'NICKLEN=16',
++                                      u'USERLEN=10',
++                                      u'HOSTLEN=63',
++                                      u'TOPICLEN=450',
++                                      u'KICKLEN=450',
++                                      u'CHANNELLEN=30',
++                                      u'KEYLEN=23',
++                                      u'CHANTYPES=#',
++                                      u'PREFIX=(ov)@+',
++                                      u'CASEMAPPING=ascii',
++                                      u'CAPAB',
++                                      u'IRCD=dancer'])
+ 
+ 
+     def test_ISUPPORT(self):
+@@ -984,28 +986,28 @@ class ClientImplementationTests(unittest.TestCase):
+ 
+ 
+     def testBounce(self):
+-        msg = "Try server some.host, port 321"
+-        self._serverTestImpl("010", msg, "bounce",
++        msg = u"Try server some.host, port 321"
++        self._serverTestImpl(u"010", msg, "bounce",
+                              info=msg)
+ 
+ 
+     def testLuserChannels(self):
+-        args = "7116"
+-        msg = "channels formed"
+-        self._serverTestImpl("254", msg, "luserChannels", args=args,
++        args = u"7116"
++        msg = u"channels formed"
++        self._serverTestImpl(u"254", msg, "luserChannels", args=args,
+                              channels=int(args))
+ 
+ 
+     def testLuserOp(self):
+-        args = "34"
+-        msg = "flagged staff members"
+-        self._serverTestImpl("252", msg, "luserOp", args=args,
++        args = u"34"
++        msg = u"flagged staff members"
++        self._serverTestImpl(u"252", msg, "luserOp", args=args,
+                              ops=int(args))
+ 
+ 
+     def testLuserMe(self):
+-        msg = "I have 1937 clients and 0 servers"
+-        self._serverTestImpl("255", msg, "luserMe",
++        msg = u"I have 1937 clients and 0 servers"
++        self._serverTestImpl(u"255", msg, "luserMe",
+                              info=msg)
+ 
+ 
+@@ -1015,16 +1017,16 @@ class ClientImplementationTests(unittest.TestCase):
+         L{IRCClient.receivedMOTD} when I{RPL_ENDOFMOTD} is received.
+         """
+         lines = [
+-            ":host.name 375 nickname :- host.name Message of the Day -",
+-            ":host.name 372 nickname :- Welcome to host.name",
+-            ":host.name 376 nickname :End of /MOTD command."]
++            u":host.name 375 nickname :- host.name Message of the Day -",
++            u":host.name 372 nickname :- Welcome to host.name",
++            u":host.name 376 nickname :End of /MOTD command."]
+         for L in lines:
+             self.assertEqual(self.client.calls, [])
+-            self.client.dataReceived(L + '\r\n')
++            self.client.dataReceived(L.encode("ASCII") + b'\r\n')
+ 
+         self.assertEqual(
+             self.client.calls,
+-            [("receivedMOTD", {"motd": ["host.name Message of the Day -", "Welcome to host.name"]})])
++            [("receivedMOTD", {"motd": [u"host.name Message of the Day -", "Welcome to host.name"]})])
+ 
+         # After the motd is delivered, the tracking variable should be
+         # reset.
+@@ -1038,28 +1040,28 @@ class ClientImplementationTests(unittest.TestCase):
+         called with a list of MOTD lines.
+         """
+         lines = [
+-            ":host.name 372 nickname :- Welcome to host.name",
+-            ":host.name 376 nickname :End of /MOTD command."]
++            u":host.name 372 nickname :- Welcome to host.name",
++            u":host.name 376 nickname :End of /MOTD command."]
+ 
+         for L in lines:
+-            self.client.dataReceived(L + '\r\n')
++            self.client.dataReceived(L.encode("ASCII") + b'\r\n')
+ 
+         self.assertEqual(
+             self.client.calls,
+-            [("receivedMOTD", {"motd": ["Welcome to host.name"]})])
++            [("receivedMOTD", {"motd": [u"Welcome to host.name"]})])
+ 
+ 
+     def _clientTestImpl(self, sender, group, type, msg, func, **kw):
+-        ident = pop(kw, 'ident', 'ident')
+-        host = pop(kw, 'host', 'host')
+-
+-        wholeUser = sender + '!' + ident + '@' + host
+-        message = (":" +
+-                   wholeUser + " " +
+-                   type + " " +
+-                   group + " :" +
+-                   msg + "\r\n")
+-        self.client.dataReceived(message)
++        ident = pop(kw, u'ident', u'ident')
++        host = pop(kw, u'host', u'host')
++
++        wholeUser = sender + u'!' + ident + u'@' + host
++        message = (u":" +
++                   wholeUser + u" " +
++                   type + u" " +
++                   group + u" :" +
++                   msg + u"\r\n")
++        self.client.dataReceived(message.encode("ASCII"))
+         self.assertEqual(
+             self.client.calls,
+             [(func, kw)])
+@@ -1067,19 +1069,19 @@ class ClientImplementationTests(unittest.TestCase):
+ 
+ 
+     def testPrivmsg(self):
+-        msg = "Tooty toot toot."
+-        self._clientTestImpl("sender", "#group", "PRIVMSG", msg, "privmsg",
+-                             ident="ident", host="host",
++        msg = u"Tooty toot toot."
++        self._clientTestImpl(u"sender", u"#group", u"PRIVMSG", msg, "privmsg",
++                             ident=u"ident", host=u"host",
+                              # Expected results below
+-                             user="sender!ident@host",
+-                             channel="#group",
++                             user=u"sender!ident@host",
++                             channel=u"#group",
+                              message=msg)
+ 
+-        self._clientTestImpl("sender", "recipient", "PRIVMSG", msg, "privmsg",
+-                             ident="ident", host="host",
++        self._clientTestImpl(u"sender", u"recipient", u"PRIVMSG", msg, "privmsg",
++                             ident=u"ident", host=u"host",
+                              # Expected results below
+-                             user="sender!ident@host",
+-                             channel="recipient",
++                             user=u"sender!ident@host",
++                             channel=u"recipient",
+                              message=msg)
+ 
+ 
+@@ -1090,27 +1092,27 @@ class ClientImplementationTests(unittest.TestCase):
+         require arguments when being added or removed.
+         """
+         add, remove = map(sorted, self.client.getChannelModeParams())
+-        self.assertEqual(add, ['b', 'h', 'k', 'l', 'o', 'v'])
+-        self.assertEqual(remove, ['b', 'h', 'o', 'v'])
++        self.assertEqual(add, [u'b', u'h', u'k', u'l', u'o', u'v'])
++        self.assertEqual(remove, [u'b', u'h', u'o', u'v'])
+ 
+         def removeFeature(name):
+-            name = '-' + name
+-            msg = "are available on this server"
++            name = u'-' + name
++            msg = u"are available on this server"
+             self._serverTestImpl(
+-                '005', msg, 'isupport', args=name, options=[name])
++                u'005', msg, 'isupport', args=name, options=[name])
+             self.assertIdentical(
+                 self.client.supported.getFeature(name), None)
+             self.client.calls = []
+ 
+         # Remove CHANMODES feature, causing getFeature('CHANMODES') to return
+         # None.
+-        removeFeature('CHANMODES')
++        removeFeature(u'CHANMODES')
+         add, remove = map(sorted, self.client.getChannelModeParams())
+-        self.assertEqual(add, ['h', 'o', 'v'])
+-        self.assertEqual(remove, ['h', 'o', 'v'])
++        self.assertEqual(add, [u'h', u'o', u'v'])
++        self.assertEqual(remove, [u'h', u'o', u'v'])
+ 
+         # Remove PREFIX feature, causing getFeature('PREFIX') to return None.
+-        removeFeature('PREFIX')
++        removeFeature(u'PREFIX')
+         add, remove = map(sorted, self.client.getChannelModeParams())
+         self.assertEqual(add, [])
+         self.assertEqual(remove, [])
+@@ -1118,7 +1120,7 @@ class ClientImplementationTests(unittest.TestCase):
+         # Restore ISUPPORT features.
+         self._sendISUPPORT()
+         self.assertNotIdentical(
+-            self.client.supported.getFeature('PREFIX'), None)
++            self.client.supported.getFeature(u'PREFIX'), None)
+ 
+ 
+     def test_getUserModeParams(self):
+@@ -1137,10 +1139,10 @@ class ClientImplementationTests(unittest.TestCase):
+         Build a MODE string and send it to the client.
+         """
+         if target is None:
+-            target = '#chan'
+-        message = ":Wolf!~wolf@yok.utu.fi MODE %s %s %s\r\n" % (
++            target = u'#chan'
++        message = u":Wolf!~wolf@yok.utu.fi MODE %s %s %s\r\n" % (
+             target, msg, args)
+-        self.client.dataReceived(message)
++        self.client.dataReceived(message.encode("ASCII"))
+ 
+ 
+     def _parseModeChange(self, results, target=None):
+@@ -1148,14 +1150,14 @@ class ClientImplementationTests(unittest.TestCase):
+         Parse the results, do some test and return the data to check.
+         """
+         if target is None:
+-            target = '#chan'
++            target = u'#chan'
+ 
+         for n, result in enumerate(results):
+             method, data = result
+-            self.assertEqual(method, 'modeChanged')
+-            self.assertEqual(data['user'], 'Wolf!~wolf@yok.utu.fi')
+-            self.assertEqual(data['channel'], target)
+-            results[n] = tuple([data[key] for key in ('set', 'modes', 'args')])
++            self.assertEqual(method, u'modeChanged')
++            self.assertEqual(data[u'user'], u'Wolf!~wolf@yok.utu.fi')
++            self.assertEqual(data[u'channel'], target)
++            results[n] = tuple([data[key] for key in (u'set', u'modes', u'args')])
+         return results
+ 
+ 
+@@ -1174,7 +1176,7 @@ class ClientImplementationTests(unittest.TestCase):
+         C{'-'}, have C{'+'} automatically prepended.
+         """
+         self._sendModeChange('s')
+-        self._checkModeChange([(True, 's', (None,))])
++        self._checkModeChange([(True, u's', (None,))])
+ 
+ 
+     def test_noModeParameters(self):
+@@ -1182,10 +1184,10 @@ class ClientImplementationTests(unittest.TestCase):
+         No parameters are passed to L{IRCClient.modeChanged} for modes that
+         don't take any parameters.
+         """
+-        self._sendModeChange('-s')
+-        self._checkModeChange([(False, 's', (None,))])
+-        self._sendModeChange('+n')
+-        self._checkModeChange([(True, 'n', (None,))])
++        self._sendModeChange(u'-s')
++        self._checkModeChange([(False, u's', (None,))])
++        self._sendModeChange(u'+n')
++        self._checkModeChange([(True, u'n', (None,))])
+ 
+ 
+     def test_oneModeParameter(self):
+@@ -1193,10 +1195,10 @@ class ClientImplementationTests(unittest.TestCase):
+         Parameters are passed to L{IRCClient.modeChanged} for modes that take
+         parameters.
+         """
+-        self._sendModeChange('+o', 'a_user')
+-        self._checkModeChange([(True, 'o', ('a_user',))])
+-        self._sendModeChange('-o', 'a_user')
+-        self._checkModeChange([(False, 'o', ('a_user',))])
++        self._sendModeChange(u'+o', u'a_user')
++        self._checkModeChange([(True, u'o', (u'a_user',))])
++        self._sendModeChange(u'-o', u'a_user')
++        self._checkModeChange([(False, u'o', (u'a_user',))])
+ 
+ 
+     def test_mixedModes(self):
+@@ -1205,11 +1207,11 @@ class ClientImplementationTests(unittest.TestCase):
+         invokes L{IRCClient.modeChanged} with mode characters and parameters
+         that match up.
+         """
+-        self._sendModeChange('+osv', 'a_user another_user')
+-        self._checkModeChange([(True, 'osv', ('a_user', None, 'another_user'))])
+-        self._sendModeChange('+v-os', 'a_user another_user')
+-        self._checkModeChange([(True, 'v', ('a_user',)),
+-                               (False, 'os', ('another_user', None))])
++        self._sendModeChange(u'+osv', u'a_user another_user')
++        self._checkModeChange([(True, u'osv', (u'a_user', None, u'another_user'))])
++        self._sendModeChange(u'+v-os', u'a_user another_user')
++        self._checkModeChange([(True, u'v', (u'a_user',)),
++                               (False, u'os', (u'another_user', None))])
+ 
+ 
+     def test_tooManyModeParameters(self):
+@@ -1217,12 +1219,12 @@ class ClientImplementationTests(unittest.TestCase):
+         Passing an argument to modes that take no parameters results in
+         L{IRCClient.modeChanged} not being called and an error being logged.
+         """
+-        self._sendModeChange('+s', 'wrong')
++        self._sendModeChange(u'+s', u'wrong')
+         self._checkModeChange([])
+         errors = self.flushLoggedErrors(irc.IRCBadModes)
+         self.assertEqual(len(errors), 1)
+         self.assertSubstring(
+-            'Too many parameters', errors[0].getErrorMessage())
++            u'Too many parameters', errors[0].getErrorMessage())
+ 
+ 
+     def test_tooFewModeParameters(self):
+@@ -1230,12 +1232,12 @@ class ClientImplementationTests(unittest.TestCase):
+         Passing no arguments to modes that do take parameters results in
+         L{IRCClient.modeChange} not being called and an error being logged.
+         """
+-        self._sendModeChange('+o')
++        self._sendModeChange(u'+o')
+         self._checkModeChange([])
+         errors = self.flushLoggedErrors(irc.IRCBadModes)
+         self.assertEqual(len(errors), 1)
+         self.assertSubstring(
+-            'Not enough parameters', errors[0].getErrorMessage())
++            u'Not enough parameters', errors[0].getErrorMessage())
+ 
+ 
+     def test_userMode(self):
+@@ -1247,17 +1249,17 @@ class ClientImplementationTests(unittest.TestCase):
+         target = self.client.nickname
+         # Mode "o" on channels is supposed to take a parameter, but since this
+         # is not a channel this will not cause an exception.
+-        self._sendModeChange('+o', target=target)
+-        self._checkModeChange([(True, 'o', (None,))], target=target)
++        self._sendModeChange(u'+o', target=target)
++        self._checkModeChange([(True, u'o', (None,))], target=target)
+ 
+         def getUserModeParams():
+-            return ['Z', '']
++            return [u'Z', u'']
+ 
+         # Introduce our own user mode that takes an argument.
+         self.patch(self.client, 'getUserModeParams', getUserModeParams)
+ 
+-        self._sendModeChange('+Z', 'an_arg', target=target)
+-        self._checkModeChange([(True, 'Z', ('an_arg',))], target=target)
++        self._sendModeChange(u'+Z', u'an_arg', target=target)
++        self._checkModeChange([(True, u'Z', (u'an_arg',))], target=target)
+ 
+ 
+     def test_heartbeat(self):
+@@ -1277,14 +1279,14 @@ class ClientImplementationTests(unittest.TestCase):
+         self.patch(self.client, '_createHeartbeat', _createHeartbeat)
+ 
+         self.assertIdentical(self.client._heartbeat, None)
+-        self.client.irc_RPL_WELCOME('foo', [])
++        self.client.irc_RPL_WELCOME(u'foo', [])
+         self.assertNotIdentical(self.client._heartbeat, None)
+-        self.assertEqual(self.client.hostname, 'foo')
++        self.assertEqual(self.client.hostname, u'foo')
+ 
+         # Pump the clock enough to trigger one LoopingCall.
+-        self.assertEqual(self.transport.value(), '')
++        self.assertEqual(self.transport.value(), b'')
+         self.clock.advance(self.client.heartbeatInterval)
+-        self.assertEqual(self.transport.value(), 'PING foo\r\n')
++        self.assertEqual(self.transport.value(), b'PING foo\r\n')
+ 
+         # When the connection is lost the heartbeat is stopped.
+         self.transport.loseConnection()
+@@ -1301,7 +1303,7 @@ class ClientImplementationTests(unittest.TestCase):
+         """
+         self.assertIdentical(self.client._heartbeat, None)
+         self.client.heartbeatInterval = None
+-        self.client.irc_RPL_WELCOME('foo', [])
++        self.client.irc_RPL_WELCOME(u'foo', [])
+         self.assertIdentical(self.client._heartbeat, None)
+ 
+ 
+@@ -1315,32 +1317,32 @@ class BasicServerFunctionalityTestCase(unittest.TestCase):
+ 
+ 
+     def check(self, s):
+-        self.assertEqual(self.f.getvalue(), s)
++        self.assertEqual(self.f.getvalue().decode("ascii"), s)
+ 
+ 
+     def testPrivmsg(self):
+-        self.p.privmsg("this-is-sender", "this-is-recip", "this is message")
+-        self.check(":this-is-sender PRIVMSG this-is-recip :this is message\r\n")
++        self.p.privmsg(u"this-is-sender", u"this-is-recip", u"this is message")
++        self.check(u":this-is-sender PRIVMSG this-is-recip :this is message\r\n")
+ 
+ 
+     def testNotice(self):
+-        self.p.notice("this-is-sender", "this-is-recip", "this is notice")
+-        self.check(":this-is-sender NOTICE this-is-recip :this is notice\r\n")
++        self.p.notice(u"this-is-sender", u"this-is-recip", u"this is notice")
++        self.check(u":this-is-sender NOTICE this-is-recip :this is notice\r\n")
+ 
+ 
+     def testAction(self):
+-        self.p.action("this-is-sender", "this-is-recip", "this is action")
+-        self.check(":this-is-sender ACTION this-is-recip :this is action\r\n")
++        self.p.action(u"this-is-sender", u"this-is-recip", u"this is action")
++        self.check(u":this-is-sender ACTION this-is-recip :this is action\r\n")
+ 
+ 
+     def testJoin(self):
+-        self.p.join("this-person", "#this-channel")
+-        self.check(":this-person JOIN #this-channel\r\n")
++        self.p.join(u"this-person", u"#this-channel")
++        self.check(u":this-person JOIN #this-channel\r\n")
+ 
+ 
+     def testPart(self):
+-        self.p.part("this-person", "#that-channel")
+-        self.check(":this-person PART #that-channel\r\n")
++        self.p.part(u"this-person", u"#that-channel")
++        self.check(u":this-person PART #that-channel\r\n")
+ 
+ 
+     def testWhois(self):
+@@ -1350,18 +1352,18 @@ class BasicServerFunctionalityTestCase(unittest.TestCase):
+         """
+         timestamp = int(time.time()-100)
+         hostname = self.p.hostname
+-        req = 'requesting-nick'
+-        targ = 'target-nick'
+-        self.p.whois(req, targ, 'target', 'host.com',
+-                'Target User', 'irc.host.com', 'A fake server', False,
+-                12, timestamp, ['#fakeusers', '#fakemisc'])
+-        expected = '\r\n'.join([
+-':%(hostname)s 311 %(req)s %(targ)s target host.com * :Target User',
+-':%(hostname)s 312 %(req)s %(targ)s irc.host.com :A fake server',
+-':%(hostname)s 317 %(req)s %(targ)s 12 %(timestamp)s :seconds idle, signon time',
+-':%(hostname)s 319 %(req)s %(targ)s :#fakeusers #fakemisc',
+-':%(hostname)s 318 %(req)s %(targ)s :End of WHOIS list.',
+-'']) % dict(hostname=hostname, timestamp=timestamp, req=req, targ=targ)
++        req = u'requesting-nick'
++        targ = u'target-nick'
++        self.p.whois(req, targ, u'target', u'host.com',
++                u'Target User', u'irc.host.com', u'A fake server', False,
++                12, timestamp, [u'#fakeusers', u'#fakemisc'])
++        expected = u'\r\n'.join([
++u':%(hostname)s 311 %(req)s %(targ)s target host.com * :Target User',
++u':%(hostname)s 312 %(req)s %(targ)s irc.host.com :A fake server',
++u':%(hostname)s 317 %(req)s %(targ)s 12 %(timestamp)s :seconds idle, signon time',
++u':%(hostname)s 319 %(req)s %(targ)s :#fakeusers #fakemisc',
++u':%(hostname)s 318 %(req)s %(targ)s :End of WHOIS list.',
++u'']) % dict(hostname=hostname, timestamp=timestamp, req=req, targ=targ)
+         self.check(expected)
+ 
+ 
+@@ -1394,6 +1396,7 @@ class DummyClient(irc.IRCClient):
+ 
+ 
+     def sendLine(self, m):
++        # Stores the un-encoded text string
+         self.lines.append(self._truncateLine(m))
+ 
+ 
+@@ -1414,8 +1417,8 @@ class ClientInviteTests(unittest.TestCase):
+         If the channel name passed to L{IRCClient.invite} does not begin with a
+         channel prefix character, one is prepended to it.
+         """
+-        self.client.invite('foo', 'bar')
+-        self.assertEqual(self.client.lines, ['INVITE foo #bar'])
++        self.client.invite(u'foo', u'bar')
++        self.assertEqual(self.client.lines, [u'INVITE foo #bar'])
+ 
+ 
+     def test_invite(self):
+@@ -1423,8 +1426,8 @@ class ClientInviteTests(unittest.TestCase):
+         L{IRCClient.invite} sends an I{INVITE} message with the specified
+         username and a channel.
+         """
+-        self.client.invite('foo', '#bar')
+-        self.assertEqual(self.client.lines, ['INVITE foo #bar'])
++        self.client.invite(u'foo', u'#bar')
++        self.assertEqual(self.client.lines, [u'INVITE foo #bar'])
+ 
+ 
+ 
+@@ -1441,8 +1444,8 @@ class ClientMsgTests(unittest.TestCase):
+         """
+         A message containing no newlines is sent in a single command.
+         """
+-        self.client.msg('foo', 'bar')
+-        self.assertEqual(self.client.lines, ['PRIVMSG foo :bar'])
++        self.client.msg(u'foo', u'bar')
++        self.assertEqual(self.client.lines, [u'PRIVMSG foo :bar'])
+ 
+ 
+     def test_invalidMaxLength(self):
+@@ -1450,8 +1453,8 @@ class ClientMsgTests(unittest.TestCase):
+         Specifying a C{length} value to L{IRCClient.msg} that is too short to
+         contain the protocol command to send a message raises C{ValueError}.
+         """
+-        self.assertRaises(ValueError, self.client.msg, 'foo', 'bar', 0)
+-        self.assertRaises(ValueError, self.client.msg, 'foo', 'bar', 3)
++        self.assertRaises(ValueError, self.client.msg, u'foo', u'bar', 0)
++        self.assertRaises(ValueError, self.client.msg, u'foo', u'bar', 3)
+ 
+ 
+     def test_multipleLine(self):
+@@ -1459,13 +1462,13 @@ class ClientMsgTests(unittest.TestCase):
+         Messages longer than the C{length} parameter to L{IRCClient.msg} will
+         be split and sent in multiple commands.
+         """
+-        maxLen = len('PRIVMSG foo :') + 3 + 2 # 2 for line endings
+-        self.client.msg('foo', 'barbazbo', maxLen)
++        maxLen = len(u'PRIVMSG foo :') + 3 + 2 # 2 for line endings
++        self.client.msg(u'foo', u'barbazbo', maxLen)
+         self.assertEqual(
+             self.client.lines,
+-            ['PRIVMSG foo :bar',
+-             'PRIVMSG foo :baz',
+-             'PRIVMSG foo :bo'])
++            [u'PRIVMSG foo :bar',
++             u'PRIVMSG foo :baz',
++             u'PRIVMSG foo :bo'])
+ 
+ 
+     def test_sufficientWidth(self):
+@@ -1473,15 +1476,15 @@ class ClientMsgTests(unittest.TestCase):
+         Messages exactly equal in length to the C{length} paramtere to
+         L{IRCClient.msg} are sent in a single command.
+         """
+-        msg = 'barbazbo'
+-        maxLen = len('PRIVMSG foo :%s' % (msg,)) + 2
+-        self.client.msg('foo', msg, maxLen)
+-        self.assertEqual(self.client.lines, ['PRIVMSG foo :%s' % (msg,)])
++        msg = u'barbazbo'
++        maxLen = len(u'PRIVMSG foo :%s' % (msg,)) + 2
++        self.client.msg(u'foo', msg, maxLen)
++        self.assertEqual(self.client.lines, [u'PRIVMSG foo :%s' % (msg,)])
+         self.client.lines = []
+-        self.client.msg('foo', msg, maxLen-1)
++        self.client.msg(u'foo', msg, maxLen-1)
+         self.assertEqual(2, len(self.client.lines))
+         self.client.lines = []
+-        self.client.msg('foo', msg, maxLen+1)
++        self.client.msg(u'foo', msg, maxLen+1)
+         self.assertEqual(1, len(self.client.lines))
+ 
+ 
+@@ -1490,8 +1493,8 @@ class ClientMsgTests(unittest.TestCase):
+         An LF at the beginning of the message is ignored.
+         """
+         self.client.lines = []
+-        self.client.msg('foo', '\nbar')
+-        self.assertEqual(self.client.lines, ['PRIVMSG foo :bar'])
++        self.client.msg(u'foo', u'\nbar')
++        self.assertEqual(self.client.lines, [u'PRIVMSG foo :bar'])
+ 
+ 
+     def test_newlinesAtEnd(self):
+@@ -1499,8 +1502,8 @@ class ClientMsgTests(unittest.TestCase):
+         An LF at the end of the message is ignored.
+         """
+         self.client.lines = []
+-        self.client.msg('foo', 'bar\n')
+-        self.assertEqual(self.client.lines, ['PRIVMSG foo :bar'])
++        self.client.msg(u'foo', u'bar\n')
++        self.assertEqual(self.client.lines, [u'PRIVMSG foo :bar'])
+ 
+ 
+     def test_newlinesWithinMessage(self):
+@@ -1508,11 +1511,11 @@ class ClientMsgTests(unittest.TestCase):
+         An LF within a message causes a new line.
+         """
+         self.client.lines = []
+-        self.client.msg('foo', 'bar\nbaz')
++        self.client.msg(u'foo', u'bar\nbaz')
+         self.assertEqual(
+             self.client.lines,
+-            ['PRIVMSG foo :bar',
+-             'PRIVMSG foo :baz'])
++            [u'PRIVMSG foo :bar',
++             u'PRIVMSG foo :baz'])
+ 
+ 
+     def test_consecutiveNewlines(self):
+@@ -1520,11 +1523,11 @@ class ClientMsgTests(unittest.TestCase):
+         Consecutive LFs do not cause a blank line.
+         """
+         self.client.lines = []
+-        self.client.msg('foo', 'bar\n\nbaz')
++        self.client.msg(u'foo', u'bar\n\nbaz')
+         self.assertEqual(
+             self.client.lines,
+-            ['PRIVMSG foo :bar',
+-             'PRIVMSG foo :baz'])
++            [u'PRIVMSG foo :bar',
++             u'PRIVMSG foo :baz'])
+ 
+ 
+     def assertLongMessageSplitting(self, message, expectedNumCommands,
+@@ -1534,21 +1537,21 @@ class ClientMsgTests(unittest.TestCase):
+         expected number of commands and the original message is transmitted in
+         its entirety over those commands.
+         """
+-        responsePrefix = ':%s!%s@%s ' % (
++        responsePrefix = u':%s!%s@%s ' % (
+             self.client.nickname,
+             self.client.realname,
+             self.client.hostname)
+ 
+-        self.client.msg('foo', message, length=length)
++        self.client.msg(u'foo', message, length=length)
+ 
+         privmsg = []
+         self.patch(self.client, 'privmsg', lambda *a: privmsg.append(a))
+         # Deliver these to IRCClient via the normal mechanisms.
+         for line in self.client.lines:
+-            self.client.lineReceived(responsePrefix + line)
++            self.client.lineReceived((responsePrefix + line).encode("ASCII"))
+ 
+         self.assertEqual(len(privmsg), expectedNumCommands)
+-        receivedMessage = ''.join(
++        receivedMessage = u''.join(
+             message for user, target, message in privmsg)
+ 
+         # Did the long message we sent arrive as intended?
+@@ -1563,7 +1566,7 @@ class ClientMsgTests(unittest.TestCase):
+         delivering long messages without losing data due to message truncation
+         when the server relays them.
+         """
+-        message = 'o' * (irc.MAX_COMMAND_LENGTH - 2)
++        message = u'o' * (irc.MAX_COMMAND_LENGTH - 2)
+         self.assertLongMessageSplitting(message, 2)
+ 
+ 
+@@ -1574,7 +1577,7 @@ class ClientMsgTests(unittest.TestCase):
+         intent of delivering long messages without losing data due to message
+         truncation when the server relays them.
+         """
+-        message = 'o' * (irc.MAX_COMMAND_LENGTH - 2)
++        message = u'o' * (irc.MAX_COMMAND_LENGTH - 2)
+         self.assertLongMessageSplitting(
+             message, 3, length=irc.MAX_COMMAND_LENGTH // 2)
+ 
+@@ -1585,13 +1588,13 @@ class ClientMsgTests(unittest.TestCase):
+         """
+         # Because MAX_COMMAND_LENGTH includes framing characters, this long
+         # line is slightly longer than half the permissible message size.
+-        longline = 'o' * (irc.MAX_COMMAND_LENGTH // 2)
++        longline = u'o' * (irc.MAX_COMMAND_LENGTH // 2)
+ 
+-        self.client.msg('foo', longline + '\n' + longline)
++        self.client.msg(u'foo', longline + u'\n' + longline)
+         self.assertEqual(
+             self.client.lines,
+-            ['PRIVMSG foo :' + longline,
+-             'PRIVMSG foo :' + longline])
++            [u'PRIVMSG foo :' + longline,
++             u'PRIVMSG foo :' + longline])
+ 
+ 
+     def test_lineBreakOnWordBoundaries(self):
+@@ -1600,13 +1603,13 @@ class ClientMsgTests(unittest.TestCase):
+         """
+         # Because MAX_COMMAND_LENGTH includes framing characters, this long
+         # line is slightly longer than half the permissible message size.
+-        longline = 'o' * (irc.MAX_COMMAND_LENGTH // 2)
++        longline = u'o' * (irc.MAX_COMMAND_LENGTH // 2)
+ 
+-        self.client.msg('foo', longline + ' ' + longline)
++        self.client.msg(u'foo', longline + u' ' + longline)
+         self.assertEqual(
+             self.client.lines,
+-            ['PRIVMSG foo :' + longline,
+-             'PRIVMSG foo :' + longline])
++            [u'PRIVMSG foo :' + longline,
++             u'PRIVMSG foo :' + longline])
+ 
+ 
+     def test_splitSanity(self):
+@@ -1616,10 +1619,10 @@ class ClientMsgTests(unittest.TestCase):
+         C{''}.
+         """
+         # Whiteboxing
+-        self.assertRaises(ValueError, irc.split, 'foo', -1)
+-        self.assertRaises(ValueError, irc.split, 'foo', 0)
+-        self.assertEqual([], irc.split('', 1))
+-        self.assertEqual([], irc.split(''))
++        self.assertRaises(ValueError, irc.split, u'foo', -1)
++        self.assertRaises(ValueError, irc.split, u'foo', 0)
++        self.assertEqual([], irc.split(u'', 1))
++        self.assertEqual([], irc.split(u''))
+ 
+ 
+     def test_splitDelimiters(self):
+@@ -1629,10 +1632,10 @@ class ClientMsgTests(unittest.TestCase):
+         is operating on.  Nothing should be added to the output list because of
+         it.
+         """
+-        r = irc.split("xx yyz", 2)
+-        self.assertEqual(['xx', 'yy', 'z'], r)
+-        r = irc.split("xx\nyyz", 2)
+-        self.assertEqual(['xx', 'yy', 'z'], r)
++        r = irc.split(u"xx yyz", 2)
++        self.assertEqual([u'xx', u'yy', u'z'], r)
++        r = irc.split(u"xx\nyyz", 2)
++        self.assertEqual([u'xx', u'yy', u'z'], r)
+ 
+ 
+     def test_splitValidatesLength(self):
+@@ -1640,8 +1643,8 @@ class ClientMsgTests(unittest.TestCase):
+         L{twisted.words.protocols.irc.split} raises C{ValueError} if given a
+         length less than or equal to C{0}.
+         """
+-        self.assertRaises(ValueError, irc.split, "foo", 0)
+-        self.assertRaises(ValueError, irc.split, "foo", -1)
++        self.assertRaises(ValueError, irc.split, u"foo", 0)
++        self.assertRaises(ValueError, irc.split, u"foo", -1)
+ 
+ 
+     def test_say(self):
+@@ -1649,9 +1652,9 @@ class ClientMsgTests(unittest.TestCase):
+         L{IRCClient.say} prepends the channel prefix C{"#"} if necessary and
+         then sends the message to the server for delivery to that channel.
+         """
+-        self.client.say("thechannel", "the message")
++        self.client.say(u"thechannel", u"the message")
+         self.assertEquals(
+-            self.client.lines, ["PRIVMSG #thechannel :the message"])
++            self.client.lines, [u"PRIVMSG #thechannel :the message"])
+ 
+ 
+ 
+@@ -1671,7 +1674,7 @@ class ClientTests(TestCase):
+ 
+         # Sanity check - we don't want anything to have happened at this
+         # point, since we're not in a test yet.
+-        self.assertEqual(self.transport.value(), "")
++        self.assertEqual(self.transport.value(), b"")
+ 
+         self.addCleanup(self.transport.loseConnection)
+         self.addCleanup(self.protocol.connectionLost, None)
+@@ -1681,20 +1684,20 @@ class ClientTests(TestCase):
+         """
+         Return the last IRC message in the transport buffer.
+         """
+-        return transport.value().split('\r\n')[-2]
++        return transport.value().decode("ascii").split(u'\r\n')[-2]
+ 
+ 
+     def test_away(self):
+         """
+         L{IRCCLient.away} sends an AWAY command with the specified message.
+         """
+-        message = "Sorry, I'm not here."
++        message = u"Sorry, I'm not here."
+         self.protocol.away(message)
+         expected = [
+-            'AWAY :%s' % (message,),
+-            '',
++            u'AWAY :%s' % (message,),
++            u'',
+         ]
+-        self.assertEqual(self.transport.value().split('\r\n'), expected)
++        self.assertEqual(self.transport.value().decode("ascii").split(u'\r\n'), expected)
+ 
+ 
+     def test_back(self):
+@@ -1703,20 +1706,20 @@ class ClientTests(TestCase):
+         """
+         self.protocol.back()
+         expected = [
+-            'AWAY :',
+-            '',
++            u'AWAY :',
++            u'',
+         ]
+-        self.assertEqual(self.transport.value().split('\r\n'), expected)
++        self.assertEqual(self.transport.value().decode("ascii").split(u'\r\n'), expected)
+ 
+ 
+     def test_whois(self):
+         """
+         L{IRCClient.whois} sends a WHOIS message.
+         """
+-        self.protocol.whois('alice')
++        self.protocol.whois(u'alice')
+         self.assertEqual(
+-            self.transport.value().split('\r\n'),
+-            ['WHOIS alice', ''])
++            self.transport.value().decode("ascii").split(u'\r\n'),
++            [u'WHOIS alice', u''])
+ 
+ 
+     def test_whoisWithServer(self):
+@@ -1724,10 +1727,10 @@ class ClientTests(TestCase):
+         L{IRCClient.whois} sends a WHOIS message with a server name if a
+         value is passed for the C{server} parameter.
+         """
+-        self.protocol.whois('alice', 'example.org')
++        self.protocol.whois(u'alice', u'example.org')
+         self.assertEqual(
+-            self.transport.value().split('\r\n'),
+-            ['WHOIS example.org alice', ''])
++            self.transport.value().decode("ascii").split(u'\r\n'),
++            [u'WHOIS example.org alice', u''])
+ 
+ 
+     def test_register(self):
+@@ -1735,18 +1738,18 @@ class ClientTests(TestCase):
+         L{IRCClient.register} sends NICK and USER commands with the
+         username, name, hostname, server name, and real name specified.
+         """
+-        username = 'testuser'
+-        hostname = 'testhost'
+-        servername = 'testserver'
+-        self.protocol.realname = 'testname'
++        username = u'testuser'
++        hostname = u'testhost'
++        servername = u'testserver'
++        self.protocol.realname = u'testname'
+         self.protocol.password = None
+         self.protocol.register(username, hostname, servername)
+         expected = [
+-            'NICK %s' % (username,),
+-            'USER %s %s %s :%s' % (
++            u'NICK %s' % (username,),
++            u'USER %s %s %s :%s' % (
+                 username, hostname, servername, self.protocol.realname),
+-            '']
+-        self.assertEqual(self.transport.value().split('\r\n'), expected)
++            u'']
++        self.assertEqual(self.transport.value().decode("ascii").split(u'\r\n'), expected)
+ 
+ 
+     def test_registerWithPassword(self):
+@@ -1755,19 +1758,19 @@ class ClientTests(TestCase):
+         C{register} method also sends a PASS command with it as the
+         argument.
+         """
+-        username = 'testuser'
+-        hostname = 'testhost'
+-        servername = 'testserver'
+-        self.protocol.realname = 'testname'
+-        self.protocol.password = 'testpass'
++        username = u'testuser'
++        hostname = u'testhost'
++        servername = u'testserver'
++        self.protocol.realname = u'testname'
++        self.protocol.password = u'testpass'
+         self.protocol.register(username, hostname, servername)
+         expected = [
+-            'PASS %s' % (self.protocol.password,),
+-            'NICK %s' % (username,),
+-            'USER %s %s %s :%s' % (
++            u'PASS %s' % (self.protocol.password,),
++            u'NICK %s' % (username,),
++            u'USER %s %s %s :%s' % (
+                 username, hostname, servername, self.protocol.realname),
+-            '']
+-        self.assertEqual(self.transport.value().split('\r\n'), expected)
++            u'']
++        self.assertEqual(self.transport.value().decode("ascii").split(u'\r\n'), expected)
+ 
+ 
+     def test_registerWithTakenNick(self):
+@@ -1776,20 +1779,20 @@ class ClientTests(TestCase):
+         new value when presented with an C{ERR_NICKNAMEINUSE} while trying to
+         register.
+         """
+-        username = 'testuser'
+-        hostname = 'testhost'
+-        servername = 'testserver'
+-        self.protocol.realname = 'testname'
+-        self.protocol.password = 'testpass'
++        username = u'testuser'
++        hostname = u'testhost'
++        servername = u'testserver'
++        self.protocol.realname = u'testname'
++        self.protocol.password = u'testpass'
+         self.protocol.register(username, hostname, servername)
+-        self.protocol.irc_ERR_NICKNAMEINUSE('prefix', ['param'])
++        self.protocol.irc_ERR_NICKNAMEINUSE(u'prefix', [u'param'])
+         lastLine = self.getLastLine(self.transport)
+-        self.assertNotEquals(lastLine, 'NICK %s' % (username,))
++        self.assertNotEquals(lastLine, u'NICK %s' % (username,))
+ 
+         # Keep chaining underscores for each collision
+-        self.protocol.irc_ERR_NICKNAMEINUSE('prefix', ['param'])
++        self.protocol.irc_ERR_NICKNAMEINUSE(u'prefix', [u'param'])
+         lastLine = self.getLastLine(self.transport)
+-        self.assertEqual(lastLine, 'NICK %s' % (username + '__',))
++        self.assertEqual(lastLine, u'NICK %s' % (username + u'__',))
+ 
+ 
+     def test_overrideAlterCollidedNick(self):
+@@ -1797,13 +1800,13 @@ class ClientTests(TestCase):
+         L{IRCClient.alterCollidedNick} determines how a nickname is altered upon
+         collision while a user is trying to change to that nickname.
+         """
+-        nick = 'foo'
+-        self.protocol.alterCollidedNick = lambda nick: nick + '***'
++        nick = u'foo'
++        self.protocol.alterCollidedNick = lambda nick: nick + u'***'
+         self.protocol.register(nick)
+-        self.protocol.irc_ERR_NICKNAMEINUSE('prefix', ['param'])
++        self.protocol.irc_ERR_NICKNAMEINUSE(u'prefix', [u'param'])
+         lastLine = self.getLastLine(self.transport)
+         self.assertEqual(
+-            lastLine, 'NICK %s' % (nick + '***',))
++            lastLine, u'NICK %s' % (nick + u'***',))
+ 
+ 
+     def test_nickChange(self):
+@@ -1811,13 +1814,13 @@ class ClientTests(TestCase):
+         When a NICK command is sent after signon, C{IRCClient.nickname} is set
+         to the new nickname I{after} the server sends an acknowledgement.
+         """
+-        oldnick = 'foo'
+-        newnick = 'bar'
++        oldnick = u'foo'
++        newnick = u'bar'
+         self.protocol.register(oldnick)
+-        self.protocol.irc_RPL_WELCOME('prefix', ['param'])
++        self.protocol.irc_RPL_WELCOME(u'prefix', [u'param'])
+         self.protocol.setNick(newnick)
+         self.assertEqual(self.protocol.nickname, oldnick)
+-        self.protocol.irc_NICK('%s!quux@qux' % (oldnick,), [newnick])
++        self.protocol.irc_NICK(u'%s!quux@qux' % (oldnick,), [newnick])
+         self.assertEqual(self.protocol.nickname, newnick)
+ 
+ 
+@@ -1828,14 +1831,14 @@ class ClientTests(TestCase):
+         nickname results in the old nickname being kept.
+         """
+         # Registration case: change illegal nickname to erroneousNickFallback
+-        badnick = 'foo'
++        badnick = u'foo'
+         self.assertEqual(self.protocol._registered, False)
+         self.protocol.register(badnick)
+-        self.protocol.irc_ERR_ERRONEUSNICKNAME('prefix', ['param'])
++        self.protocol.irc_ERR_ERRONEUSNICKNAME(u'prefix', [u'param'])
+         lastLine = self.getLastLine(self.transport)
+         self.assertEqual(
+-            lastLine, 'NICK %s' % (self.protocol.erroneousNickFallback,))
+-        self.protocol.irc_RPL_WELCOME('prefix', ['param'])
++            lastLine, u'NICK %s' % (self.protocol.erroneousNickFallback,))
++        self.protocol.irc_RPL_WELCOME(u'prefix', [u'param'])
+         self.assertEqual(self.protocol._registered, True)
+         self.protocol.setNick(self.protocol.erroneousNickFallback)
+         self.assertEqual(
+@@ -1845,10 +1848,10 @@ class ClientTests(TestCase):
+         # nickname instead of erroneousNickFallback.
+         oldnick = self.protocol.nickname
+         self.protocol.setNick(badnick)
+-        self.protocol.irc_ERR_ERRONEUSNICKNAME('prefix', ['param'])
++        self.protocol.irc_ERR_ERRONEUSNICKNAME(u'prefix', [u'param'])
+         lastLine = self.getLastLine(self.transport)
+         self.assertEqual(
+-            lastLine, 'NICK %s' % (badnick,))
++            lastLine, u'NICK %s' % (badnick,))
+         self.assertEqual(self.protocol.nickname, oldnick)
+ 
+ 
+@@ -1857,16 +1860,16 @@ class ClientTests(TestCase):
+         L{IRCClient.desrcibe} sends a CTCP ACTION message to the target
+         specified.
+         """
+-        target = 'foo'
+-        channel = '#bar'
+-        action = 'waves'
++        target = u'foo'
++        channel = u'#bar'
++        action = u'waves'
+         self.protocol.describe(target, action)
+         self.protocol.describe(channel, action)
+         expected = [
+-            'PRIVMSG %s :\01ACTION %s\01' % (target, action),
+-            'PRIVMSG %s :\01ACTION %s\01' % (channel, action),
+-            '']
+-        self.assertEqual(self.transport.value().split('\r\n'), expected)
++            u'PRIVMSG %s :\01ACTION %s\01' % (target, action),
++            u'PRIVMSG %s :\01ACTION %s\01' % (channel, action),
++            u'']
++        self.assertEqual(self.transport.value().decode("ascii").split(u'\r\n'), expected)
+ 
+ 
+     def test_noticedDoesntPrivmsg(self):
+@@ -1875,10 +1878,10 @@ class ClientTests(TestCase):
+         C{privmsg()}
+         """
+         def privmsg(user, channel, message):
+-            self.fail("privmsg() should not have been called")
++            self.fail(u"privmsg() should not have been called")
+         self.protocol.privmsg = privmsg
+         self.protocol.irc_NOTICE(
+-            'spam', ['#greasyspooncafe', "I don't want any spam!"])
++            u'spam', [u'#greasyspooncafe', u"I don't want any spam!"])
+ 
+ 
+ 
+@@ -1891,8 +1894,8 @@ class DccChatFactoryTests(unittest.TestCase):
+         An instance of the DccChat protocol is returned, which has the factory
+         property set to the factory which created it.
+         """
+-        queryData = ('fromUser', None, None)
++        queryData = (u'fromUser', None, None)
+         f = irc.DccChatFactory(None, queryData)
+-        p = f.buildProtocol('127.0.0.1')
++        p = f.buildProtocol(u'127.0.0.1')
+         self.assertTrue(isinstance(p, irc.DccChat))
+         self.assertEqual(p.factory, f)
+-- 
+1.7.10.4
+

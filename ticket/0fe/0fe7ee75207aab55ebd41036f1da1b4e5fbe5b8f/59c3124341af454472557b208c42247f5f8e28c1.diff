@@ -1,0 +1,250 @@
+Index: D:/work/eclipse-workspace/twisted/twisted/words/test/test_irc.py
+===================================================================
+--- D:/work/eclipse-workspace/twisted/twisted/words/test/test_irc.py	(revision 22805)
++++ D:/work/eclipse-workspace/twisted/twisted/words/test/test_irc.py	(working copy)
+@@ -20,8 +20,7 @@
+     "xargs%(NUL)smight%(NUL)slike%(NUL)sthis" % {'NUL': irc.NUL },
+     "embedded%(CR)snewline%(CR)s%(NL)sFUN%(NL)s" % {'CR': irc.CR,
+                                                     'NL': irc.NL},
+-    "escape!%(X)s escape!%(M)s %(X)s%(X)sa %(M)s0" % {'X': irc.X_QUOTE,
+-                                                      'M': irc.M_QUOTE}
++    "escape!escape!%(M)s %(M)s0" % {'M': irc.M_QUOTE}
+     ]
+ 
+ 
+@@ -31,12 +30,7 @@
+         for s in stringSubjects:
+             self.failUnlessEqual(s, irc.lowDequote(irc.lowQuote(s)))
+ 
+-    def test_ctcpquoteSanity(self):
+-        """Testing CTCP message level quote/dequote"""
+-        for s in stringSubjects:
+-            self.failUnlessEqual(s, irc.ctcpDequote(irc.ctcpQuote(s)))
+ 
+-
+ class IRCClientWithoutLogin(irc.IRCClient):
+     performLogin = 0
+ 
+@@ -297,6 +291,24 @@
+                              user="sender!ident@host",
+                              channel="recipient",
+                              message=msg)
++        
++    def test_ACTION(self):
++        """Testing CTCP ACTION.
++        
++        This imitates behavior of wide-spread IRC clients for ACTION CTCP
++        query.
++        """
++        
++        actionQuery = (r":nick!guy@over.there PRIVMSG #theChan :"
++                       "%(X)cACTION \o/%(X)c%(EOL)s"
++                       % {'X': irc.X_DELIM,
++                       'EOL': irc.CR + irc.LF})
++        
++        self.client.dataReceived(actionQuery)
++        self.assertEquals(self.client.calls,
++                          [("action", dict(user="nick!guy@over.there",
++                                           channel="#theChan",
++                                           data=r"\o/"))])
+ 
+ class BasicServerFunctionalityTestCase(unittest.TestCase):
+     def setUp(self):
+Index: D:/work/eclipse-workspace/twisted/twisted/words/protocols/irc.py
+===================================================================
+--- D:/work/eclipse-workspace/twisted/twisted/words/protocols/irc.py	(revision 22805)
++++ D:/work/eclipse-workspace/twisted/twisted/words/protocols/irc.py	(working copy)
+@@ -1028,16 +1028,13 @@
+ 
+         if not message: return # don't raise an exception if some idiot sends us a blank message
+ 
++        # If message starts with X_DELIM, it's CTCP message.
+         if message[0]==X_DELIM:
+-            m = ctcpExtract(message)
+-            if m['extended']:
+-                self.ctcpQuery(user, channel, m['extended'])
++            # Trailing X_DELIM is optional.
++            tag, data = ctcpParse(message)
++            self.ctcpQuery(user, channel, tag, data)
++            return
+ 
+-            if not m['normal']:
+-                return
+-
+-            message = string.join(m['normal'], ' ')
+-
+         self.privmsg(user, channel, message)
+ 
+     def irc_NOTICE(self, prefix, params):
+@@ -1045,16 +1042,13 @@
+         channel = params[0]
+         message = params[-1]
+ 
++        # If message starts with X_DELIM, it's CTCP message.
+         if message[0]==X_DELIM:
+-            m = ctcpExtract(message)
+-            if m['extended']:
+-                self.ctcpReply(user, channel, m['extended'])
++            # Trailing X_DELIM is optional.
++            tag, data = ctcpParse(message)
++            self.ctcpReply(user, channel, tag, data)
++            return
+ 
+-            if not m['normal']:
+-                return
+-
+-            message = string.join(m['normal'], ' ')
+-
+         self.noticed(user, channel, message)
+ 
+     def irc_NICK(self, prefix, params):
+@@ -1155,15 +1149,14 @@
+     ### Receiving a CTCP query from another party
+     ### It is safe to leave these alone.
+ 
+-    def ctcpQuery(self, user, channel, messages):
++    def ctcpQuery(self, user, channel, tag, data):
+         """Dispatch method for any CTCP queries received.
+         """
+-        for m in messages:
+-            method = getattr(self, "ctcpQuery_%s" % m[0], None)
+-            if method:
+-                method(user, channel, m[1])
+-            else:
+-                self.ctcpUnknownQuery(user, channel, m[0], m[1])
++        method = getattr(self, "ctcpQuery_%s" % tag, None)
++        if method:
++            method(user, channel, data)
++        else:
++            self.ctcpUnknownQuery(user, channel, tag, data)
+ 
+     def ctcpQuery_ACTION(self, user, channel, data):
+         self.action(user, channel, data)
+@@ -1419,16 +1412,16 @@
+     ### Receiving a response to a CTCP query (presumably to one we made)
+     ### You may want to add methods here, or override UnknownReply.
+ 
+-    def ctcpReply(self, user, channel, messages):
++    def ctcpReply(self, user, channel, tag, data):
+         """Dispatch method for any CTCP replies received.
+         """
+-        for m in messages:
+-            method = getattr(self, "ctcpReply_%s" % m[0], None)
+-            if method:
+-                method(user, channel, m[1])
+-            else:
+-                self.ctcpUnknownReply(user, channel, m[0], m[1])
+ 
++        method = getattr(self, "ctcpReply_%s" % tag, None)
++        if method:
++            method(user, channel, data)
++        else:
++            self.ctcpUnknownReply(user, channel, tag, data)
++
+     def ctcpReply_PING(self, user, channel, data):
+         nick = user.split('!', 1)[0]
+         if (not self._pings) or (not self._pings.has_key((nick, data))):
+@@ -1908,47 +1901,18 @@
+ 
+ X_DELIM = chr(001)
+ 
+-def ctcpExtract(message):
+-    """Extract CTCP data from a string.
++def ctcpParse(message):
++    """Basic CTCP message parsing, data decoding is done by handlers"""
+ 
+-    Returns a dictionary with two items:
++    # Trailing X_DELIM is optional.
++    if message[-1] == X_DELIM:
++        message = message[1:-1]
++    else:
++        message = message[1:]
++    
++    tag, data = message.split(" ", 1)
++    return (tag, data)
+ 
+-       - C{'extended'}: a list of CTCP (tag, data) tuples
+-       - C{'normal'}: a list of strings which were not inside a CTCP delimeter
+-    """
+-
+-    extended_messages = []
+-    normal_messages = []
+-    retval = {'extended': extended_messages,
+-              'normal': normal_messages }
+-
+-    messages = string.split(message, X_DELIM)
+-    odd = 0
+-
+-    # X1 extended data X2 nomal data X3 extended data X4 normal...
+-    while messages:
+-        if odd:
+-            extended_messages.append(messages.pop(0))
+-        else:
+-            normal_messages.append(messages.pop(0))
+-        odd = not odd
+-
+-    extended_messages[:] = filter(None, extended_messages)
+-    normal_messages[:] = filter(None, normal_messages)
+-
+-    extended_messages[:] = map(ctcpDequote, extended_messages)
+-    for i in xrange(len(extended_messages)):
+-        m = string.split(extended_messages[i], SPC, 1)
+-        tag = m[0]
+-        if len(m) > 1:
+-            data = m[1]
+-        else:
+-            data = None
+-
+-        extended_messages[i] = (tag, data)
+-
+-    return retval
+-
+ # CTCP escaping
+ 
+ M_QUOTE= chr(020)
+@@ -1983,36 +1947,6 @@
+ 
+     return mEscape_re.sub(sub, s)
+ 
+-X_QUOTE = '\\'
+-
+-xQuoteTable = {
+-    X_DELIM: X_QUOTE + 'a',
+-    X_QUOTE: X_QUOTE + X_QUOTE
+-    }
+-
+-xDequoteTable = {}
+-
+-for k, v in xQuoteTable.items():
+-    xDequoteTable[v[-1]] = k
+-
+-xEscape_re = re.compile('%s.' % (re.escape(X_QUOTE),), re.DOTALL)
+-
+-def ctcpQuote(s):
+-    for c in (X_QUOTE, X_DELIM):
+-        s = string.replace(s, c, xQuoteTable[c])
+-    return s
+-
+-def ctcpDequote(s):
+-    def sub(matchobj, xDequoteTable=xDequoteTable):
+-        s = matchobj.group()[1]
+-        try:
+-            s = xDequoteTable[s]
+-        except KeyError:
+-            s = s
+-        return s
+-
+-    return xEscape_re.sub(sub, s)
+-
+ def ctcpStringify(messages):
+     """
+     @type messages: a list of extended messages.  An extended
+@@ -2034,7 +1968,7 @@
+             m = "%s %s" % (tag, data)
+         else:
+             m = str(tag)
+-        m = ctcpQuote(m)
++
+         m = "%s%s%s" % (X_DELIM, m, X_DELIM)
+         coded_messages.append(m)
+ 

@@ -1,0 +1,172 @@
+diff --git a/src/twisted/internet/iocpreactor/abstract.py b/src/twisted/internet/iocpreactor/abstract.py
+index 1cae9f7..2c64ab9 100644
+--- a/src/twisted/internet/iocpreactor/abstract.py
++++ b/src/twisted/internet/iocpreactor/abstract.py
+@@ -188,11 +188,11 @@ class FileHandle(_ConsumerMixin, _LogOwner):
+ 
+ 
+     def _cbWrite(self, rc, numBytesWritten, evt):
+-        if self._handleWrite(rc, numBytesWritten, evt):
++        if self._handleWrite(rc, numBytesWritten, evt) and self._writeScheduled is None:
+             self.doWrite()
+ 
+ 
+-    def _handleWrite(self, rc, numBytesWritten, evt):
++    def _handleWrite(self, rc, numBytesWritten, evt, update_offset=False):
+         """
+         Returns false if we should stop writing for now
+         """
+@@ -200,36 +200,37 @@ class FileHandle(_ConsumerMixin, _LogOwner):
+             return False
+         # XXX: not handling WSAEWOULDBLOCK
+         # ("too many outstanding overlapped I/O requests")
+-        if rc:
++        if rc and rc != ERROR_IO_PENDING:
+             self.connectionLost(failure.Failure(
+                                 error.ConnectionLost("write error -- %s (%s)" %
+                                     (errno.errorcode.get(rc, 'unknown'), rc))))
+             return False
+-        else:
++        elif update_offset is True:
+             self.offset += numBytesWritten
+-            # If there is nothing left to send,
+-            if self.offset == len(self.dataBuffer) and not self._tempDataLen:
+-                self.dataBuffer = b""
+-                self.offset = 0
+-                # stop writing
+-                self.stopWriting()
+-                # If I've got a producer who is supposed to supply me with data
+-                if self.producer is not None and ((not self.streamingProducer)
+-                                                  or self.producerPaused):
+-                    # tell them to supply some more.
+-                    self.producerPaused = True
+-                    self.producer.resumeProducing()
+-                elif self.disconnecting:
+-                    # But if I was previously asked to let the connection die,
+-                    # do so.
+-                    self.connectionLost(failure.Failure(main.CONNECTION_DONE))
+-                elif self._writeDisconnecting:
+-                    # I was previously asked to half-close the connection.
+-                    self._writeDisconnected = True
+-                    self._closeWriteConnection()
+-                return False
+-            else:
+-                return True
++
++        # If there is nothing left to send,
++        if self.offset == len(self.dataBuffer) and not self._tempDataLen:
++            self.dataBuffer = b""
++            self.offset = 0
++            # stop writing
++            self.stopWriting()
++            # If I've got a producer who is supposed to supply me with data
++            if self.producer is not None and ((not self.streamingProducer)
++                                              or self.producerPaused):
++                # tell them to supply some more.
++                self.producerPaused = False
++                self.producer.resumeProducing()
++            elif self.disconnecting:
++                # But if I was previously asked to let the connection die,
++                # do so.
++                self.connectionLost(failure.Failure(main.CONNECTION_DONE))
++            elif self._writeDisconnecting:
++                # I was previously asked to half-close the connection.
++                self._writeDisconnected = True
++                self._closeWriteConnection()
++            return False
++        else:
++            return True
+ 
+ 
+     def doWrite(self):
+@@ -243,16 +244,14 @@ class FileHandle(_ConsumerMixin, _LogOwner):
+             self._tempDataLen = 0
+ 
+         evt = _iocp.Event(self._cbWrite, self)
+-
+         # Send as much data as you can.
+         if self.offset:
+             sendView = memoryview(self.dataBuffer)
+-            evt.buff = buff = sendView[self.offset:]
++            buff = sendView[self.offset:]
+         else:
+-            evt.buff = buff = self.dataBuffer
++            buff = self.dataBuffer
+         rc, data = self.writeToHandle(buff, evt)
+-        if rc and rc != ERROR_IO_PENDING:
+-            self._handleWrite(rc, data, evt)
++        self._handleWrite(rc, data, evt, update_offset=True)
+ 
+ 
+     def writeToHandle(self, buff, evt):
+diff --git a/src/twisted/internet/test/test_iocp.py b/src/twisted/internet/test/test_iocp.py
+index 0762c6f..a182a5e 100644
+--- a/src/twisted/internet/test/test_iocp.py
++++ b/src/twisted/internet/test/test_iocp.py
+@@ -20,7 +20,7 @@ try:
+     from twisted.internet.iocpreactor import iocpsupport as _iocp, tcp, udp
+     from twisted.internet.iocpreactor.reactor import IOCPReactor, EVENTS_PER_LOOP, KEY_NORMAL
+     from twisted.internet.iocpreactor.interfaces import IReadWriteHandle
+-    from twisted.internet.iocpreactor.const import SO_UPDATE_ACCEPT_CONTEXT
++    from twisted.internet.iocpreactor.const import SO_UPDATE_ACCEPT_CONTEXT, ERROR_IO_PENDING
+     from twisted.internet.iocpreactor.abstract import FileHandle
+ except ImportError:
+     skip = 'This test only applies to IOCPReactor'
+@@ -32,6 +32,14 @@ except error as e:
+ else:
+     ipv6Skip = None
+ 
++
++class FakeSocket(object):
++    def fileno(self):
++        return 0
++
++class FakeProtocol(object):
++    pass
++
+ class SupportTests(unittest.TestCase):
+     """
+     Tests for L{twisted.internet.iocpreactor.iocpsupport}, low-level reactor
+@@ -148,3 +156,35 @@ class IOCPReactorTests(unittest.TestCase):
+         ir.doIteration(0)
+         self.assertEqual(fd.counter, EVENTS_PER_LOOP + 1)
+ 
++    def test_handleSlowServer(self):
++        """
++        Tests that multiple sends to a server that hasn't ACK'd do not result
++        in sending invalid data.
++        """
++
++        send_buffers = []
++        first_buffer = b"1234"
++        second_buffer = b"6789"
++
++        # patch _iocp.send to hold on to the send buffer.
++        def _patched_iocpsend(socket, send_buf, evt, flags=0):
++            send_buffers.append(send_buf)
++            return ERROR_IO_PENDING, len(send_buf)
++
++        self.patch(_iocp, "send", _patched_iocpsend)
++
++        ir = IOCPReactor()
++
++        conn = tcp.Connection(FakeSocket(), FakeProtocol(), ir)
++        conn.connected = True
++
++        conn.write(first_buffer)
++        ir.runUntilCurrent()
++        self.assertEqual(1, len(send_buffers))
++        self.assertEqual(first_buffer, send_buffers[0])
++
++        # Now send the second buffer, this will exercise the bug
++        conn.write(second_buffer)
++        ir.runUntilCurrent()
++        self.assertEqual(2, len(send_buffers))
++        self.assertEqual(second_buffer, send_buffers[1])
+diff --git a/src/twisted/newsfragments/9353.bugfix b/src/twisted/newsfragments/9353.bugfix
+new file mode 100644
+index 0000000..960b363
+--- /dev/null
++++ b/src/twisted/newsfragments/9353.bugfix
+@@ -0,0 +1 @@
++twisted.internet.iocpreactor now sends correct data when sending data to a server that hasn't yet acknowledged a previous send.

@@ -1,0 +1,1168 @@
+Index: twisted/internet/defer.py
+===================================================================
+RCS file: /cvs/Twisted/twisted/internet/defer.py,v
+retrieving revision 1.48
+diff -u -u -r1.48 defer.py
+--- twisted/internet/defer.py	10 Aug 2003 13:34:55 -0000	1.48
++++ twisted/internet/defer.py	20 Aug 2003 14:54:24 -0000
+@@ -25,6 +25,8 @@
+ 
+ from __future__ import nested_scopes
+ 
++import types
++
+ # Twisted imports
+ from twisted.python import log, failure
+ 
+@@ -438,6 +440,51 @@
+     d = DeferredList(deferredList, fireOnOneErrback=1)
+     d.addCallback(_parseDListResult)
+     return d
++
++def getRecursiveResults(items, dfrList=None, results=None, index=None):
++    """Return possibly nested list of possibly deferred results.
++
++    Deferred results which turn out to be lists are recursively expanded
++    as well.
++    
++    """
++    if isinstance(items, types.StringTypes):
++        if results is not None:
++            results[index] = items
++            return results
++        return items
++
++    if isinstance(items, Deferred):
++        items.addCallback(getRecursiveResults, None, results, index)
++        if dfrList is not None:
++            dfrList.append(items)
++        return items
++    try:
++        itemlength = len(items)
++        items[0:1]
++    except TypeError:
++        if results is not None:
++            results[index] = items
++            return results
++        return items
++    else:
++        myresults = [None] * itemlength
++        dfrList = dfrList or []
++        for i in xrange(itemlength):
++            getRecursiveResults(items[i], dfrList, myresults, i)
++
++        if results is not None:
++            results[index] = myresults
++            return results
++        else:
++            if dfrList:
++                dl = DeferredList(dfrList, fireOnOneErrback=1)
++                dl.addCallback(lambda x: myresults)
++                for d in dfrList:
++                    d.addErrback(lambda x: None)
++                return dl
++            else:
++                return myresults
+ 
+ # Constants for use with DeferredList
+ 
+Index: twisted/protocols/imap4.py
+===================================================================
+RCS file: /cvs/Twisted/twisted/protocols/imap4.py,v
+retrieving revision 1.162
+diff -u -u -r1.162 imap4.py
+--- twisted/protocols/imap4.py	20 Aug 2003 03:22:09 -0000	1.162
++++ twisted/protocols/imap4.py	20 Aug 2003 14:54:42 -0000
+@@ -50,6 +50,7 @@
+ import inspect
+ import base64
+ import binascii
++import calendar
+ import hmac
+ import re
+ import tempfile
+@@ -59,6 +60,7 @@
+ import sys
+ 
+ import email.Utils
++from email.Generator import Generator
+ 
+ try:
+     import cStringIO as StringIO
+@@ -476,8 +478,9 @@
+         self.tags = {}
+         self.canStartTLS = implements(self.transport, ITLSTransport)
+         self.setTimeout(self.timeOut)
++        self.canStartTLS = implements(self.transport, ITLSTransport)
+         self.sendServerGreeting()
+-    
++
+     def connectionLost(self, reason):
+         self.setTimeout(None)
+         if self._onLogout:
+@@ -714,7 +717,10 @@
+             rest = arg[1]
+         arg = arg[0]
+ 
+-        return (parseIdList(arg), rest)
++        try:
++            return (parseIdList(arg), rest)
++        except IllegalIdentifierError, e:
++            raise IllegalClientResponse("Bad message number " + str(e))
+ 
+     def arg_fetchatt(self, line):
+         """
+@@ -934,7 +940,7 @@
+ 
+         maybeDeferred(self.authenticateLogin, user, passwd).addCallbacks(
+             self.__cbLogin, self.__ebLogin, (tag,), None, (tag,), None
+-        )
++        ).addErrback(self.__ebLogin, tag)
+ 
+     unauth_LOGIN = (do_LOGIN, arg_astring, arg_astring)
+ 
+@@ -960,6 +966,7 @@
+         raise cred.error.UnauthorizedLogin()
+ 
+     def __cbLogin(self, (iface, avatar, logout), tag):
++        log.debug("__cbLogin called")
+         if iface is not IAccount:
+             self.sendBadResponse(tag, 'Server error')
+             log.err("__cbLogin called with %r, IAccount expected" % (iface,))
+@@ -971,6 +978,7 @@
+             self.setTimeout(self.POSTAUTH_TIMEOUT)
+ 
+     def __ebLogin(self, failure, tag):
++        log.debug("__ebLogin called")
+         if failure.check(cred.error.UnauthorizedLogin):
+             self.sendNegativeResponse(tag, 'LOGIN failed')
+         else:
+@@ -1450,13 +1458,13 @@
+             self.sendPositiveResponse(tag, 'FETCH completed')
+         else:
+             try:
+-                self._sendMessageFetchResponse(msgId, msg, query, uid)
++                self._sendMessageFetchResponse(msgId, msg, query, tag, uid)
+             except:
+                 log.err()
+             from twisted.internet import reactor
+             reactor.callLater(0, self._consumeMessageIterable, results, tag, query, uid)
+ 
+-    def _sendMessageFetchResponse(self, msgId, msg, query, uid):
++    def _sendMessageFetchResponse(self, msgId, msg, query, tag, uid):
+         seenUID = False
+         response = []
+         for part in query:
+@@ -1465,42 +1473,64 @@
+             elif part.type == 'flags':
+                 response.extend(('FLAGS', msg.getFlags()))
+             elif part.type == 'internaldate':
+-                response.extend(('INTERNALDATE', msg.getInternalDate()))
++                # XXX The IMAP spec writers invented their own date format
++                # for some obscure reason (Standards are great, everyone
++                # should have one). msg.getInternalDate() sensibly returns
++                # an RFC822-style date, reparse it into the IMAP abomination
++                dfr = defer.maybeDeferred(msg.getInternalDate).addCallbacks(
++                    rfcToImapDate)
++                response.extend(('INTERNALDATE', dfr))
+             elif part.type == 'rfc822header':
+-                response.extend(('RFC822.HEADER', _formatHeaders(msg.getHeaders(True)) + '\r\n'))
++                response.extend(('RFC822.HEADER', getRfc822Headers(msg)))
+             elif part.type == 'rfc822text':
+                 response.extend(('RFC822.TEXT', msg.getBodyFile()))
+             elif part.type == 'rfc822size':
+-                response.extend(('RFC822.SIZE', str(msg.getSize())))
++                response.extend(('RFC822.SIZE', msg.getSize()))
+             elif part.type == 'rfc822':
+-                response.extend(('RFC822', _formatHeaders(msg.getHeaders(True)) + msg.getBodyFile().read()))
++                response.extend(('RFC822', getRfc822Data(msg)))
+             elif part.type == 'uid':
+                 seenUID = True
+-                response.extend(('UID', str(msg.getUID())))
++                response.extend(('UID', msg.getUID()))
+             elif part.type == 'bodystructure':
+-                response.extend(('BODYSTRUCTURE', getBodyStructure(msg, True)))
++                response.extend((str(part), getBodyStructure(msg,
++                                                             part.extended)))
+             elif part.type == 'body':
+                 subMsg = msg
+                 for p in part.part or ():
+                     subMsg = subMsg.getSubPart(p)
+                 if part.header:
+                     if not part.header.fields:
+-                        response.extend((str(part), _formatHeaders(msg.getHeaders(True)) + '\r\n'))
++                        response.extend((str(part), _formatHeaders(msg.getHeaders(True))))
+                     else:
+                         hdrs = subMsg.getHeaders(part.header.negate, *part.header.fields)
+-                        response.extend((str(part), _formatHeaders(hdrs) + '\r\n'))
++                        response.extend((str(part), _formatHeaders(hdrs)))
+                 elif part.text:
+                     response.extend((str(part), subMsg.getBodyFile()))
+                 elif part.mime:
+-                    response.extend((str(part), _formatHeaders(msg.getHeaders(True)) + '\r\n'))
++                    response.extend((str(part), _formatHeaders(msg.getHeaders(True))))
+                 elif part.empty:
+-                    response.extend((str(part), _formatHeaders(msg.getHeaders(True)) + subMsg.getBodyFile().read()))
++                    response.extend((str(part), _formatBody(msg.getHeaders(True), subMsg.getBodyFile())))
+                 else:
+                     # Simplified bodystructure request
+                     response.extend(('BODY', getBodyStructure(msg, False)))
+ 
+         if uid and not seenUID:
+-            response[:0] = ['UID', str(msg.getUID())]
++            response[:0] = ['UID', msg.getUID()]
++
++        # Collect possibly defered results
++        dl = []
++        for item in response:
++            dl.append(defer.maybeDeferred(lambda : item))
++
++        dfr = defer.DeferredList(dl, fireOnOneErrback=1)
++        dfr.addCallbacks(self.__cbFetchResult, self.__ebFetch,
++                        (msgId,), None,
++                        (tag,), None)
++        for d in dl:
++            d.addErrback(log.err)
++
++    def __cbFetchResult(self, results, msgId):
++        response = [result for success, result in results if success]
+         self.sendUntaggedResponse("%d FETCH %s" % (msgId, collapseNestedLists([response])))
+ 
+     def __ebFetch(self, failure, tag):
+@@ -1657,7 +1687,8 @@
+     STATUS_CODES = ('OK', 'NO', 'BAD', 'PREAUTH', 'BYE')
+ 
+     STATUS_TRANSFORMATIONS = {
+-        'MESSAGES': int, 'RECENT': int, 'UNSEEN': int
++        'MESSAGES': int, 'RECENT': int, 'UNSEEN': int,
++        'UIDVALIDITY': int, 'UIDNEXT' : int,
+     }
+ 
+     context = None
+@@ -1700,9 +1731,9 @@
+             self._parts.append(rest.read())
+             self.setLineMode(passon.lstrip('\r\n'))
+ 
+-#    def sendLine(self, line):
+-#        print 'S:', repr(line)
+-#        return basic.LineReceiver.sendLine(self, line)
++    def sendLine(self, line):
++#        print 'cS:', repr(line)
++        return basic.LineReceiver.sendLine(self, line)
+ 
+     def _setupForLiteral(self, rest, octets):
+         self._pendingBuffer = self.messageFile(octets)
+@@ -1711,7 +1742,7 @@
+         self.setRawMode()
+ 
+     def lineReceived(self, line):
+-#        print 'C: ' + repr(line)
++#        print 'cC: ' + repr(line)
+         if self._parts is None:
+             lastPart = line.rfind(' ')
+             if lastPart != -1:
+@@ -2217,6 +2248,11 @@
+                                 datum['UIDVALIDITY'] = int(content[1])
+                             except ValueError:
+                                 raise IllegalServerResponse(parts)
++                        elif key == 'UIDNEXT':
++                            try:
++                                datum['UIDNEXT'] = int(content[1])
++                            except ValueError:
++                                raise IllegalServerResponse(parts)
+                         elif key == 'UNSEEN':
+                             try:
+                                 datum['UNSEEN'] = int(content[1])
+@@ -2950,7 +2986,7 @@
+             if headerArgs is not None:
+                 payload = ' (%s)' % ' '.join(headerArgs)
+             else:
+-                payload = ' ()'
++                payload = ''
+         else:
+             payload = ''
+         if offset is None:
+@@ -3501,12 +3537,18 @@
+     """
+     pieces = []
+     for i in items:
++        try:
++            ii = iter(i)
++        except:
++            ii = None
+         if i is None:
+             pieces.extend([' ', 'NIL'])
+         elif hasattr(i, 'read'):
+             d = i.read()
+             pieces.extend([' ', '{', str(len(d)), '}', IMAP4Server.delimiter, d])
+-        elif isinstance(i, types.StringTypes):
++        elif isinstance(i, types.StringTypes) or ii is None:
++            if ii is None:
++                i = str(i)
+             if _needsLiteral(i):
+                 pieces.extend([' ', '{', str(len(i)), '}', IMAP4Server.delimiter, i])
+             elif (not i.startswith('BODY')) and _needsQuote(i):
+@@ -3514,9 +3556,9 @@
+             else:
+                 pieces.extend([' ', i])
+         elif pieces and pieces[-1].upper() == 'BODY.PEEK':
+-            pieces.append('[%s]' % (collapseNestedLists(i),))
++            pieces.append('[%s]' % (collapseNestedLists(ii),))
+         else:
+-            pieces.extend([' ', '(%s)' % (collapseNestedLists(i),)])
++            pieces.extend([' ', '(%s)' % (collapseNestedLists(ii),)])
+     return ''.join(pieces[1:])
+ 
+ class IClientAuthentication(components.Interface):
+@@ -3874,6 +3916,32 @@
+     def getOtherNamespaces(self):
+         return None
+ 
++class HeaderList(list):
++    # Should probably also enforce that all entries are 2-tuples
++    def get(self, key, default=None):
++        key = key.lower()
++        for k,v in self:
++            if k.lower() == key:
++                return v
++
++        return default
++
++    def get_all(self, key):
++        res = []
++        key = key.lower()
++        for k,v in self:
++            if k.lower() == key:
++                res.append(v)
++
++        return res
++
++    def __in__(self, key):
++        return key in self.keys()
++
++    def keys(self):
++        return [k for k,v in self]
++        
++
+ _statusRequestDict = {
+     'MESSAGES': 'getMessageCount',
+     'RECENT': 'getRecentCount',
+@@ -3888,140 +3956,197 @@
+     return r
+ 
+ def parseAddr(addr):
++    "Turn address header value into IMAP list"
+     if addr is None:
+-        return [(None, None, None),]
++        return None
+     addrs = email.Utils.getaddresses([addr])
+     return [[fn or None, None] + addr.split('@') for fn, addr in addrs]
+ 
+ def getEnvelope(msg):
+-    headers = msg.getHeaders(True)
++    return defer.maybeDeferred(
++        msg.getHeaders, False, 'date', 'subject', 'from', 'sender', 'reply-to',
++                       'to', 'cc', 'bcc', 'in-reply-to', 'message-id'
++        ).addCallbacks(__cbGetEnvelope)
++
++def __cbGetEnvelope(headers):
+     date = headers.get('date')
+     subject = headers.get('subject')
+-    from_ = headers.get('from')
+-    sender = headers.get('sender', from_)
+-    reply_to = headers.get('reply-to', from_)
+-    to = headers.get('to')
+-    cc = headers.get('cc')
+-    bcc = headers.get('bcc')
++    from_ = headers.get('from') or headers.get('sender')
++    sender = parseAddr(headers.get('sender', from_))
++    reply_to = parseAddr(headers.get('reply-to', from_))
++    from_ = parseAddr(from_)
++    to = parseAddr(headers.get('to'))
++    cc = parseAddr(headers.get('cc'))
++    bcc = parseAddr(headers.get('bcc'))
+     in_reply_to = headers.get('in-reply-to')
+-    mid = headers.get('message-id')
+-    return (date, subject, parseAddr(from_), parseAddr(sender),
+-        reply_to and parseAddr(reply_to), to and parseAddr(to),
+-        cc and parseAddr(cc), bcc and parseAddr(bcc), in_reply_to, mid)
+-
+-def getLineCount(msg):
+-    # XXX - Super expensive, CACHE THIS VALUE FOR LATER RE-USE
+-    # XXX - This must be the number of lines in the ENCODED version
+-    lines = 0
+-    for _ in msg.getBodyFile():
+-        lines += 1
+-    return lines
+-
+-def getBodyStructure(msg, extended=False):
+-    # XXX - This does not properly handle multipart messages
+-    # BODYSTRUCTURE is obscenely complex and criminally under-documented.
+-    
+-    attrs = {}
+-    headers = 'content-type', 'content-id', 'content-description', 'content-transfer-encoding'
+-    headers = msg.getHeaders(False, *headers)
+-    mm = headers.get('content-type')
+-    if mm:
+-        mm = ''.join(mm.splitlines())
+-        mimetype = mm.split(';')
+-        if mimetype:
+-            type = mimetype[0].split('/', 1)
+-            if len(type) == 1:
+-                major = type[0]
+-                minor = None
+-            elif len(type) == 2:
+-                major, minor = type
+-            else:
+-                major = minor = None
+-            attrs = dict([x.strip().lower().split('=', 1) for x in mimetype[1:]])
+-        else:
+-            major = minor = None
++    message_id = headers.get('message-id')
++    return (date, subject, from_, sender, reply_to, to, cc, bcc, in_reply_to,
++            message_id)
++
++def rfcToImapDate(rfcdate):
++    day = rfcdate[5:7]
++    month = rfcdate[8:11]
++    if rfcdate[14] == ' ': # Two-digit year
++        year = '%.4d' % (int(rfcdate[12:14])+1900)
++        timetz = rfcdate[15:29]
+     else:
+-        major = minor = None
+-    
+-    
+-    size = str(msg.getSize())
+-    result = [
+-        major, minor,                       # Main and Sub MIME types
+-        attrs.items(),                      # content-type parameter list
+-        headers.get('content-id'),          # Duh
+-        headers.get('content-description'), # Duh
+-        headers.get('content-transfer-encoding'), # Duh
+-        size,                               # Number of octets total
+-    ]
+-    
+-    if major is not None:
+-        if major.lower() == 'text':
+-            result.append(str(getLineCount(msg)))
+-        elif (major.lower(), minor.lower()) == ('message', 'rfc822'):
+-            contained = msg.getSubPart(0)
+-            result.append(getEnvelope(contained))
+-            result.append(getBodyStructure(contained, False))
+-            result.append(str(getLineCount(contained)))
+-
+-    if not extended or major is None:
+-        return result
+-
+-    if major.lower() != 'multipart':
+-        headers = 'content-md5', 'content-disposition', 'content-language'
+-        headers = msg.getHeaders(False, *headers)
+-        disp = headers.get('content-disposition')
+-
+-        # XXX - I dunno if this is really right
+-        if disp:
+-            disp = disp.split('; ')
+-            if len(disp) == 1:
+-                disp = (disp[0].lower(), None)
+-            elif len(disp) > 1:
+-                disp = (disp[0].lower(), [x.split('=') for x in disp[1:]])
+-
+-        result.append(headers.get('content-md5'))
+-        result.append(disp)
+-        result.append(headers.get('content-language'))
++        year = rfcdate[12:16]
++        timetz = rfcdate[17:31]
++        
++    return '%s-%s-%s %s' % (day, month, year, timetz)
++
++_days = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']
++_months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
++           'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
++def imapToEpochTime(imapdate):
++    """
++    Take an IMAP date/time string and return a tuple containing
++    seconds since the epoch and timezone offset in seconds
++    """
++    day = int(imapdate[:2])
++    month = _months.index(imapdate[3:6])+1
++    year = int(imapdate[7:11])
++    hour = int(imapdate[12:14])
++    minute = int(imapdate[15:17])
++    second = int(imapdate[18:20])
++    tzoffset = -(int(imapdate[21:24])*3600 + int(imapdate[24:26])*60)
++
++    seconds = calendar.timegm((year, month, day, hour, minute, second))
++    seconds += tzoffset
++
++    return seconds, tzoffset
++
++def imapToRfcDate(imapdate):
++    seconds, tzoffset = imapToEpochTime(imapdate)
++    tzstring = imapdate[21:26]
++
++    seconds -= tzoffset # Treat it as UTC -> don't worry about timezone
++    timeinfo = time.gmtime(seconds)
++
++    return "%s, %02d %s %04d %02d:%02d:%02d %s" % (
++        _days[timeinfo[6]], timeinfo[2], _months[timeinfo[1] - 1],
++        timeinfo[0], timeinfo[3], timeinfo[4], timeinfo[5], tzstring)
++
++def getRfc822Headers(msg):
++    """Return a rfc822-style headers for msg (including blank line)"""
++    return defer.maybeDeferred(msg.getHeaders).addCallback(__cbRfc822Headers)
++
++def __cbRfc822Headers(headers):
++    headers = [': '.join(hdr) for hdr in headers]
++    headers.extend(('',''))
++    return '\r\n'.join(headers)
++    
++def getRfc822Data(msg):
++    """Return an rfc822-style message string with the contents of msg"""
++    return defer.maybeDeferred(msg.getBodyFile).addCallback(
++        lambda x: x.read()).addCallback(__cbRfc822GetHeaders, msg)
++
++def __cbRfc822GetHeaders(body, msg):
++    return getRfc822Headers(msg).addCallback(__cbRfc822JoinHdrBody, body)
++
++def __cbRfc822JoinHdrBody(hdr, body):
++    return ''.join((hdr, body))
++
++def getBodyStructure(msg, ext=True):
++    return msg.fetchMimeData().addCallback(bodyStructure, ext)
++
++def bodyStructure(msg, ext=True):
++    "Generate IMAP BODY[STRUCTURE] response"
++    res = []
++
++    if msg.get_content_maintype() == 'multipart':
++        for part in msg.get_payload():
++            res.append(part.fetchMimeData().addCallback(bodyStructure, ext))
++        res.append(msg.get_content_subtype())
++        if ext:
++            extdata = []
++            for hdr in ['content-type', 'content-disposition']:
++                extdata.append(splitParams(msg.get(hdr)))
++
++            extdata.extend([msg.get('content-language'),
++                            msg.get('content-location')])
++            res.extend(extdata)
+     else:
+-        result = [result]
+-        try:
+-            i = 0
+-            while True:
+-                submsg = msg.getSubPart(i)
+-                L.append(getBodyStructure(submsg))
+-                i += 1
+-        except IndexError:
+-            result.append(minor)
+-            result.append(attrs.items())
+-
+-            # XXX - I dunno if this is really right
+-            headers = msg.getHeaders(False, 'content-disposition', 'content-language')
+-            disp = headers.get('content-disposition')
+-            if disp:
+-                disp = disp.split('; ')
+-                if len(disp) == 1:
+-                    disp = (disp[0].lower(), None)
+-                elif len(disp) > 1:
+-                    disp = (disp[0].lower(), [x.split('=') for x in disp[1:]])
+-            
+-            result.append(disp)
+-            result.append(headers.get('content-language'))
++        res.extend([msg.get_content_maintype(), msg.get_content_subtype()])
++        res.extend([splitParams(msg.get('content-type')),
++                    msg.get('content-id'),
++                    msg.get('content-description'),
++                    msg.get('content-transfer-encoding'),
++                    msg.getSize()])
++
++        if msg.get_content_type() == 'message/rfc822':
++            # A message/rfc822 has exactly 1 subpart
++            part = msg.get_payload(0)
++            res.extend([getEnvelope(part),
++                        part.fetchMimeData().addCallback(bodyStructure, ext),
++                        msg.getBodySize()])
++        elif msg.get_content_maintype() == 'text':
++            res.append(msg.getBodySize())
++        if ext:
++            extdata = [msg.get('content-md5')]
++            extdata.extend([splitParams(msg.get('content-disposition')),
++                            msg.get('content-language'),
++                            msg.get('content-location')])
++            res.extend(extdata)
++
++    return defer.getRecursiveResults(res)
++
++def splitParams(value,default=None):
++    """Get parameters from MIME-header, i.e. for
++         value='text/plain; charset=us-ascii; foo=bar; baz'
++        return
++         [ ('charset', 'us-ascii'), ('foo', 'bar'), ('baz' None)]
++        """
++    params = []
++    if value is None:
++        return default
+ 
+-    return result
++    for param in value.split(';')[1:]:
++        try:
++            name, val = param.split('=',1)
++            name = name.strip()
++            val = val.strip()
++        except ValueError:
++            # Bare attribute
++            name = param.strip()
++            val = None
++        params.append((name, val))
++    return params
++
++class BodyGenerator(Generator):
++    "A class that returns the body of a message object"
++    def _write(self, msg):
++        "Just write the contents, skip writing the headers"
++        self._dispatch(msg)
++
++    def clone(self, fp):
++        """Return a normal generator, so we get headers inside"""
++        return Generator(fp, self._mangle_from_, self._Generator__maxheaderlen)
++
++def flattenBody(msg):
++    b = StringIO.StringIO()
++    g = BodyGenerator(b)
++    g.flatten(msg)
++    return b.getvalue()
+ 
+ class IMessage(components.Interface):
+-    def getHeaders(self, negate, *names):
++    """Container for a message in the IMAP mailbox. Should be fairly
++    similar to an email.Message message.
++
++    Note: all returns may be defereds
++    """
++    def getHeaders(self, negate=True, *names):
+         """Retrieve a group of message headers.
+         
+-        @type names: C{tuple} of C{str}
+-        @param names: The names of the headers to retrieve or omit.
+-        
+         @type negate: C{bool}
+         @param negate: If True, indicates that the headers listed in C{names}
+         should be omitted from the return value, rather than included.
+         
+-        @rtype: C{dict}
+-        @return: A mapping of header field names to header field values
++        @type names: C{tuple} of C{str}
++        @param names: The names of the headers to retrieve or omit.
++        
++        @rtype: C{HeaderList}
++        @return: A searchable list of header field names to header field values
+         """ 
+ 
+     def getFlags(self):
+@@ -4048,6 +4173,12 @@
+         @rtype: C{int}
+         """
+ 
++    def getBodySize(self):
++        """Retrieve the size of the body, in number of lines.
++
++        @rtype C{int}
++        """
++
+     def getUID(self):
+         """Retrieve the unique identifier associated with this message.
+         """
+@@ -4065,6 +4196,41 @@
+         @return: The specified sub-part.
+         """
+ 
++    def fetchMimeData(self):
++        """Fetch all data to generate BODYSTRUCTURE from backing store
++
++        @rtype: C{deferred} of C{IMessage}
++        @return: A deferred, which will be called with an IMessage which
++        has retrieve the neccessary information from backing store.
++        """
++        pass
++
++    # These behave similar to the same functions in email.Message
++    def get_payload(self, index=None):
++        pass
++
++    def get_content_type(self):
++        pass
++
++    def get_content_maintype(self):
++        pass
++
++    def get_content_subtype(self):
++        pass
++
++    def get(self, key, default=None):
++        """Get a header value
++
++        @type key: C{string}
++        @param key: Header to look for
++
++        @type default: C{any}
++        @param default: Value returned if header is not found (default None)
++
++        @rtype: C{string}
++        @return: The value of one of the headers that match.
++        """
++
+ class ISearchableMailbox(components.Interface):
+     def search(self, query, uid):
+         """Search for messages that meet the given query criteria.
+@@ -4269,14 +4435,28 @@
+         read-write.
+         """
+ 
++def _formatBody(headers, body):
++    dfr = _formatHeaders(headers)
++    dfr.addCallback(_cbFormatBody, body)
++    return dfr
++
++def _cbFormatBody(hdrs, body):
++    dfr = defer.maybeDeferred(lambda : body).addCallback(_cbFormatBody2, hdrs)
++    return dfr
++
++def _cbFormatBody2(body, hdrs):
++    return hdrs + body
++        
+ def _formatHeaders(headers, order=None):
++    return defer.maybeDeferred(lambda : headers).addCallback(_cbFormatHeaders, order)
++
++def _cbFormatHeaders(headers, order=None):
+     if order is not None:
+-        headers = dict([(h.lower(), v) for (h, v) in headers.iteritems()])
+         items = [(h, headers[h.lower()]) for h in order if h.lower() in headers]
+     else:
+-        items = headers.iteritems()
++        items = headers
+     hdrs = [': '.join((k, '\r\n'.join(v.splitlines()))) for (k, v) in items]
+-    hdrs = '\r\n'.join(hdrs) + '\r\n'
++    hdrs = '\r\n'.join(hdrs) + '\r\n\r\n'
+     return hdrs
+ 
+ class _FetchParser:
+@@ -4353,7 +4533,15 @@
+ 
+     class BodyStructure:
+         type = 'bodystructure'
+-        __str__ = lambda self: 'bodystructure'
++        extended = True
++        def __init__(self, ext=True):
++            self.extended = ext
++
++        def __str__(self):
++            if self.extended:
++                return 'BODYSTRUCTURE'
++            else:
++                return 'BODY'
+ 
+     # These three aren't top-level, they don't need type indicators
+     class Header:
+@@ -4483,11 +4671,14 @@
+                 return len(name)
+         
+         b = self.Body()
+-        if l.startswith('body.peek'):
++        if l.startswith('body.peek['):
+             b.peek = True
+             used = 9
+-        elif l.startswith('body'):
++        elif l.startswith('body['):
+             used = 4
++        elif l.startswith('body'):
++            self.result.append(self.BodyStructure(False))
++            return 4
+         else:
+             raise Exception("Nothing recognized in fetch_att: %s" % (l,))
+         
+Index: twisted/test/test_defer.py
+===================================================================
+RCS file: /cvs/Twisted/twisted/test/test_defer.py,v
+retrieving revision 1.27
+diff -u -u -r1.27 test_defer.py
+--- twisted/test/test_defer.py	24 Jul 2003 07:10:05 -0000	1.27
++++ twisted/test/test_defer.py	20 Aug 2003 14:54:45 -0000
+@@ -253,6 +253,16 @@
+         r = unittest.deferredError(defer.maybeDeferred(lambda: d))
+         r.trap(RuntimeError)
+ 
++    def testGetRecursiveResults(self):
++        result = []
++        rdl = [ defer.succeed(1), [ defer.succeed(2), 3 ], "foo" ]
++        expected = [ 1, [2, 3], "foo" ]
++        def cb(data, result=result):
++            result.extend(data)
++
++        d = defer.getRecursiveResults(rdl)
++        d.addCallback(cb)
++        self.assertEquals(result, expected)
+ 
+ class LogTestCase(unittest.TestCase):
+ 
+Index: twisted/test/test_imap.py
+===================================================================
+RCS file: /cvs/Twisted/twisted/test/test_imap.py,v
+retrieving revision 1.76
+diff -u -u -r1.76 test_imap.py
+--- twisted/test/test_imap.py	20 Aug 2003 03:22:06 -0000	1.76
++++ twisted/test/test_imap.py	20 Aug 2003 14:54:53 -0000
+@@ -83,11 +83,17 @@
+ class IMAP4HelperTestCase(unittest.TestCase):
+     def testHeaderFormatter(self):
+         cases = [
+-            ({'Header1': 'Value1', 'Header2': 'Value2'}, 'Header2: Value2\r\nHeader1: Value1\r\n'),
++            ({'Header1': 'Value1', 'Header2': 'Value2'}, 'Header2: Value2\r\nHeader1: Value1\r\n\r\n'),
+         ]
+-        
++
++        def result(R):
++            self.result = R
++
+         for (input, output) in cases:
+-            self.assertEquals(imap4._formatHeaders(input), output)
++            imap4._formatHeaders(imap4.HeaderList(
++                input.items())).addCallback(result)
++            
++            self.assertEquals(self.result, output)
+ 
+     def testMessageSet(self):
+         m1 = MessageSet()
+@@ -260,17 +266,16 @@
+         p = P()
+         p.parseString('BODY')
+         self.assertEquals(len(p.result), 1)
+-        self.failUnless(isinstance(p.result[0], p.Body))
+-        self.assertEquals(p.result[0].peek, False)
+-        self.assertEquals(p.result[0].header, None)
++        self.failUnless(isinstance(p.result[0], p.BodyStructure))
++        self.assertEquals(p.result[0].extended, False)
+         self.assertEquals(str(p.result[0]), 'BODY')
+ 
+         p = P()
+-        p.parseString('BODY.PEEK')
++        p.parseString('BODY.PEEK[]')
+         self.assertEquals(len(p.result), 1)
+         self.failUnless(isinstance(p.result[0], p.Body))
+         self.assertEquals(p.result[0].peek, True)
+-        self.assertEquals(str(p.result[0]), 'BODY')
++        self.assertEquals(str(p.result[0]), 'BODY[]')
+         
+         p = P()
+         p.parseString('BODY[]')
+@@ -942,7 +947,7 @@
+         
+         self.assertEquals(
+             self.statused,
+-            {'MESSAGES': 9, 'UIDNEXT': '10', 'UNSEEN': 4}
++            {'MESSAGES': 9, 'UIDNEXT': 10, 'UNSEEN': 4}
+         )
+     
+     def testFailedStatus(self):
+@@ -1342,15 +1347,15 @@
+     __implements__ = (imap4.IMessage,)
+     
+     def __init__(self, headers, flags, date, body, uid, subpart):
+-        self.headers = headers
++        self.headers = imap4.HeaderList(headers)
+         self.flags = flags
+         self.body = StringIO(body)
+         self.size = len(body)
+         self.date = date
+         self.uid = uid
+         self.subpart = subpart
+-        
+-    def getHeaders(self, negate, *names):
++
++    def getHeaders(self, negate=True, *names):
+         self.got_headers = negate, names
+         return self.headers
+ 
+@@ -1365,6 +1370,9 @@
+     
+     def getSize(self):
+         return self.size
++
++    def getBodySize(self):
++        return len(self.body.readlines())
+     
+     def getUID(self):
+         return self.uid
+@@ -1373,6 +1381,27 @@
+         self.got_subpart = part
+         return self.subpart
+ 
++    def fetchMimeData(self):
++        return defer.succeed(self)
++
++    def get_content_type(self):
++        return self.headers.get('content-type','text/plain').split(';')[0]
++
++    def get_content_maintype(self):
++        return self.get_content_type().split('/')[0]
++
++    def get_content_subtype(self):
++        return self.get_content_type().split('/')[1]
++
++    def get_payload(self, index=None):
++        if index is None:
++            self.got_subpart = None
++            return [self.subpart]
++        return self.getSubPart(index)
++
++    def get(self, key, default=None):
++        return self.headers.get(key, default)
++
+ class NewStoreTestCase(unittest.TestCase, IMAP4HelperMixin):
+     result = None
+     storeArgs = None
+@@ -1475,9 +1504,9 @@
+         
+         self.messages = '7'
+         self.msgObjs = [
+-            FakeyMessage({}, (), '', '', 12345, None),
+-            FakeyMessage({}, (), '', '', 999, None),
+-            FakeyMessage({}, (), '', '', 10101, None),
++            FakeyMessage([], (), '', '', 12345, None),
++            FakeyMessage([], (), '', '', 999, None),
++            FakeyMessage([], (), '', '', 10101, None),
+         ]
+         self.expected = {
+             0: {'UID': '12345'},
+@@ -1490,8 +1519,8 @@
+         self.function = self.client.fetchFlags
+         self.messages = '9'
+         self.msgObjs = [
+-            FakeyMessage({}, ['FlagA', 'FlagB', '\\FlagC'], '', '', 54321, None),
+-            FakeyMessage({}, ['\\FlagC', 'FlagA', 'FlagB'], '', '', 12345, None),
++            FakeyMessage([], ['FlagA', 'FlagB', '\\FlagC'], '', '', 54321, None),
++            FakeyMessage([], ['\\FlagC', 'FlagA', 'FlagB'], '', '', 12345, None),
+         ]
+         self.expected = {
+             0: {'FLAGS': ['FlagA', 'FlagB', '\\FlagC']},
+@@ -1506,16 +1535,14 @@
+         self.function = self.client.fetchInternalDate
+         self.messages = '13'
+         self.msgObjs = [
+-            FakeyMessage({}, (), 'Tuesday', '', 23232, None),
+-            FakeyMessage({}, (), '20-Oct-1981 03:25:19 -0500', '', 101, None),
+-            FakeyMessage({}, (), '15-Feb-1985 01:30:05 +0900', '', 202, None),
+-            FakeyMessage({}, (), '01-Jun-1992 13:51:48 -0100', '', 303, None),
++            FakeyMessage([], (), 'Mon, 20 Oct 1981 03:25:19 -0500', '', 101, None),
++            FakeyMessage([], (), 'Mon, 15 Feb 1985 01:30:05 +0900', '', 202, None),
++            FakeyMessage([], (), 'Mon, 01 Jun 1992 13:51:48 -0100', '', 303, None),
+         ]
+         self.expected = {
+-            0: {'INTERNALDATE': 'Tuesday'},
+-            1: {'INTERNALDATE': '20-Oct-1981 03:25:19 -0500'},
+-            2: {'INTERNALDATE': '15-Feb-1985 01:30:05 +0900'},
+-            3: {'INTERNALDATE': '01-Jun-1992 13:51:48 -0100'},
++            0: {'INTERNALDATE': '20-Oct-1981 03:25:19 -0500'},
++            1: {'INTERNALDATE': '15-Feb-1985 01:30:05 +0900'},
++            2: {'INTERNALDATE': '01-Jun-1992 13:51:48 -0100'},
+         }
+         self._fetchWork(uid)
+     
+@@ -1529,7 +1556,7 @@
+             FakeyMessage({
+                 'from': 'user@domain', 'to': 'resu@domain',
+                 'date': 'thursday', 'subject': 'it is a message',
+-                'message-id': 'id-id-id-yayaya'}, (), '', '', 65656,
++                'message-id': 'id-id-id-yayaya'}.items(), (), '', '', 65656,
+                 None),
+         ]
+         self.expected = {
+@@ -1555,11 +1582,16 @@
+                 'content-id': 'this-is-the-content-id',
+                 'content-description': 'describing-the-content-goes-here!',
+                 'content-transfer-encoding': '8BIT',
+-            }, (), '', 'Body\nText\nGoes\nHere\n', 919293, None)]
++                'content-md5': 'md5sum',
++                'content-disposition': 'inline',
++                'content-language': 'x-non-human',
++                'content-location': 'URI::here'
++            }.items(), (), '', 'Body\nText\nGoes\nHere\n', 919293, None)]
+         self.expected = {0: {'BODYSTRUCTURE': [
+             'text', 'plain', [['name', 'thing'], ['key', 'value']],
+             'this-is-the-content-id', 'describing-the-content-goes-here!',
+-            '8BIT', '20', '4', None, None, None]}}
++            '8BIT', '20', '4', 'md5sum', [], 'x-non-human',
++            'URI::here']}}
+         self._fetchWork(uid)
+         
+     def testFetchBodyStructureUID(self):
+@@ -1567,17 +1599,15 @@
+     
+     def testFetchSimplifiedBody(self, uid=0):
+         self.function = self.client.fetchSimplifiedBody
+-        self.messages = '21'
+-        self.msgObjs = [FakeyMessage({}, (), '', 'Yea whatever', 91825,
+-            FakeyMessage({'content-type': 'image/jpg'}, (), '',
++        self.messages = '91825'
++        self.msgObjs = [FakeyMessage([('content-type', 'multipart/mixed')], (), '', 'Yea whatever', 91825,
++            FakeyMessage([('content-type', 'image/jpeg')], (), '',
+                 'Body Body Body', None, None
+             )
+         )]
+         self.expected = {0:
+-            {'BODY': 
+-                [None, None, [], None, None, None,
+-                    '12'
+-                ]
++            {'BODY': [['image', 'jpeg', [], None, None, None,
++                       str(len('Body Body Body'))], 'mixed']
+             }
+         }
+ 
+@@ -1589,7 +1619,7 @@
+     def testFetchSimplifiedBodyText(self, uid=0):
+         self.function = self.client.fetchSimplifiedBody
+         self.messages = '21'
+-        self.msgObjs = [FakeyMessage({'content-type': 'text/plain'},
++        self.msgObjs = [FakeyMessage([('content-type', 'text/plain')],
+             (), '', 'Yea whatever', 91825, None)]
+         self.expected = {0: 
+             {'BODY': 
+@@ -1607,17 +1637,16 @@
+     def testFetchSimplifiedBodyRFC822(self, uid=0):
+         self.function = self.client.fetchSimplifiedBody
+         self.messages = '21'
+-        self.msgObjs = [FakeyMessage({'content-type': 'message/rfc822'},
++        self.msgObjs = [FakeyMessage([('content-type', 'message/rfc822')],
+             (), '', 'Yea whatever', 91825, 
+-            FakeyMessage({'content-type': 'image/jpg'}, (), '',
++            FakeyMessage([('content-type', 'image/jpg')], (), '',
+                 'Body Body Body', None, None
+             )
+         )]
+         self.expected = {0: 
+             {'BODY': 
+                 ['message', 'rfc822', [], None, None, None,
+-                    '12', [None, None, [[None, None, None]],
+-                    [[None, None, None]], None, None, None,
++                    '12', [None, None, None, None, None, None, None,
+                     None, None, None], ['image', 'jpg', [],
+                     None, None, None, '14'], '1'
+                 ]
+@@ -1633,10 +1662,10 @@
+         self.function = self.client.fetchMessage
+         self.messages = '1,3,7,10101'
+         self.msgObjs = [
+-            FakeyMessage({'Header': 'Value'}, (), '', 'BODY TEXT\r\n', 91, None),
++            FakeyMessage([('Header', 'Value')], (), '', 'BODY TEXT\r\n', 91, None),
+         ]
+         self.expected = {
+-            0: {'RFC822': 'Header: Value\r\nBODY TEXT\r\n'}
++            0: {'RFC822': 'Header: Value\r\n\r\nBODY TEXT\r\n'}
+         }
+         self._fetchWork(uid)
+ 
+@@ -1647,10 +1676,10 @@
+         self.function = self.client.fetchHeaders
+         self.messages = '9,6,2'
+         self.msgObjs = [
+-            FakeyMessage({'H1': 'V1', 'H2': 'V2'}, (), '', '', 99, None),
++            FakeyMessage([('H1', 'V1'), ('H2', 'V2')], (), '', '', 99, None),
+         ]
+         self.expected = {
+-            0: {'RFC822.HEADER': imap4._formatHeaders({'H1': 'V1', 'H2': 'V2'}) + '\r\n'},
++            0: {'RFC822.HEADER': 'H1: V1\r\nH2: V2\r\n\r\n'},
+         }
+         self._fetchWork(uid)
+ 
+@@ -1661,7 +1690,7 @@
+         self.function = self.client.fetchBody
+         self.messages = '1,2,3,4,5,6,7'
+         self.msgObjs = [
+-            FakeyMessage({'Header': 'Value'}, (), '', 'Body goes here\r\n', 171, None),
++            FakeyMessage([('Header', 'Value')], (), '', 'Body goes here\r\n', 171, None),
+         ]
+         self.expected = {
+             0: {'RFC822.TEXT': 'Body goes here\r\n'},
+@@ -1675,7 +1704,7 @@
+         self.function = self.client.fetchSize
+         self.messages = '1:100,2:*'
+         self.msgObjs = [
+-            FakeyMessage({}, (), '', 'x' * 20, 123, None),
++            FakeyMessage([], (), '', 'x' * 20, 123, None),
+         ]
+         self.expected = {
+             0: {'RFC822.SIZE': '20'},
+@@ -1689,24 +1718,24 @@
+         self.function = self.client.fetchFull
+         self.messages = '1,3'
+         self.msgObjs = [
+-            FakeyMessage({}, ('\\XYZ', '\\YZX', 'Abc'),
++            FakeyMessage([], ('\\XYZ', '\\YZX', 'Abc'),
+                 'Sun, 25 Jul 2010 06:20:30 -0400 (EDT)',
+                 'xyz' * 2, 654, None),
+-            FakeyMessage({}, ('\\One', '\\Two', 'Three'),
++            FakeyMessage([], ('\\One', '\\Two', 'Three'),
+                 'Mon, 14 Apr 2003 19:43:44 -0400',
+                 'abc' * 4, 555, None),
+         ]
+         self.expected = {
+             0: {'FLAGS': ['\\XYZ', '\\YZX', 'Abc'],
+-                'INTERNALDATE': 'Sun, 25 Jul 2010 06:20:30 -0400 (EDT)',
++                'INTERNALDATE': '25-Jul-2010 06:20:30 -0400',
+                 'RFC822.SIZE': '6',
+-                'ENVELOPE': [None, None, [[None, None, None]], [[None, None, None]], None, None, None, None, None, None],
+-                'BODY': [None, None, [], None, None, None, '6']},
++                'ENVELOPE': [None, None, None, None, None, None, None, None, None, None],
++                'BODY': ['text', 'plain', None, None, None, None, '6', '1']},
+             1: {'FLAGS': ['\\One', '\\Two', 'Three'],
+-                'INTERNALDATE': 'Mon, 14 Apr 2003 19:43:44 -0400',
++                'INTERNALDATE': '14-Apr-2003 19:43:44 -0400',
+                 'RFC822.SIZE': '12',
+-                'ENVELOPE': [None, None, [[None, None, None]], [[None, None, None]], None, None, None, None, None, None],
+-                'BODY': [None, None, [], None, None, None, '12']},
++                'ENVELOPE': [None, None, None, None, None, None, None, None, None, None],
++                'BODY': ['text', 'plain', None, None, None, None, '12', '1']},
+         }
+         self._fetchWork(uid)
+     
+@@ -1717,19 +1746,19 @@
+         self.function = self.client.fetchAll
+         self.messages = '1,2:3'
+         self.msgObjs = [
+-            FakeyMessage({}, (), 'Mon, 14 Apr 2003 19:43:44 +0400',
++            FakeyMessage([], (), 'Mon, 14 Apr 2003 19:43:44 +0400',
+                 'Lalala', 10101, None),
+-            FakeyMessage({}, (), 'Tue, 15 Apr 2003 19:43:44 +0200',
++            FakeyMessage([], (), 'Tue, 15 Apr 2003 19:43:44 +0200',
+                 'Alalal', 20202, None),
+         ]
+         self.expected = {
+-            0: {'ENVELOPE': [None, None, [[None, None, None]], [[None, None, None]], None, None, None, None, None, None],
++            0: {'ENVELOPE': [None, None, None, None, None, None, None, None, None, None],
+                 'RFC822.SIZE': '6',
+-                'INTERNALDATE': 'Mon, 14 Apr 2003 19:43:44 +0400',
++                'INTERNALDATE': '14-Apr-2003 19:43:44 +0400',
+                 'FLAGS': []},
+-            1: {'ENVELOPE': [None, None, [[None, None, None]], [[None, None, None]], None, None, None, None, None, None],
++            1: {'ENVELOPE': [None, None, None, None, None, None, None, None, None, None],
+                 'RFC822.SIZE': '6',
+-                'INTERNALDATE': 'Tue, 15 Apr 2003 19:43:44 +0200',
++                'INTERNALDATE': '15-Apr-2003 19:43:44 +0200',
+                 'FLAGS': []},
+         }
+         self._fetchWork(uid)
+@@ -1741,11 +1770,11 @@
+         self.function = self.client.fetchFast
+         self.messages = '1'
+         self.msgObjs = [
+-            FakeyMessage({}, ('\\X',), '19 Mar 2003 19:22:21 -0500', '', 9, None),
++            FakeyMessage([], ('\\X',), 'Mon, 19 Mar 2003 19:22:21 -0500', '', 9, None),
+         ]
+         self.expected = {
+             0: {'FLAGS': ['\\X'],
+-                'INTERNALDATE': '19 Mar 2003 19:22:21 -0500',
++                'INTERNALDATE': '19-Mar-2003 19:22:21 -0500',
+                 'RFC822.SIZE': '0'},
+         }
+         self._fetchWork(uid)

@@ -1,0 +1,162 @@
+Index: twisted/test/test_compat.py
+===================================================================
+--- twisted/test/test_compat.py	(revision 12888)
++++ twisted/test/test_compat.py	(working copy)
+@@ -4,7 +4,7 @@
+ 
+ from twisted.trial import unittest
+ 
+-import os, sys, types
++import os, sys, types, socket
+ 
+ class IterableCounter:
+     def __init__(self, lim=0):
+@@ -101,3 +101,57 @@
+         self.assertEquals(' \tx x'.strip('\t '), 'x x')
+         self.assertEquals(' x\t '.strip(' \t'), 'x')
+         self.assertEquals('x x \t'.strip(' \t'), 'x x')
++
++    def testNToP(self):
++        # from python's test_socket.py
++        f = lambda a: socket.inet_ntop(socket.AF_INET6, a)
++        g = lambda a: socket.inet_ntop(socket.AF_INET, a)
++
++        self.assertEquals('::', f('\x00' * 16))
++        self.assertEquals('::1', f('\x00' * 15 + '\x01'))
++        self.assertEquals(
++            'aef:b01:506:1001:ffff:9997:55:170',
++            f('\x0a\xef\x0b\x01\x05\x06\x10\x01\xff\xff\x99\x97\x00\x55\x01\x70'
++)
++        )
++
++        self.assertEquals('1.0.1.0', g('\x01\x00\x01\x00'))
++        self.assertEquals('170.85.170.85', g('\xaa\x55\xaa\x55'))
++        self.assertEquals('255.255.255.255', g('\xff\xff\xff\xff'))
++
++        # additions
++        self.assertEquals('100::', f('\x01' + '\x00' * 15))
++        self.assertEquals('100::1', f('\x01' + '\x00' * 14 + '\x01'))
++
++    def testPToN(self):
++        # from python's test_socket.py
++        f = lambda a: socket.inet_pton(socket.AF_INET6, a)
++        g = lambda a: socket.inet_pton(socket.AF_INET, a)
++
++        self.assertEquals('\x00' * 16, f('::'))
++        self.assertEquals('\x00' * 16, f('0::0'))
++        self.assertEquals('\x00\x01' + '\x00' * 14, f('1::'))
++        self.assertEquals(
++            '\x45\xef\x76\xcb\x00\x1a\x56\xef\xaf\xeb\x0b\xac\x19\x24\xae\xae',
++            f('45ef:76cb:1a:56ef:afeb:bac:1924:aeae')
++        )
++        
++        self.assertEquals('\x00\x00\x00\x00', g('0.0.0.0'))
++        self.assertEquals('\xff\x00\xff\x00', g('255.0.255.0'))
++        self.assertEquals('\xaa\xaa\xaa\xaa', g('170.170.170.170'))
++
++        # additions
++        self.assertEquals('\x00' * 14 + '\x00\x01', f('::1'))
++        self.assertEquals('\x00' * 12 + '\x01\x02\x03\x04', f('::1.2.3.4'))
++        self.assertEquals(
++            '\x00\x01\x00\x02\x00\x03\x00\x04\x00\x05\x00\x06\x01\x02\x03\xff',
++            f('1:2:3:4:5:6:1.2.3.255'))
++        
++        self.assertRaises(ValueError, f, '1:2:3:4:5:6:7:8:')
++        self.assertRaises(ValueError, f, ':1:2:3:4:5:6:7:8')
++        self.assertRaises(ValueError, f, '1::2::3')
++        self.assertRaises(ValueError, f, '1:::3')
++        self.assertRaises(ValueError, f, ':::')
++        self.assertRaises(ValueError, f, '1:2')
++        self.assertRaises(ValueError, f, '::1.2')
++        
+Index: twisted/python/compat.py
+===================================================================
+--- twisted/python/compat.py	(revision 12888)
++++ twisted/python/compat.py	(working copy)
+@@ -48,35 +48,79 @@
+     __builtin__.bool = bool
+     del bool
+ 
+-
+-if not hasattr(socket, 'inet_pton'):
++try:
++    socket.inet_pton(socket.AF_INET6, "::")
++except (NameError, socket.error):
+     def inet_pton(af, addr):
+         if af == socket.AF_INET:
+             parts = map(int, addr.split('.'))
++            if len(parts) != 4:
++                raise ValueError("not a dotted quad")
++            for part in parts:
++                if not 0 <= part <= 255:
++                    raise ValueError('part too large or small')
+             return struct.pack('!BBBB', *parts)
+-        elif af == getattr(socket, 'AF_INET6', None):
++        elif af == getattr(socket, 'AF_INET6', 'AF_INET6'):
++            if addr == '::':
++                return '\x00' * 16
+             parts = addr.split(':')
++            if '.' in parts[-1]:
++                rawipv4 = socket.inet_pton(socket.AF_INET, parts[-1])
++                unpackedipv4 = struct.unpack('!HH', rawipv4)
++                parts[-1:] = [hex(x)[2:] for x in unpackedipv4]
+             elide = parts.count('')
+-            if elide == 3:
+-                return '\x00' * 16
++            if elide > 2:
++                raise ValueError('Too many "::"')
+             elif elide == 2:
+                 i = parts.index('')
++                if i not in (0, len(parts) - 2) or parts[i+1]:
++                    raise ValueError('Too many "::"')
+                 parts[i:i+2] = ['0'] * (10 - len(parts))
+             elif elide == 1:
+                 i = parts.index('')
++                if i in (0, len(parts) - 1):
++                    raise ValueError('illegal single ":" at the start or end')
+                 parts[i:i+1] = ['0'] * (9 - len(parts))
+             parts = [int(x, 16) for x in parts]
++            if len(parts) != 8:
++                raise ValueError("incorrect address lenght")
+             return struct.pack('!HHHHHHHH', *parts)
+         else:
+             raise socket.error(97, 'Address family not supported by protocol')
+ 
+     def inet_ntop(af, addr):
+         if af == socket.AF_INET:
++            if len(addr) != 4:
++                raise ValueError("address lenght incorrect")
+             parts = struct.unpack('!BBBB', addr)
+             return '.'.join(map(str, parts))
+-        elif af == getattr(socket, 'AF_INET6', None):
++        elif af == getattr(socket, 'AF_INET6', 'AF_INET6'):
++            if len(addr) != 16:
++                raise ValueError("address lenght incorrect")
+             parts = struct.unpack('!HHHHHHHH', addr)
+-            return ':'.join([hex(x)[2:] for x in parts])
++            bestBase = -1
++            curBase = -1
++            for i in range(8):
++                if parts[i] == 0:
++                    if curBase == -1:
++                        curBase, curLen = i, 1
++                    else:
++                        curLen += 1
++                else:
++                    if curBase != -1:
++                        if bestBase == -1 or curLen > bestLen:
++                            bestBase, bestLen = curBase, curLen
++                        curBase = -1
++            if curBase != -1 and (bestBase == -1 or curLen > bestLen):
++                bestBase, bestLen = curBase, curLen
++            parts = [hex(x)[2:] for x in parts]
++            if bestBase != -1:
++                parts[bestBase:bestBase + bestLen] = ['']
++            if parts[0] == '':
++                parts.insert(0, '')
++            if parts[-1] == '':
++                parts.insert(-1, '')
++            return ':'.join(parts)
+         else:
+             raise socket.error(97, 'Address family not supported by protocol')
+ 

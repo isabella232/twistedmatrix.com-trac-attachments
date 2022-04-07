@@ -1,0 +1,171 @@
+Index: twisted/mail/test/test_mail.py
+===================================================================
+--- twisted/mail/test/test_mail.py	(revision 11659)
++++ twisted/mail/test/test_mail.py	(working copy)
+@@ -11,6 +11,8 @@
+ import StringIO
+ import rfc822
+ 
++from twisted.trial import unittest
++
+ from zope.interface import providedBy
+ 
+ from twisted.trial import unittest
+@@ -186,6 +188,47 @@
+         self.failUnless(self.service.lookupPortal('domain') is o1)
+         self.failUnless(self.service.defaultPortal() is o2)
+ 
++class MaildirAppendStringTestCase(unittest.TestCase):
++    def setUp(self):
++        self.d = self.mktemp()
++        mail.maildir.initializeMaildir(self.d)
++
++    def tearDown(self):
++        shutil.rmtree(self.d)
++
++    def testAppend(self):
++        mbox = mail.maildir.MaildirMailbox(self.d)
++        for i in xrange(1, 11):
++            self.assertEquals(\
++                unittest.deferredResult(mbox.appendMessage("X" * i)),
++                None)
++        self.assertEquals(len(mbox.listMessages()),
++                          10)
++        self.assertEquals(len(mbox.getMessage(5).read()), 6)
++
++class MaildirAppendFileTestCase(unittest.TestCase):
++    def setUp(self):
++        self.d = self.mktemp()
++        mail.maildir.initializeMaildir(self.d)
++
++    def tearDown(self):
++        shutil.rmtree(self.d)
++
++    def testAppend(self):
++        mbox = mail.maildir.MaildirMailbox(self.d)
++        for i in xrange(1, 11):
++            temp = tempfile.TemporaryFile()
++            temp.write("X" * i)
++            temp.seek(0,0)
++            self.assertEquals(unittest.deferredResult(\
++                mbox.appendMessage(temp)),
++                              None)
++            temp.close()
++        self.assertEquals(len(mbox.listMessages()),
++                          10)
++        self.assertEquals(len(mbox.getMessage(5).read()), 6)
++
++
+ class MaildirTestCase(unittest.TestCase):
+     def setUp(self):
+         self.d = self.mktemp()
+Index: twisted/mail/maildir.py
+===================================================================
+--- twisted/mail/maildir.py	(revision 11659)
++++ twisted/mail/maildir.py	(working copy)
+@@ -13,6 +13,7 @@
+ import socket
+ import time
+ import md5
++import cStringIO
+ 
+ from zope.interface import implements
+ 
+@@ -23,10 +24,12 @@
+ 
+ from twisted.mail import pop3
+ from twisted.mail import smtp
++from twisted.protocols import basic
+ from twisted.persisted import dirdbm
+ from twisted.python import log
+ from twisted.mail import mail
+ from twisted.mail import alias
++from twisted.internet import interfaces, defer, reactor
+ from twisted.python.components import backwardsCompatImplements
+ 
+ from twisted import cred
+@@ -159,6 +162,72 @@
+     ## end of IDomain
+     ##
+ 
++class MaildirMailboxAppendMessageTask:
++    implements(interfaces.IConsumer)
++    def __init__(self, mbox, msg):
++        self.mbox = mbox
++        self.defer = defer.Deferred()
++        if not hasattr(msg, "read"):
++            msg = StringIO.StringIO(msg)
++        self.msg = msg
++        self.createTempFile()
++        self.filesender = basic.FileSender()
++        self.filesender.beginFileTransfer(self.msg, self)
++    
++    def registerProducer(self, producer, streaming):
++        self.myproducer = producer
++        self.streaming = streaming
++        if not streaming:
++            self.prodProducer()
++    
++    def prodProducer(self):
++        if self.myproducer is not None:
++            reactor.callLater(0, self.prodProducer)
++            self.myproducer.resumeProducing()
++
++    def unregisterProducer(self):
++        self.myproducer = None
++        self.streaming = None
++        os.close(self.fh)
++        self.moveFileToNew()
++    
++    def write(self, data):
++        os.write(self.fh, data)
++    
++    def moveFileToNew(self):
++        while True:
++            newname = os.path.join(self.mbox.path, "new", _generateMaildirName())
++            try:
++                os.rename(self.tmpname, newname)
++                break
++            except OSError, (err, estr):
++                import errno
++                # if the newname exists, retry with a new newname.
++                if err != errno.EEXIST: 
++                    self.defer.errback(sys.exc_info()[1])
++                    newname = None
++                    break
++        if newname is not None:
++            self.mbox.list.append(newname)
++            self.defer.callback(None)
++        
++    def createTempFile(self):
++        attr = os.O_RDWR | os.O_CREAT | os.O_EXCL | \
++            getattr(os, "O_NOINHERIT", 0) | \
++            getattr(os, "O_NOFOLLOW", 0)
++        tries = 0
++        while True:
++            self.tmpname = os.path.join(self.mbox.path, "tmp", _generateMaildirName())
++            self.fh = os.open(self.tmpname, attr, 0600)
++            if self.fh >= 0:
++                break
++            tries += 1
++            if tries > 500:
++                self.defer.errback(RuntimeError("Could not create tmp file for %s" % self.mbox.path))
++                break
++    
++                
++        
+ class MaildirMailbox(pop3.Mailbox):
+     """Implement the POP3 mailbox semantics for a Maildir mailbox
+     """
+@@ -239,6 +308,11 @@
+                     self.list.append(real)
+         self.deleted.clear()
+ 
++    def appendMessage(self, txt):
++        """Appends a message into the mailbox."""
++        task = MaildirMailboxAppendMessageTask(self, txt)
++        return task.defer
++
+ class StringListMailbox:
+     implements(pop3.IMailbox)
+     

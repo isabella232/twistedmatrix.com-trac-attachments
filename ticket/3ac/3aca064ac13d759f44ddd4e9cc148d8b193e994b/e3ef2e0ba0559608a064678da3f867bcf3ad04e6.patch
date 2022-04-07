@@ -1,0 +1,253 @@
+diff --git twisted/web/test/requesthelper.py twisted/web/test/requesthelper.py
+index 88c6e9f..2d33db6 100644
+--- twisted/web/test/requesthelper.py
++++ twisted/web/test/requesthelper.py
+@@ -118,7 +118,8 @@ class DummyRequest(object):
+         self.responseCode = None
+         self.headers = {}
+         self._finishedDeferreds = []
+-
++        self._serverName = b"dummy"
++        self.clientproto = b"HTTP/1.0"
+ 
+     def getHeader(self, name):
+         """
+@@ -133,6 +134,8 @@ class DummyRequest(object):
+         """
+         return self.headers.get(name.lower(), None)
+ 
++    def getAllHeaders(self):
++        return self.headers
+ 
+     def setHeader(self, name, value):
+         """TODO: make this assert on write() if the header is content-length
+@@ -237,3 +240,15 @@ class DummyRequest(object):
+         if isinstance(self.client, IPv4Address):
+             return self.client.host
+         return None
++
++
++    def getRequestHostname(self):
++        return self._serverName
++
++
++    def getHost(self):
++        return DummyChannel.TCP()
++
++
++    def getClient(self):
++        pass
+diff --git twisted/web/test/test_cgi.py twisted/web/test/test_cgi.py
+index db63211..74040f3 100755
+--- twisted/web/test/test_cgi.py
++++ twisted/web/test/test_cgi.py
+@@ -214,6 +214,30 @@ class CGI(unittest.TestCase):
+         self.assertEqual(res, "readallinput ok%s" % os.linesep)
+ 
+ 
++class CGIScriptTests(unittest.TestCase):
++    """
++    Tests for L{twcgi.CGIScript}.
++    """
++
++
++    def test_pathInfo(self):
++        """
++        L{twcgi.CGIScript.render} sets the process environment I{PATH_INFO} from
++        the request path.
++        """
++        class FakeReactor:
++            def spawnProcess(self, process, filename, args, env, wdir):
++                self.process_env = env
++
++        _reactor = FakeReactor()
++        resource = twcgi.CGIScript(self.mktemp(), _reactor=_reactor)
++        request = DummyRequest(['a', 'b'])
++        _render(resource, request)
++
++        self.assertIn("PATH_INFO", _reactor.process_env)
++        self.assertEqual(_reactor.process_env["PATH_INFO"],
++                         "/a/b")
++
+ 
+ class CGIDirectoryTests(unittest.TestCase):
+     """
+diff --git twisted/web/test/test_util.py twisted/web/test/test_util.py
+index ac628e7..1ba9d19 100644
+--- twisted/web/test/test_util.py
++++ twisted/web/test/test_util.py
+@@ -13,7 +13,7 @@ from twisted.web.error import FlattenerError
+ from twisted.web.util import (
+     redirectTo, _SourceLineElement,
+     _SourceFragmentElement, _FrameElement, _StackElement,
+-    FailureElement, formatFailure, DeferredResource)
++    FailureElement, formatFailure, DeferredResource, htmlIndent)
+ 
+ from twisted.web.http import FOUND
+ from twisted.web.server import Request
+@@ -422,3 +422,50 @@ class DeferredResourceTests(TestCase):
+         deferredResource = DeferredResource(defer.succeed(result))
+         deferredResource.render(request)
+         self.assertEqual(rendered, [result])
++
++
++class HtmlIndentTests(TestCase):
++    """
++    Tests for L{htmlIndent}
++    """
++
++
++    def test_simpleInput(self):
++        """
++        L{htmlIndent} transparently process input with no special cases inside.
++        """
++        line = "foo bar"
++        self.assertEqual(line, htmlIndent(line))
++
++
++    def test_escapeHtml(self):
++        """
++        L{htmlIndent} escapes HTML from its input.
++        """
++        line = "<br />"
++        self.assertEqual("&lt;br /&gt;", htmlIndent(line))
++
++
++    def test_stripTrailingWhitespace(self):
++        """
++        L{htmlIndent} removes trailing whitespaces from its input.
++        """
++        line = " foo bar  "
++        self.assertEqual(" foo bar", htmlIndent(line))
++
++
++    def test_forceSpacingFromSpaceCharacters(self):
++        """
++        If L{htmlIndent} detects consecutive space characters, it forces the
++        rendering by substituting unbreakable space.
++        """
++        line = "  foo  bar"
++        self.assertEqual("&nbsp;foo&nbsp;bar", htmlIndent(line))
++
++
++    def test_indentFromTabCharacters(self):
++        """
++        L{htmlIndent} replaces tab characters by unbreakable spaces.
++        """
++        line = "\tfoo"
++        self.assertEqual("&nbsp; &nbsp; &nbsp; &nbsp; foo", htmlIndent(line))
+diff --git twisted/web/twcgi.py twisted/web/twcgi.py
+index 5ab580d..8f8613f 100644
+--- twisted/web/twcgi.py
++++ twisted/web/twcgi.py
+@@ -8,7 +8,6 @@ I hold resource classes and helper classes that deal with CGI scripts.
+ """
+ 
+ # System Imports
+-import string
+ import os
+ import urllib
+ 
+@@ -51,11 +50,14 @@ class CGIScript(resource.Resource):
+     IPC with an external process with an unpleasant protocol.
+     """
+     isLeaf = 1
+-    def __init__(self, filename, registry=None):
++    def __init__(self, filename, registry=None, _reactor=None):
+         """
+         Initialize, with the name of a CGI script file.
+         """
+         self.filename = filename
++        if _reactor is None:
++            _reactor = reactor
++        self._reactor = _reactor
+ 
+ 
+     def render(self, request):
+@@ -68,8 +70,8 @@ class CGIScript(resource.Resource):
+         @type request: L{twisted.web.http.Request}
+         @param request: An HTTP request.
+         """
+-        script_name = "/"+string.join(request.prepath, '/')
+-        serverName = string.split(request.getRequestHostname(), ':')[0]
++        script_name = "/" + "/".join(request.prepath)
++        serverName = request.getRequestHostname().split(':')[0]
+         env = {"SERVER_SOFTWARE":   server.version,
+                "SERVER_NAME":       serverName,
+                "GATEWAY_INTERFACE": "CGI/1.1",
+@@ -89,7 +91,7 @@ class CGIScript(resource.Resource):
+             env['REMOTE_ADDR'] = ip
+         pp = request.postpath
+         if pp:
+-            env["PATH_INFO"] = "/"+string.join(pp, '/')
++            env["PATH_INFO"] = "/" + "/".join(pp)
+ 
+         if hasattr(request, "content"):
+             # request.content is either a StringIO or a TemporaryFile, and
+@@ -99,20 +101,21 @@ class CGIScript(resource.Resource):
+             request.content.seek(0,0)
+             env['CONTENT_LENGTH'] = str(length)
+ 
+-        qindex = string.find(request.uri, '?')
+-        if qindex != -1:
++        try:
++            qindex = request.uri.index('?')
++        except ValueError: # '?' not found
++            env['QUERY_STRING'] = ''
++            qargs = []
++        else:
+             qs = env['QUERY_STRING'] = request.uri[qindex+1:]
+             if '=' in qs:
+                 qargs = []
+             else:
+                 qargs = [urllib.unquote(x) for x in qs.split('+')]
+-        else:
+-            env['QUERY_STRING'] = ''
+-            qargs = []
+ 
+         # Propogate HTTP headers
+         for title, header in request.getAllHeaders().items():
+-            envname = string.upper(string.replace(title, '-', '_'))
++            envname = title.replace('-', '_').upper()
+             if title not in ('content-type', 'content-length'):
+                 envname = "HTTP_" + envname
+             env[envname] = header
+@@ -143,8 +146,8 @@ class CGIScript(resource.Resource):
+             will get spawned.
+         """
+         p = CGIProcessProtocol(request)
+-        reactor.spawnProcess(p, self.filename, [self.filename] + qargs, env,
+-                             os.path.dirname(self.filename))
++        self._reactor.spawnProcess(p, self.filename, [self.filename] + qargs,
++                                   env, os.path.dirname(self.filename))
+ 
+ 
+ 
+diff --git twisted/web/util.py twisted/web/util.py
+index 0c6cdb6..2befc59 100644
+--- twisted/web/util.py
++++ twisted/web/util.py
+@@ -12,10 +12,8 @@ __all__ = [
+ 
+ from cStringIO import StringIO
+ import linecache
+-import string
+ import types
+ 
+-from twisted.python.filepath import FilePath
+ from twisted.python.reflect import fullyQualifiedName
+ from twisted.python.deprecate import deprecatedModuleAttribute
+ from twisted.python.versions import Version
+@@ -200,9 +198,9 @@ htmlReprTypes = {types.DictType: htmlDict,
+ 
+ 
+ def htmlIndent(snippetLine):
+-    ret = string.replace(string.replace(html.escape(string.rstrip(snippetLine)),
+-                                  '  ', '&nbsp;'),
+-                   '\t', '&nbsp; &nbsp; &nbsp; &nbsp; ')
++    ret = html.escape(snippetLine.rstrip())\
++            .replace('  ', '&nbsp;')\
++            .replace('\t', '&nbsp; &nbsp; &nbsp; &nbsp; ')
+     return ret
+ 
+ 

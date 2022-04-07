@@ -1,0 +1,187 @@
+Index: twisted/test/test_xmlrpc.py
+===================================================================
+RCS file: /cvs/Twisted/twisted/test/test_xmlrpc.py,v
+retrieving revision 1.7
+diff -u -r1.7 test_xmlrpc.py
+--- twisted/test/test_xmlrpc.py	18 Jun 2003 16:31:20 -0000	1.7
++++ twisted/test/test_xmlrpc.py	15 Aug 2003 08:40:50 -0000
+@@ -25,7 +25,7 @@
+     class XMLRPC: pass
+ else:
+     from twisted.web import xmlrpc
+-    from twisted.web.xmlrpc import XMLRPC
++    from twisted.web.xmlrpc import XMLRPC, XMLRPCIntrospection
+ 
+ from twisted.trial import unittest
+ from twisted.web import server
+@@ -37,10 +37,13 @@
+ 
+     FAILURE = 666
+     NOT_FOUND = 23
+-    
++
++    # don't change the doc string, it's part of the test
+     def xmlrpc_add(self, a, b):
++        """Help for add."""
+         return a + b
+ 
++    # don't add a doc string, it's part of the test
+     def xmlrpc_defer(self, x):
+         return defer.succeed(x)
+ 
+@@ -95,3 +98,28 @@
+     
+     def proxy(self):
+         return xmlrpc.Proxy("http://localhost:%d" % self.port)
++
++
++class XMLRPCTestIntrospection(XMLRPCTestCase):
++
++    def setUp(self):
++        xmlrpc = Test()
++        XMLRPCIntrospection(xmlrpc)
++        self.p = reactor.listenTCP(0, server.Site(xmlrpc),interface="127.0.0.1")
++        self.port = self.p.getHost()[2]
++
++    def testListMethods(self):
++        d = self.proxy().callRemote("system.listMethods")
++        list = unittest.deferredResult(d)
++        list.sort()
++        self.failUnlessEqual(list, ['add', 'defer', 'deferFail', 'deferFault',
++                                    'fail', 'fault', 'system.listMethods',
++                                    'system.methodHelp'])
++
++    def testMethodHelp(self):
++        d = self.proxy().callRemote("system.methodHelp", 'add')
++        help = unittest.deferredResult(d)
++        self.failUnlessEqual(help, 'Help for add.')
++        d = self.proxy().callRemote("system.methodHelp", 'defer')
++        help = unittest.deferredResult(d)
++        self.failUnlessEqual(help, '')
+Index: twisted/web/xmlrpc.py
+===================================================================
+RCS file: /cvs/Twisted/twisted/web/xmlrpc.py,v
+retrieving revision 1.27
+diff -u -r1.27 xmlrpc.py
+--- twisted/web/xmlrpc.py	27 Jul 2003 00:04:14 -0000	1.27
++++ twisted/web/xmlrpc.py	15 Aug 2003 08:40:50 -0000
+@@ -34,7 +34,7 @@
+ # Sibling Imports
+ from twisted.web import resource, server
+ from twisted.internet import defer, protocol, reactor
+-from twisted.python import log
++from twisted.python import log, reflect
+ from twisted.protocols import http
+ 
+ # These are deprecated, use the class level definitions
+@@ -89,6 +89,10 @@
+     Binary, Boolean, DateTime, Deferreds, or Handler instances.
+ 
+     By default methods beginning with 'xmlrpc_' are published.
++
++    Sub-handlers for prefixed methods (e.g., system.listMethods)
++    can be added with putChild. By default, prefixes are
++    separated with a '.'. Override self.separator to change this.
+     """
+ 
+     # Error codes for Twisted, if they conflict with yours then
+@@ -97,7 +101,8 @@
+     FAILURE = 8002
+ 
+     isLeaf = 1
+-    
++    separator = '.'
++
+     def render(self, request):
+         request.content.seek(0, 0)
+         args, functionPath = xmlrpclib.loads(request.content.read())
+@@ -116,7 +121,7 @@
+                 self._cbRender, request
+             )
+         return server.NOT_DONE_YET
+-    
++
+     def _cbRender(self, result, request):
+         if isinstance(result, Handler):
+             result = result.result
+@@ -136,23 +141,67 @@
+             return failure.value
+         log.err(failure)
+         return Fault(self.FAILURE, "error")
+-        
++
+     def _getFunction(self, functionPath):
+         """Given a string, return a function, or raise NoSuchFunction.
+-        
++
+         This returned function will be called, and should return the result
+         of the call, a Deferred, or a Fault instance.
+-        
++
+         Override in subclasses if you want your own policy. The default
+         policy is that given functionPath 'foo', return the method at
+         self.xmlrpc_foo, i.e. getattr(self, "xmlrpc_" + functionPath).
++        If functionPath contains self.separator, the sub-handler for
++        the initial prefix is used to search for the remaining path.
+         """
++        if functionPath.find(self.separator) >= 0:
++            prefix, functionPath = functionPath.split(self.separator, 2)
++            handler = self.getChildWithDefault(prefix, None)
++            return handler._getFunction(functionPath)
++
+         f = getattr(self, "xmlrpc_%s" % functionPath, None)
+         if f and callable(f):
+             return f
+         else:
+             raise NoSuchFunction
+ 
++    def _listFunctions(self):
++        """Return a list of the names of all xmlrpc methods."""
++        return reflect.prefixedMethodNames(self.__class__, 'xmlrpc_')
++
++
++class XMLRPCIntrospection(XMLRPC):
++    """Implement the XML-RPC Introspection API.
++    """
++
++    def __init__(self, parent):
++        """Use this class to add Introspection support to an XMLRPC server.
++
++        @param parent: the XMLRPC server to add Introspection support to.
++        """
++
++        XMLRPC.__init__(self)
++        self.xmlrpc_parent = parent
++        parent.putChild('system', self)
++
++    def xmlrpc_listMethods(self):
++        """Return a list of the method names implemented by this server."""
++        functions = []
++        todo = [(self.xmlrpc_parent, '')]
++        while todo:
++            obj, prefix = todo.pop(0)
++            functions.extend([ prefix + name for name in obj._listFunctions() ])
++            todo.extend([ (obj.getChildWithDefault(name, None),
++                           prefix + name + obj.separator)
++                          for name in obj.listNames() ])
++        return functions
++
++    def xmlrpc_methodHelp(self, method):
++        """Return a documentation string describing the use of the given method.
++        """
++        method = self.xmlrpc_parent._getFunction(method)
++        return getattr(method, '__doc__', None) or ''
++
+ 
+ class QueryProtocol(http.HTTPClient):
+ 
+@@ -240,7 +289,8 @@
+         factory = QueryFactory(self.url, self.host, method, *args)
+         if self.secure:
+             from twisted.internet import ssl
+-            reactor.connectSSL(self.host, self.port or 443, factory, ssl.ClientContextFactory())
++            reactor.connectSSL(self.host, self.port or 443,
++                               factory, ssl.ClientContextFactory())
+         else:
+             reactor.connectTCP(self.host, self.port or 80, factory)
+         return factory.deferred

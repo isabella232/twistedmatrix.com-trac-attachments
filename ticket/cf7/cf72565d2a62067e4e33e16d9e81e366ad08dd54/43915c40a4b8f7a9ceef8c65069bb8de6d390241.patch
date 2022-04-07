@@ -1,0 +1,325 @@
+Index: twisted/internet/cdefer/cdefer.c
+===================================================================
+--- twisted/internet/cdefer/cdefer.c	(revision 20689)
++++ twisted/internet/cdefer/cdefer.c	(working copy)
+@@ -37,6 +37,7 @@
+ PyObject * failure_class = NULL;
+ PyObject * already_called = NULL;
+ PyObject * debuginfo_class = NULL;
++PyObject * format_stack = NULL;
+ 
+ typedef struct {
+     PyObject_HEAD
+@@ -55,6 +56,12 @@
+ 
+ /* Prototypes */
+ 
++static PyObject *cdefer_setDebugging(cdefer_Deferred *self,
++        PyObject *args, PyObject *kwargs);
++
++static PyObject *cdefer_getDebugging(cdefer_Deferred *self,
++        PyObject *args, PyObject *kwargs);
++
+ static PyObject * cdefer_Deferred_new(PyTypeObject *type, PyObject *args,
+         PyObject *kwargs);
+ 
+@@ -105,10 +112,48 @@
+ static PyObject *cdefer_Deferred__continue(cdefer_Deferred *self,
+         PyObject *args, PyObject *kwargs);
+ 
++
++static int is_debug = 0;
++
++static PyObject *cdefer_setDebugging(cdefer_Deferred *self,
++        PyObject *args, PyObject *kwargs)
++{
++    int new_debug;
++    PyObject *on;
++    static char *argnames[] = {"on", NULL};
++    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "O", argnames, &on)) {
++        return NULL;
++    }
++    new_debug = PyObject_IsTrue(on);
++    if (-1 == new_debug) {
++        return NULL;
++    }
++    is_debug = new_debug;
++    Py_INCREF(Py_None);
++    return Py_None;
++}
++
++static char cdefer_setDebugging_doc[] = "Enable or disable Deferred debugging.\n\n    When debugging is on, the call stacks from creation and invocation are\n    recorded, and added to any AlreadyCalledErrors we raise.\n";
++
++
++static PyObject *cdefer_getDebugging(cdefer_Deferred *self,
++        PyObject *args, PyObject *kwargs)
++{
++    static char *argnames[] = {NULL};
++    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "", argnames)) {
++        return NULL;
++    }
++    return PyBool_FromLong(is_debug);
++}
++
++static char cdefer_getDebugging_doc[] = "Determine whether Deferred debugging is enabled.\n";
++
++
+ static PyTypeObject cdefer_DeferredType;
+ 
+ static PyObject * cdefer_Deferred_new(PyTypeObject *type, PyObject *args,
+-        PyObject *kwargs) {
++                                      PyObject *kwargs)
++{
+     cdefer_Deferred *self;
+     self = (cdefer_Deferred *)type->tp_alloc(type, 0);
+     return (PyObject *)self;
+@@ -142,12 +187,46 @@
+     return 0;
+ }
+ 
++static int cdefer_Deferred__set_debug_stack(cdefer_Deferred *self, char *name)
++{
++    int rc;
++    PyObject *stack;
++
++    /* Keep the debug info object even if we fail to format stack
++     * or place it into the dict. */
++    stack = PyObject_CallObject(format_stack, NULL);
++    if (!stack) {
++        return -1;
++    }
++    rc = PyObject_SetAttrString(self->debuginfo, name, stack);
++    /* Unlike other functions of this naming convention (and
++     * unlike PyDict_GetItemString), PyDict_SetItemString
++     * copies/creates a new reference, so we shouldn't keep ours
++     * too. */
++    Py_DECREF(stack);
++    if (-1 == rc) {
++        return -1;
++    }
++    return 0;
++}
++
+ static int cdefer_Deferred___init__(cdefer_Deferred *self, PyObject *args,
+-        PyObject *kwargs) {
++                                    PyObject *kwargs)
++{
+     static char *argnames[] = {NULL};
+     if (!PyArg_ParseTupleAndKeywords(args, kwargs, "", argnames)) {
+         return -1;
+     }
++    if (is_debug) {
++        self->debuginfo = PyObject_CallObject(debuginfo_class, NULL);
++        if (!self->debuginfo) {
++            return -1;
++        }
++        if (-1 == cdefer_Deferred__set_debug_stack(self, "creator")) {
++            return -1;
++        }
++    }
++
+     self->paused = 0;
+     self->callback_index = 0;
+     self->callbacks = PyList_New(0);
+@@ -411,7 +490,7 @@
+     PyObject *newArgs2;
+     PyObject *kwargs;
+     PyObject *_continue;
+-    PyObject *type, *value, *traceback, *failArgs;
++    PyObject *type, *value, *traceback;
+     PyObject *tmp;
+     PyObject *result;
+     int size;
+@@ -492,13 +571,7 @@
+                     Py_INCREF(traceback);
+                 }
+ 
+-                failArgs = Py_BuildValue("(OOO)", value, type, traceback);
+-                if (!failArgs) {
+-                    PyErr_Restore(type, value, traceback);
+-                    return NULL;
+-                }
+-                self->result = PyObject_CallObject(failure_class, failArgs);
+-                Py_DECREF(failArgs);
++                self->result = PyObject_CallFunction(failure_class, "OOO", value, type, traceback);
+                 if (!self->result) {
+                     PyErr_Restore(type, value, traceback);
+                     return NULL;
+@@ -569,11 +642,43 @@
+ }
+ 
+ static PyObject *cdefer_Deferred__startRunCallbacks(cdefer_Deferred *self,
+-        PyObject *result) {
++                                                    PyObject *result)
++{
++    PyObject * already_called_instance;
++    PyObject * debug_tracebacks;
++    
++    if (is_debug && !self->debuginfo) {
++        self->debuginfo = PyObject_CallObject(debuginfo_class, NULL);
++        if (!self->debuginfo) {
++            return NULL;
++        }
++    }
++
+     if (self->called) {
++        if (is_debug) {
++            debug_tracebacks = PyObject_CallMethod(
++                self->debuginfo, "_getDebugTracebacks", "s", "\n");
++            if (!debug_tracebacks) {
++                return NULL;
++            }
++            already_called_instance = PyObject_CallFunction(already_called, "O", debug_tracebacks);
++            Py_DECREF(debug_tracebacks);
++            if (!already_called_instance) {
++                return NULL;
++            }
++            PyErr_SetObject(already_called, already_called_instance);
++            Py_DECREF(already_called_instance);
++            return NULL;
++        }
+         PyErr_SetNone(already_called);
+         return NULL;
+     }
++    if (is_debug) {
++        if (-1 == cdefer_Deferred__set_debug_stack(self, "invoker")) {
++            return NULL;
++        }
++    }
++
+     self->called = 1;
+     Py_XDECREF(self->result);
+     self->result = result;
+@@ -598,7 +703,6 @@
+ static PyObject *cdefer_Deferred_errback(cdefer_Deferred *self, PyObject *args,
+         PyObject *kwargs) {
+     PyObject *fail;
+-    PyObject *tpl;
+     PyObject *tmp;
+     PyObject *result;
+     static char *argnames[] = {"fail", NULL};
+@@ -612,12 +716,7 @@
+          * wrapper (If we do, the wrapper belongs to us) */
+         Py_INCREF(fail);
+     } else {
+-        tpl = Py_BuildValue("(O)", fail);
+-        if (!tpl) {
+-            return NULL;
+-        }
+-        tmp = PyObject_CallObject(failure_class, tpl);
+-        Py_DECREF(tpl);
++        tmp = PyObject_CallFunction(failure_class, "O", fail);
+         if (!tmp) {
+             return NULL;
+         }
+@@ -723,6 +822,12 @@
+ };
+ 
+ static PyMethodDef cdefer_methods[] = {
++    {"setDebugging", (PyCFunction)cdefer_setDebugging,
++     METH_VARARGS|METH_KEYWORDS, cdefer_setDebugging_doc},
++    
++    {"getDebugging", (PyCFunction)cdefer_getDebugging,
++     METH_VARARGS|METH_KEYWORDS, cdefer_getDebugging_doc},
++    
+     {NULL}  /* Sentinel */
+ };
+ 
+@@ -733,6 +838,7 @@
+     PyObject * m = NULL;
+     PyObject * f = NULL;
+     PyObject * d = NULL;
++    PyObject * traceback_module = NULL;
+ 
+     if (PyType_Ready(&cdefer_DeferredType) < 0) {
+         return;
+@@ -771,7 +877,17 @@
+     if(!debuginfo_class) {
+         goto Error;
+     }
+-    
++
++    traceback_module = PyImport_ImportModule("traceback");
++    if (!traceback_module) {
++        goto Error;
++    }
++
++    format_stack = PyObject_GetAttrString(traceback_module, "format_stack");
++    if(!format_stack) {
++        goto Error;
++    }
++
+     return;
+ Error:
+     Py_XDECREF(f);
+@@ -779,5 +895,7 @@
+     Py_XDECREF(d);
+     Py_XDECREF(already_called);
+     Py_XDECREF(debuginfo_class);
++    Py_XDECREF(traceback_module);
++    Py_XDECREF(format_stack);
+ }
+ 
+Index: twisted/internet/defer.py
+===================================================================
+--- twisted/internet/defer.py	(revision 20689)
++++ twisted/internet/defer.py	(working copy)
+@@ -281,16 +281,14 @@
+         self.unpause()
+ 
+     def _startRunCallbacks(self, result):
++        if self.debug and self._debugInfo is None:
++            self._debugInfo = DebugInfo()
+         if self.called:
+             if self.debug:
+-                if self._debugInfo is None:
+-                    self._debugInfo = DebugInfo()
+-                extra = "\n" + self._debugInfo._getDebugTracebacks()
++                extra = self._debugInfo._getDebugTracebacks("\n")
+                 raise AlreadyCalledError(extra)
+             raise AlreadyCalledError
+         if self.debug:
+-            if self._debugInfo is None:
+-                self._debugInfo = DebugInfo()
+             self._debugInfo.invoker = traceback.format_stack()[:-2]
+         self.called = True
+         self.result = result
+@@ -376,8 +374,8 @@
+     """Deferred debug helper"""
+     failResult = None
+ 
+-    def _getDebugTracebacks(self):
+-        info = ''
++    def _getDebugTracebacks(self, prefix=''):
++        info = prefix
+         if hasattr(self, "creator"):
+             info += " C: Deferred was created:\n C:"
+             info += "".join(self.creator).rstrip().replace("\n","\n C:")
+@@ -439,26 +437,10 @@
+         return False
+ 
+ try:
+-    from twisted.internet.cdefer import Deferred as CDeferred
++    from twisted.internet.cdefer import Deferred, setDebugging, getDebugging
+ except ImportError:
+     pass
+-else:
+-    PyDeferred = Deferred
+-    PyDeferred.debug = True
+-    # Debugging enabled via use of PyDeferred
+-    def setDebugging(new_value):
+-        global is_debug, Deferred
+-        is_debug = new_value
+-        if is_debug:
+-            Deferred = PyDeferred
+-        else:
+-            Deferred = CDeferred
+-    def getDebugging():
+-        global is_debug
+-        return is_debug
+ 
+-    setDebugging(False)
+-
+ class DeferredList(Deferred):
+     """I combine a group of deferreds into one callback.
+ 

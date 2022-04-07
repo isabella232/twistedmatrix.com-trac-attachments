@@ -1,0 +1,476 @@
+Index: twisted/conch/test/test_connect.py
+===================================================================
+--- twisted/conch/test/test_connect.py	(revision 24991)
++++ twisted/conch/test/test_connect.py	(working copy)
+@@ -1,4 +1,24 @@
+-# -*- test-case-name: twisted.conch.test.test_cftp -*-
++"""
++Supplies tests for the L{twisted.conch.client.connect} alternatives
++to L{twisted.conch.client.direct}.  The latter predates the former and
++is retained for backward compatibility as it was not possible to
++modify it without breaking its API.
++
++The major difference is this:  when you use the implementation in direct,
++it is not possible to cleanly close a connection without closing the
++reactor, unless you are willing to poke into the internals of the
++implementation as shown in the 
++test_direct_connect_lose_connection_workaround test below.  The
++executive summary of the problem is that the implementation provides
++only a single deferred for a workflow that requires more than one
++callback.  In some cases (closing a connection), this strategy 
++prevents the underlying connection from being closed.
++
++The alternative offered by L{twisted.conch.client.connect} provides
++a distinct set of deferreds that do not prevent users from closing
++connections.
++"""
++
+ # Copyright (c) 2001-2008 Twisted Matrix Laboratories.
+ # See LICENSE file for details.
+ 
+@@ -10,11 +30,7 @@
+     Crypto = None
+ 
+ try:
+-    from twisted.conch import unix, error
+-    from twisted.conch.scripts import cftp
+-    from twisted.conch.client import connect, default, options, direct
+-    from twisted.conch.ssh import connection, transport
+-    from twisted.conch.test.test_filetransfer import FileTransferForTestAvatar
++    from twisted.conch import unix
+ except ImportError:
+     unix = None
+     try:
+@@ -24,27 +40,32 @@
+         pass
+ 
+ from twisted.cred import portal
+-from twisted.internet import reactor, protocol, interfaces, defer
+-from twisted.internet.utils import getProcessOutputAndValue
++from twisted.internet import reactor, interfaces, defer
+ from twisted.python import log
+-from twisted.conch.client import direct, options
++from twisted.conch import error
++from twisted.conch.client import direct, options, connect, default
+ from twisted.trial import unittest
++from twisted.conch.ssh import connection, transport
+ 
+-from twisted.conch.test import test_ssh, test_conch
+-from twisted.conch.test.test_filetransfer import SFTPTestBase
++from twisted.conch.test import test_ssh
+ from twisted.conch.test.test_filetransfer import TestAvatar
+ 
++
++
+ class TestRealm:
+     def requestAvatar(self, avatarID, mind, *interfaces):
+         a = TestAvatar()
+         return interfaces[0], a, lambda: None
+ 
++
++
+ class ClientTestBase(unittest.TestCase):
+     """
+     Provides SSH server start/stop capabilities that our subclasses
+     (which test client behavior) can rely on.
+     """
+ 
++
+     def setUp(self):
+         """
+         Prepare the key data and known hosts files.
+@@ -61,6 +82,7 @@
+         f.write('127.0.0.1 ' + test_ssh.publicRSA_openssh)
+         f.close()
+ 
++
+     def startServer(self):
+         """
+         Fire up an SSH server on an available port.
+@@ -71,8 +93,10 @@
+         p.registerChecker(test_ssh.ConchTestPublicKeyChecker())
+         self.serverFactory = test_ssh.ConchTestServerFactory()
+         self.serverFactory.portal = p
+-        self.server = reactor.listenTCP(0, self.serverFactory, interface="127.0.0.1")
++        self.server = reactor.listenTCP(0, self.serverFactory, 
++                                        interface="127.0.0.1")
+ 
++
+     def stopServer(self):
+         """
+         Bring down the SSH server
+@@ -86,9 +110,11 @@
+         d.addCallback(self._cbStopServer)
+         return d
+ 
++
+     def _cbStopServer(self, ignored):
+         return defer.maybeDeferred(self.server.stopListening)
+ 
++
+     def tearDown(self):
+         """
+         Clean up the files we created for our tests.
+@@ -100,6 +126,8 @@
+             except:
+                 pass
+ 
++
++
+ class TestOurServerOurClientConnections(ClientTestBase):
+     """
+     Tests that exercise connection behavior for conch clients talking
+@@ -107,6 +135,7 @@
+     server, as it is not under test in these scenarios.
+     """
+ 
++
+     def setUp(self):
+         """
+         Start up a server before each test.
+@@ -116,6 +145,7 @@
+         d.addCallback(lambda _: self.startServer())
+         return d
+ 
++
+     def tearDown(self):
+         """
+         Kill off our server
+@@ -125,6 +155,7 @@
+         d.addCallback(lambda _: self.stopServer())
+         return d
+ 
++
+     def _makeOpts(self):
+         """
+         create the options we'll use for the SSH client.
+@@ -143,17 +174,23 @@
+         opts.identitys = ['dsa_test',]
+         return opts
+ 
++
+     def _cbConnect(self, ignored, conn):
+         """
+-        A callback that arranges additional callbacks for the deferred on the supplied connection.
+-        These shutdown the connection.
++        A callback that arranges additional callbacks for the deferred
++        on the supplied connection.  These shutdown the connection.
+ 
+-        Returns the connection's deferred so that it can become part of the callback chain.
++        Returns the connection's deferred so that it can become part
++        of the callback chain.
+         """
+-        conn.deferred.addCallback(lambda _: log.msg("client connection is up, ready to close it down"))
+-        conn.deferred.addCallback((lambda _, c: c.transport.loseConnection()), conn)
++        conn.deferred.addCallback(
++            lambda _: log.msg("client connection is up, "
++                              "ready to close it down"))
++        conn.deferred.addCallback(
++            (lambda _, c: c.transport.loseConnection()), conn)
+         return conn.deferred
+ 
++
+     def test_direct_connect_lose_connection_workaround(self):
+         """
+         direct.connect has a buggy factory that relies on a single
+@@ -184,11 +221,13 @@
+ 
+         # set up a connection as usual
+         d = direct.connect(self.server.getHost().host, opts['port'], 
+-                           opts, vhk, default.SSHUserAuthClient(opts['user'], opts, conn))
++                           opts, vhk, default.SSHUserAuthClient(opts['user']
++                                                                , opts, conn))
+ 
+         # after we get called back, inject the replacement
+         d.addCallback(_cbInjectReplacementDeferredOnFactory, newd, conn)
+-        # and then "normal" work can begin, in this case, we just call loseConnection
++        # and then "normal" work can begin, in this case, we just call 
++        # loseConnection
+         d.addCallback(self._cbConnect, conn)
+         
+         # the replacement deferred will get an errback when
+@@ -196,9 +235,12 @@
+         afd = self.assertFailure(newd, error.ConchError)
+         # and that errback's value will be a connection lost message,
+         # since that's what we wanted.
+-        afd.addCallback(lambda v: self.assertEquals(transport.DISCONNECT_CONNECTION_LOST, v.data))
++        afd.addCallback(
++            lambda v: self.assertEquals(transport.DISCONNECT_CONNECTION_LOST,
++                                        v.data))
+         return afd
+ 
++
+     def test_connect_connectTCP_loseConnection(self):
+         """
+         Test that connections openned with connect.connectTCP do not have
+@@ -214,28 +256,38 @@
+         conn = ClientConnection()
+ 
+         # set up a connection as usual
+-        willConnect = connect.connectTCP(self.server.getHost().host, opts['port'], 
+-                                         opts, vhk, default.SSHUserAuthClient(opts['user'], opts, conn))
++        willConnect = connect.connectTCP(
++            self.server.getHost().host, 
++            opts['port'], 
++            opts, vhk, 
++            default.SSHUserAuthClient(opts['user'], opts, conn))
+ 
+         willConnect.addCallback(lambda _: log.msg("will connect did connect"))
+-        # and then "normal" work can begin, in this case, we just call loseConnection
++        
++        # and then "normal" work can begin, in this case, we just call
++        # loseConnection
+         willConnect.addCallback(self._cbConnect, conn)
+ 
+         def _cb_didDisconnect(ignored, conn):
+             dd = conn.transport.factory.didDisconnect
+-            dd.addErrback(lambda f: self.assertEquals(transport.DISCONNECT_CONNECTION_LOST, f.value.data))
++            dd.addErrback(
++                lambda f: 
++                self.assertEquals(transport.DISCONNECT_CONNECTION_LOST, 
++                                  f.value.data))
+             return dd
+ 
+         willConnect.addCallback(_cb_didDisconnect, conn)
+         
+         return willConnect
+ 
++
+     def test_connect_connectTCP_serverDisconnects(self):
+         """
+         test callback/errback chain of our client when the server
+         drops the connection.
+         """
+ 
++
+         # a conch options instance
+         opts = self._makeOpts()
+         # an all-permitting verify host key function
+@@ -245,8 +297,11 @@
+         conn = ClientConnection()
+ 
+         # set up a connection as usual
+-        willConnect = connect.connectTCP(self.server.getHost().host, opts['port'], 
+-                                         opts, vhk, default.SSHUserAuthClient(opts['user'], opts, conn))
++        willConnect = connect.connectTCP(
++            self.server.getHost().host, 
++            opts['port'], 
++            opts, vhk, 
++            default.SSHUserAuthClient(opts['user'], opts, conn))
+ 
+         willConnect.addCallback(lambda _: log.msg("will connect did connect"))
+ 
+@@ -260,13 +315,16 @@
+ 
+         def _cb_didDisconnect(ignored, conn):
+             dd = conn.transport.factory.didDisconnect
+-            dd.addErrback(lambda f: self.assertEquals(transport.DISCONNECT_CONNECTION_LOST, f.value.data))
++            dd.addErrback(
++                lambda f: self.assertEquals(
++                    transport.DISCONNECT_CONNECTION_LOST, f.value.data))
+             return dd
+ 
+         willConnect.addCallback(_cb_didDisconnect, conn)
+         
+         return willConnect
+ 
++
+     def test_connect_connectTCP_err_handling_during_connection(self):
+         """
+         test err back chain when the connection can't be established.
+@@ -281,21 +339,31 @@
+         conn = ClientConnection()
+ 
+         # set up a connection as usual
+-        willConnect = connect.connectTCP(self.server.getHost().host, opts['port'], 
+-                                         opts, vhk, default.SSHUserAuthClient(opts['user'], opts, conn))
++        willConnect = connect.connectTCP(
++            self.server.getHost().host, 
++            opts['port'], 
++            opts, vhk, 
++            default.SSHUserAuthClient(opts['user'], opts, conn))
+ 
+-        willConnect.addErrback(lambda f: self.assertEquals(transport.DISCONNECT_HOST_KEY_NOT_VERIFIABLE, f.value.data))
++        willConnect.addErrback(
++            lambda f: self.assertEquals(
++                transport.DISCONNECT_HOST_KEY_NOT_VERIFIABLE, f.value.data))
+         # make certain the errback got called
+-        willConnect.addCallback(lambda d: self.assertEquals(transport.DISCONNECT_HOST_KEY_NOT_VERIFIABLE, d))
++        willConnect.addCallback(
++            lambda d: self.assertEquals(
++                transport.DISCONNECT_HOST_KEY_NOT_VERIFIABLE, d))
+ 
+         return willConnect
+ 
++
++
+ class ClientConnection(connection.SSHConnection):
+     """
+     A simple SSHConnection that calls back on a deferred when it gets
+     the serviceStarted notification.
+     """
+ 
++
+     def __init__(self):
+         """
+         Set up in the super class and then prepare a deferred.
+@@ -304,6 +372,7 @@
+         connection.SSHConnection.__init__(self)
+         self.deferred = defer.Deferred()
+ 
++
+     def serviceStarted(self):
+         """
+         We're ready to start opening channels now, so tell whoever
+@@ -313,5 +382,7 @@
+         connection.SSHConnection.serviceStarted(self)
+         self.deferred.callback(None)
+ 
++
++
+ if not unix or not Crypto or not interfaces.IReactorProcess(reactor, None):
+-    TestOurServerOurClient.skip = "don't run w/o PyCrypto"
++    TestOurServerOurClientConnections.skip = "don't run w/o PyCrypto"
+Index: twisted/conch/client/connect.py
+===================================================================
+--- twisted/conch/client/connect.py	(revision 24991)
++++ twisted/conch/client/connect.py	(working copy)
+@@ -1,7 +1,7 @@
++# -*- test-case-name: twisted.conch.test.test_connect -*-
+ # Copyright (c) 2001-2004 Twisted Matrix Laboratories.
+ # See LICENSE for details.
+ 
+-#
+ import os
+ 
+ from twisted.internet import defer, protocol, reactor
+@@ -19,6 +19,8 @@
+     return _ebConnect(None, useConnects, host, port, options, verifyHostKey,
+                       userAuthObject)
+ 
++
++
+ def _ebConnect(f, useConnects, host, port, options, vhk, uao):
+     if not useConnects:
+         return f
+@@ -29,6 +31,7 @@
+     return d
+ 
+ 
++
+ class SSHClientFactory(protocol.ClientFactory):
+     """
+     An SSHClientFactory based on the one in
+@@ -38,19 +41,23 @@
+ 
+     didConnect = 0
+ 
+-    def __init__(self, willConnect, didDisconnect, options, verifyHostKey, userAuthObject):
++
++    def __init__(self, willConnect, didDisconnect, options, verifyHostKey, 
++                 userAuthObject):
+         self.willConnect = willConnect.addCallback(self._cbWillConnect)
+         self.didDisconnect = didDisconnect
+         self.options = options
+         self.verifyHostKey = verifyHostKey
+         self.userAuthObject = userAuthObject
+ 
++
+     def _cbWillConnect(self, ignored):
+         #log.msg("_cbWillConnect")
+         self.didConnect = 1
+         self.willConnect = None
+         return ignored
+ 
++
+     def clientConnectionLost(self, connector, reason):
+         log.msg("clientConnectionLost", reason)
+         if self.options['reconnect']:
+@@ -85,6 +92,7 @@
+     disconnect behavior after the connection is established.
+     """
+ 
++
+     def __init__(self, factory):
+         self.factory = factory
+         self.unixServer = None
+@@ -119,6 +127,7 @@
+         else:
+             self.factory.willConnect.errback(error.ConchError(desc, code))
+ 
++
+     def sendDisconnect(self, code, reason):
+         """
+         this message is issued when either the server or the client
+@@ -145,7 +154,8 @@
+             # only if receiveError didn't get there first (due to an
+             # error received from the other side).
+             if not self.factory.didDisconnect.called:
+-                self.factory.didDisconnect.errback(error.ConchError(reason, code))
++                self.factory.didDisconnect.errback(error.ConchError(reason, 
++                                                                    code))
+             else:
+                 pass # already called in receiveError
+         elif not self.factory.willConnect.called:
+@@ -167,8 +177,8 @@
+         Ask our factory to verify the other side's host key.
+         """
+ 
+-        return self.factory.verifyHostKey(self, self.transport.getPeer().host, pubKey,
+-                                          fingerprint)
++        return self.factory.verifyHostKey(self, self.transport.getPeer().host, 
++                                          pubKey, fingerprint)
+ 
+ 
+     def setService(self, service):
+@@ -186,21 +196,26 @@
+             if not self.factory.options['nocache']:
+                 user = self.factory.userAuthObject.user
+                 peer = self.transport.getPeer()
+-                filename = os.path.expanduser("~/.conch-%s-%s-%i" % (user, peer.host, peer.port))
++                filename = os.path.expanduser("~/.conch-%s-%s-%i" % 
++                                              (user, peer.host, peer.port))
+ 
+-                # this is one possible solution to the deprecation of the mode argument to listenUNIX
+-                # but it is not enabled here because t.c.c.unix expects to find the socket file
+-                # in the "bad" location
++                # this is one possible solution to the deprecation of
++                # the mode argument to listenUNIX but it is not
++                # enabled here because t.c.c.unix expects to find the
++                # socket file in the "bad" location
+ 
+                 #path = os.path.expanduser("~/.conch")
+                 #if not os.path.exists(path):
+                 #    os.makedirs(path)
+                 #     os.chmod(path, 0700)
+-                #filename = os.path.join(path, "%s-%s-%i" % (user, peer.host, peer.port))
++                #filename = os.path.join(path, "%s-%s-%i" % 
++                #                        (user, peer.host, peer.port))
+ 
+                 u = unix.SSHUnixServerFactory(service)
+                 try:
+-                    self.unixServer = reactor.listenUNIX(filename, u, mode=0600, wantPID=1)
++                    self.unixServer = reactor.listenUNIX(filename, u, 
++                                                         mode=0600, 
++                                                         wantPID=1)
+                 except:
+                     if self.factory.d is not None:
+                         d, self.factory.d = self.factory.d, None
+@@ -216,6 +231,8 @@
+ 
+         self.requestService(self.factory.userAuthObject)
+ 
++
++
+ def connectTCP(host, port, options, verifyHostKey, userAuthObject):
+     """
+     connect to host:port using options.  Host key verification will be
+@@ -234,6 +251,7 @@
+ 
+     willConnect = defer.Deferred()
+     didDisconnect = defer.Deferred()
+-    factory = SSHClientFactory(willConnect, didDisconnect, options, verifyHostKey, userAuthObject)
++    factory = SSHClientFactory(willConnect, didDisconnect, options, 
++                               verifyHostKey, userAuthObject)
+     reactor.connectTCP(host, port, factory)
+     return willConnect

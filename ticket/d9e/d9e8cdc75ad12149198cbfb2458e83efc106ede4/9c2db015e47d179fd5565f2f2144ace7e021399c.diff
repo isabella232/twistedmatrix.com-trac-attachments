@@ -1,0 +1,1743 @@
+Index: twisted/words/test/test_jabbertls.py
+===================================================================
+--- twisted/words/test/test_jabbertls.py	(revision 0)
++++ twisted/words/test/test_jabbertls.py	(revision 0)
+@@ -0,0 +1,233 @@
++from twisted.trial import unittest, util
++
++from zope.interface import implements, providedBy
++
++from twisted.internet import defer, task, reactor, interfaces, tcp
++from twisted.internet.error import ConnectionLost
++from twisted.test import proto_helpers
++from twisted.words.xish import domish
++from twisted.words.protocols.jabber import error, xmlstream, tls
++
++from twisted.test.proto_helpers import StringTransport, LineSendingProtocol
++
++try:
++    from twisted.test.ssl_helpers import ClientTLSContext, ServerTLSContext
++except ImportError:
++    ClientTLSContext = ServerTLSContext = None
++
++try:
++    from twisted.internet import ssl
++except ImportError:
++    ssl = None
++if ssl and not ssl.supported:
++    ssl = None
++
++NS_XMPP_TLS = 'urn:ietf:params:xml:ns:xmpp-tls'
++
++class DummySSLTransport:
++    """
++    I provide dummy ssl transport.
++    """
++    
++    def getPeerCertificate(self):
++        return None
++
++def _getTLSClass(klass, _existing={}):
++    if klass not in _existing:
++        class TLSConnection(DummySSLTransport, klass):
++            implements(interfaces.ISSLTransport)
++        _existing[klass] = TLSConnection
++    return _existing[klass]
++
++class StringTransportWithDummyTLS(StringTransport):
++    """
++    I provide a simple transport object with dummy tls support.
++    """
++    
++    implements(interfaces.ITLSTransport)
++    
++    def startTLS(self, ctx):
++        self.__class__ = _getTLSClass(self.__class__)
++
++class InitiatingTest(unittest.TestCase):
++    originating = 'example.com'
++    
++    def setUp(self):
++        self.output = []
++        self.authenticator = xmlstream.ConnectAuthenticator(self.originating)
++        self.authenticator.namespace = 'jabber:client'
++        self.xmlstream = xmlstream.XmlStream(self.authenticator)
++        self.xmlstream.send = self.output.append
++        
++        self.init = tls.TLSInitiatingInitializer(self.xmlstream)
++        
++        self.xmlstream.connectionMade()
++        self.xmlstream.transport = StringTransportWithDummyTLS()
++    
++    def _sendHeader(self):
++        self.xmlstream.dataReceived("<?xml version='1.0'?>"
++            "<stream:stream xmlns:stream='http://etherx.jabber.org/streams' "
++            "xmlns='jabber:client' from='%s' version='1.0'>" % \
++                self.originating)
++        self.xmlstream.dataReceived(
++            "<stream:features xmlns='http://etherx.jabber.org/streams'>"
++            "<starttls xmlns='urn:ietf:params:xml:ns:xmpp-tls'/>"
++            "</stream:features>")
++    
++    def testOutput(self):
++        self._sendHeader()
++        self.init.start()
++        
++        header = self.output.pop(0)
++        
++        try:
++            element = self.output.pop(0)
++        except IndexError, e:
++            self.fail("No output")
++        
++        self.assertEquals(element.name, "starttls")
++        self.assertEquals(element.uri, NS_XMPP_TLS)
++        self.assertEquals(element.attributes, {})
++        self.assertEquals(str(element), "")
++        
++        try:
++            self.output.pop(0)
++        except IndexError, e:
++            pass
++        else:
++            self.fail("Unexpected output")
++    
++    def testFailure(self):
++        d = self.init.start()
++        
++        def _cb(result):
++            self.fail("TLS Negotiation succeeded!")
++        
++        def _eb(failure):
++            self.assertEquals(failure.type, tls.TLSFailed)
++        
++        d.addCallback(_cb)
++        d.addErrback(_eb)
++        
++        self._sendHeader()
++        
++        self.xmlstream.dataReceived(
++            "<failure xmlns='urn:ietf:params:xml:ns:xmpp-tls'/>")
++        self.xmlstream.dataReceived("</stream:stream>")
++        
++        return d
++    
++    def testProceed(self):
++        d = self.init.start()
++        
++        def _cb(result):
++            self.assertEquals(result, xmlstream.Reset)
++            
++            try:
++                self.output.pop()
++            except IndexError, e:
++                self.fail("No stream header found")
++        
++        def _eb(failure):
++            self.fail("XML Stream failed %s" % failure)
++        
++        d.addErrback(_eb)
++        d.addCallback(_cb)
++        
++        self._sendHeader()
++        
++        # clear the buffer
++        while self.output:
++            self.output.pop()
++        
++        self.xmlstream.dataReceived(
++            "<proceed xmlns='urn:ietf:params:xml:ns:xmpp-tls'/>")
++        
++        return d
++
++class ReceivingTest(unittest.TestCase):
++    receiving = "foobar.net"
++    
++    def setUp(self):
++        self.output = []
++        self.authenticator = xmlstream.ListenAuthenticator()
++        self.authenticator.namespace = 'jabber:client'
++        self.xmlstream = xmlstream.XmlStream(self.authenticator)
++        self.xmlstream.send = self.output.append
++        
++        self.init = tls.TLSReceivingInitializer(self.xmlstream,
++            ClientTLSContext())
++        
++        self.xmlstream.initializers = [self.init]
++        
++        self.xmlstream.connectionMade()
++        self.xmlstream.transport = StringTransportWithDummyTLS()
++
++    def _getContextFactory(self):
++        context = ssl.ClientContextFactory()
++        context.method = ssl.SSL.TLSv1_METHOD
++        
++        return context
++
++    def _sendHeader(self):
++        self.xmlstream.dataReceived("<?xml version='1.0'?>"
++            "<stream:stream xmlns:stream='http://etherx.jabber.org/streams' "
++            "xmlns='jabber:client' to='%s' version='1.0'>" % \
++                self.receiving)
++
++    def testBasic(self):
++        self._sendHeader()
++        
++        root = self.output[1]
++        
++        self.assertEquals(root.uri, 'http://etherx.jabber.org/streams')
++        self.assertEquals(root.name, 'features')
++        self.assertEquals(len(root.children), 1)
++        
++        feature = root.children[0]
++        
++        self.assertEquals(feature.uri, NS_XMPP_TLS)
++        self.assertEquals(feature.name, 'starttls')
++        self.assertEquals(len(feature.children), 1)
++        
++        required = feature.children[0]
++        
++        self.assertEquals(required.name, 'required')
++        self.assertEquals(required.uri, None)
++    
++    def testStartTLS(self):
++        d = defer.Deferred()
++        
++        def authd(result):
++            if not interfaces.ISSLTransport.providedBy(
++                self.xmlstream.transport):
++                self.fail("auth'd but stream is not secure")
++                d.errback(result)
++            else:
++                d.callback(result)
++        
++        self.xmlstream.addObserver(xmlstream.STREAM_AUTHD_EVENT, authd)
++
++        self._sendHeader()
++        
++        self.xmlstream.dataReceived("<starttls xmlns='%s'/>" % NS_XMPP_TLS)
++        
++        last_received = self.output[-1]
++        
++        self.assertEquals(last_received.uri, NS_XMPP_TLS)
++        self.assertEquals(last_received.name, 'proceed')
++        
++        while len(self.output) > 0:
++           self.output.pop()
++        
++        self.assertEquals(
++            interfaces.ISSLTransport.providedBy(self.xmlstream.transport),
++            True)
++        
++        self._sendHeader()
++        
++        last_received = self.output[-1]
++        
++        self.assertEquals(last_received.uri, 'http://etherx.jabber.org/streams')
++        self.assertEquals(last_received.name, 'features')
++        self.assertEquals(len(last_received.children), 0)
+Index: twisted/words/test/test_jabberserver.py
+===================================================================
+--- twisted/words/test/test_jabberserver.py	(revision 20408)
++++ twisted/words/test/test_jabberserver.py	(working copy)
+@@ -5,11 +5,21 @@
+ Tests for twisted.words.protocols.jabber.server
+ """
+ 
++import StringIO
++
+ from twisted.trial import unittest
+-from twisted.words.protocols.jabber import server
++from twisted.words.protocols.jabber import server, xmlstream, error
++from twisted.protocols import loopback
++from twisted.internet import address, protocol, reactor, defer
++from twisted.words.xish import xpath, domish
+ 
++from twisted.test.proto_helpers import StringTransport, LineSendingProtocol
++
++from twisted.trial import util
++
++DIALBACK_NS = "jabber:server:dialback"
++
+ class GenerateKeyTest(unittest.TestCase):
+-
+     def testBasic(self):
+         secret = "s3cr3tf0rd14lb4ck"
+         receiving = "example.net"
+@@ -20,3 +30,413 @@
+ 
+         self.assertEqual(key,
+             '008c689ff366b50c63d69a3e2d2c0e0e1f8404b0118eb688a0102c87cb691bdc')
++
++class DialbackReceivingInitializerTest(unittest.TestCase):
++    secret = "qwerty"
++    receiving = "example.net"
++    originating = "example.com"
++    _id = "S09283411S"
++    
++    def setUp(self):
++        self.key = server.generateKey(self.secret, self.receiving,
++            self.originating, self._id)
++        self.output = []
++        
++        self.authenticator = xmlstream.Authenticator()
++        self.xmlstream = xmlstream.XmlStream(self.authenticator)
++        self.xmlstream.send = self.output.append
++        self.xmlstream.connectionMade()
++        self.xmlstream.transport = StringTransport()
++        self.xmlstream.initiating = False
++        
++        self.xmlstream.dataReceived("<stream:stream xmlns='jabber:server' "
++                        "xmlns:stream='http://etherx.jabber.org/streams' "
++                        "xmlns:db='jabber:server:dialback'>")
++        self.xmlstream.thisHost = self.receiving
++        self.xmlstream.otherHost = self.originating
++        self.init = server.ReceivingDialbackInitializer(self.xmlstream,
++            self.receiving, self.originating, self._id, self.key)
++    
++    def testSentHeader(self):
++        d = self.init.initialize()
++        
++        header = self.output[0]
++        
++        self.assertEquals(header.uri, "jabber:server:dialback")
++        self.assertEquals(header.name, "verify")
++        self.assertEquals(header['to'], self.originating)
++        self.assertEquals(header['from'], self.receiving)
++        self.assertEquals(header['id'], self._id)
++        self.assertNotEquals(str(header), "")
++        
++    def testSendBadId(self):
++        d = self.init.initialize()
++        
++        def _cb(result):
++            self.fail("Bad id accepted")
++        
++        def _eb(failure):
++            try:
++                failure.raiseException()
++            except server.DialbackFailed, e:
++                pass
++            except Exception, e:
++                raise e
++            
++            # check the stream error that was sent
++            stream_error = error.exceptionFromStreamError(self.output[2])
++            
++            self.assertEqual(isinstance(stream_error, error.StreamError), True)
++            self.assertEqual(stream_error.condition, 'invalid-id')
++        
++        d.addCallback(_cb)
++        d.addErrback(_eb)
++        
++        def sendVerify():
++            self.xmlstream.dataReceived("<verify xmlns='jabber:server:dialback' "
++                "id='BAD_ID' to='%s' from='%s' type='valid' />" % (
++                    self.receiving, self.originating))
++            
++        reactor.callLater(0, sendVerify)
++        
++        return d
++    
++    def testSendBadFrom(self):
++        d = self.init.initialize()
++        
++        def _cb(result):
++            self.fail("Bad from accepted")
++        
++        def _eb(failure):
++            try:
++                failure.raiseException()
++            except server.DialbackFailed, e:
++                pass
++            except Exception, e:
++                raise e
++            
++            # check the stream error that was sent
++            stream_error = error.exceptionFromStreamError(self.output[2])
++            
++            self.assertEqual(isinstance(stream_error, error.StreamError), True)
++            self.assertEqual(stream_error.condition, 'invalid-from')
++        
++        d.addCallback(_cb)
++        d.addErrback(_eb)
++        
++        def sendVerify():
++            self.xmlstream.dataReceived("<verify xmlns='jabber:server:dialback' "
++                "id='%s' to='%s' from='%s' type='valid' />" % (
++                    self._id, self.receiving, 'bad-from'))
++            
++        reactor.callLater(0, sendVerify)
++        
++        return d
++        
++    def testSendBadTo(self):
++        d = self.init.initialize()
++        
++        def _cb(result):
++            self.fail("Bad to accepted")
++        
++        def _eb(failure):
++            try:
++                failure.raiseException()
++            except server.DialbackFailed, e:
++                pass
++            except Exception, e:
++                raise e
++            
++            # check the stream error that was sent
++            stream_error = error.exceptionFromStreamError(self.output[2])
++            
++            self.assertEqual(isinstance(stream_error, error.StreamError), True)
++            self.assertEqual(stream_error.condition, 'host-unknown')
++        
++        d.addCallback(_cb)
++        d.addErrback(_eb)
++        
++        def sendVerify():
++            self.xmlstream.dataReceived("<verify xmlns='jabber:server:dialback' "
++                "id='%s' to='bad-to' from='%s' type='valid' />" % (
++                    self._id, self.originating))
++            
++        reactor.callLater(0, sendVerify)
++        
++        return d
++    
++    def testCheckVerify(self):
++        d = self.init.initialize()
++        
++        def sendVerify():
++            self.xmlstream.dataReceived("<verify xmlns='jabber:server:dialback' "
++                "id='%s' to='%s' from='%s' type='valid' />" % (
++                    self._id, self.receiving, self.originating))
++            
++        reactor.callLater(0, sendVerify)
++        
++        return d
++    
++    def testCheckVerifyFailure(self):
++        d = self.init.initialize()
++        
++        def _cb(result):
++            self.fail("Failed dialback request accepted")
++        def _eb(failure):
++            try:
++                failure.raiseException()
++            except server.DialbackFailed, e:
++                pass
++            except Exception, e:
++                raise e
++        
++        d.addCallback(_cb)
++        d.addErrback(_eb)
++        
++        def sendVerify():
++            self.xmlstream.dataReceived("<verify xmlns='jabber:server:dialback' "
++                "id='%s' to='%s' from='%s' type='invalid' />" % (
++                    self._id, self.receiving, self.originating))
++        
++        reactor.callLater(0, sendVerify)
++        
++        return d
++        
++    def testStreamError(self):
++        d = self.init.initialize()
++        
++        def _cb(result):
++            self.fail("")
++        
++        def _eb(failure):
++            pass
++        
++        def sendInvalidMarkup():
++            self.xmlstream.dataReceived("<<invalid markup />")
++        
++        d.addCallback(_cb)
++        d.addErrback(_eb)
++        
++        reactor.callLater(0, sendInvalidMarkup)
++        
++        return d
++
++class DialbackOriginatingInitializerTest(unittest.TestCase):
++    secret = "secret"
++    receiving = "example.net"
++    originating = "example.com"
++    
++    def setUp(self):
++        self.output = []
++        
++        self.authenticator = xmlstream.Authenticator()
++        self.xmlstream = xmlstream.XmlStream(self.authenticator)
++        self.xmlstream.send = self.output.append
++        self.xmlstream.connectionMade()
++        self.xmlstream.transport = StringTransport()
++        
++        self.xmlstream.dataReceived("<stream:stream xmlns='jabber:server' "
++                        "xmlns:stream='http://etherx.jabber.org/streams' "
++                        "xmlns:db='jabber:server:dialback' id='12345'>")
++        self.xmlstream.thisHost = self.originating
++        self.xmlstream.otherHost = self.receiving
++        
++        self.init = server.OriginatingDialbackInitializer(self.xmlstream,
++                        self.originating, self.receiving, self.secret)
++    
++    def testBasic(self):
++        d = self.init.initialize()
++        
++        result = self.output[0]
++        
++        self.assertEquals(domish.IElement.providedBy(result), True)
++        self.assertEquals(result.uri, 'jabber:server:dialback')
++        self.assertEquals(result['to'], self.receiving)
++        self.assertEquals(result['from'], self.originating)
++        self.assertNotEquals(str(result), "")
++    
++    def testVerify(self):
++        d = self.init.initialize()
++        
++        def sendResult():
++            self.xmlstream.dataReceived(
++            "<result xmlns='jabber:server:dialback' "
++                "to='%s' from='%s' type='valid' />" % (
++                    self.originating, self.receiving))
++        
++        reactor.callLater(0, sendResult)
++        
++        return d
++    
++    def testVerifyFailure(self):
++        d = self.init.initialize()
++        
++        def _eb(failure):
++            try:
++                failure.raiseException()
++            except server.DialbackFailed, e:
++                pass
++            except Exception, e:
++                raise
++        
++        def sendResult():
++            self.xmlstream.dataReceived(
++                "<result xmlns='jabber:server:dialback' to='%s' from='%s' "
++                "type='invalid' />" % (
++                    self.originating, self.receiving))
++        
++        reactor.callLater(0, sendResult)
++        
++        d.addErrback(_eb)
++        
++        return d
++    
++    def testStreamError(self):
++        d = self.init.initialize()
++        
++        def _cb(result):
++            self.fail("")
++        
++        def _eb(failure):
++            pass
++        
++        def sendInvalidMarkup():
++            self.xmlstream.dataReceived("<<invalid markup />")
++        
++        reactor.callLater(0, sendInvalidMarkup)
++        
++        d.addCallback(_cb)
++        d.addErrback(_eb)
++        
++        return d
++
++class DialbackConnectTest(unittest.TestCase):
++    secret = "secret"
++    receiving = "example.net"
++    originating = "example.com"
++    
++    def setUp(self):
++        self.authenticator = server.XMPPServerConnectAuthenticator(
++                            self.receiving, self.originating, self.secret)
++        self.xmlstream = xmlstream.XmlStream(self.authenticator)
++        self.xmlstream.transport = StringTransport()
++    
++    def testBasic(self):
++        self.assertEquals(self.secret, self.authenticator.secret)
++        self.assertEquals(self.receiving, self.authenticator.thisHost)
++        self.assertEquals(self.originating, self.authenticator.otherHost)
++        
++        for initializer in self.xmlstream.initializers:
++            if isinstance(initializer, server.OriginatingDialbackInitializer):
++                break
++        else:
++            self.fail("OriginatingDialbackInitiator unavailable")
++        
++    def testConnect(self):
++        self.xmlstream.connectionMade()
++        
++        self.assertEquals(self.xmlstream.thisHost, self.authenticator.thisHost)
++        
++        for ns in ('jabber:server:dialback', 'http://etherx.jabber.org/streams'):
++            self.assertIn(ns, self.xmlstream.prefixes)
++        
++        self.assertNotEquals(self.xmlstream.transport.value(), "")
++    
++class DialbackVerifyTest(unittest.TestCase):
++    receiving = "example.net"
++    originating = "example.com"
++    id_ = "I1234567SD"
++    secret = "shhhhh"
++    
++    def setUp(self):
++        self.key = server.generateKey(self.secret, self.receiving,
++            self.originating, self.id_)
++        
++        self.authenticator = server.XMPPServerVerifyAuthenticator(
++                        self.originating, self.receiving, self.id_, self.key)
++        self.xmlstream = xmlstream.XmlStream(self.authenticator)
++        self.xmlstream.transport = StringTransport()
++    
++    def testBasic(self):
++        self.assertEquals(self.key, self.authenticator.key)
++        self.assertEquals(self.originating, self.authenticator.thisHost)
++        self.assertEquals(self.receiving, self.authenticator.otherHost)
++        self.assertEquals(self.id_, self.authenticator.originalStreamID)
++        
++        for initializer in self.xmlstream.initializers:
++            if isinstance(initializer, server.ReceivingDialbackInitializer):
++                break
++        else:
++            self.fail("ReceivingDialbackInitializer unavailable")
++    
++    def testConnect(self):
++        self.xmlstream.connectionMade()
++        
++        self.assertEquals(self.xmlstream.thisHost, self.authenticator.thisHost)
++        
++        for ns in ('jabber:server:dialback', 'http://etherx.jabber.org/streams'):
++            self.assertIn(ns, self.xmlstream.prefixes)
++        
++        self.assertNotEquals(self.xmlstream.transport.value(), "")
++
++class DialbackListenTest(unittest.TestCase):
++    receiving = "example.org"
++    originating = "example.net"
++    id_ = "2093845023948"
++    secret = "not-telling"
++    
++    def setUp(self):
++        self.output = []
++        self.authenticator = server.XMPPServerListenAuthenticator(
++                        self.receiving, self.secret)
++        self.xmlstream = xmlstream.XmlStream(self.authenticator)
++        self.xmlstream.transport = StringTransport()
++        self.xmlstream.send = self.output.append
++    
++    def testBasic(self):
++        self.assertEquals(self.secret, self.authenticator.secret)
++        self.assertEquals(self.receiving, self.authenticator.domain)
++        self.assertEquals(self.xmlstream.initiating, False)
++    
++    def testConnect(self):
++        self.xmlstream.connectionMade()
++        self.assertIn('http://etherx.jabber.org/streams',
++            self.xmlstream.prefixes)
++    
++    def testSendBadNS(self):
++        self.xmlstream.connectionMade()
++        self.xmlstream.dataReceived(
++            "<stream xmlns='http://etherx.jabber.org/streams'>")
++        
++        stream_error = error.exceptionFromStreamError(self.output[1])
++        
++        self.assertEquals(isinstance(stream_error, error.StreamError), True)
++        self.assertEquals(stream_error.condition, 'invalid-namespace')
++    
++    def testHeader(self):
++        self.xmlstream.connectionMade()
++        
++        d = defer.Deferred()
++        
++        def authd(result):
++            d.callback(None)
++        
++        def failed(result):
++            self.fail("Failed to init stream")
++            d.errback(result)
++        
++        self.xmlstream.addObserver(xmlstream.STREAM_AUTHD_EVENT, authd)
++        self.xmlstream.addObserver(xmlstream.INIT_FAILED_EVENT, failed)
++        
++        self.xmlstream.dataReceived(
++            "<stream:stream xmlns='jabber:server' "
++            "xmlns:stream='http://etherx.jabber.org/streams' "
++            "xmlns:db='jabber:server:dialback'>")
++        
++        last_received = self.output[-1]
++        
++        self.assertEquals(last_received.uri, 'http://etherx.jabber.org/streams')
++        self.assertEquals(last_received.name, 'features')
++        self.assertEquals(len(last_received.children), 0)
++        
++        return d
+Index: twisted/words/test/test_jabberxmlstream.py
+===================================================================
+--- twisted/words/test/test_jabberxmlstream.py	(revision 20408)
++++ twisted/words/test/test_jabberxmlstream.py	(working copy)
+@@ -13,8 +13,6 @@
+ from twisted.words.xish import domish
+ from twisted.words.protocols.jabber import error, xmlstream
+ 
+-NS_XMPP_TLS = 'urn:ietf:params:xml:ns:xmpp-tls'
+-
+ class IQTest(unittest.TestCase):
+     """
+     Tests both IQ and the associated IIQResponseTracker callback.
+@@ -494,123 +492,6 @@
+         self.assert_(self.initFailure.check(TestError))
+ 
+ 
+-
+-class TLSInitiatingInitializerTest(unittest.TestCase):
+-    def setUp(self):
+-        self.output = []
+-        self.done = []
+-
+-        self.savedSSL = xmlstream.ssl
+-
+-        self.authenticator = xmlstream.Authenticator()
+-        self.xmlstream = xmlstream.XmlStream(self.authenticator)
+-        self.xmlstream.send = self.output.append
+-        self.xmlstream.connectionMade()
+-        self.xmlstream.dataReceived("<stream:stream xmlns='jabber:client' "
+-                        "xmlns:stream='http://etherx.jabber.org/streams' "
+-                        "from='example.com' id='12345' version='1.0'>")
+-        self.init = xmlstream.TLSInitiatingInitializer(self.xmlstream)
+-
+-
+-    def tearDown(self):
+-        xmlstream.ssl = self.savedSSL
+-
+-
+-    def testWantedSupported(self):
+-        """
+-        Test start when TLS is wanted and the SSL library available.
+-        """
+-        self.xmlstream.transport = proto_helpers.StringTransport()
+-        self.xmlstream.transport.startTLS = lambda ctx: self.done.append('TLS')
+-        self.xmlstream.reset = lambda: self.done.append('reset')
+-        self.xmlstream.sendHeader = lambda: self.done.append('header')
+-
+-        d = self.init.start()
+-        d.addCallback(self.assertEquals, xmlstream.Reset)
+-        starttls = self.output[0]
+-        self.assertEquals('starttls', starttls.name)
+-        self.assertEquals(NS_XMPP_TLS, starttls.uri)
+-        self.xmlstream.dataReceived("<proceed xmlns='%s'/>" % NS_XMPP_TLS)
+-        self.assertEquals(['TLS', 'reset', 'header'], self.done)
+-
+-        return d
+-
+-    if not xmlstream.ssl:
+-        testWantedSupported.skip = "SSL not available"
+-
+-    def testWantedNotSupportedNotRequired(self):
+-        """
+-        Test start when TLS is wanted and the SSL library available.
+-        """
+-        xmlstream.ssl = None
+-
+-        d = self.init.start()
+-        d.addCallback(self.assertEquals, None)
+-        self.assertEquals([], self.output)
+-
+-        return d
+-
+-
+-    def testWantedNotSupportedRequired(self):
+-        """
+-        Test start when TLS is wanted and the SSL library available.
+-        """
+-        xmlstream.ssl = None
+-        self.init.required = True
+-
+-        d = self.init.start()
+-        self.assertFailure(d, xmlstream.TLSNotSupported)
+-        self.assertEquals([], self.output)
+-
+-        return d
+-
+-
+-    def testNotWantedRequired(self):
+-        """
+-        Test start when TLS is not wanted, but required by the server.
+-        """
+-        tls = domish.Element(('urn:ietf:params:xml:ns:xmpp-tls', 'starttls'))
+-        tls.addElement('required')
+-        self.xmlstream.features = {(tls.uri, tls.name): tls}
+-        self.init.wanted = False
+-
+-        d = self.init.start()
+-        self.assertEquals([], self.output)
+-        self.assertFailure(d, xmlstream.TLSRequired)
+-
+-        return d
+-
+-
+-    def testNotWantedNotRequired(self):
+-        """
+-        Test start when TLS is not wanted, but required by the server.
+-        """
+-        tls = domish.Element(('urn:ietf:params:xml:ns:xmpp-tls', 'starttls'))
+-        self.xmlstream.features = {(tls.uri, tls.name): tls}
+-        self.init.wanted = False
+-
+-        d = self.init.start()
+-        d.addCallback(self.assertEqual, None)
+-        self.assertEquals([], self.output)
+-        return d
+-
+-
+-    def testFailed(self):
+-        """
+-        Test failed TLS negotiation.
+-        """
+-        # Pretend that ssl is supported, it isn't actually used when the
+-        # server starts out with a failure in response to our initial
+-        # C{starttls} stanza.
+-        xmlstream.ssl = 1
+-
+-        d = self.init.start()
+-        self.assertFailure(d, xmlstream.TLSFailed)
+-        self.xmlstream.dataReceived("<failure xmlns='%s'/>" % NS_XMPP_TLS)
+-        return d
+-
+-
+-
+ class TestFeatureInitializer(xmlstream.BaseFeatureInitiatingInitializer):
+     feature = ('testns', 'test')
+ 
+@@ -618,7 +499,6 @@
+         return defer.succeed(None)
+ 
+ 
+-
+ class BaseFeatureInitiatingInitializerTest(unittest.TestCase):
+ 
+     def setUp(self):
+Index: twisted/words/test/test_jabberclient.py
+===================================================================
+--- twisted/words/test/test_jabberclient.py	(revision 20408)
++++ twisted/words/test/test_jabberclient.py	(working copy)
+@@ -4,7 +4,7 @@
+ import sha
+ from twisted.test import proto_helpers
+ from twisted.trial import unittest
+-from twisted.words.protocols.jabber import client, error, jid, xmlstream
++from twisted.words.protocols.jabber import client, error, jid, xmlstream, tls
+ from twisted.words.protocols.jabber.sasl import SASLInitiatingInitializer
+ 
+ 
+@@ -272,14 +272,14 @@
+         self.assertEqual('secret', xs.authenticator.password)
+ 
+         # test list of initializers
+-        version, tls, sasl, bind, session = xs.initializers
++        version, tls_, sasl, bind, session = xs.initializers
+ 
+-        self.assert_(isinstance(tls, xmlstream.TLSInitiatingInitializer))
++        self.assert_(isinstance(tls_, tls.TLSInitiatingInitializer))
+         self.assert_(isinstance(sasl, SASLInitiatingInitializer))
+         self.assert_(isinstance(bind, client.BindInitializer))
+         self.assert_(isinstance(session, client.SessionInitializer))
+ 
+-        self.assertFalse(tls.required)
++        self.assertFalse(tls_.required)
+         self.assertTrue(sasl.required)
+         self.assertFalse(bind.required)
+         self.assertFalse(session.required)
+Index: twisted/words/protocols/jabber/xmlstream.py
+===================================================================
+--- twisted/words/protocols/jabber/xmlstream.py	(revision 20408)
++++ twisted/words/protocols/jabber/xmlstream.py	(working copy)
+@@ -23,18 +23,10 @@
+ from twisted.words.xish.xmlstream import STREAM_END_EVENT
+ from twisted.words.xish.xmlstream import STREAM_ERROR_EVENT
+ 
+-try:
+-    from twisted.internet import ssl
+-except ImportError:
+-    ssl = None
+-if ssl and not ssl.supported:
+-    ssl = None
+-
+ STREAM_AUTHD_EVENT = intern("//event/stream/authd")
+ INIT_FAILED_EVENT = intern("//event/xmpp/initfailed")
+ 
+ NS_STREAMS = 'http://etherx.jabber.org/streams'
+-NS_XMPP_TLS = 'urn:ietf:params:xml:ns:xmpp-tls'
+ 
+ Reset = object()
+ 
+@@ -46,7 +38,7 @@
+     return sha.new("%s%s" % (sid, password)).hexdigest()
+ 
+ 
+-class Authenticator:
++class Authenticator(object):
+     """
+     Base class for business logic of initializing an XmlStream
+ 
+@@ -109,12 +101,10 @@
+         """
+         self.xmlstream = xmlstream
+ 
+-
+ class ConnectAuthenticator(Authenticator):
+     """
+     Authenticator for initiating entities.
+     """
+-
+     namespace = None
+ 
+     def __init__(self, otherHost):
+@@ -140,7 +130,6 @@
+         successfully processed, but that the XML Stream has been reset. An
+         example is the TLSInitiatingInitializer.
+         """
+-
+         def remove_first(result):
+             self.xmlstream.initializers.pop(0)
+ 
+@@ -159,6 +148,7 @@
+ 
+             try:
+                 init = self.xmlstream.initializers[0]
++                
+             except IndexError:
+                 self.xmlstream.dispatch(self.xmlstream, STREAM_AUTHD_EVENT)
+                 return None
+@@ -179,44 +169,101 @@
+ class ListenAuthenticator(Authenticator):
+     """
+     Authenticator for receiving entities.
++    
++    @ivar index: Position within the XML Stream initializers list.
++    @type index: L{int}
+     """
+-
+     namespace = None
++    index = None
+ 
+     def associateWithStream(self, xmlstream):
+         Authenticator.associateWithStream(self, xmlstream)
+         self.xmlstream.initiating = False
+ 
++    def streamStarted(self):
++        self.initializeStream()
+ 
++    def initializeStream(self):
++        """
++        Perform stream initialization procedures.
++
++        An L{XmlStream} holds a list of initializer objects in its
++        C{initializers} attribute. This method calls these initializers in
++        order and dispatches the C{STREAM_AUTHD_EVENT} event when the list has
++        been successfully processed. Otherwise it dispatches the
++        C{INIT_FAILED_EVENT} event with the failure.
++
++        Initializers may return the special L{Reset} object to halt the
++        initialization processing. It signals that the current initializer was
++        successfully processed, but that the XML Stream has been reset.
++        """
++        dl = []
++        
++        def check_reset(result):
++            for d in result:
++                if d[0] == defer.FAILURE:
++                    self.xmlstream.dispatch(d[1], INIT_FAILED_EVENT)
++                    break
++                
++                if d[1] == Reset:
++                    self.xmlstream.reset()
++                    break
++            else:
++                self.xmlstream.dispatch(None, STREAM_AUTHD_EVENT)
++            
++            return result
++        
++        for init in self.xmlstream.initializers:
++            d = defer.maybeDeferred(init.initialize)
++            d.addErrback(self.xmlstream.dispatch, INIT_FAILED_EVENT)
++            dl.append(d)
++            
++            if init.advertizeFeature():
++                self.xmlstream.features[init.feature] = init.getFeatureElement()
++        
++        dl = defer.DeferredList(dl)
++        dl.addCallback(check_reset)
++        
++        self.xmlstream.sendFeatures()
++
+ class FeatureNotAdvertized(Exception):
+     """
+     Exception indicating a stream feature was not advertized, while required by
+     the initiating entity.
+     """
+ 
+-
+-class BaseFeatureInitiatingInitializer(object):
++class BaseFeatureInitializer(object):
+     """
+     Base class for initializers with a stream feature.
+-
+-    This assumes the associated XmlStream represents the initiating entity
+-    of the connection.
+-
++    
+     @cvar feature: tuple of (uri, name) of the stream feature root element.
+     @type feature: tuple of (L{str}, L{str})
+     @ivar required: whether the stream feature is required to be advertized
+                     by the receiving entity.
+     @type required: L{bool}
+     """
+-
+-    implements(ijabber.IInitiatingInitializer)
+-
+     feature = None
+     required = False
+-
++    
+     def __init__(self, xs):
+         self.xmlstream = xs
++    
++    def start(self):
++        """
++        Start the actual initialization.
+ 
++        May return a deferred for asynchronous initialization.
++        """
++
++class BaseFeatureInitiatingInitializer(BaseFeatureInitializer):
++    """
++    Base class for initializers with a stream feature.
++
++    This assumes the associated XmlStream represents the initiating entity
++    of the connection.
++    """
++    implements(ijabber.IInitiatingInitializer)
++    
+     def initialize(self):
+         """
+         Initiate the initialization.
+@@ -235,110 +282,48 @@
+         else:
+             return None
+ 
+-    def start(self):
+-        """
+-        Start the actual initialization.
+-
+-        May return a deferred for asynchronous initialization.
+-        """
+-
+-
+-class TLSError(Exception):
++class BaseFeatureReceivingInitializer(BaseFeatureInitializer):
+     """
+-    TLS base exception.
++    This assumes the associated XmlStream represents the receiving entity
++    of the connection.
+     """
+-
+-
+-class TLSFailed(TLSError):
+-    """
+-    Exception indicating failed TLS negotiation
+-    """
+-
+-
+-class TLSRequired(TLSError):
+-    """
+-    Exception indicating required TLS negotiation.
+-
+-    This exception is raised when the receiving entity requires TLS
+-    negotiation and the initiating does not desire to negotiate TLS.
+-    """
+-
+-
+-class TLSNotSupported(TLSError):
+-    """
+-    Exception indicating missing TLS support.
+-
+-    This exception is raised when the initiating entity wants and requires to
+-    negotiate TLS when the OpenSSL library is not available.
+-    """
+-
+-
+-class TLSInitiatingInitializer(BaseFeatureInitiatingInitializer):
+-    """
+-    TLS stream initializer for the initiating entity.
+-
+-    It is strongly required to include this initializer in the list of
+-    initializers for an XMPP stream. By default it will try to negotiate TLS.
+-    An XMPP server may indicate that TLS is required. If TLS is not desired,
+-    set the C{wanted} attribute to False instead of removing it from the list
+-    of initializers, so a proper exception L{TLSRequired} can be raised.
+-
+-    @cvar wanted: indicates if TLS negotiation is wanted.
+-    @type wanted: L{bool}
+-    """
+-
+-    feature = (NS_XMPP_TLS, 'starttls')
+-    wanted = True
+-    _deferred = None
+-
+-    def onProceed(self, obj):
++    implements(ijabber.IReceivingInitializer)
++    
++    def initialize(self):
+         """
+-        Proceed with TLS negotiation and reset the XML stream.
++        Initiate the initialization.
++        
++        Checks if the feature should be advertized. If it does, the
++        initialization is started. If not, the initialization silently
++        succeeds.
+         """
++        if self.advertizeFeature():
++            return self.start()
++        else:
++            return None
+ 
+-        self.xmlstream.removeObserver('/failure', self.onFailure)
+-        ctx = ssl.CertificateOptions()
+-        self.xmlstream.transport.startTLS(ctx)
+-        self.xmlstream.reset()
+-        self.xmlstream.sendHeader()
+-        self._deferred.callback(Reset)
+-
+-    def onFailure(self, obj):
+-        self.xmlstream.removeObserver('/proceed', self.onProceed)
+-        self._deferred.errback(TLSFailed())
+-
+-    def start(self):
++    def advertizeFeature(self):
+         """
+-        Start TLS negotiation.
+-
+-        This checks if the receiving entity requires TLS, the SSL library is
+-        available and uses the C{required} and C{wanted} instance variables to
+-        determine what to do in the various different cases.
+-
+-        For example, if the SSL library is not available, and wanted and
+-        required by the user, it raises an exception. However if it is not
+-        required by both parties, initialization silently succeeds, moving
+-        on to the next step.
++        Checks to see if the feature should be advertized on the receiving
++        XML Stream.
++        
++        @rtype: L{bool}
+         """
+-        if self.wanted:
+-            if ssl is None:
+-                if self.required:
+-                    return defer.fail(TLSNotSupported())
+-                else:
+-                    return defer.succeed(None)
+-            else:
+-                pass
+-        elif self.xmlstream.features[self.feature].required:
+-            return defer.fail(TLSRequired())
++        if self.required:
++            return True
+         else:
+-            return defer.succeed(None)
++            return False
+ 
+-        self._deferred = defer.Deferred()
+-        self.xmlstream.addOnetimeObserver("/proceed", self.onProceed)
+-        self.xmlstream.addOnetimeObserver("/failure", self.onFailure)
+-        self.xmlstream.send(domish.Element((NS_XMPP_TLS, "starttls")))
+-        return self._deferred
++    def getFeatureElement(self):
++        """
++        @rtype: L{domish.Element} or None
++        """
++        if not self.feature:
++            return None
+ 
++        el = domish.Element(self.feature)
++        
++        return el
+ 
+ class XmlStream(xmlstream.XmlStream):
+     """
+@@ -369,7 +354,6 @@
+     @ivar authenticator: associated authenticator that uses C{initializers} to
+                          initialize the XML stream.
+     """
+-
+     version = (1, 0)
+     namespace = 'invalid'
+     thisHost = None
+@@ -403,6 +387,7 @@
+         registered event observers will continue to be in place.
+         """
+         self._headerSent = False
++        self.features = {}
+         self._initializeStream()
+ 
+     def onStreamError(self, errelem):
+@@ -435,6 +420,20 @@
+             self.features[(feature.uri, feature.name)] = feature
+         self.authenticator.streamStarted()
+ 
++    def sendFeatures(self):
++        """
++        Called when an receiving entity
++        """
++        if not self._headerSent:
++            self.sendHeader()
++
++        features = domish.Element((NS_STREAMS, 'features'))
++
++        for feature in self.features.items():
++            features.addChild(feature[1])
++
++        self.send(features)
++
+     def sendHeader(self):
+         """
+         Send stream header.
+@@ -510,7 +509,7 @@
+ 
+     def connectionMade(self):
+         """
+-        Called when a connection is made.
++        Called when a connection is madehttp://etherx.jabber.org/streams.
+ 
+         Notifies the authenticator when a connection has been made.
+         """
+@@ -574,7 +573,6 @@
+         else:
+             self.authenticator.streamStarted()
+ 
+-
+ class XmlStreamFactory(xmlstream.XmlStreamFactory):
+     """
+     Factory for Jabber XmlStream objects as a reconnecting client.
+@@ -583,21 +581,19 @@
+     it generates Jabber specific L{XmlStream} instances that have
+     authenticators.
+     """
+-
++    
+     protocol = XmlStream
+-
++    
+     def __init__(self, authenticator):
+         xmlstream.XmlStreamFactory.__init__(self, authenticator)
+         self.authenticator = authenticator
+ 
+-
+ class TimeoutError(Exception):
+     """
+     Exception raised when no IQ response has been received before the
+     configured timeout.
+     """
+ 
+-
+ def upgradeWithIQResponseTracker(xs):
+     """
+     Enhances an XmlStream for iq response tracking.
+@@ -626,7 +622,6 @@
+             else:
+                 d.callback(iq)
+ 
+-
+     def disconnected(_):
+         """
+         Make sure deferreds do not linger on after disconnect.
+@@ -639,7 +634,7 @@
+         xs.iqDeferreds = {}
+         for d in iqDeferreds.itervalues():
+             d.errback(ConnectionLost())
+-
++    
+     xs.iqDeferreds = {}
+     xs.iqDefaultTimeout = getattr(xs, 'iqDefaultTimeout', None)
+     xs.addObserver(xmlstream.STREAM_END_EVENT, disconnected)
+@@ -647,7 +642,6 @@
+     xs.addObserver('/iq[@type="error"]', callback)
+     directlyProvides(xs, ijabber.IIQResponseTracker)
+ 
+-
+ class IQ(domish.Element):
+     """
+     Wrapper for an iq stanza.
+@@ -661,9 +655,8 @@
+                    L{TimeoutError} failure.
+     @type timeout: C{float}
+     """
+-
+     timeout = None
+-
++    
+     def __init__(self, xmlstream, stanzaType="set"):
+         """
+         @type xmlstream: L{xmlstream.XmlStream}
+@@ -676,7 +669,7 @@
+         self.addUniqueId()
+         self["type"] = stanzaType
+         self._xmlstream = xmlstream
+-
++    
+     def send(self, to=None):
+         """
+         Send out this iq.
+@@ -713,11 +706,10 @@
+                 return result
+ 
+             d.addBoth(cancelTimeout)
+-
++        
+         self._xmlstream.send(self)
+         return d
+ 
+-
+ def toResponse(stanza, stanzaType=None):
+     """
+     Create a response stanza from another stanza.
+@@ -733,11 +725,10 @@
+     @return: the response stanza.
+     @rtype: L{domish.Element}
+     """
+-
+     toAddr = stanza.getAttribute('from')
+     fromAddr = stanza.getAttribute('to')
+     stanzaID = stanza.getAttribute('id')
+-
++    
+     response = domish.Element((None, stanza.name))
+     if toAddr:
+         response['to'] = toAddr
+@@ -747,5 +738,5 @@
+         response['id'] = stanzaID
+     if type:
+         response['type'] = stanzaType
+-
++    
+     return response
+Index: twisted/words/protocols/jabber/client.py
+===================================================================
+--- twisted/words/protocols/jabber/client.py	(revision 20408)
++++ twisted/words/protocols/jabber/client.py	(working copy)
+@@ -5,7 +5,7 @@
+ 
+ from twisted.internet import defer
+ from twisted.words.xish import domish, xpath, utility
+-from twisted.words.protocols.jabber import xmlstream, sasl, error
++from twisted.words.protocols.jabber import xmlstream, sasl, error, tls
+ from twisted.words.protocols.jabber.jid import JID
+ 
+ NS_XMPP_STREAMS = 'urn:ietf:params:xml:ns:xmpp-streams'
+@@ -357,7 +357,7 @@
+         xmlstream.ConnectAuthenticator.associateWithStream(self, xs)
+ 
+         xs.initializers = [CheckVersionInitializer(xs)]
+-        inits = [ (xmlstream.TLSInitiatingInitializer, False),
++        inits = [ (tls.TLSInitiatingInitializer, False),
+                   (sasl.SASLInitiatingInitializer, True),
+                   (BindInitializer, False),
+                   (SessionInitializer, False),
+Index: twisted/words/protocols/jabber/ijabber.py
+===================================================================
+--- twisted/words/protocols/jabber/ijabber.py	(revision 20408)
++++ twisted/words/protocols/jabber/ijabber.py	(working copy)
+@@ -14,21 +14,50 @@
+     Initializers perform a step in getting the XML stream ready to be
+     used for the exchange of XML stanzas.
+     """
++    xmlstream = Attribute("""The associated XML stream""")
++    feature = Attribute("""tuple of (uri, name) of the feature element.""")
++    required = Attribute("""whether the stream feature is required to be """
++        """advertized by the receiving entity.""")
++    
++    def initialize():
++        """
++        Initiate the initialization step.
+ 
++        May return a deferred when the initialization is done asynchronously.
++        """
++    
++    def start(self):
++        """
++        Start the actual initialization.
++
++        May return a deferred for asynchronous initialization.
++        """
++
++    
+ class IInitiatingInitializer(IInitializer):
+     """
+     Interface for XML stream initializers for the initiating entity.
+     """
+ 
+-    xmlstream = Attribute("""The associated XML stream""")
+ 
+-    def initialize():
++class IReceivingInitializer(IInitializer):
++    """
++    Interface for XML stream initializers for the receiving entity.
++    """
++    def advertizeFeature():
+         """
+-        Initiate the initialization step.
+-
+-        May return a deferred when the initialization is done asynchronously.
++        Checks to see if the associated feature should be advertized.
++        
++        @rtype: boolean
+         """
++    
++    def getFeatureElement():
++        """
++        @return: the feature element.
++        @rtype: L{domish.Element}
++        """
+ 
++
+ class IIQResponseTracker(Interface):
+     """
+     IQ response tracker interface.
+@@ -48,6 +77,7 @@
+     iqDeferreds = Attribute("Dictionary of deferreds waiting for an iq "
+                              "response")
+ 
++
+ class IService(Interface):
+     """
+     External server-side component service interface.
+Index: twisted/words/protocols/jabber/sasl.py
+===================================================================
+--- twisted/words/protocols/jabber/sasl.py	(revision 20408)
++++ twisted/words/protocols/jabber/sasl.py	(working copy)
+@@ -223,3 +223,4 @@
+         except AttributeError:
+             condition = None
+         self._deferred.errback(SASLAuthError(condition))
++
+Index: twisted/words/protocols/jabber/tls.py
+===================================================================
+--- twisted/words/protocols/jabber/tls.py	(revision 0)
++++ twisted/words/protocols/jabber/tls.py	(revision 0)
+@@ -0,0 +1,210 @@
++# -*- test-case-name: twisted.words.test.test_jabbertls -*-
++#
++# Copyright (c) 2001-2007 Twisted Matrix Laboratories.
++# See LICENSE for details.
++
++"""
++XMPP TLS Negotiation
++"""
++
++from twisted.internet import defer, interfaces
++from twisted.words.protocols.jabber import xmlstream
++from twisted.words.xish import domish
++
++try:
++    from twisted.internet import ssl
++except ImportError:
++    ssl = None
++if ssl and not ssl.supported:
++    ssl = None
++
++NS_XMPP_TLS = 'urn:ietf:params:xml:ns:xmpp-tls'
++
++class TLSError(Exception):
++    """
++    TLS base exception.
++    """
++
++class TLSFailed(TLSError):
++    """
++    Exception indicating failed TLS negotiation
++    """
++    def getElement(self):
++        return domish.Element((NS_XMPP_TLS, 'failure'))
++
++class TLSRequired(TLSError):
++    """
++    Exception indicating required TLS negotiation.
++
++    This exception is raised when the receiving entity requires TLS
++    negotiation and the initiating does not desire to negotiate TLS.
++    """
++
++class TLSNotSupported(TLSError):
++    """
++    Exception indicating missing TLS support.
++
++    This exception is raised when the initiating entity wants and requires to
++    negotiate TLS when the OpenSSL library is not available.
++    """
++
++class TLSInitiatingInitializer(xmlstream.BaseFeatureInitiatingInitializer):
++    """
++    TLS stream initializer for the initiating entity.
++
++    It is strongly required to include this initializer in the list of
++    initializers for an XMPP stream. By default it will try to negotiate TLS.
++    An XMPP server may indicate that TLS is required. If TLS is not desired,
++    set the C{wanted} attribute to False instead of removing it from the list
++    of initializers, so a proper exception L{TLSRequired} can be raised.
++
++    @cvar wanted: indicates if TLS negotiation is wanted.
++    @type wanted: L{bool}
++    """
++
++    feature = (NS_XMPP_TLS, 'starttls')
++    wanted = True
++    _deferred = None
++
++    def onProceed(self, obj):
++        """
++        Proceed with TLS negotiation and reset the XML stream.
++        """
++        self.xmlstream.removeObserver('/failure', self.onFailure)
++        ctx = ssl.CertificateOptions()
++        self.xmlstream.transport.startTLS(ctx)
++        self.xmlstream.reset()
++        self.xmlstream.sendHeader()
++        self._deferred.callback(xmlstream.Reset)
++
++    def onFailure(self, obj):
++        self.xmlstream.removeObserver('/proceed', self.onProceed)
++        self._deferred.errback(TLSFailed())
++
++    def start(self):
++        """
++        Start TLS negotiation.
++
++        This checks if the receiving entity requires TLS, the SSL library is
++        available and uses the C{required} and C{wanted} instance variables to
++        determine what to do in the various different cases.
++
++        For example, if the SSL library is not available, and wanted and
++        required by the user, it raises an exception. However if it is not
++        required by both parties, initialization silently succeeds, moving
++        on to the next step.
++        """
++        if self.wanted:
++            if ssl is None:
++                if self.required:
++                    return defer.fail(TLSNotSupported())
++                else:
++                    return defer.succeed(None)
++            else:
++                pass
++        elif self.xmlstream.features[self.feature].required:
++            return defer.fail(TLSRequired())
++        else:
++            return defer.succeed(None)
++        
++        self._deferred = defer.Deferred()
++        self.xmlstream.addOnetimeObserver("/proceed", self.onProceed)
++        self.xmlstream.addOnetimeObserver("/failure", self.onFailure)
++        self.xmlstream.send(domish.Element((NS_XMPP_TLS, "starttls")))
++        
++        return self._deferred
++
++class TLSReceivingInitializer(xmlstream.BaseFeatureReceivingInitializer):
++    """
++    TLS stream initializer for the receiving entity.
++
++    It is strongly suggested to include this initializer in the list of
++    initializers for an XMPP stream. An XMPP client may require TLS.
++    
++    @ivar ctx: contextFactory for negotiating TLS
++    """
++    feature = (NS_XMPP_TLS, 'starttls')
++    _deferred = None
++    required = True
++    ctx = None
++    
++    def __init__(self, xs, ctx=None):
++        xmlstream.BaseFeatureReceivingInitializer.__init__(self, xs)
++        
++        self.ctx = ctx
++    
++    def advertizeFeature(self):
++        if ssl is None:
++            return False
++        
++        return (interfaces.ITLSTransport.providedBy(self.xmlstream.transport)
++                and not interfaces.ISSLTransport.providedBy(
++                    self.xmlstream.transport))
++    
++    def start(self):
++        """
++        Start TLS negotiation.
++
++        This checks if the receiving entity requires TLS, the SSL library is
++        available and uses the C{required} and C{wanted} instance variables to
++        determine what to do in the various different cases.
++
++        For example, if the SSL library is not available, and wanted and
++        required by the user, it raises an exception. However if it is not
++        required by both parties, initialization silently succeeds, moving
++        on to the next step.
++        """
++        self.xmlstream.addObserver("/starttls[@xmlns='%s']" % \
++                                              NS_XMPP_TLS, self.onInit)
++        
++        if ssl is None:
++            if self.required:
++                return defer.fail(TLSNotSupported())
++        
++        if interfaces.ISSLTransport.providedBy(self.xmlstream.transport):
++            # the stream is already encrypted
++            return defer.succeed(None)
++        
++        if not self.required:
++            return defer.succeed(None)
++        
++        self._deferred = defer.Deferred()
++        
++        return self._deferred
++    
++    def onInit(self, stanza):
++        """
++        TLS negotiation requested.
++        """
++        def fail():
++            exc = TLSFailed()
++            self.xmlstream.send(exc)
++            
++            if self._deferred:
++                self._deferred.errback(exc)
++        
++        ctx = None
++        
++        if ssl is not None and self.ctx is None:
++            fail()
++            
++            return
++        
++        if interfaces.ISSLTransport.providedBy(self.xmlstream.transport):
++            fail()
++            
++            return
++        
++        self.xmlstream.send(domish.Element((NS_XMPP_TLS, "proceed")))
++        
++        self.xmlstream.transport.startTLS(self.ctx)
++        self._deferred.callback(xmlstream.Reset)
++    
++    def getFeatureElement(self):
++        el = xmlstream.BaseFeatureReceivingInitializer.getFeatureElement(self)
++        
++        if self.required:
++            el.addChild(domish.Element((None, 'required')))
++        
++        return el
++
+Index: twisted/words/protocols/jabber/server.py
+===================================================================
+--- twisted/words/protocols/jabber/server.py	(revision 20408)
++++ twisted/words/protocols/jabber/server.py	(working copy)
+@@ -17,7 +17,7 @@
+ from zope.interface import implements
+ from twisted.internet import defer, reactor
+ from twisted.names.srvconnect import SRVConnector
+-from twisted.words.protocols.jabber import ijabber, xmlstream
++from twisted.words.protocols.jabber import ijabber, xmlstream, error
+ from twisted.words.xish import domish
+ 
+ NS_DIALBACK = 'jabber:server:dialback'
+@@ -147,7 +147,8 @@
+     def onVerify(self, verify):
+         self.xmlstream.removeObserver(xmlstream.STREAM_ERROR_EVENT,
+                                       self.onStreamError)
+-        if verify['id'] != self.id:
++        
++        if verify['id'] != self.originalStreamID:
+             self.xmlstream.sendStreamError(error.StreamError('invalid-id'))
+             self._deferred.errback(DialbackFailed())
+         elif verify['to'] != self.thisHost:
+@@ -156,14 +157,14 @@
+         elif verify['from'] != self.otherHost:
+             self.xmlstream.sendStreamError(error.StreamError('invalid-from'))
+             self._deferred.errback(DialbackFailed())
+-        if verify['type'] == 'valid':
++        elif verify['type'] == 'valid':
+             self._deferred.callback(None)
+         else:
+             self._deferred.errback(DialbackFailed())
+-
++    
+     def onStreamError(self, failure):
+         self.xmlstream.removeObserver("/verify[@xmlns='%s']" % NS_DIALBACK,
+-                                      self.onResult)
++                                      self.onVerify)
+         self._deferred.errback(failure)
+ 
+ class XMPPServerConnectAuthenticator(xmlstream.ConnectAuthenticator):
+@@ -207,7 +208,7 @@
+         xmlstream.ConnectAuthenticator.associateWithStream(self, xs)
+         init = ReceivingDialbackInitializer(xs, self.thisHost, self.otherHost,
+                                             self.originalStreamID, self.key)
+-        xs.initializers = []
++        xs.initializers = [init]
+ 
+ class XMPPServerListenAuthenticator(xmlstream.ListenAuthenticator):
+     namespace = 'jabber:server'
+@@ -220,19 +221,19 @@
+     def streamStarted(self):
+         if self.xmlstream.namespace != self.namespace:
+            self.xmlstream.namespace = self.namespace
+-
+-        peerPrefixes = self.xmlstream.prefixes
+-
+-        self.xmlstream.prefixes = {xmlstream.NS_STREAMS: 'stream',
+-                                   NS_DIALBACK: 'db'}
+-
++        
+         # Detect request for dialback. Since we don't support anything
+         # else, raise stream error if the namespace is not provided.
+         if NS_DIALBACK not in self.xmlstream.prefixes:
+             exc = error.StreamError('invalid-namespace')
+             self.xmlstream.sendStreamError(exc)
++            
+             return
+-
++        
++        xmlstream.ListenAuthenticator.streamStarted(self)
++        self.xmlstream.addObserver(xmlstream.STREAM_AUTHD_EVENT, self.onAuth)
++    
++    def onAuth(self):
+         self.xmlstream.thisHost = self.domain
+         self.xmlstream.sid = 'random' # FIXME
+         self.xmlstream.addObserver("//verify[@xmlns='%s']" % NS_DIALBACK,
+@@ -240,7 +241,7 @@
+         self.xmlstream.addObserver("//result[@xmlns='%s']" % NS_DIALBACK,
+                                    self.onResult)
+         self.xmlstream.sendHeader()
+-
++    
+         if self.xmlstream.version >= (1, 0):
+             features = domish.Element((xmlstream.NS_STREAMS, 'features'))
+             self.xmlstream.send(features)
+@@ -282,7 +283,7 @@
+             def logDataOut(buf):
+                 log.msg("SEND!: %r" % buf)
+ 
+-            xs.rawDataInFn = logDataIn
++            xs.raXMPPServerListenAuthenticatorwDataInFn = logDataIn
+             xs.rawDataOutFn = logDataOut
+ 
+         def reply(validity):
+@@ -318,3 +319,4 @@
+                                         originatingServer,
+                                         factory)
+         connector.connect()
++

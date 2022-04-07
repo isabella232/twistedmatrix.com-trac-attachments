@@ -1,0 +1,282 @@
+diff -r 824fa1cd4917 twisted/conch/ssh/common.py
+--- a/twisted/conch/ssh/common.py	Sat May 26 09:07:52 2007 +0200
++++ b/twisted/conch/ssh/common.py	Thu May 31 14:04:15 2007 +0200
+@@ -11,16 +11,27 @@ Maintainer: U{Paul Swartz<mailto:z3p@twi
+ """
+ 
+ import struct
++
+ try:
+     from Crypto import Util
+-    from Crypto.Util import randpool
+ except ImportError:
+     import warnings
+     warnings.warn("PyCrypto not installed, but continuing anyways!", 
+             RuntimeWarning)
+-else:
+-    entropy = randpool.RandomPool()
+-    entropy.stir()
++
++from twisted.python import secrandom
++
++class Entropy(object):
++    """
++    A Crypto.Util.randpool.RandomPool mock for compatibility.
++    """
++    def get_bytes(self, numBytes):
++        """
++        Get a number of random bytes.
++        """
++        return secrandom.secureRandom(numBytes)
++
++entropy = Entropy()
+ 
+ 
+ def NS(t):
+diff -r 824fa1cd4917 twisted/conch/ssh/transport.py
+--- a/twisted/conch/ssh/transport.py	Sat May 26 09:07:52 2007 +0200
++++ b/twisted/conch/ssh/transport.py	Thu May 31 14:04:40 2007 +0200
+@@ -26,7 +26,6 @@ from Crypto import Util
+ from Crypto import Util
+ from Crypto.Cipher import XOR
+ from Crypto.PublicKey import RSA
+-from Crypto.Util import randpool
+ 
+ # twisted imports
+ from twisted.conch import error
+diff -r 824fa1cd4917 twisted/names/dns.py
+--- a/twisted/names/dns.py	Sat May 26 09:07:52 2007 +0200
++++ b/twisted/names/dns.py	Thu May 31 13:59:45 2007 +0200
+@@ -28,40 +28,17 @@ except ImportError:
+ 
+ AF_INET6 = socket.AF_INET6
+ 
+-try:
+-    from Crypto.Util import randpool
+-except ImportError:
+-    for randSource in ('urandom',):
+-        try:
+-            f = file('/dev/' + randSource)
+-            f.read(2)
+-            f.close()
+-        except:
+-            pass
+-        else:
+-            def randomSource(r = file('/dev/' + randSource, 'rb').read):
+-                return struct.unpack('H', r(2))[0]
+-            break
+-    else:
+-        warnings.warn(
+-            "PyCrypto not available - proceeding with non-cryptographically "
+-            "secure random source",
+-            RuntimeWarning,
+-            1
+-        )
+-
+-        def randomSource():
+-            return random.randint(0, 65535)
+-else:
+-    def randomSource(r = randpool.RandomPool().get_bytes):
+-        return struct.unpack('H', r(2))[0]
+ from zope.interface import implements, Interface
+ 
+ 
+ # Twisted imports
+ from twisted.internet import protocol, defer
+-from twisted.python import log, failure
++from twisted.python import log, failure, secrandom
+ from twisted.python import util as tputil
++
++def randomSource():
++    return struct.unpack('H', secrandom.secureRandom(2))[0]
++
+ 
+ PORT = 53
+ 
+diff -r 824fa1cd4917 twisted/python/secrandom.py
+--- /dev/null	Thu Jan 01 00:00:00 1970 +0000
++++ b/twisted/python/secrandom.py	Thu May 31 13:47:10 2007 +0200
+@@ -0,0 +1,64 @@
++# -*- test-case-name: twisted.test.test_secrandom -*-
++# Copyright (c) 2001-2007 Twisted Matrix Laboratories.
++# See LICENSE for details.
++
++"""
++Cryptographically secure random implementation, with fallback on normal random.
++"""
++
++# System imports
++import warnings
++import os
++import random
++
++try:
++    from Crypto.Util import randpool
++except ImportError:
++    randomPool = None
++else:
++    randomPool = randpool.RandomPool()
++    randomPool.stir()
++
++
++def secureRandom(nbytes):
++    """
++    Return a number of (hopefully) secure random bytes.
++
++    @param nbytes: number of bytes to generate.
++    @type nbytes: C{int}.
++    @return: a string of random bytes.
++    @rtype: C{str}.
++    """
++    global isSecure
++    isSecure = True
++    if randomPool:
++        return randomPool.get_bytes(nbytes)
++    try:
++        # NOTE: os.urandom is slow on some platforms (10x slower than
++        # getrandbits here on an Ubuntu box)
++        bytes = os.urandom(nbytes)
++    except (AttributeError, NotImplementedError):
++        isSecure = False
++        # Why getrandbits() doesn't simply return bytes is beyond me...
++        try:
++            n = random.getrandbits(nbytes * 8)
++            hexBytes = ("%%0%dx" % (nbytes * 2)) % n
++        except AttributeError:
++            # getrandbits() is 2.4+ only
++            lim = 2**32
++            hexBytes = ""
++            for i in range((nbytes + 3) // 4):
++                hexBytes += "%08x" % random.randrange(lim)
++            hexBytes = hexBytes[:nbytes * 2]
++        bytes = hexBytes.decode('hex')
++    return bytes
++
++
++# Spout warning only once
++secureRandom(1)
++if not isSecure:
++    warnings.warn(
++        "Neither PyCrypto nor os.urandom available - "
++        "proceeding with non-cryptographically secure random source",
++        RuntimeWarning,
++    )
+diff -r 824fa1cd4917 twisted/test/test_secrandom.py
+--- /dev/null	Thu Jan 01 00:00:00 1970 +0000
++++ b/twisted/test/test_secrandom.py	Thu May 31 13:56:24 2007 +0200
+@@ -0,0 +1,115 @@
++# Copyright (c) 2007 Twisted Matrix Laboratories.
++# See LICENSE for details.
++
++"""
++Test cases for twisted.python.secrandom
++"""
++
++import os
++import random
++
++from twisted.trial import unittest
++from twisted.python import secrandom
++
++
++class SecureRandomTestCaseBase(object):
++    """
++    Base class for secureRandom test cases.
++    """
++
++    def _check(self):
++        """
++        Check secureRandom behaviour.
++        """
++        for nbytes in range(17, 25):
++            s = secrandom.secureRandom(nbytes)
++            self.assertEquals(len(s), nbytes)
++            s2 = secrandom.secureRandom(nbytes)
++            self.assertEquals(len(s2), nbytes)
++            # This is crude but hey
++            self.assertNotEquals(s2, s)
++
++
++class SecureRandomTestCase(SecureRandomTestCaseBase, unittest.TestCase):
++    """
++    Test secureRandom under normal conditions.
++    """
++
++    def test_normal(self):
++        """
++        Test secureRandom() in normal conditions (with PyCrypto).
++        """
++        self._check()
++
++
++class SecureRandomWithoutPyCryptoTestCase(
++    SecureRandomTestCaseBase, unittest.TestCase):
++    """
++    Test secure random with forced absence of PyCrypto lib.
++    """
++
++    def setUp(self):
++        """
++        Replace secrandom's randomPool with None.
++        """
++        self.old_randomPool = secrandom.randomPool
++        secrandom.randomPool = None
++
++    def tearDown(self):
++        """
++        Restore secrandom's randomPool.
++        """
++        secrandom.randomPool = self.old_randomPool
++
++    def test_normal(self):
++        """
++        Test secureRandom() with os.urandom.
++        """
++        self._check()
++
++    def test_withoutUrandom(self):
++        """
++        Test secureRandom() without os.urandom.
++        """
++        old_urandom = getattr(os, "urandom", None)
++        try:
++            if old_urandom:
++                del os.urandom
++            self._check()
++        finally:
++            if old_urandom:
++                os.urandom = old_urandom
++
++    def test_withoutUrandomAndGetrandbits(self):
++        """
++        Test secureRandom() with neither os.urandom nor random.getrandbits.
++        """
++        old_urandom = getattr(os, "urandom", None)
++        old_getrandbits = getattr(random, "getrandbits", None)
++        try:
++            if old_urandom:
++                del os.urandom
++            if old_getrandbits:
++                del random.getrandbits
++            self._check()
++        finally:
++            if old_urandom:
++                os.urandom = old_urandom
++            if old_getrandbits:
++                random.getrandbits = old_getrandbits
++
++    def test_withUnimplementedUrandom(self):
++        """
++        Test secureRandom() with unimplemented os.urandom.
++        """
++        old_urandom = getattr(os, "urandom", None)
++        try:
++            def my_urandom(_):
++                raise NotImplementedError
++            os.urandom = my_urandom
++            self._check()
++        finally:
++            if old_urandom:
++                os.urandom = old_urandom
++            else:
++                del os.urandom

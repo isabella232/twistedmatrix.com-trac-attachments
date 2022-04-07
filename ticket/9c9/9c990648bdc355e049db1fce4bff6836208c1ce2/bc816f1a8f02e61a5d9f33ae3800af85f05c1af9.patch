@@ -1,0 +1,305 @@
+diff --git a/twisted/scripts/_twistd_unix.py b/twisted/scripts/_twistd_unix.py
+index 0a58b9b..884eaa8 100644
+--- a/twisted/scripts/_twistd_unix.py
++++ b/twisted/scripts/_twistd_unix.py
+@@ -2,7 +2,7 @@
+ # Copyright (c) 2001-2009 Twisted Matrix Laboratories.
+ # See LICENSE for details.
+ 
+-import os, errno, sys
++import os, errno, fcntl, sys
+ 
+ from twisted.python import log, syslog, logfile
+ from twisted.python.util import switchUID, uidFromString, gidFromString
+@@ -62,32 +62,44 @@ class ServerOptions(app.ServerOptions):
+             self['pidfile'] = os.path.abspath(self['pidfile'])
+ 
+ 
+-def checkPID(pidfile):
++def acquirePID(pidfile):
+     if not pidfile:
+         return
+-    if os.path.exists(pidfile):
++    # We don't know if we'll be reading or writing until we try to grab
++    # the exclusive lock, so use mode 'a+'
++    fd = open(pidfile, 'a+')
++
++    try:
++        # Try to acquire an exclusive lock for the duration of the process.
++        fcntl.lockf(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
++    except IOError, e:
++        if e.errno not in (errno.EACCES, errno.EAGAIN):
++            # Error was not locking-related, so re-raise.
++            # See http://docs.python.org/library/fcntl.html#fcntl.lockf
++            raise
++
++        fd.seek(0)
++        # PIDs typically fit in 5 bytes, so reading 128 bytes should be enough.
++        pidStr = fd.read(128)
+         try:
+-            pid = int(open(pidfile).read())
++            pid = int(pidStr)
+         except ValueError:
+-            sys.exit('Pidfile %s contains non-numeric value' % pidfile)
+-        try:
+-            os.kill(pid, 0)
+-        except OSError, why:
+-            if why[0] == errno.ESRCH:
+-                # The pid doesnt exists.
+-                log.msg('Removing stale pidfile %s' % pidfile, isError=True)
+-                os.remove(pidfile)
+-            else:
+-                sys.exit("Can't check status of PID %s from pidfile %s: %s" %
+-                         (pid, pidfile, why[1]))
+-        else:
+-            sys.exit("""\
+-Another twistd server is running, PID %s\n
++            pid = None
++
++        sys.exit("""\
++Another twistd server is running, PID %r\n
+ This could either be a previously started instance of your application or a
+ different application entirely. To start a new one, either run it in some other
+ directory, or use the --pidfile and --logfile parameters to avoid clashes.
+-""" %  pid)
++""" % (pid,))
++
++    # truncate instead of seek(0), because we're in append mode.
++    fd.truncate(0)
+ 
++    # We can't write anything to the pidfile yet, because we don't know
++    # what the pid will be, if the program is about to daemonize.
++
++    return fd
+ 
+ 
+ class UnixAppLogger(app.AppLogger):
+@@ -185,11 +197,16 @@ class UnixApplicationRunner(app.ApplicationRunner):
+     """
+     loggerFactory = UnixAppLogger
+ 
++    def __init__(self, *args, **kwargs):
++        app.ApplicationRunner.__init__(self, *args, **kwargs)
++        self.pidfd = None
++
++
+     def preApplication(self):
+         """
+         Do pre-application-creation setup.
+         """
+-        checkPID(self.config['pidfile'])
++        self.pidfd = acquirePID(self.config['pidfile'])
+         self.config['nodaemon'] = (self.config['nodaemon']
+                                    or self.config['debug'])
+         self.oldstdout = sys.stdout
+@@ -218,6 +235,9 @@ class UnixApplicationRunner(app.ApplicationRunner):
+         if not pidfile:
+             return
+         try:
++            if self.pidfd:
++                self.pidfd.close()
++                self.pidfd = None
+             os.unlink(pidfile)
+         except OSError, e:
+             if e.errno == errno.EACCES or e.errno == errno.EPERM:
+@@ -228,7 +248,7 @@ class UnixApplicationRunner(app.ApplicationRunner):
+             log.err(None, "Failed to unlink PID file")
+ 
+ 
+-    def setupEnvironment(self, chroot, rundir, nodaemon, umask, pidfile):
++    def setupEnvironment(self, chroot, rundir, nodaemon, umask):
+         """
+         Set the filesystem root, the working directory, and daemonize.
+ 
+@@ -245,10 +265,6 @@ class UnixApplicationRunner(app.ApplicationRunner):
+ 
+         @type umask: C{int} or L{NoneType}
+         @param umask: The value to which to change the process umask.
+-
+-        @type pidfile: C{str} or L{NoneType}
+-        @param pidfile: If not C{None}, the path to a file into which to put
+-            the PID of this process.
+         """
+         daemon = not nodaemon
+ 
+@@ -263,10 +279,30 @@ class UnixApplicationRunner(app.ApplicationRunner):
+             os.umask(umask)
+         if daemon:
+             daemonize()
+-        if pidfile:
+-            f = open(pidfile,'wb')
+-            f.write(str(os.getpid()))
+-            f.close()
++
++            if self.pidfd:
++                # Re-acquire an exclusive lock on the pidfile, because the parent
++                # process is dead, and exclusive locks do not "transfer" to children.
++                try:
++                    fcntl.lockf(self.pidfd, fcntl.LOCK_EX | fcntl.LOCK_NB)
++                except IOError, e:
++                    if e.errno not in (errno.EACCES, errno.EAGAIN):
++                        # Error was not locking-related, so re-raise.
++                        # See http://docs.python.org/library/fcntl.html#fcntl.lockf
++                        raise
++                    sys.exit("""\
++Failed to re-acquire a lock on the pidfile. Did another twistd with the
++same pidfile start while I was daemonizing?
++""")
++
++        if self.pidfd:
++            # If we daemonized, only now do we have the pid for the
++            # long-runnning process.
++            # truncate again, just to be sure.
++            self.pidfd.truncate(0)
++            self.pidfd.write(str(os.getpid()))
++            # Flush instead of closing, because we want to hold on to the lock.
++            self.pidfd.flush()
+ 
+ 
+     def shedPrivileges(self, euid, uid, gid):
+@@ -302,8 +338,7 @@ class UnixApplicationRunner(app.ApplicationRunner):
+             launchWithName(process.processName)
+         self.setupEnvironment(
+             self.config['chroot'], self.config['rundir'],
+-            self.config['nodaemon'], self.config['umask'],
+-            self.config['pidfile'])
++            self.config['nodaemon'], self.config['umask'])
+ 
+         service.IService(application).privilegedStartService()
+ 
+diff --git a/twisted/test/test_twistd.py b/twisted/test/test_twistd.py
+index 84b0cc4..1ec0d0a 100644
+--- a/twisted/test/test_twistd.py
++++ b/twisted/test/test_twistd.py
+@@ -366,8 +366,7 @@ class ApplicationRunnerTest(unittest.TestCase):
+ 
+         events = []
+         class FakeUnixApplicationRunner(twistd._SomeApplicationRunner):
+-            def setupEnvironment(self, chroot, rundir, nodaemon, umask,
+-                                 pidfile):
++            def setupEnvironment(self, chroot, rundir, nodaemon, umask):
+                 events.append('environment')
+ 
+             def shedPrivileges(self, euid, uid, gid):
+@@ -545,7 +544,7 @@ class UnixApplicationRunnerSetupEnvironmentTests(unittest.TestCase):
+         L{UnixApplicationRunner.setupEnvironment} changes the root of the
+         filesystem if passed a non-C{None} value for the C{chroot} parameter.
+         """
+-        self.runner.setupEnvironment("/foo/bar", ".", True, None, None)
++        self.runner.setupEnvironment("/foo/bar", ".", True, None)
+         self.assertEqual(self.root, "/foo/bar")
+ 
+ 
+@@ -554,7 +553,7 @@ class UnixApplicationRunnerSetupEnvironmentTests(unittest.TestCase):
+         L{UnixApplicationRunner.setupEnvironment} does not change the root of
+         the filesystem if passed C{None} for the C{chroot} parameter.
+         """
+-        self.runner.setupEnvironment(None, ".", True, None, None)
++        self.runner.setupEnvironment(None, ".", True, None)
+         self.assertIdentical(self.root, self.unset)
+ 
+ 
+@@ -563,7 +562,7 @@ class UnixApplicationRunnerSetupEnvironmentTests(unittest.TestCase):
+         L{UnixApplicationRunner.setupEnvironment} changes the working directory
+         of the process to the path given for the C{rundir} parameter.
+         """
+-        self.runner.setupEnvironment(None, "/foo/bar", True, None, None)
++        self.runner.setupEnvironment(None, "/foo/bar", True, None)
+         self.assertEqual(self.cwd, "/foo/bar")
+ 
+ 
+@@ -572,7 +571,7 @@ class UnixApplicationRunnerSetupEnvironmentTests(unittest.TestCase):
+         L{UnixApplicationRunner.setupEnvironment} daemonizes the process if
+         C{False} is passed for the C{nodaemon} parameter.
+         """
+-        self.runner.setupEnvironment(None, ".", False, None, None)
++        self.runner.setupEnvironment(None, ".", False, None)
+         self.assertTrue(self.daemon)
+ 
+ 
+@@ -581,7 +580,7 @@ class UnixApplicationRunnerSetupEnvironmentTests(unittest.TestCase):
+         L{UnixApplicationRunner.setupEnvironment} does not daemonize the
+         process if C{True} is passed for the C{nodaemon} parameter.
+         """
+-        self.runner.setupEnvironment(None, ".", True, None, None)
++        self.runner.setupEnvironment(None, ".", True, None)
+         self.assertFalse(self.daemon)
+ 
+ 
+@@ -590,8 +589,13 @@ class UnixApplicationRunnerSetupEnvironmentTests(unittest.TestCase):
+         L{UnixApplicationRunner.setupEnvironment} writes the process's PID to
+         the file specified by the C{pidfile} parameter.
+         """
++        nodaemon = True
+         pidfile = self.mktemp()
+-        self.runner.setupEnvironment(None, ".", True, None, pidfile)
++        # Replace self.runner
++        self.runner = UnixApplicationRunner(
++            {'pidfile': pidfile, 'nodaemon': nodaemon, 'debug': False})
++        self.runner.preApplication()
++        self.runner.setupEnvironment(None, ".", nodaemon, None)
+         fObj = file(pidfile)
+         pid = int(fObj.read())
+         fObj.close()
+@@ -604,8 +608,13 @@ class UnixApplicationRunnerSetupEnvironmentTests(unittest.TestCase):
+         process's PID to the file specified by the C{pidfile} parameter if
+         C{nodaemon} is C{False}.
+         """
++        nodaemon = False
+         pidfile = self.mktemp()
+-        self.runner.setupEnvironment(None, ".", False, None, pidfile)
++        # Replace self.runner
++        self.runner = UnixApplicationRunner(
++            {'pidfile': pidfile, 'nodaemon': nodaemon, 'debug': False})
++        self.runner.preApplication()
++        self.runner.setupEnvironment(None, ".", nodaemon, None)
+         fObj = file(pidfile)
+         pid = int(fObj.read())
+         fObj.close()
+@@ -617,7 +626,7 @@ class UnixApplicationRunnerSetupEnvironmentTests(unittest.TestCase):
+         L{UnixApplicationRunner.setupEnvironment} changes the process umask to
+         the value specified by the C{umask} parameter.
+         """
+-        self.runner.setupEnvironment(None, ".", False, 123, None)
++        self.runner.setupEnvironment(None, ".", False, 123)
+         self.assertEqual(self.mask, 123)
+ 
+ 
+@@ -627,7 +636,7 @@ class UnixApplicationRunnerSetupEnvironmentTests(unittest.TestCase):
+         umask if C{None} is passed for the C{umask} parameter and C{True} is
+         passed for the C{nodaemon} parameter.
+         """
+-        self.runner.setupEnvironment(None, ".", True, None, None)
++        self.runner.setupEnvironment(None, ".", True, None)
+         self.assertIdentical(self.mask, self.unset)
+ 
+ 
+@@ -637,7 +646,7 @@ class UnixApplicationRunnerSetupEnvironmentTests(unittest.TestCase):
+         C{0077} if C{None} is passed for the C{umask} parameter and C{False} is
+         passed for the C{nodaemon} parameter.
+         """
+-        self.runner.setupEnvironment(None, ".", False, None, None)
++        self.runner.setupEnvironment(None, ".", False, None)
+         self.assertEqual(self.mask, 0077)
+ 
+ 
+@@ -667,8 +676,8 @@ class UnixApplicationRunnerStartApplicationTests(unittest.TestCase):
+         self.runner = UnixApplicationRunner(options)
+ 
+         args = []
+-        def fakeSetupEnvironment(self, chroot, rundir, nodaemon, umask, pidfile):
+-            args.extend((chroot, rundir, nodaemon, umask, pidfile))
++        def fakeSetupEnvironment(self, chroot, rundir, nodaemon, umask):
++            args.extend((chroot, rundir, nodaemon, umask))
+ 
+         # Sanity check
+         self.assertEqual(
+@@ -682,7 +691,7 @@ class UnixApplicationRunnerStartApplicationTests(unittest.TestCase):
+ 
+         self.assertEqual(
+             args,
+-            ['/foo/chroot', '/foo/rundir', True, 56, '/foo/pidfile'])
++            ['/foo/chroot', '/foo/rundir', True, 56])
+ 
+ 
+ 

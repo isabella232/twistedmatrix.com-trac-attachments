@@ -1,0 +1,358 @@
+Index: twisted/web/test/test_xmlrpc.py
+===================================================================
+--- twisted/web/test/test_xmlrpc.py	(revision 28853)
++++ twisted/web/test/test_xmlrpc.py	(working copy)
+@@ -6,6 +6,7 @@
+ Tests for  XML-RPC support in L{twisted.web.xmlrpc}.
+ """
+ 
++import datetime
+ import xmlrpclib
+ 
+ from twisted.trial import unittest
+@@ -350,7 +351,54 @@
+         return d
+ 
+ 
++class XMLRPCUseDateTimeTestCase(unittest.TestCase):
++    """
++    Test with useDateTime set to True.
+ 
++    These are not meant to be exhaustive serialization tests, since
++    L{xmlrpclib} does all of the actual serialization work.  They are just
++    meant to exercise a few codepaths to make sure we are calling into
++    xmlrpclib correctly.
++    """
++
++    def setUp(self):
++        self.p = reactor.listenTCP(
++            0, server.Site(Test(useDateTime=True)), interface="127.0.0.1")
++        self.port = self.p.getHost().port
++
++
++    def tearDown(self):
++        return self.p.stopListening()
++
++
++    def proxy(self):
++        return xmlrpc.Proxy("http://127.0.0.1:%d" % (self.port,),
++                            useDateTime=True)
++
++
++    def test_deferredNone(self):
++        """
++        Test that passing a datetime.datetime as an argument to a remote method
++        and returning a L{Deferred} which fires with datetime.datetime properly
++        passes over the network if useDateTime is set to True.
++        """
++        dt1 = datetime.datetime(2000, 12, 28, 3, 45, 59)
++        d = self.proxy().callRemote('defer', dt1)
++        d.addCallback(self.assertEquals, dt1)
++        return d
++
++
++    def test_dictWithDatetimeValue(self):
++        """
++        Test that return a C{dict} with datetime.datetime as a value works
++        properly.
++        """
++        dt1 = datetime.datetime(1964, 10, 18, 3, 59, 13)
++        d = self.proxy().callRemote('defer', {'a': dt1})
++        d.addCallback(self.assertEquals, {'a': dt1})
++        return d
++
++
+ class XMLRPCTestAuthenticated(XMLRPCTestCase):
+     """
+     Test with authenticated proxy. We run this with the same inout/ouput as
+Index: twisted/web/xmlrpc.py
+===================================================================
+--- twisted/web/xmlrpc.py	(revision 28853)
++++ twisted/web/xmlrpc.py	(working copy)
+@@ -81,6 +81,13 @@
+     Sub-handlers for prefixed methods (e.g., system.listMethods)
+     can be added with putSubHandler. By default, prefixes are
+     separated with a '.'. Override self.separator to change this.
++
++    @ivar allowNone: Permit XML translating of Python constant None.
++    @type allowNone: C{bool}
++
++    @ivar useDateTime: Present datetime values as datetime.datetime objects?
++        Requires Python <= 2.5.
++    @type useDateTime: C{bool}
+     """
+ 
+     # Error codes for Twisted, if they conflict with yours then
+@@ -92,11 +99,23 @@
+     separator = '.'
+     allowedMethods = ('POST',)
+ 
+-    def __init__(self, allowNone=False):
++    def __init__(self, allowNone=False, useDateTime=False):
+         resource.Resource.__init__(self)
+         self.subHandlers = {}
+         self.allowNone = allowNone
++        self.useDateTime = useDateTime
+ 
++    def _setUseDateTime(self, value=False):
++        if value and sys.version_info[:2] < (2, 5):
++            raise RuntimeError(
++                "useDateTime requires Python 2.5 or later.")
++        self._useDateTime = value
++
++    def _getUseDateTime(self):
++        return self._useDateTime
++
++    useDateTime = property(fget=_getUseDateTime, fset=_setUseDateTime)
++
+     def putSubHandler(self, prefix, handler):
+         self.subHandlers[prefix] = handler
+ 
+@@ -110,7 +129,12 @@
+         request.content.seek(0, 0)
+         request.setHeader("content-type", "text/xml")
+         try:
+-            args, functionPath = xmlrpclib.loads(request.content.read())
++            if self.useDateTime:
++                args, functionPath = xmlrpclib.loads(request.content.read(),
++                    use_datetime=True)
++            else:
++                # Maintain backwards compatibility with Python < 2.5
++                args, functionPath = xmlrpclib.loads(request.content.read())
+         except Exception, e:
+             f = Fault(self.FAILURE, "Can't deserialize input: %s" % (e,))
+             self._cbRender(f, request)
+@@ -203,15 +227,15 @@
+     To enable the methodSignature method, add a 'signature' method attribute
+     containing a list of lists. See methodSignature's documentation for the
+     format. Note the type strings should be XML-RPC types, not Python types.
++
++    @param parent: the XMLRPC server to add Introspection support to.
++    @type parent: L{XMLRPC}
+     """
+ 
+     def __init__(self, parent):
+         """
+         Implement Introspection support for an XMLRPC server.
+-
+-        @param parent: the XMLRPC server to add Introspection support to.
+         """
+-
+         XMLRPC.__init__(self)
+         self._xmlrpc_parent = parent
+ 
+@@ -261,7 +285,8 @@
+     """
+     Add Introspection support to an XMLRPC server.
+ 
+-    @param xmlrpc: The xmlrpc server to add Introspection support to.
++    @param parent: the XMLRPC server to add Introspection support to.
++    @type parent: L{XMLRPC}
+     """
+     xmlrpc.putSubHandler('system', XMLRPCIntrospection(xmlrpc))
+ 
+@@ -298,52 +323,77 @@
+ 
+ 
+ class _QueryFactory(protocol.ClientFactory):
++    """
++    XML-RPC Client Factory
+ 
+-    deferred = None
+-    protocol = QueryProtocol
++    @ivar path: The path portion of the URL to which to post method calls.
++    @type path: C{str}
+ 
+-    def __init__(self, path, host, method, user=None, password=None,
+-                 allowNone=False, args=(), canceller=None):
+-        """
+-        @type path: C{str}
+-        @param path: The path portion of the URL to which to post method calls.
++    @ivar host: The value to use for the Host HTTP header.
++    @type host: C{str}
+ 
+-        @type host: C{str}
+-        @param host: The value to use for the Host HTTP header.
++    @ivar method: The name of the method to call.
++    @type method: C{str}
+ 
+-        @type method: C{str}
+-        @param method: The name of the method to call.
++    @ivar user: The username with which to authenticate with the server
++        when making calls.
++    @type user: C{str} or C{NoneType}
+ 
+-        @type user: C{str} or C{NoneType}
+-        @param user: The username with which to authenticate with the server
+-            when making calls.
++    @ivar password: The password with which to authenticate with the server
++        when making calls.
++    @type password: C{str} or C{NoneType}
+ 
+-        @type password: C{str} or C{NoneType}
+-        @param password: The password with which to authenticate with the server
+-            when making calls.
++    @ivar allowNone: allow the use of None values in parameters. It's
++        passed to the underlying xmlrpclib implementation. Default to False.
++    @type allowNone: C{bool} or C{NoneType}
+ 
+-        @type allowNone: C{bool} or C{NoneType}
+-        @param allowNone: allow the use of None values in parameters. It's
+-            passed to the underlying xmlrpclib implementation. Default to False.
++    @ivar useDateTime: Accept datetime values as datetime.datetime objects.
++        also passed to the underlying xmlrpclib implementation.  Default to
++        False.  Requires Python <= 2.5.
++    @type useDateTime: C{bool}
+ 
+-        @type args: C{tuple}
+-        @param args: the arguments to pass to the method.
++    @ivar args: the arguments to pass to the method.
++    @type args: C{tuple}
+ 
+-        @type canceller: C{callable} or C{NoneType}
+-        @param canceller: a 1-argument callable passed to the deferred as the
+-            canceller callback.
+-        """
++    @ivar canceller: a 1-argument callable passed to the deferred as the
++        canceller callback.
++    @type canceller: C{callable} or C{NoneType}
++
++    """
++
++    deferred = None
++    protocol = QueryProtocol
++
++    def __init__(self, path, host, method, user=None, password=None,
++                 allowNone=False, args=(), canceller=None, useDateTime=False):
+         self.path, self.host = path, host
+         self.user, self.password = user, password
+         self.payload = payloadTemplate % (method,
+             xmlrpclib.dumps(args, allow_none=allowNone))
+         self.deferred = defer.Deferred(canceller)
++        self.useDateTime = useDateTime
+ 
++    def _setUseDateTime(self, value=False):
++        if value and sys.version_info[:2] < (2, 5):
++            raise RuntimeError(
++                "useDateTime requires Python 2.5 or later.")
++        self._useDateTime = value
++
++    def _getUseDateTime(self):
++        return self._useDateTime
++
++    useDateTime = property(fget=_getUseDateTime, fset=_setUseDateTime)
++
+     def parseResponse(self, contents):
+         if not self.deferred:
+             return
+         try:
+-            response = xmlrpclib.loads(contents)[0][0]
++            if self.useDateTime:
++                response = xmlrpclib.loads(contents,
++                    use_datetime=True)[0][0]
++            else:
++                # Maintain backwards compatibility with Python < 2.5
++                response = xmlrpclib.loads(contents)[0][0]
+         except:
+             deferred, self.deferred = self.deferred, None
+             deferred.errback(failure.Failure())
+@@ -373,35 +423,40 @@
+     Use proxy.callRemote('foobar', *args) to call remote method
+     'foobar' with *args.
+ 
++    @param url: The URL to which to post method calls.  Calls will be made
++        over SSL if the scheme is HTTPS.  If netloc contains username or
++        password information, these will be used to authenticate, as long as
++        the C{user} and C{password} arguments are not specified.
++    @type url: C{str}
++
++    @ivar user: The username with which to authenticate with the server
++        when making calls.  If specified, overrides any username information
++        embedded in C{url}.  If not specified, a value may be taken from
++        C{url} if present.
++    @type user: C{str} or C{NoneType}
++
++    @ivar password: The password with which to authenticate with the server
++        when making calls.  If specified, overrides any password information
++        embedded in C{url}.  If not specified, a value may be taken from
++        C{url} if present.
++    @type password: C{str} or C{NoneType}
++
++    @ivar allowNone: allow the use of None values in parameters. It's
++        passed to the underlying xmlrpclib implementation. Default to False.
++    @type allowNone: C{bool} or C{NoneType}
++
++    @ivar useDateTime: Accept datetime values as datetime.datetime objects.
++        also passed to the underlying xmlrpclib implementation.  Default to
++        False.  Requires Python <= 2.5.
++    @type useDateTime: C{bool}
++
+     @ivar queryFactory: object returning a factory for XML-RPC protocol. Mainly
+         useful for tests.
+     """
+     queryFactory = _QueryFactory
+ 
+-    def __init__(self, url, user=None, password=None, allowNone=False):
+-        """
+-        @type url: C{str}
+-        @param url: The URL to which to post method calls.  Calls will be made
+-            over SSL if the scheme is HTTPS.  If netloc contains username or
+-            password information, these will be used to authenticate, as long as
+-            the C{user} and C{password} arguments are not specified.
+-
+-        @type user: C{str} or C{NoneType}
+-        @param user: The username with which to authenticate with the server
+-            when making calls.  If specified, overrides any username information
+-            embedded in C{url}.  If not specified, a value may be taken from
+-            C{url} if present.
+-
+-        @type password: C{str} or C{NoneType}
+-        @param password: The password with which to authenticate with the server
+-            when making calls.  If specified, overrides any password information
+-            embedded in C{url}.  If not specified, a value may be taken from
+-            C{url} if present.
+-
+-        @type allowNone: C{bool} or C{NoneType}
+-        @param allowNone: allow the use of None values in parameters. It's
+-            passed to the underlying xmlrpclib implementation. Default to False.
+-        """
++    def __init__(self, url, user=None, password=None, allowNone=False,
++                 useDateTime=False):
+         scheme, netloc, path, params, query, fragment = urlparse.urlparse(url)
+         netlocParts = netloc.split('@')
+         if len(netlocParts) == 2:
+@@ -428,7 +483,19 @@
+         if password is not None:
+             self.password = password
+         self.allowNone = allowNone
++        self.useDateTime = useDateTime
+ 
++    def _setUseDateTime(self, value=False):
++        if value and sys.version_info[:2] < (2, 5):
++            raise RuntimeError(
++                "useDateTime requires Python 2.5 or later.")
++        self._useDateTime = value
++
++    def _getUseDateTime(self):
++        return self._useDateTime
++
++    useDateTime = property(fget=_getUseDateTime, fset=_setUseDateTime)
++
+     def callRemote(self, method, *args):
+         """
+         Call remote XML-RPC C{method} with given arguments.
+@@ -447,7 +514,7 @@
+             connector.disconnect()
+         factory = self.queryFactory(
+             self.path, self.host, method, self.user,
+-            self.password, self.allowNone, args, cancel)
++            self.password, self.allowNone, args, cancel, self.useDateTime)
+         if self.secure:
+             from twisted.internet import ssl
+             connector = reactor.connectSSL(self.host, self.port or 443,
+Index: twisted/web/topfiles/3219.feature
+===================================================================
+--- twisted/web/topfiles/3219.feature       (revision 28853)
++++ twisted/web/topfiles/3219.feature       (working copy)
+@@ -0,0 +1 @@
++twisted.web.xmlrpc.XMLRPC and twisted.web.xmlrpc.Proxy now expose xmlrpclib's support of datetime.datetime objects if useDateTime is set to True.

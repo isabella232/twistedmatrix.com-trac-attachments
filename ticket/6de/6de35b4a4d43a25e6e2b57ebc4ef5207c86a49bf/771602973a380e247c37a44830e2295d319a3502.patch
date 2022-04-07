@@ -1,0 +1,165 @@
+From cf6ef01c72c3665a77a54c3dacb30282cd78c971 Mon Sep 17 00:00:00 2001
+From: Phillip Knauss <knauss@.telsasoft.com>
+Date: Tue, 22 Jul 2014 10:12:27 -0500
+Subject: [PATCH 1/2] Use challengeLifetimeSecs as a per-instance value while
+ retaining backwards compatibility, unit tests, update wrapper to use *args
+ and **kwargs so it doesn't need to be changed if DigestCredentialFactory is
+ changed in the future
+
+---
+ twisted/cred/credentials.py     | 26 ++++++++++++++++++++------
+ twisted/test/test_digestauth.py | 29 +++++++++++++++++++++++++++++
+ twisted/web/_auth/digest.py     |  6 ++++--
+ 3 files changed, 53 insertions(+), 8 deletions(-)
+
+diff --git a/twisted/cred/credentials.py b/twisted/cred/credentials.py
+index 05ac2a4..d5847d4 100644
+--- a/twisted/cred/credentials.py
++++ b/twisted/cred/credentials.py
+@@ -179,7 +179,8 @@ class DigestCredentialFactory(object):
+     Support for RFC2617 HTTP Digest Authentication
+ 
+     @cvar CHALLENGE_LIFETIME_SECS: The number of seconds for which an
+-        opaque should be valid.
++        opaque should be valid. Can be overridden by setting
++        C{DigestCredentialFactory.challengeLifetimeSecs} on an instance.
+ 
+     @type privateKey: C{str}
+     @ivar privateKey: A random string used for generating the secure opaque.
+@@ -192,6 +193,12 @@ class DigestCredentialFactory(object):
+     @type authenticationRealm: C{str}
+     @param authenticationRealm: case sensitive string that specifies the realm
+         portion of the challenge
++
++    @type challengeLifetimeSecs: C{int}
++    @param challengeLifetimeSecs: Override 
++        C{DigestCredentialFactory.CHALLENGE_LIFETIME_SECS} to specify the
++        number of seconds for which an opaque should be valid.
++
+     """
+ 
+     _parseparts = re.compile(
+@@ -208,11 +215,15 @@ class DigestCredentialFactory(object):
+ 
+     scheme = "digest"
+ 
+-    def __init__(self, algorithm, authenticationRealm):
++    def __init__(self, 
++                 algorithm, 
++                 authenticationRealm, 
++                 challengeLifetimeSecs=None):
+         self.algorithm = algorithm
+         self.authenticationRealm = authenticationRealm
+         self.privateKey = secureRandom(12)
+-
++        self.challengeLifetimeSecs = challengeLifetimeSecs
++        
+ 
+     def getChallenge(self, address):
+         """
+@@ -314,9 +325,12 @@ class DigestCredentialFactory(object):
+             raise error.LoginFailed(
+                 'Invalid response, invalid opaque/time values')
+ 
+-        if (int(self._getTime()) - when >
+-            DigestCredentialFactory.CHALLENGE_LIFETIME_SECS):
+-
++        # Verify the timeout
++        challengeLifetimeSecs = self.CHALLENGE_LIFETIME_SECS
++        if self.challengeLifetimeSecs is not None:
++          challengeLifetimeSecs = self.challengeLifetimeSecs
++          
++        if (int(self._getTime()) - when > challengeLifetimeSecs):
+             raise error.LoginFailed(
+                 'Invalid response, incompatible opaque/nonce too old')
+ 
+diff --git a/twisted/test/test_digestauth.py b/twisted/test/test_digestauth.py
+index 5c70af2..7475cf7 100644
+--- a/twisted/test/test_digestauth.py
++++ b/twisted/test/test_digestauth.py
+@@ -622,6 +622,35 @@ class DigestAuthTests(TestCase):
+             self.clientAddress.host)
+ 
+ 
++    def test_oldNonceWithCustomTimeout(self):
++        """
++        L{DigestCredentialFactory.decode} raises L{LoginFailed} when the given
++        opaque is older than C{DigestCredentialFactory.CHALLENGE_LIFETIME_SECS}
++        with overridden value.
++        """
++        credentialFactory =\
++          FakeDigestCredentialFactory(self.algorithm,
++                                      self.realm,
++                                      challengeLifetimeSecs = 1)
++        challenge = credentialFactory.getChallenge(self.clientAddress.host)
++
++        key = '%s,%s,%s' % (challenge['nonce'],
++                            self.clientAddress.host,
++                            '-137876876')
++        digest = md5(key + credentialFactory.privateKey).hexdigest()
++        ekey = b64encode(key)
++
++        oldNonceOpaque = '%s-%s' % (digest, ekey.strip('\n'))
++
++        self.assertEqual(credentialFactory.challengeLifetimeSecs, 1)
++        self.assertRaises(
++            LoginFailed,
++            credentialFactory._verifyOpaque,
++            oldNonceOpaque,
++            challenge['nonce'],
++            self.clientAddress.host)
++
++
+     def test_mismatchedOpaqueChecksum(self):
+         """
+         L{DigestCredentialFactory.decode} raises L{LoginFailed} when the opaque
+diff --git a/twisted/web/_auth/digest.py b/twisted/web/_auth/digest.py
+index 90ebf20..2795759 100644
+--- a/twisted/web/_auth/digest.py
++++ b/twisted/web/_auth/digest.py
+@@ -21,12 +21,14 @@ class DigestCredentialFactory(object):
+ 
+     scheme = 'digest'
+ 
+-    def __init__(self, algorithm, authenticationRealm):
++    def __init__(self, algorithm, authenticationRealm, *args, **kwargs):
+         """
+         Create the digest credential factory that this object wraps.
+         """
+         self.digest = credentials.DigestCredentialFactory(algorithm,
+-                                                          authenticationRealm)
++                                                          authenticationRealm,
++                                                          *args,
++                                                          **kwargs)
+ 
+ 
+     def getChallenge(self, request):
+-- 
+2.0.0
+
+
+From 0319485073c455637229c0c94fc2002fe161cc38 Mon Sep 17 00:00:00 2001
+From: Phillip Knauss <knauss@.telsasoft.com>
+Date: Tue, 22 Jul 2014 10:45:08 -0500
+Subject: [PATCH 2/2] Add issue to NEWS
+
+---
+ NEWS | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/NEWS b/NEWS
+index a8f833c..0728fe8 100644
+--- a/NEWS
++++ b/NEWS
+@@ -269,7 +269,7 @@ Bugfixes
+ 
+ Other
+ -----
+- - #5004, #6881, #6956
++ - #5004, #6881, #6956, #7539
+ 
+ 
+ Twisted Words 14.0.0 (2014-05-08)
+-- 
+2.0.0
+

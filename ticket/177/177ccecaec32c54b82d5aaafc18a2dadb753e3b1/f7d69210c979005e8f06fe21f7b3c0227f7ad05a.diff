@@ -1,0 +1,115 @@
+--- C:/Users/BRMA/AppData/Local/Temp/abstract.py-revBASE.svn004.tmp.py	Thu Mar 15 13:18:28 2012
++++ E:/Workspace/svn/Twisted-5562/twisted/internet/iocpreactor/abstract.py	Tue Jan 15 12:37:35 2013
+@@ -146,12 +146,12 @@
+ 
+     # write stuff
+     dataBuffer = ''
+-    offset = 0
+     writing = False
+     _writeScheduled = None
+     _writeDisconnecting = False
+     _writeDisconnected = False
+     writeBufferSize = 2**2**2**2
++    writePending = False
+ 
+ 
+     def loseWriteConnection(self):
+@@ -168,28 +168,26 @@
+         # in current code should never be called
+         self.connectionLost(reason)
+ 
+-
+     def startWriting(self):
+         self.reactor.addActiveHandle(self)
+         self.writing = True
+-        if not self._writeScheduled:
++        if not self.writePending and not self._writeScheduled:
+             self._writeScheduled = self.reactor.callLater(0,
+                                                           self._resumeWriting)
+ 
+-
+     def stopWriting(self):
+         if self._writeScheduled:
+             self._writeScheduled.cancel()
+             self._writeScheduled = None
+         self.writing = False
+ 
+-
+     def _resumeWriting(self):
+         self._writeScheduled = None
+         self.doWrite()
+ 
+ 
+     def _cbWrite(self, rc, bytes, evt):
++        self.writePending = False
+         if self._handleWrite(rc, bytes, evt):
+             self.doWrite()
+ 
+@@ -208,11 +206,9 @@
+                                     (errno.errorcode.get(rc, 'unknown'), rc))))
+             return False
+         else:
+-            self.offset += bytes
+             # If there is nothing left to send,
+-            if self.offset == len(self.dataBuffer) and not self._tempDataLen:
++            if bytes == len(self.dataBuffer) and not self._tempDataLen:
+                 self.dataBuffer = ""
+-                self.offset = 0
+                 # stop writing
+                 self.stopWriting()
+                 # If I've got a producer who is supposed to supply me with data
+@@ -227,35 +223,42 @@
+                     self.connectionLost(failure.Failure(main.CONNECTION_DONE))
+                 elif self._writeDisconnecting:
+                     # I was previously asked to to half-close the connection.
++                    self._closeWriteConnection()
+                     self._writeDisconnected = True
+-                    self._closeWriteConnection()
+                 return False
+             else:
++                if bytes > 0:
++                      if bytes < len(self.dataBuffer):
++                        # remove processed bytes
++                        self.dataBuffer = buffer(self.dataBuffer, bytes)
++                    else:
++                        self.databuffer = ""
+                 return True
+ 
+ 
+     def doWrite(self):
+-        if len(self.dataBuffer) - self.offset < self.SEND_LIMIT:
++        ''' should only called when no current write is pending, 
++            we dont know where to start the write from until we know how many were written
++        '''
++        if self.writePending:
++            return
++        if len(self.dataBuffer) < self.SEND_LIMIT:
+             # If there is currently less than SEND_LIMIT bytes left to send
+             # in the string, extend it with the array data.
+-            self.dataBuffer = (buffer(self.dataBuffer, self.offset) +
+-                               "".join(self._tempDataBuffer))
+-            self.offset = 0
++            self.dataBuffer += "".join(self._tempDataBuffer)
+             self._tempDataBuffer = []
+             self._tempDataLen = 0
+ 
+         evt = _iocp.Event(self._cbWrite, self)
+ 
+         # Send as much data as you can.
+-        if self.offset:
+-            evt.buff = buff = buffer(self.dataBuffer, self.offset)
++        evt.buff = buff = self.dataBuffer
++        rc, _bytes = self.writeToHandle(buff, evt)
++        if rc and rc != ERROR_IO_PENDING:
++            self._handleWrite(rc, 0, evt)
+         else:
+-            evt.buff = buff = self.dataBuffer
+-        rc, bytes = self.writeToHandle(buff, evt)
+-        if rc and rc != ERROR_IO_PENDING:
+-            self._handleWrite(rc, bytes, evt)
++            self.writePending = True
+ 
+-
+     def writeToHandle(self, buff, evt):
+         raise NotImplementedError() # TODO: this should default to WriteFile
+ 

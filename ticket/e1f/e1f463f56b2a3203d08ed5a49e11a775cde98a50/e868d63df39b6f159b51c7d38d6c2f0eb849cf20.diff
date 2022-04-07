@@ -1,0 +1,88 @@
+--- imap4.py	Wed Nov 10 14:08:41 2004
++++ imap4.new	Thu Nov 11 12:29:41 2004
+@@ -1934,7 +1934,7 @@
+ class IllegalServerResponse(IMAP4Exception): pass
+ 
+ 
+-class IMAP4Client(basic.LineReceiver):
++class IMAP4Client(basic.LineReceiver, policies.TimeoutMixin):
+     """IMAP4 client protocol implementation
+ 
+     @ivar state: A string representing the state the connection is currently
+@@ -1950,6 +1950,10 @@
+ 
+     startedTLS = False
+ 
++    #Number of seconds to wait before timing out a connection.
++    #If the number is <= 0 no timeout checking will be performed.
++    timeout = 0
++
+     # Capabilities are not allowed to change during the session
+     # So cache the first response and use that for all later
+     # lookups
+@@ -1977,6 +1981,7 @@
+ 
+         self._tag = None
+         self._parts = None
++        self._lastCmd = None
+ 
+     def registerAuthenticator(self, auth):
+         """Register a new form of authentication
+@@ -1992,6 +1997,9 @@
+         self.authenticators[auth.getName().upper()] = auth
+ 
+     def rawDataReceived(self, data):
++        if self.timeout > 0:
++            self.setTimeout(self.timeout)
++
+         self._pendingSize -= len(data)
+         if self._pendingSize > 0:
+             self._pendingBuffer.write(data)
+@@ -2017,8 +2025,20 @@
+         self._parts = [rest, '\r\n']
+         self.setRawMode()
+ 
++    def connectionMade(self):
++        if self.timeout > 0:
++            self.setTimeout(self.timeout)
++
++    def connectionLost(self, reason):
++        """We are no longer connected"""
++        if self.timeout > 0:
++            self.setTimeout(None)
++
+     def lineReceived(self, line):
+ #        print 'C: ' + repr(line)
++        if self.timeout > 0:
++            self.resetTimeout()
++
+         if self._parts is None:
+             lastPart = line.rfind(' ')
+             if lastPart != -1:
+@@ -2046,6 +2066,18 @@
+             self._tag = self._parts = None
+             self.dispatchCommand(tag, rest)
+ 
++    def timeoutConnection(self):
++        e = error.TimeoutError("Communication with IMAP Server timed out. Please try again later.")
++
++        if self._lastCmd and not self._lastCmd.defer.called:
++            self._lastCmd.defer.errback(e)
++
++        if self.queued:
++            for cmd in self.queued:
++                cmd.defer.errback(e)
++
++        self.transport.loseConnection()
++
+     def _regularDispatch(self, line):
+         parts = line.split(None, 1)
+         if len(parts) != 2:
+@@ -2185,6 +2217,7 @@
+         self.tags[t] = cmd
+         self.sendLine(cmd.format(t))
+         self.waiting = t
++        self._lastCmd = cmd
+         return cmd.defer
+ 
+     def getCapabilities(self, useCache=1):

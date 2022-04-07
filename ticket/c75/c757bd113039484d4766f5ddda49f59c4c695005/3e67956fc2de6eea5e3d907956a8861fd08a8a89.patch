@@ -1,0 +1,471 @@
+Index: twisted/mail/smtp.py
+===================================================================
+--- twisted/mail/smtp.py	(revision 46340)
++++ twisted/mail/smtp.py	(working copy)
+@@ -342,7 +342,8 @@
+     else:
+         return '<%s>' % str(res[1])
+ 
+-COMMAND, DATA, AUTH = 'COMMAND', 'DATA', 'AUTH'
++GREETING, COMMAND, DATA, AUTH, PROCESSING = \
++  'GREETING', 'COMMAND', 'DATA', 'AUTH', 'PROCESSING'
+ 
+ class AddressError(SMTPError):
+     "Parse error in address"
+@@ -498,7 +499,7 @@
+         semantics should be to discard the message
+         """
+ 
+-class SMTP(basic.LineOnlyReceiver, policies.TimeoutMixin):
++class SMTP(basic.LineReceiver, policies.TimeoutMixin):
+     """
+     SMTP server-side protocol.
+     """
+@@ -528,21 +529,75 @@
+     _onLogout = None
+ 
+     def __init__(self, delivery=None, deliveryFactory=None):
+-        self.mode = COMMAND
++        self.mode = GREETING
++        self.deferGreeting = False   # Or a count in seconds
++        self.saved_mode = None
+         self._from = None
+         self._helo = None
+         self._to = []
+         self.delivery = delivery
+         self.deliveryFactory = deliveryFactory
+ 
++    # These two are hooks that allow the ESMTP subclass to support PIPELINING
++    # if it so desires (by calling pauseProducing/resumeProducing); they
++    # also let us detect attempts to use pipelining when we don't support it.
++    def beginProcessing(self):
++        """
++        Called when the server is busy processing a command and might
++        end up waiting on a L{twisted.internet.defer.Deferred}.
++
++        This will happen, for example, when invoking the C{validateFrom}
++        and C{validateTo} methods on the L{IMessageDelivery} object.
++        """
++        self.saved_mode = self.mode
++        self.mode = PROCESSING
++
++        
++    def endProcessing(self):
++        """
++        Called when the server has finished waiting on a L{Deferred}.
++        """
++        self.mode = self.saved_mode
++
++        
+     def timeoutConnection(self):
+         msg = '%s Timeout. Try talking faster next time!' % (self.host,)
+         self.sendCode(421, msg)
+         self.transport.loseConnection()
+ 
++        
++    def protocolViolation(self):
++        """
++        Called when the server detects a protocol violation that is likely
++        to indicate the the client is spamming, for instance, talking before
++        the greeting, or sending commands before the server has finished
++        processing the current command.
++
++        Default behaviour is to drop the connection.
++        """
++        self.transport.loseConnection()        
++
++        
+     def greeting(self):
+         return '%s NO UCE NO UBE NO RELAY PROBES' % (self.host,)
+ 
++    
++    def _sendGreeting(self):
++        self.sendCode(220, self.greeting())
++        self.mode = COMMAND
++
++        
++    def sendGreeting(self):
++        """
++        Send the SMTP greeting.  If C{deferGreeting} is set, this may
++        in fact be done asynchronously.
++        """
++        if not self.deferGreeting:
++            self._sendGreeting()
++        else:
++            reactor.callLater(self.deferGreeting, self._sendGreeting)
++
++            
+     def connectionMade(self):
+         # Ensure user-code always gets something sane for _helo
+         peer = self.transport.getPeer()
+@@ -551,7 +606,7 @@
+         except AttributeError: # not an IPv4Address
+             host = str(peer)
+         self._helo = (None, host)
+-        self.sendCode(220, self.greeting())
++        self.sendGreeting()
+         self.setTimeout(self.timeout)
+ 
+     def sendCode(self, code, message=''):
+@@ -567,6 +622,12 @@
+         self.resetTimeout()
+         return getattr(self, 'state_' + self.mode)(line)
+ 
++    
++    def state_GREETING(self, line):
++        self.sendCode(503, 'Command sent before greeting - wait your turn')
++        self.protocolViolation()
++
++        
+     def state_COMMAND(self, line):
+         # Ignore leading and trailing whitespace, as well as an arbitrary
+         # amount of whitespace between the command and its argument, though
+@@ -583,6 +644,12 @@
+         else:
+             self.sendSyntaxError()
+ 
++            
++    def state_PROCESSING(self, line):
++        self.sendCode(503, 'Pipelining not supported - wait your turn')
++        self.protocolViolation()
++
++        
+     def sendSyntaxError(self):
+         self.sendCode(500, 'Error: bad syntax')
+ 
+@@ -628,7 +695,7 @@
+                          |''' + qstring + r''' # addr
+                          )\s*(\s(?P<opts>.*))? # Optional WS + ESMTP options
+                          $''',re.I|re.X)
+-
++    
+     def do_MAIL(self, rest):
+         if self._from:
+             self.sendCode(503,"Only one sender per message, please")
+@@ -646,6 +713,7 @@
+             self.sendCode(553, str(e))
+             return
+ 
++        self.beginProcessing()
+         validated = defer.maybeDeferred(self.validateFrom, self._helo, addr)
+         validated.addCallbacks(self._cbFromValidate, self._ebFromValidate)
+ 
+@@ -653,8 +721,8 @@
+     def _cbFromValidate(self, from_, code=250, msg='Sender address accepted'):
+         self._from = from_
+         self.sendCode(code, msg)
++        self.endProcessing()
+ 
+-
+     def _ebFromValidate(self, failure):
+         if failure.check(SMTPBadSender):
+             self.sendCode(failure.value.code,
+@@ -667,6 +735,7 @@
+             self.sendCode(
+                 451,
+                 'Requested action aborted: local error in processing')
++        self.endProcessing()
+ 
+ 
+     def do_RCPT(self, rest):
+@@ -684,6 +753,7 @@
+             self.sendCode(553, str(e))
+             return
+ 
++        self.beginProcessing()
+         d = defer.maybeDeferred(self.validateTo, user)
+         d.addCallbacks(
+             self._cbToValidate,
+@@ -696,6 +766,7 @@
+             user = to
+         self._to.append((user, to))
+         self.sendCode(code, msg)
++        self.endProcessing()
+ 
+     def _ebToValidate(self, failure):
+         if failure.check(SMTPBadRcpt, SMTPServerError):
+@@ -706,6 +777,7 @@
+                 451,
+                 'Requested action aborted: local error in processing'
+             )
++        self.endProcessing()
+ 
+     def _disconnect(self, msgs):
+         for msg in msgs:
+@@ -791,6 +863,7 @@
+                 if not self.__messages:
+                     self._messageHandled("thrown away")
+                     return
++                self.beginProcessing()
+                 defer.DeferredList([
+                     m.eomReceived() for m in self.__messages
+                 ], consumeErrors=True).addCallback(self._messageHandled
+@@ -839,6 +912,7 @@
+             self.sendCode(550, msg)
+         else:
+             self.sendCode(250, 'Delivery in progress')
++        self.endProcessing()
+ 
+ 
+     def _cbAnonymousAuthentication(self, (iface, avatar, logout)):
+@@ -1643,13 +1717,14 @@
+ 
+     authenticated = False
+ 
+-    def __init__(self, chal = None, contextFactory = None):
++    def __init__(self, chal = None, contextFactory = None, pipelining = False):
+         SMTP.__init__(self)
+         if chal is None:
+             chal = {}
+         self.challengers = chal
+         self.authenticated = False
+         self.ctx = contextFactory
++        self.pipelining = pipelining
+ 
+     def connectionMade(self):
+         SMTP.connectionMade(self)
+@@ -1660,11 +1735,24 @@
+     def greeting(self):
+         return SMTP.greeting(self) + ' ESMTP'
+ 
++    def beginProcessing(self):
++        if self.pipelining:
++            self.pauseProducing()
++        else:
++            SMTP.beginProcessing(self)
++            
++    def endProcessing(self):
++        if self.pipelining:
++            self.resumeProducing()
++        else:
++            SMTP.endProcessing(self)
+ 
+     def extensions(self):
+         ext = {'AUTH': self.challengers.keys()}
+         if self.canStartTLS and not self.startedTLS:
+             ext['STARTTLS'] = None
++        if self.pipelining:
++            ext['PIPELINING'] = None
+         return ext
+ 
+     def lookupMethod(self, command):
+@@ -1684,7 +1772,13 @@
+                 r.append(c)
+         return '\n'.join(r)
+ 
++    def do_HELO(self, rest):
++        # Can't use pipelining if someone sends HELO
++        self.pipelining = False
++        SMTP.do_HELO(self, rest)
++    
+     def do_EHLO(self, rest):
++        extra = self.clearLineBuffer().strip()
+         peer = self.transport.getPeer().host
+         self._helo = (rest, peer)
+         self._from = None
+@@ -1696,6 +1790,12 @@
+                 self.listExtensions(),
+             )
+         )
++        # Spamming software might try to do this (EHLO, then lots of other
++        # commands without waiting to see if PIPELINING is supported).  We
++        # might not always detect this, but when we do, drop the connection.
++        if extra:
++            self.sendCode(503, 'Illegal attempt to use pipelining before EHLO')
++            self.protocolViolation()
+ 
+     def ext_STARTTLS(self, rest):
+         if self.startedTLS:
+Index: twisted/mail/test/test_smtp.py
+===================================================================
+--- twisted/mail/test/test_smtp.py	(revision 46340)
++++ twisted/mail/test/test_smtp.py	(working copy)
+@@ -1061,7 +1061,6 @@
+         raise NotImplementedError("This oughtn't be called in the course of this test.")
+ 
+ 
+-
+ class SMTPServerTests(unittest.TestCase):
+     """
+     Test various behaviors of L{twisted.mail.smtp.SMTP} and
+@@ -1092,7 +1091,71 @@
+         s.connectionLost(error.ConnectionDone())
+         self.assertNotIn("ESMTP", t.value())
+ 
++        
++    def testSMTPDeferGreeting(self):
++        """
++        Test that the SMTP server defers its greeting.
++        """
++        s = smtp.SMTP()
++        s.host = 'example.com'
++        s.deferGreeting = 0.1
++        t = StringTransport()
++        s.makeConnection(t)
++        self.assertEqual(t.value(), '')
+ 
++        def checkGreeting():
++            s.connectionLost(error.ConnectionDone())
++            self.assertIn('example.com', t.value())
++        
++        d = task.deferLater(reactor, 0.2, checkGreeting)
++        return d
++
++    
++    def testSMTPEarlyCommandFails(self):
++        """
++        Test that when the SMTP server defers its greeting, a command
++        sent before the greeting fails and causes the connection to close.
++        """
++        s = smtp.SMTP()
++        s.deferGreeting = 0.1
++        t = StringTransport()
++        s.makeConnection(t)
++        s.dataReceived('HELO example.com\r\n')
++        self.assertTrue(t.disconnecting)
++        s.connectionLost(error.ConnectionDone())
++        self.assertEqual(t.value(),
++                         '503 Command sent before greeting - wait your turn\r\n')
++
++        d = task.deferLater(reactor, 0.2, lambda: None)
++        return d
++        
++    def testSMTPPipeliningFails(self):
++        """
++        Test that trying to send pipelined commands to the SMTP server
++        causes it to error and disconnect.
++        """
++        class SlowDelivery(NotImplementedDelivery):
++            def validateFrom(self, helo, origin):
++                # Make this take half a second so there's time to issue commands
++                return task.deferLater(reactor, 0.1, lambda: None)
++        
++        s = smtp.SMTP()
++        s.delivery = SlowDelivery()
++        t = StringTransport()
++        s.makeConnection(t)
++        s.dataReceived('HELO example.com\r\n')
++        t.clear()
++        s.dataReceived('MAIL FROM: nobody@example.com\r\n'
++                       'RCPT TO: somebody@example.com\r\n')
++        self.assertTrue(t.disconnecting)
++        s.connectionLost(error.ConnectionDone())
++        self.assertEqual(t.value(),
++                         '503 Pipelining not supported - wait your turn\r\n')
++
++        d = task.deferLater(reactor, 0.2, lambda: None)
++        return d
++
++        
+     def testESMTPGreetingHost(self):
+         """
+         Similar to testSMTPGreetingHost, but for the L{smtp.ESMTP} class.
+@@ -1112,7 +1175,93 @@
+         s.connectionLost(error.ConnectionDone())
+         self.assertIn("ESMTP", t.value())
+ 
++        
++    def testESMTPPipelining(self):
++        """
++        Test that PIPELINING works with ESMTP.
++        """
++        class SlowDelivery(NotImplementedDelivery):
++            def validateFrom(self, helo, origin):
++                # Make this take half a second so there's time to issue commands
++                return task.deferLater(reactor, 0.1, lambda: origin)
++            def validateTo(self, user):
++                return lambda: DummyMessage()
++            
++        s = smtp.ESMTP(pipelining=True)
++        s.host = 'localhost'
++        s.delivery = SlowDelivery()
++        t = StringTransport(
++            peerAddress=address.IPv4Address('TCP', '127.0.0.1', 12345))
++        s.makeConnection(t)
++        t.clear()
++        s.dataReceived('EHLO example.com\r\n')
++        responseLines = t.value().splitlines()
++        self.assertEqual(responseLines[0],
++                         '250-localhost Hello 127.0.0.1, nice to meet you')
++        self.assertEqual(responseLines[1],
++                         '250 PIPELINING')
++        self.assertEqual(len(responseLines), 2)
+ 
++        t.clear()
++        
++        s.dataReceived('MAIL FROM: nobody@example.com\r\n'
++                       'RCPT TO: somebody@example.com\r\n')
++
++        def checkResult():
++            s.connectionLost(error.ConnectionDone())
++            self.assertEqual(t.value(),
++                             '250 Sender address accepted\r\n'
++                             '250 Recipient address accepted\r\n')
++            
++        d = task.deferLater(reactor, 0.2, checkResult)
++        return d
++
++    def testESMTPBlindPipeliningFails(self):
++        """
++        Test that attempts to use pipelining before EHLO are rejected.
++        """
++        s = smtp.ESMTP(pipelining=True)
++        s.host = 'localhost'
++        t = StringTransport(
++            peerAddress=address.IPv4Address('TCP', '127.0.0.1', 12345))
++        s.makeConnection(t)
++        t.clear()
++        s.dataReceived('EHLO example.com\r\n'
++                       'MAIL FROM: nobody@example.com\r\n'
++                       'RCPT TO: somebody@example.com\r\n')
++        
++        self.assertTrue(t.disconnecting)
++        s.connectionLost(error.ConnectionDone())
++        self.assertEqual(t.value(),
++                         '250-localhost Hello 127.0.0.1, nice to meet you\r\n'
++                         '250 PIPELINING\r\n'
++                         '503 Illegal attempt to use pipelining before EHLO\r\n')
++
++    def testESMPTPipeliningWithHELOFails(self):
++        """
++        Test that attempting to use pipelining after HELO fails.
++        """
++        class SlowDelivery(NotImplementedDelivery):
++            def validateFrom(self, helo, origin):
++                # Make this take half a second so there's time to issue commands
++                return task.deferLater(reactor, 0.1, lambda: None)
++        
++        s = smtp.ESMTP(pipelining=True)
++        s.delivery = SlowDelivery()
++        t = StringTransport()
++        s.makeConnection(t)
++        s.dataReceived('HELO example.com\r\n')
++        t.clear()
++        s.dataReceived('MAIL FROM: nobody@example.com\r\n'
++                       'RCPT TO: somebody@example.com\r\n')
++        self.assertTrue(t.disconnecting)
++        s.connectionLost(error.ConnectionDone())
++        self.assertEqual(t.value(),
++                         '503 Pipelining not supported - wait your turn\r\n')
++
++        d = task.deferLater(reactor, 0.2, lambda: None)
++        return d        
++        
+     def test_acceptSenderAddress(self):
+         """
+         Test that a C{MAIL FROM} command with an acceptable address is
+Index: twisted/mail/topfiles/8126.bugfix
+===================================================================
+--- twisted/mail/topfiles/8126.bugfix	(revision 0)
++++ twisted/mail/topfiles/8126.bugfix	(working copy)
+@@ -0,0 +1,3 @@
++twisted.mail.smtp.SMTP no longer accepts commands while it is processing an existing command.  Since SMTP is stateful, the existing behaviour was buggy and might have led to security problems or at least unexpected behaviour.
++
++twisted.mail.smtp.SMTP also now rejects attempts to send commands before the SMTP greeting.
+Index: twisted/mail/topfiles/8126.feature
+===================================================================
+--- twisted/mail/topfiles/8126.feature	(revision 0)
++++ twisted/mail/topfiles/8126.feature	(working copy)
+@@ -0,0 +1 @@
++twisted.mail.smtp.ESMTP is now able to offer the PIPELINING extension.  This is related to the bugfix to twisted.mail.smtp.SMTP.
+\ No newline at end of file

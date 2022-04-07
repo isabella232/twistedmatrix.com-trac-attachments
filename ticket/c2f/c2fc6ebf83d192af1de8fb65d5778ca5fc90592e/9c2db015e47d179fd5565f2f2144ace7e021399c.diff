@@ -1,0 +1,115 @@
+Index: twisted/test/test_pbfailure.py
+===================================================================
+--- twisted/test/test_pbfailure.py	(revision 13614)
++++ twisted/test/test_pbfailure.py	(working copy)
+@@ -4,7 +4,7 @@
+ 
+ from twisted.trial import unittest
+ 
+-from twisted.spread import pb
++from twisted.spread import pb, flavors, jelly
+ from twisted.internet import reactor, defer
+ from twisted.python import log, failure
+ 
+@@ -16,6 +16,16 @@
+ class DieError(Exception): pass
+ class TimeoutError(Exception): pass
+ 
++
++#class JellyError(flavors.Jellyable, pb.Error): pass
++class JellyError(flavors.Jellyable, pb.Error, pb.RemoteCopy): pass
++class SecurityError(pb.Error, pb.RemoteCopy): pass
++
++pb.setUnjellyableForClass(JellyError, JellyError)
++pb.setUnjellyableForClass(SecurityError, SecurityError)
++pb.globalSecurity.allowInstancesOf(SecurityError)
++
++
+ ####
+ # server-side
+ ####
+@@ -29,7 +39,13 @@
+     def remote_die(self):
+         raise DieError("*gack*")
+ 
++    def remote_jelly(self):
++        raise JellyError("I'm jellyable!")
+ 
++    def remote_security(self):
++        raise SecurityError("I'm secure!")
++
++
+ class PBFailureTest(unittest.TestCase):
+ 
+     compare = unittest.TestCase.assertEquals
+@@ -68,7 +84,8 @@
+         return d
+ 
+     def addFailingCallbacks(self, remoteCall, expectedResult):
+-        for m in (self.failurePoop, self.failureFail, self.failureDie, self.failureNoSuch, lambda x: x):
++        for m in (self.failurePoop, self.failureFail, self.failureDie, self.failureNoSuch,
++                  self.failureJelly, self.failureSecurity, lambda x: x):
+             remoteCall.addCallbacks(self.success, m, callbackArgs=(expectedResult,))
+         return remoteCall
+ 
+@@ -82,7 +99,8 @@
+         return ignored
+ 
+     def connected(self, persp):
+-        methods = (('poop', 42), ('fail', 420), ('die', 4200), ('nosuch', 42000))
++        methods = (('poop', 42), ('fail', 420), ('die', 4200), ('nosuch', 42000),
++                   ('jelly', 43), ('security', 430))
+         return defer.gatherResults([
+             self.addFailingCallbacks(persp.callRemote(meth), result) for (meth, result) in methods])
+ 
+@@ -110,7 +128,19 @@
+         self.compare(fail.traceback, "Traceback unavailable\n")
+         return 42000
+ 
++    def failureJelly(self, fail):
++        fail.trap(JellyError)
++        self.failIf(isinstance(fail.type, str))
++        self.failUnless(isinstance(fail.value, fail.type))
++        return 43
+ 
++    def failureSecurity(self, fail):
++        fail.trap(SecurityError)
++        self.failIf(isinstance(fail.type, str))
++        self.failUnless(isinstance(fail.value, fail.type))
++        return 430
++
++
+ class PBFailureTestUnsafe(PBFailureTest):
+ 
+     compare = unittest.TestCase.failIfEquals
+Index: twisted/spread/pb.py
+===================================================================
+--- twisted/spread/pb.py	(revision 13614)
++++ twisted/spread/pb.py	(working copy)
+@@ -91,6 +91,7 @@
+ from flavors import ViewPoint
+ from flavors import Viewable
+ from flavors import Copyable
++from flavors import Jellyable
+ from flavors import Cacheable
+ from flavors import RemoteCopy
+ from flavors import RemoteCache
+@@ -886,7 +887,17 @@
+             netResult = object.remoteMessageReceived(self, message, netArgs, netKw)
+         except Error, e:
+             if answerRequired:
+-                self._sendError(CopyableFailure(e), requestID)
++                # If the error is Jellyable or explicitly allowed via the
++                # global security options, send it back and let the code on
++                # the other end deal with unjellying.
++                # If it isn't Jellyable, wrap it in a CopyableFailure, which
++                # ensures it can be unjellied on the other end.  We have to
++                # do this because all errors must be sent back.
++                eType = type(e).__name__.replace(' ', '_')
++                if isinstance(e, Jellyable) or globalSecurity.isTypeAllowed(eType):
++                    self._sendError(e, requestID)
++                else:
++                    self._sendError(CopyableFailure(e), requestID)
+         except:
+             if answerRequired:
+                 log.msg("Peer will receive following PB traceback:", isError=True)

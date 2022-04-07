@@ -1,0 +1,124 @@
+Index: twisted/internet/test/test_process.py
+===================================================================
+--- twisted/internet/test/test_process.py	(revision 30364)
++++ twisted/internet/test/test_process.py	(working copy)
+@@ -246,12 +246,27 @@
+         self.runReactor(reactor)
+         self.assertEqual(result, ["Foo\n"])
+ 
++    def test_unlistedOpenFileDescriptors(self):
++        from twisted.python.runtime import platformType
++        if platformType != "posix":
++            raise SkipTest("Test only applies to POSIX platforms")
++        from twisted.internet import process
++        
++        fd = max(process._listOpenFD()) + 1
++        try:
++            os.dup2(0, fd)
++        except OSError, e:
++            if e.errno == errno.EBADF:
++                # fd - 1 was the highest possible fd.
++                return
++            raise
++        lst = process._listOpenFD()
++        os.close(fd)
++        self.assertTrue(fd in lst)
+ 
+     def test_openFileDescriptors(self):
+         """
+-        A spawned process has only stdin, stdout and stderr open
+-        (file descriptor 3 is also reported as open, because of the call to
+-        'os.listdir()').
++        A spawned process has at least stdin, stdout and stderr open.
+         """
+         from twisted.python.runtime import platformType
+         if platformType != "posix":
+@@ -263,11 +278,13 @@
+             "import sys",
+             "sys.path.insert(0, '%s')" % (top.path,),
+             "from twisted.internet import process",
+-            "sys.stdout.write(str(process._listOpenFDs()))",
++            "sys.stdout.write(' '.join([ str(fd) for fd in process._listOpenFDs() ]))",
+             "sys.stdout.flush()")
+ 
+         def checkOutput(output):
+-            self.assertEquals('[0, 1, 2, 3]', output)
++            self.assertTrue(0 in output)
++            self.assertTrue(1 in output)
++            self.assertTrue(2 in output)
+ 
+         reactor = self.buildReactor()
+ 
+@@ -280,7 +297,7 @@
+ 
+             def processEnded(self, reason):
+                 try:
+-                    checkOutput("".join(self.output))
++                    checkOutput(map(int, "".join(self.output).split()))
+                 finally:
+                     reactor.stop()
+ 
+Index: twisted/internet/process.py
+===================================================================
+--- twisted/internet/process.py	(revision 30364)
++++ twisted/internet/process.py	(working copy)
+@@ -466,37 +466,39 @@
+         return "<%s pid=%s status=%s>" % (self.__class__.__name__,
+                                           self.pid, self.status)
+ 
++def _lofds_dev_fd():
++    return [int(fd) for fd in os.listdir('/dev/fd')]
++def _lofds_proc_fd():
++    return [int(fd) for fd in os.listdir('/proc/%d/fd' % (os.getpid(),))]
++def _lofds_rlimit():
++    import resource
++    return xrange(resource.getrlimit(resource.RLIMIT_NOFILE)[0])
++def _lofds_default():
++    return xrange(_lofds_default_maxfd)
+ 
++_lofds_default_maxfd = 256
++if sys.platform.startswith('openbsd'):
++    _lofds_methods = _lofds_rlimit,
++else:
++    _lofds_methods = _lofds_dev_fd, _lofds_proc_fd, _lofds_rlimit,    
+ 
+ def _listOpenFDs():
+     """
+     Return an iterable of potentially open file descriptors.
+ 
+-    This function returns an iterable over the contents of /dev/fd or
+-    /proc/<pid>/fd, if they're available on the platform. If they're not, the
+-    returned value is the range [0, maxfds], where 'maxfds' is at least 256.
++    This function tries the various methods specified in _lofds_methods in turn
++    and return the result given by the first that doesn't fail.
+     """
+-    dname = "/dev/fd"
+-    try:
+-        return [int(fd) for fd in os.listdir(dname)]
+-    except:
+-        dname = "/proc/%d/fd" % (os.getpid(),)
++    for method in _lofds_methods:
+         try:
+-            return [int(fd) for fd in os.listdir(dname)]
++            r = method()
++            _lofds_method = method
++            return r
+         except:
+-            try:
+-                import resource
+-                maxfds = resource.getrlimit(resource.RLIMIT_NOFILE)[1] + 1
+-                # OS-X reports 9223372036854775808. That's a lot of fds
+-                # to close
+-                if maxfds > 1024:
+-                    maxfds = 1024
+-            except:
+-                maxfds = 256
+-            return xrange(maxfds)
++            pass
++    return _lofds_default()
+ 
+ 
+-
+ class Process(_BaseProcess):
+     """
+     An operating-system Process.

@@ -1,0 +1,71 @@
+Don't start the win32 helper reactor until the main reactor is running.
+
+Otherwise the helper's thread could be left blocked if the main reactor is
+not started, preventing the process from exiting.
+
+Index: twisted/internet/test/test_win32events.py
+===================================================================
+--- twisted/internet/test/test_win32events.py	(patch fix-shutdown-races)
++++ twisted/internet/test/test_win32events.py	(patch delay-helper-start)
+@@ -268,5 +268,25 @@
+         self._testEventSignaledWhileStopping('after')
+ 
+ 
++    def test_eventsNotMonitoredBeforeReactorRunning(self):
++        """
++        An event added with L{IReactorWin32Events.addEvent} is not monitored
++        for signal state change until the reactor is started.
++        """
++        reactor = self.buildReactor()
++        event = win32event.CreateEvent(None, False, False, None)
++        finished = Deferred()
++        listener = Listener(finished)
++        win32event.SetEvent(event)
++        reactor.addEvent(event, listener, 'ocurred')
++        # Try to switch to the helper reactor thread, in case the helper
++        # reactor was started too early. This is not reliable, but such are
++        # threads. The worst thing that can happen is the test passing instead
++        # of failing.
++        time.sleep(0.1)
++        waitResult = win32event.WaitForSingleObject(event, 0)
++        self.assertEqual(waitResult, win32event.WAIT_OBJECT_0)
++
++
+ 
+ globals().update(Win32EventsTestsBuilder.makeTestCaseClasses())
+Index: twisted/internet/win32eventreactor.py
+===================================================================
+--- twisted/internet/win32eventreactor.py	(patch fix-shutdown-races)
++++ twisted/internet/win32eventreactor.py	(patch delay-helper-start)
+@@ -372,7 +372,7 @@
+ 
+     def _makeHelperReactor(self):
+         """
+-        Create and (in a new thread) start a L{Win32Reactor} instance to use for
++        Create and schedule the start of a L{Win32Reactor} instance to use for
+         the implementation of L{IReactorWin32Events}.
+         """
+         self._reactor = Win32Reactor()
+@@ -380,10 +380,20 @@
+         # is not "the" I/O thread.  Prevent it from registering it as such.
+         self._reactor._registerAsIOThread = False
+         self._events = {}
++        self.addSystemEventTrigger(
++            'before', 'shutdown', self._unmakeHelperReactor)
++        # Don't start the helper before the main reactor is running. If the
++        # main reactor doesn't get started, the helper will never be stopped
++        # otherwise.
++        self.callWhenRunning(self._startHelperReactor)
++
++
++    def _startHelperReactor(self):
++        """
++        Start the L{Win32Reactor} helper reactor in a new thread.
++        """
+         self._reactorThread = Thread(
+             target=self._reactor.run, args=(False,))
+-        self.addSystemEventTrigger(
+-            'before', 'shutdown', self._unmakeHelperReactor)
+         self._reactorThread.start()
+ 
+ 

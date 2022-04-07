@@ -1,0 +1,272 @@
+diff --git twisted/conch/ssh/_kex.py twisted/conch/ssh/_kex.py
+index 32de116..e473b88 100644
+--- twisted/conch/ssh/_kex.py
++++ twisted/conch/ssh/_kex.py
+@@ -23,7 +23,7 @@ class _IKexAlgorithm(Interface):
+         "key exchange. Algorithms with lower precedence values are more "
+         "preferred.")
+ 
+-    hashAlgorithm = Attribute(
++    hashProcessor = Attribute(
+         "A callable hash algorithm constructor (e.g. C{hashlib.sha256}) "
+         "suitable for use with this key exchange algorithm.")
+ 
+@@ -65,7 +65,7 @@ class _DHGroupExchangeSHA256(object):
+     """
+ 
+     preference = 1
+-    hashAlgorithm = sha256
++    hashProcessor = sha256
+ 
+ 
+ 
+@@ -77,7 +77,7 @@ class _DHGroupExchangeSHA1(object):
+     """
+ 
+     preference = 2
+-    hashAlgorithm = sha1
++    hashProcessor = sha1
+ 
+ 
+ 
+@@ -89,7 +89,7 @@ class _DHGroup1SHA1(object):
+     """
+ 
+     preference = 3
+-    hashAlgorithm = sha1
++    hashProcessor = sha1
+     # Diffie-Hellman primes from Oakley Group 2 (RFC 2409, 6.2).
+     prime = long('17976931348623159077083915679378745319786029604875601170644'
+         '44236841971802161585193689478337958649255415021805654859805036464405'
+@@ -108,7 +108,7 @@ class _DHGroup14SHA1(object):
+     """
+ 
+     preference = 4
+-    hashAlgorithm = sha1
++    hashProcessor = sha1
+     # Diffie-Hellman primes from Oakley Group 14 (RFC 3526, 3).
+     prime = long('32317006071311007300338913926423828248817941241140239112842'
+         '00975140074170663435422261968941736356934711790173790970419175460587'
+@@ -168,9 +168,9 @@ def isFixedGroup(kexAlgorithm):
+ 
+ 
+ 
+-def getHashAlgorithm(kexAlgorithm):
++def getHashProcessor(kexAlgorithm):
+     """
+-    Get the hash algorithm to use in key exchange.
++    Get the hash algorithm callable to use in key exchange.
+ 
+     @param kexAlgorithm: The key exchange algorithm name.
+     @type kexAlgorithm: C{str}
+@@ -179,7 +179,7 @@ def getHashAlgorithm(kexAlgorithm):
+     @rtype: C{callable}
+     """
+     kex = getKex(kexAlgorithm)
+-    return kex.hashAlgorithm
++    return kex.hashProcessor
+ 
+ 
+ 
+diff --git twisted/conch/ssh/factory.py twisted/conch/ssh/factory.py
+index fd43d4c..e1f2b86 100644
+--- twisted/conch/ssh/factory.py
++++ twisted/conch/ssh/factory.py
+@@ -12,6 +12,7 @@ from twisted.internet import protocol
+ from twisted.python import log
+ 
+ from twisted.conch import error
++from twisted.conch.ssh import _kex
+ import transport, userauth, connection
+ 
+ import random
+@@ -54,12 +55,11 @@ class SSHFactory(protocol.Factory):
+         t = protocol.Factory.buildProtocol(self, addr)
+         t.supportedPublicKeys = self.privateKeys.keys()
+         if not self.primes:
+-            log.msg('disabling diffie-hellman-group-exchange because we '
+-                    'cannot find moduli file')
+-            ske = t.supportedKeyExchanges[:]
+-            ske.remove('diffie-hellman-group-exchange-sha1')
+-            ske.remove('diffie-hellman-group-exchange-sha256')
+-            t.supportedKeyExchanges = ske
++            log.msg('disabling non-fixed-group key exchange algorithms '
++                    'because we cannot find moduli file')
++            t.supportedKeyExchanges = [
++                kexAlgorithm for kexAlgorithm in t.supportedKeyExchanges
++                if _kex.isFixedGroup(kexAlgorithm)]
+         return t
+ 
+ 
+diff --git twisted/conch/ssh/transport.py twisted/conch/ssh/transport.py
+index 54fbb3c..653a9ee 100644
+--- twisted/conch/ssh/transport.py
++++ twisted/conch/ssh/transport.py
+@@ -738,10 +738,10 @@ class SSHTransportBase(protocol.Protocol):
+         @type sharedSecret: C{str}
+         @type exchangeHash: C{str}
+         """
+-        hashAlgorithm = _kex.getHashAlgorithm(self.kexAlg)
+-        k1 = hashAlgorithm(sharedSecret + exchangeHash + c + self.sessionID)
++        hashProcessor = _kex.getHashProcessor(self.kexAlg)
++        k1 = hashProcessor(sharedSecret + exchangeHash + c + self.sessionID)
+         k1 = k1.digest()
+-        k2 = hashAlgorithm(sharedSecret + exchangeHash + k1).digest()
++        k2 = hashProcessor(sharedSecret + exchangeHash + k1).digest()
+         return k1 + k2
+ 
+ 
+@@ -1032,7 +1032,7 @@ class SSHServerTransport(SSHTransportBase):
+ 
+         serverDHpublicKey = _MPpow(self.g, y, self.p)
+         sharedSecret = _MPpow(clientDHpublicKey, y, self.p)
+-        h = _kex.getHashAlgorithm(self.kexAlg)()
++        h = _kex.getHashProcessor(self.kexAlg)()
+         h.update(NS(self.otherVersionString))
+         h.update(NS(self.ourVersionString))
+         h.update(NS(self.otherKexInitPayload))
+@@ -1258,7 +1258,7 @@ class SSHClientTransport(SSHTransportBase):
+         """
+         serverKey = keys.Key.fromString(pubKey)
+         sharedSecret = _MPpow(f, self.x, self.p)
+-        h = _kex.getHashAlgorithm(self.kexAlg)()
++        h = _kex.getHashProcessor(self.kexAlg)()
+         h.update(NS(self.ourVersionString))
+         h.update(NS(self.otherVersionString))
+         h.update(NS(self.ourKexInitPayload))
+diff --git twisted/conch/test/test_transport.py twisted/conch/test/test_transport.py
+index 42a373c..eaf5e9f 100644
+--- twisted/conch/test/test_transport.py
++++ twisted/conch/test/test_transport.py
+@@ -273,13 +273,12 @@ class MockFactory(factory.SSHFactory):
+ 
+     def getPrimes(self):
+         """
+-        Diffie-Hellman primes that can be used for the
+-        diffie-hellman-group-exchange-sha1 or
+-        diffie-hellman-group-exchange-sha256 key exchange.
++        Diffie-Hellman primes that can be used for key exchange algorithms
++        that use group exchange to establish a prime / generator group.
+ 
+         @return: The primes and generators.
+         @rtype: C{dict} mapping the key size to a C{list} of
+-            C{(generator, prime)} tupple.
++            C{(generator, prime)} tuple.
+         """
+         # In these tests, we hardwire the prime values to those defined by the
+         # diffie-hellman-group1-sha1 key exchange algorithm, to avoid requiring
+@@ -398,7 +397,7 @@ class DHGroupExchangeSHA1Mixin:
+     """
+ 
+     kexAlgorithm = 'diffie-hellman-group-exchange-sha1'
+-    hashAlgorithm = sha1
++    hashProcessor = sha1
+ 
+ 
+ 
+@@ -408,7 +407,7 @@ class DHGroupExchangeSHA256Mixin:
+     """
+ 
+     kexAlgorithm = 'diffie-hellman-group-exchange-sha256'
+-    hashAlgorithm = sha256
++    hashProcessor = sha256
+ 
+ 
+ 
+@@ -423,7 +422,7 @@ class BaseSSHTransportBaseCase:
+ 
+ class BaseSSHTransportTests(BaseSSHTransportBaseCase, TransportTestCase):
+     """
+-    Test TransportBase.  It implements the non-server/client specific
++    Test TransportBase. It implements the non-server/client specific
+     parts of the SSH transport protocol.
+     """
+ 
+@@ -1114,9 +1113,9 @@ class BaseSSHTransportDHGroupExchangeBaseCase(BaseSSHTransportBaseCase):
+         self.proto.kexAlg = self.kexAlgorithm
+         self.proto.sessionID = 'EF'
+ 
+-        k1 = self.hashAlgorithm(
++        k1 = self.hashProcessor(
+             'AB' + 'CD' + 'K' + self.proto.sessionID).digest()
+-        k2 = self.hashAlgorithm('ABCD' + k1).digest()
++        k2 = self.hashProcessor('ABCD' + k1).digest()
+         self.assertEqual(self.proto._getKey('K', 'AB', 'CD'), k1 + k2)
+ 
+ 
+@@ -1263,10 +1262,10 @@ class ServerSSHTransportTests(ServerSSHTransportBaseCase, TransportTestCase):
+     Tests for SSHServerTransport.
+     """
+ 
+-    def test_KEXINIT(self):
++    def test_KEXINITAllAlgorithms(self):
+         """
+-        Test that receiving a KEXINIT packet sets up the correct values on the
+-        server.
++        Test that receiving a KEXINIT packet listing all Twisted's supported
++        algorithms sets up the correct values on the server.
+         """
+         self.proto.dataReceived( 'SSH-2.0-Twisted\r\n\x00\x00\x01\xf4\x04\x14'
+                 '\x99\x99\x99\x99\x99\x99\x99\x99\x99\x99\x99\x99\x99\x99\x99'
+@@ -1447,7 +1446,7 @@ class ServerSSHTransportTests(ServerSSHTransportBaseCase, TransportTestCase):
+         Test that NEWKEYS transitions the keys in nextEncryptions to
+         currentEncryptions.
+         """
+-        self.test_KEXINIT()
++        self.test_KEXINITAllAlgorithms()
+ 
+         self.proto.nextEncryptions = transport.SSHCiphers('none', 'none',
+                                                           'none', 'none')
+@@ -1560,7 +1559,7 @@ class ServerSSHTransportDHGroupExchangeBaseCase(ServerSSHTransportBaseCase):
+         y = common.getMP('\x00\x00\x00\x80' + '\x99' * 128)[0]
+         f = common._MPpow(self.proto.g, y, self.proto.p)
+         sharedSecret = common._MPpow(e, y, self.proto.p)
+-        h = self.hashAlgorithm()
++        h = self.hashProcessor()
+         h.update(common.NS(self.proto.ourVersionString) * 2)
+         h.update(common.NS(self.proto.ourKexInitPayload) * 2)
+         h.update(common.NS(self.proto.factory.publicKeys['ssh-rsa'].blob()))
+@@ -1592,7 +1591,7 @@ class ServerSSHTransportDHGroupExchangeBaseCase(ServerSSHTransportBaseCase):
+         y = common.getMP('\x00\x00\x00\x80' + '\x99' * 128)[0]
+         f = common._MPpow(self.proto.g, y, self.proto.p)
+         sharedSecret = common._MPpow(e, y, self.proto.p)
+-        h = self.hashAlgorithm()
++        h = self.hashProcessor()
+         h.update(common.NS(self.proto.ourVersionString) * 2)
+         h.update(common.NS(self.proto.ourKexInitPayload) * 2)
+         h.update(common.NS(self.proto.factory.publicKeys['ssh-rsa'].blob()))
+@@ -1664,11 +1663,12 @@ class ClientSSHTransportTests(ClientSSHTransportBaseCase, TransportTestCase):
+     Tests for SSHClientTransport.
+     """
+ 
+-    def test_KEXINIT(self):
++    def test_KEXINITAllAlgorithms(self):
+         """
+-        Test that receiving a KEXINIT packet sets up the correct values on the
+-        client.  The way algorithms are picks is that the first item in the
+-        client's list that is also in the server's list is chosen.
++        Test that receiving a KEXINIT packet listing all Twisted's supported
++        algorithms sets up the correct values on the client.  The way
++        algorithms are picked is that the first item in the client's list
++        that is also in the server's list is chosen.
+         """
+         self.proto.dataReceived( 'SSH-2.0-Twisted\r\n\x00\x00\x01\xf4\x04\x14'
+                 '\x99\x99\x99\x99\x99\x99\x99\x99\x99\x99\x99\x99\x99\x99\x99'
+@@ -1814,7 +1814,7 @@ class ClientSSHTransportTests(ClientSSHTransportBaseCase, TransportTestCase):
+         Test that NEWKEYS transitions the keys from nextEncryptions to
+         currentEncryptions.
+         """
+-        self.test_KEXINIT()
++        self.test_KEXINITAllAlgorithms()
+         secure = [False]
+         def stubConnectionSecure():
+             secure[0] = True
+@@ -1941,7 +1941,7 @@ class ClientSSHTransportDHGroupExchangeBaseCase(ClientSSHTransportBaseCase):
+         """
+         self.test_KEX_DH_GEX_GROUP()
+         sharedSecret = common._MPpow(3, self.proto.x, self.proto.p)
+-        h = self.hashAlgorithm()
++        h = self.hashProcessor()
+         h.update(common.NS(self.proto.ourVersionString) * 2)
+         h.update(common.NS(self.proto.ourKexInitPayload) * 2)
+         h.update(common.NS(self.blob))

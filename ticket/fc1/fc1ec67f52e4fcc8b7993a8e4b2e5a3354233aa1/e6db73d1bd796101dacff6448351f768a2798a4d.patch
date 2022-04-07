@@ -1,0 +1,178 @@
+Index: /home/wolf/twisted-trunk/twisted/words/protocols/irc.py
+===================================================================
+--- /home/wolf/twisted-trunk/twisted/words/protocols/irc.py	(revision 23912)
++++ /home/wolf/twisted-trunk/twisted/words/protocols/irc.py	(working copy)
+@@ -66,6 +66,14 @@
+ class IRCPasswordMismatch(Exception):
+     pass
+ 
++class InvalidPrefix(ValueError):
++    """
++    Raised when the PREFIX value of the ISUPPORT message is not in the form
++    '(xxx)yyy' where 'xxx' are the modes (e.g. 'ohv') and 'yyy' the prefixes
++    (e.g. '@%+').
++    """
++    pass
++
+ def parsemsg(s):
+     """Breaks a message from an IRC server into its prefix, command, and arguments.
+     """
+@@ -1181,7 +1189,9 @@
+ 
+     def irc_RPL_BOUNCE(self, prefix, params):
+         # 005 is doubly assigned.  Piece of crap dirty trash protocol.
+-        if params[-1] == "are available on this server":
++        if (params[-1] == 'are available on this server' or
++            params[-1] ==  'are supported by this server'):
++            self.irc_RPL_ISUPPORT(params[1:-1])
+             self.isupport(params[1:-1])
+         else:
+             self.bounce(params[1])
+@@ -1207,6 +1217,111 @@
+     def irc_unknown(self, prefix, command, params):
+         pass
+ 
++
++    def irc_RPL_ISUPPORT(self, args):
++        """
++        Parse the ISUPPORT message and save the data in the L{ISUPPORT} dict.
++
++        All the args with values will be saved as keys and values in the dict,
++        the ones without values will be added to a L{set} under the 'FLAGS' key.
++
++        Some arguments (PREFIX, CHANMODES, CHANLIMIT, MAXLIST, LANGUAGE and
++        possibly others) will require additional parsing, provided by the
++        _parseISupport* methods.
++        """
++        for arg in args:
++            if '=' not in arg:
++                # the arg doesn't accept a value, it is added to the flags
++                self.ISUPPORT['flags'].add(arg)
++            else:
++                key, value = self._parseISupportArg(arg)
++                self.ISUPPORT[key] = value
++                # check if a parser for this arg exists and send it the value
++                # the parser could replace or add new values to self.ISUPPORT
++                parser = '_parseISupport' + key.capitalize()
++                if hasattr(self, parser):
++                    getattr(self, parser)(value)
++
++
++    def _parseISupportArg(self, param):
++        """
++        Split a param=value couple of the ISUPPORT message.
++        """
++        try:
++            key, value = param.split('=', 1)
++        except ValueError:
++            # if it's an empty value return the key and an empty string
++            return param.rstrip('='), ''
++        if value.isdigit():
++            value = int(value)
++        return key, value
++
++
++    def _parseISupportPrefix(self, prefix):
++        """
++        Parse the PREFIX value of the ISUPPORT message and add the USERPREFIX
++        and USERMODES items to the L{ISUPPORT} dict.
++
++        The prefix has to be in the form '(xxx)yyy' where 'xxx' are the modes
++        (e.g. 'ohv') and 'yyy' the prefixes (e.g. '@%+').
++
++        USERMODES is a dict with the modes as keys and the prefixes as values.
++        USERPREFIX is a dict with the prefixes as keys and the modes as values.
++
++        Note: the modes will be also added to the CHANMODES values.
++        """
++        res = re.match('^\(([^)]*)\)(\S*)$', prefix)
++        if not res:
++            raise InvalidPrefix(
++                "'%s' has to be in the form '(xxx)yyy' where 'xxx' are the "
++                "modes (e.g. 'ohv') and 'yyy' the prefixes (e.g. '@%%+')." %
++                prefix)
++        modes, prefixes = res.groups()
++        if len(modes) != len(prefixes):
++            modlen, preflen = len(modes), len(prefixes)
++            raise InvalidPrefix(
++                "the number of modes (%d, '%s') is not equal to the number of "
++                "prefixes (%d, '%s')." % (modlen, modes, preflen, prefixes))
++        if not prefixes and not modes:
++            # the prefix string is well-formed but it is empty, the message is
++            # ignored and the default prefixes/modes are used
++            return
++        self.ISUPPORT['USERMODES'] = dict(zip(modes, prefixes))
++        self.ISUPPORT['USERPREFIX'] = dict(zip(prefixes, modes))
++        self.ISUPPORT['CHANMODES'].update([(m, (True, True)) for m in modes])
++
++
++    def _parseISupportChanmodes(self, chanmodes):
++        """
++        Parse the CHANMODES value of the ISUPPORT message and replace the
++        CHANMODES value in the L{ISUPPORT} dict.
++
++        The chanmodes are divided in a comma-separated list of modes formed by
++        four groups: A,B,C,D. The modes in the groups A and B always have a
++        parameter, the ones in C only when the mode is set and the ones in D
++        don't have any parameter.
++
++        The new CHANMODES value will be a dict with the modes as keys and tuples
++        formed by two bools as values. E.g. C{'l': (True, False)} means that the
++        mode 'l' accepts a parameter when added and no parameters when removed.
++
++        Note: the modes specified in the PREFIX value are included here by the
++        L{_parseISupportPrefix} method and they always accept a parameter.
++        """
++        groups = chanmodes.split(',', 3)
++        if len(modes) != 4:
++            raise InvalidChanmodes(
++                "'%s' should be a list of 4 comma-separated groups of modes,")
++        modesdict = self.ISUPPORT['CHANMODES']
++        for group, modes in zip('ABCD', groups):
++            if group in ('A', 'B'):
++                modesdict.update([(m, (True, True)) for m in modes])
++            if group == 'C':
++                modesdict.update([(m, (True, False)) for m in modes])
++            if group == 'D':
++                modesdict.update([(m, (False, False)) for m in modes])
++
++
+     ### Receiving a CTCP query from another party
+     ### It is safe to leave these alone.
+ 
+@@ -1526,7 +1641,35 @@
+         self._queue = []
+         if self.performLogin:
+             self.register(self.nickname)
++        # some default data used if the ISUPPORT message is not received
++        # if the message is received this data will be replaced with the ones
++        # sent by the server
++        self.ISUPPORT = {
++            # all the params without values will be saved in 'flags'
++            'flags': set(),
++            'PREFIX': '(ohv)@%+',
++            'USERPREFIX': {'@': 'o', '%': 'h', '+': 'v'},
++            'USERMODES': {'o': '@', 'h': '%', 'v': '+'},
++            'CHANTYPES': '#&',
++            # from http://www.faqs.org/rfcs/rfc1459.html
++            # see also the _parseISupportChanmodes method
++            'CHANMODES': {
++                'o': (True, True),    # op/deop a user
++                'h': (True, True),    # hop/dehop (halfop) a user (not in RFC)
++                'v': (True, True),    # voice/devoice a user
++                'b': (True, True),    # ban/unban a user/mask
++                'l': (True, False),   # set the user limit to channel
++                'k': (True, False),   # set a channel key (password)
++                't': (False, False),  # only ops set topic
++                's': (False, False),  # secret channel
++                'p': (False, False),  # private channel
++                'i': (False, False),  # invite-only channel
++                'm': (False, False),  # moderated channel
++                'n': (False, False)   # no external messages
++            }
++        }
+ 
++
+     def dataReceived(self, data):
+         basic.LineReceiver.dataReceived(self, data.replace('\r', ''))
+ 

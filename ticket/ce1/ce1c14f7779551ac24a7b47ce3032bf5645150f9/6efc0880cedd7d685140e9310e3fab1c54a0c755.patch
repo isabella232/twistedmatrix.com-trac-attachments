@@ -1,0 +1,431 @@
+Index: twisted/internet/interfaces.py
+===================================================================
+--- twisted/internet/interfaces.py	(revision 29170)
++++ twisted/internet/interfaces.py	(working copy)
+@@ -1501,12 +1501,15 @@
+         Close stderr.
+         """
+ 
+-    def closeChildFD(descriptor):
++    def closeChildFD(childFD):
+         """
+         Close a file descriptor which is connected to the child process, identified
+         by its FD in the child process.
+-        """
+ 
++        @type childFD: C{int}
++        @param childFD: The file descriptor to close.
++       """
++
+     def writeToChild(childFD, data):
+         """
+         Similar to L{ITransport.write} but also allows the file descriptor in
+@@ -1533,12 +1536,11 @@
+         Send a signal to the process.
+ 
+         @param signalID: can be
+-          - one of C{\"HUP\"}, C{\"KILL\"}, C{\"STOP\"}, or C{\"INT\"}.
+-              These will be implemented in a
+-              cross-platform manner, and so should be used
+-              if possible.
+-          - an integer, where it represents a POSIX
+-              signal ID.
++          - one of C{\"HUP\"}, C{\"KILL\"}, C{\"TERM\"}, C{\"STOP\"},
++            or C{\"INT\"}.  These will be implemented in a cross-platform
++            manner, and so should be used if possible.
++          - an integer, where it represents a POSIX signal ID.
++        @type signalID: C{int} or C{str} 
+ 
+         @raise twisted.internet.error.ProcessExitedAlready: The process has
+         already exited.
+Index: twisted/internet/_dumbwin32proc.py
+===================================================================
+--- twisted/internet/_dumbwin32proc.py	(revision 29170)
++++ twisted/internet/_dumbwin32proc.py	(working copy)
+@@ -24,7 +24,7 @@
+ PIPE_ATTRS_INHERITABLE.bInheritHandle = 1
+ 
+ from zope.interface import implements
+-from twisted.internet.interfaces import IProcessTransport, IConsumer, IProducer
++from twisted.internet import interfaces
+ 
+ from twisted.python.win32 import quoteArguments
+ 
+@@ -113,7 +113,8 @@
+         msvcrt.setmode(sys.stderr.fileno(), os.O_BINARY)
+ 
+     """
+-    implements(IProcessTransport, IConsumer, IProducer)
++    implements(interfaces.IProcessTransport, interfaces.IConsumer,
++               interfaces.IPushProducer)
+ 
+     closedNotifies = 0
+ 
+@@ -233,20 +234,11 @@
+ 
+         self._addPollableResource(_Reaper(self))
+ 
+-
+-    def signalProcess(self, signalID):
+-        if self.pid is None:
+-            raise error.ProcessExitedAlready()
+-        if signalID in ("INT", "TERM", "KILL"):
+-            win32process.TerminateProcess(self.hProcess, 1)
+-
+-
+     def _getReason(self, status):
+         if status == 0:
+             return error.ProcessDone(status)
+         return error.ProcessTerminated(status)
+ 
+-
+     def write(self, data):
+         """Write data to the process' stdin."""
+         self.stdin.write(data)
+@@ -255,49 +247,18 @@
+         """Write data to the process' stdin."""
+         self.stdin.writeSequence(seq)
+ 
+-    def closeChildFD(self, fd):
+-        if fd == 0:
+-            self.closeStdin()
+-        elif fd == 1:
+-            self.closeStdout()
+-        elif fd == 2:
+-            self.closeStderr()
+-        else:
+-            raise NotImplementedError("Only standard-IO file descriptors available on win32")
+-
+-    def closeStdin(self):
+-        """Close the process' stdin.
+-        """
+-        self.stdin.close()
+-
+-    def closeStderr(self):
+-        self.stderr.close()
+-
+-    def closeStdout(self):
+-        self.stdout.close()
+-
+-    def loseConnection(self):
+-        """Close the process' stdout, in and err."""
+-        self.closeStdin()
+-        self.closeStdout()
+-        self.closeStderr()
+-
+-
+     def outConnectionLost(self):
+         self.proto.childConnectionLost(1)
+         self.connectionLostNotify()
+ 
+-
+     def errConnectionLost(self):
+         self.proto.childConnectionLost(2)
+         self.connectionLostNotify()
+ 
+-
+     def inConnectionLost(self):
+         self.proto.childConnectionLost(0)
+         self.connectionLostNotify()
+ 
+-
+     def connectionLostNotify(self):
+         """
+         Will be called 3 times, by stdout/err threads and process handle.
+@@ -305,7 +266,6 @@
+         self.closedNotifies += 1
+         self.maybeCallProcessEnded()
+ 
+-
+     def maybeCallProcessEnded(self):
+         if self.closedNotifies == 3 and self.lostProcess:
+             win32file.CloseHandle(self.hProcess)
+@@ -314,7 +274,43 @@
+             self.hThread = None
+             BaseProcess.maybeCallProcessEnded(self)
+ 
++    # IProcessTransport
++    def closeStdin(self):
++        """Close the process' stdin.
++        """
++        self.stdin.close()
+ 
++    def closeStderr(self):
++        self.stderr.close()
++
++    def closeStdout(self):
++        self.stdout.close()
++
++    def closeChildFD(self, fd):
++        if fd == 0:
++            self.closeStdin()
++        elif fd == 1:
++            self.closeStdout()
++        elif fd == 2:
++            self.closeStderr()
++        else:
++            raise NotImplementedError("Only standard-IO file descriptors available on win32")
++
++    def writeToChild(self, childFD, data):
++        raise NotImplementedError("Only standard-IO file descriptors available on win32")
++
++    def loseConnection(self):
++        """Close the process' stdout, in and err."""
++        self.closeStdin()
++        self.closeStdout()
++        self.closeStderr()
++
++    def signalProcess(self, signalID):
++        if self.pid is None:
++            raise error.ProcessExitedAlready()
++        if signalID in ("INT", "TERM", "KILL"):
++            win32process.TerminateProcess(self.hProcess, 1)
++
+     # IConsumer
+     def registerProducer(self, producer, streaming):
+         self.stdin.registerProducer(producer, streaming)
+@@ -322,7 +318,7 @@
+     def unregisterProducer(self):
+         self.stdin.unregisterProducer()
+ 
+-    # IProducer
++    # IPushProducer
+     def pauseProducing(self):
+         self._pause()
+ 
+Index: twisted/internet/process.py
+===================================================================
+--- twisted/internet/process.py	(revision 29170)
++++ twisted/internet/process.py	(working copy)
+@@ -23,6 +23,9 @@
+ except ImportError:
+     fcntl = None
+ 
++from zope.interface import implements
++from twisted.internet import interfaces
++
+ from twisted.python import log, failure
+ from twisted.python.util import switchUID
+ from twisted.internet import fdesc, abstract, error
+@@ -321,6 +324,7 @@
+         return error.ProcessDone(status)
+ 
+ 
++    # IProcessTransport
+     def signalProcess(self, signalID):
+         """
+         Send the given signal C{signalID} to the process. It'll translate a
+@@ -477,6 +481,8 @@
+     on sockets...)
+     """
+ 
++    implements(interfaces.IProcessTransport, interfaces.IConsumer)
++
+     debug = False
+     debug_child = False
+ 
+@@ -693,18 +699,42 @@
+ 
+         self._resetSignalDisposition()
+ 
++    def writeSequence(self, seq):
++        """
++        Call this to write to standard input on this process.
+ 
+-    def writeToChild(self, childFD, data):
+-        self.pipes[childFD].write(data)
++        NOTE: This will silently lose data if there is no standard input.
++        """
++        if 0 in self.pipes:
++            self.pipes[0].writeSequence(seq)
+ 
+-    def closeChildFD(self, childFD):
+-        # for writer pipes, loseConnection tries to write the remaining data
+-        # out to the pipe before closing it
+-        # if childFD is not in the list of pipes, assume that it is already
+-        # closed
+-        if childFD in self.pipes:
+-            self.pipes[childFD].loseConnection()
++    def childDataReceived(self, name, data):
++        self.proto.childDataReceived(name, data)
+ 
++    def childConnectionLost(self, childFD, reason):
++        # this is called when one of the helpers (ProcessReader or
++        # ProcessWriter) notices their pipe has been closed
++        os.close(self.pipes[childFD].fileno())
++        del self.pipes[childFD]
++        try:
++            self.proto.childConnectionLost(childFD)
++        except:
++            log.err()
++        self.maybeCallProcessEnded()
++
++    def maybeCallProcessEnded(self):
++        # we don't call ProcessProtocol.processEnded until:
++        #  the child has terminated, AND
++        #  all writers have indicated an error status, AND
++        #  all readers have indicated EOF
++        # This ensures that we've gathered all output from the process.
++        if self.pipes:
++            return
++        if not self.lostProcess:
++            self.reapProcess()
++            return
++        _BaseProcess.maybeCallProcessEnded(self)
++
+     def pauseProducing(self):
+         for p in self.pipes.itervalues():
+             if isinstance(p, ProcessReader):
+@@ -715,7 +745,18 @@
+             if isinstance(p, ProcessReader):
+                 p.startReading()
+ 
+-    # compatibility
++    # IProcessTransport
++    def writeToChild(self, childFD, data):
++        self.pipes[childFD].write(data)
++
++    def closeChildFD(self, childFD):
++        # for writer pipes, loseConnection tries to write the remaining data
++        # out to the pipe before closing it
++        # if childFD is not in the list of pipes, assume that it is already
++        # closed
++        if childFD in self.pipes:
++            self.pipes[childFD].loseConnection()
++
+     def closeStdin(self):
+         """
+         Call this to close standard input on this process.
+@@ -733,15 +774,7 @@
+         self.closeStderr()
+         self.closeStdout()
+ 
+-    def write(self, data):
+-        """
+-        Call this to write to standard input on this process.
+-
+-        NOTE: This will silently lose data if there is no standard input.
+-        """
+-        if 0 in self.pipes:
+-            self.pipes[0].write(data)
+-
++    # IConsumer
+     def registerProducer(self, producer, streaming):
+         """
+         Call this to register producer for standard input.
+@@ -760,49 +793,23 @@
+         if 0 in self.pipes:
+             self.pipes[0].unregisterProducer()
+ 
+-    def writeSequence(self, seq):
++    def write(self, data):
+         """
+         Call this to write to standard input on this process.
+ 
+         NOTE: This will silently lose data if there is no standard input.
+         """
+         if 0 in self.pipes:
+-            self.pipes[0].writeSequence(seq)
++            self.pipes[0].write(data)
+ 
+ 
+-    def childDataReceived(self, name, data):
+-        self.proto.childDataReceived(name, data)
+-
+-
+-    def childConnectionLost(self, childFD, reason):
+-        # this is called when one of the helpers (ProcessReader or
+-        # ProcessWriter) notices their pipe has been closed
+-        os.close(self.pipes[childFD].fileno())
+-        del self.pipes[childFD]
+-        try:
+-            self.proto.childConnectionLost(childFD)
+-        except:
+-            log.err()
+-        self.maybeCallProcessEnded()
+-
+-    def maybeCallProcessEnded(self):
+-        # we don't call ProcessProtocol.processEnded until:
+-        #  the child has terminated, AND
+-        #  all writers have indicated an error status, AND
+-        #  all readers have indicated EOF
+-        # This insures that we've gathered all output from the process.
+-        if self.pipes:
+-            return
+-        if not self.lostProcess:
+-            self.reapProcess()
+-            return
+-        _BaseProcess.maybeCallProcessEnded(self)
+-
+-
+ class PTYProcess(abstract.FileDescriptor, _BaseProcess):
+     """
+     An operating-system Process that uses PTY support.
+     """
++
++    implements(interfaces.IFileDescriptor, interfaces.IReadDescriptor)
++
+     status = -1
+     pid = None
+ 
+@@ -905,6 +912,23 @@
+     def closeStderr(self):
+         pass
+ 
++    def maybeCallProcessEnded(self):
++        # two things must happen before we call the ProcessProtocol's
++        # processEnded method. 1: the child process must die and be reaped
++        # (which calls our own processEnded method). 2: the child must close
++        # their stdin/stdout/stderr fds, causing the pty to close, causing
++        # our connectionLost method to be called. #2 can also be triggered
++        # by calling .loseConnection().
++        if self.lostProcess == 2:
++            _BaseProcess.maybeCallProcessEnded(self)
++
++    def writeSomeData(self, data):
++        """
++        Write some data to the open process.
++        """
++        return fdesc.writeToFD(self.fd, data)
++
++    # IReadDescriptor
+     def doRead(self):
+         """
+         Called when my standard output stream is ready for reading.
+@@ -913,22 +937,17 @@
+             self.fd,
+             lambda data: self.proto.childDataReceived(1, data))
+ 
++    # IFileDescriptor
++    def logPrefix(self):
++        # self.pid should have been defined by _fork in __init__
++        return "PTY pid=%d" % (self.pid,)
++
+     def fileno(self):
+         """
+         This returns the file number of standard output on this process.
+         """
+         return self.fd
+ 
+-    def maybeCallProcessEnded(self):
+-        # two things must happen before we call the ProcessProtocol's
+-        # processEnded method. 1: the child process must die and be reaped
+-        # (which calls our own processEnded method). 2: the child must close
+-        # their stdin/stdout/stderr fds, causing the pty to close, causing
+-        # our connectionLost method to be called. #2 can also be triggered
+-        # by calling .loseConnection().
+-        if self.lostProcess == 2:
+-            _BaseProcess.maybeCallProcessEnded(self)
+-
+     def connectionLost(self, reason):
+         """
+         I call this to clean up when one or all of my connections has died.
+@@ -938,8 +957,3 @@
+         self.lostProcess += 1
+         self.maybeCallProcessEnded()
+ 
+-    def writeSomeData(self, data):
+-        """
+-        Write some data to the open process.
+-        """
+-        return fdesc.writeToFD(self.fd, data)

@@ -1,0 +1,93 @@
+Index: proxy.py
+=================================
+--- proxy.py	(from TwistedWeb-0.5.0)
++++ proxy.py
+@@ -19,13 +19,16 @@
+ """
+ 
+ # twisted imports
+-from twisted.protocols import http
+ from twisted.internet import reactor, protocol
+-from twisted.web import resource, server
++from twisted.web import http, resource, server
+ 
+ # system imports
+ import urlparse
+ 
++# string for identifying this proxy in 'Via' headers
++import socket
++from twisted.web.server import version as server_version
++proxy_via_identifier = '1.0 %s %s' % (socket.getfqdn(), server_version)
+ 
+ class ProxyClient(http.HTTPClient):
+     """Used by ProxyClientFactory to implement a simple web proxy."""
+@@ -39,6 +42,7 @@
+         headers["connection"] = "close"
+         self.headers = headers
+         self.data = data
++        self.got_via = False
+ 
+     def connectionMade(self):
+         self.sendCommand(self.command, self.rest)
+@@ -51,9 +55,14 @@
+         self.father.transport.write("%s %s %s\r\n" % (version, code, message))
+ 
+     def handleHeader(self, key, value):
++        if key.lower() == 'via':
++            self.got_via = True
++            value += ', %s' % proxy_via_identifier
+         self.father.transport.write("%s: %s\r\n" % (key, value))
+ 
+     def handleEndHeaders(self):
++        if not self.got_via:
++            self.father.transport.write("Via: %s\r\n" % proxy_via_identifier)
+         self.father.transport.write("\r\n")
+     
+     def handleResponsePart(self, buffer):
+@@ -86,6 +95,7 @@
+         self.father.transport.write("Content-Type: text/html\r\n")
+         self.father.transport.write("\r\n")
+         self.father.transport.write('''<H1>Could not connect</H1>''')
++        self.father.transport.loseConnection()
+ 
+ 
+ 
+@@ -95,6 +105,14 @@
+     protocols = {'http': ProxyClientFactory}
+     ports = {'http': 80}
+ 
++    def isLoop(self, headers):
++        global proxy_via_identifier
++        for via in headers.get('via').split(','):
++            if via.strip() == proxy_via_identifier:
++                # That's us! We have a loop.
++                return True
++        return False
++
+     def process(self):
+         parsed = urlparse.urlparse(self.uri)
+         protocol = parsed[0]
+@@ -108,8 +126,22 @@
+             rest = rest+'/'
+         class_ = self.protocols[protocol]
+         headers = self.getAllHeaders().copy()
++        if headers.has_key('via'):
++            if self.isLoop(headers):
++                self.transport.write('HTTP/1.0 %d Proxy loop\r\n' % http.BAD_GATEWAY)  # is this the right status code?
++                self.transport.write('Content-Type: text/html\r\n')
++                self.transport.write('\r\n')
++                self.transport.write('<H1>Proxy loop detected at: %s</H1>' % proxy_via_identifier)
++                self.transport.loseConnection()
++                return
++            headers['via'] += ', %s' % proxy_via_identifier
++        else:
++            headers['via'] = proxy_via_identifier
+         if not headers.has_key('host'):
+-            headers['host'] = host
++            if port == self.ports[protocol]:
++                headers['host'] = host
++            else:
++                headers['host'] = '%s:%d' % (host, port)
+         self.content.seek(0, 0)
+         s = self.content.read()
+         clientFactory = class_(self.method, rest, self.clientproto, headers,

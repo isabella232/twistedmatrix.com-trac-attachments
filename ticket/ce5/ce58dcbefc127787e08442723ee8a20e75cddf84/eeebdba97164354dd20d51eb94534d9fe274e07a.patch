@@ -1,0 +1,114 @@
+=== modified file 'twisted/application/internet.py'
+--- twisted/application/internet.py	2012-09-06 17:55:48 +0000
++++ twisted/application/internet.py	2012-12-08 06:37:38 +0000
+@@ -227,6 +227,7 @@
+     """
+ 
+     volatile = ['_loop']
++    _loop = None
+ 
+     def __init__(self, step, callable, *args, **kwargs):
+         self.step = step
+@@ -250,6 +251,9 @@
+         log.err(why)
+ 
+     def stopService(self):
++        if not self._loop:
++            warnings.warn("TimerService.stopService called before startService", stacklevel=2)
++            return
+         if self._loop.running:
+             self._loop.stop()
+         return service.Service.stopService(self)
+
+=== modified file 'twisted/application/test/test_internet.py'
+--- twisted/application/test/test_internet.py	2011-07-14 18:05:14 +0000
++++ twisted/application/test/test_internet.py	2012-12-08 07:20:55 +0000
+@@ -11,7 +11,7 @@
+ 
+ from twisted.internet.protocol import Factory
+ from twisted.trial.unittest import TestCase
+-from twisted.application.internet import StreamServerEndpointService
++from twisted.application.internet import StreamServerEndpointService, TimerService
+ from twisted.internet.interfaces import IStreamServerEndpoint, IListeningPort
+ from twisted.internet.defer import Deferred, CancelledError
+ 
+@@ -105,7 +105,7 @@
+ 
+ class TestEndpointService(TestCase):
+     """
+-    Tests for L{twisted.application.internet}.
++    Tests for L{twisted.application.internet.StreamServerEndpointService}.
+     """
+ 
+     def setUp(self):
+@@ -249,4 +249,67 @@
+         stoppingErrors = self.flushLoggedErrors(ZeroDivisionError)
+         self.assertEqual(len(stoppingErrors), 1)
+ 
+-
++class FakeLoopingCall:
++    stopped = False
++    def __init__(self, f, *args, **kwargs):
++        self.call = (f, args, kwargs)
++
++    def start(self, interval, now=False):
++        self.started = (interval, now)
++        self.running = True
++        self.deferred = Deferred()
++        return self.deferred
++
++    def stop(self):
++        self.stopped = True
++        self.running = False
++
++class TestTimerService(TestCase):
++    """
++    Tests for L{twisted.application.internet.TimerService}.
++    """
++    call = (lambda: None, ('arg1', 'arg2'), {'arg3': 'here'})
++    interval = 32
++    
++    def setUp(self):
++        """
++        Construct a L{TimerService} to test.
++        """
++        from twisted.internet import task
++        self.patch(task, 'LoopingCall', FakeLoopingCall)
++        self.svc = TimerService(self.interval, self.call[0], *self.call[1], **self.call[2])
++
++    def test_stopServiceWarns(self):
++        """
++        L{TimerService.stopService} warns the user if
++        C{startService} hasn't been called.
++        """
++        self.assertWarns(UserWarning, "TimerService.stopService called before startService",
++                __file__, lambda: self.svc.stopService())
++
++    def test_startService(self):
++        """
++        L{TimerService.startService} creates a L(LoopingCall} and starts it.
++        """
++        self.svc.startService()
++        self.assertEqual(self.call, self.svc._loop.call)
++        self.assertEqual((self.interval, True), self.svc._loop.started)
++
++    def test_exception(self):
++        """
++        L{TimerService} can be safely stopped if the call raises an exception.
++        """
++        self.svc.startService()
++        self.svc._loop.deferred.errback(ZeroDivisionError())
++        self.svc.stopService()
++        warnings = self.flushWarnings(UserWarning)
++        errors = self.flushLoggedErrors(ZeroDivisionError)
++        self.assertEqual((0, 1), (len(warnings), len(errors)))
++
++    def test_stopService(self):
++        """
++        L{TimerService.stopService} stops the L{LoopingCall}.
++        """
++        self.svc.startService()
++        self.svc.stopService()
++        self.assertTrue(self.svc._loop.stopped)
+
+=== added file 'twisted/topfiles/6202.misc'

@@ -1,0 +1,157 @@
+=== modified file 'twisted/web/client.py'
+--- twisted/web/client.py	2012-06-07 13:15:27 +0000
++++ twisted/web/client.py	2012-10-12 16:53:37 +0000
+@@ -311,7 +311,7 @@
+     def __init__(self, url, method='GET', postdata=None, headers=None,
+                  agent="Twisted PageGetter", timeout=0, cookies=None,
+                  followRedirect=True, redirectLimit=20,
+-                 afterFoundGet=False):
++                 afterFoundGet=False, canceller=None):
+         self.followRedirect = followRedirect
+         self.redirectLimit = redirectLimit
+         self._redirectCount = 0
+@@ -336,7 +336,7 @@
+ 
+         self.waiting = 1
+         self._disconnectedDeferred = defer.Deferred()
+-        self.deferred = defer.Deferred()
++        self.deferred = defer.Deferred(canceller)
+         # Make sure the first callback on the result Deferred pauses the
+         # callback chain until the request connection is closed.
+         self.deferred.addBoth(self._waitForDisconnect)
+@@ -408,12 +408,10 @@
+         result has yet been provided to the result Deferred, provide the
+         connection failure reason as an error result.
+         """
+-        if self.waiting:
+-            self.waiting = 0
+-            # If the connection attempt failed, there is nothing more to
+-            # disconnect, so just fire that Deferred now.
+-            self._disconnectedDeferred.callback(None)
+-            self.deferred.errback(reason)
++        self.noPage(reason)
++        # If the connection attempt failed, there is nothing more to
++        # disconnect, so just fire that Deferred now.
++        self._disconnectedDeferred.callback(None)
+ 
+ 
+ 
+@@ -427,7 +425,8 @@
+                  method='GET', postdata=None, headers=None,
+                  agent="Twisted client", supportPartial=0,
+                  timeout=0, cookies=None, followRedirect=1,
+-                 redirectLimit=20, afterFoundGet=False):
++                 redirectLimit=20, afterFoundGet=False,
++                 canceller=None):
+         self.requestedPartial = 0
+         if isinstance(fileOrName, types.StringTypes):
+             self.fileName = fileOrName
+@@ -445,7 +444,7 @@
+             self, url, method=method, postdata=postdata, headers=headers,
+             agent=agent, timeout=timeout, cookies=cookies,
+             followRedirect=followRedirect, redirectLimit=redirectLimit,
+-            afterFoundGet=afterFoundGet)
++            afterFoundGet=afterFoundGet, canceller=canceller)
+ 
+ 
+     def gotHeaders(self, headers):
+@@ -596,15 +595,18 @@
+ 
+     @return: The factory created by C{factoryFactory}
+     """
++    def cancel(d):
++        factory.noPage(defer.CancelledError())
++        connector.disconnect()
+     scheme, host, port, path = _parse(url)
+-    factory = factoryFactory(url, *args, **kwargs)
++    factory = factoryFactory(url, canceller=cancel, *args, **kwargs)
+     if scheme == 'https':
+         from twisted.internet import ssl
+         if contextFactory is None:
+             contextFactory = ssl.ClientContextFactory()
+-        reactor.connectSSL(host, port, factory, contextFactory)
++        connector = reactor.connectSSL(host, port, factory, contextFactory)
+     else:
+-        reactor.connectTCP(host, port, factory)
++        connector = reactor.connectTCP(host, port, factory)
+     return factory
+ 
+ 
+@@ -615,6 +617,10 @@
+     Download a page. Return a deferred, which will callback with a
+     page (as a string) or errback with a description of the error.
+ 
++    If the deferred is cancelled before the request completes, the
++    connection is closed and the deferred will fire with a
++    L{defer.CancelledError}.
++
+     See L{HTTPClientFactory} to see what extra arguments can be passed.
+     """
+     return _makeGetterFactory(
+@@ -628,9 +634,16 @@
+     """
+     Download a web page to a file.
+ 
++    Download a page. Return a deferred, which will callback with None
++    or errback with a description of the error.
++
++    If the deferred is cancelled before the request completes, the
++    connection is closed and the deferred will fire with a
++    L{defer.CancelledError}.
++
+     @param file: path to file on filesystem, or file-like object.
+ 
+-    See HTTPDownloader to see what extra args can be passed.
++    See L{HTTPDownloader} to see what extra args can be passed.
+     """
+     factoryFactory = lambda url, *a, **kw: HTTPDownloader(url, file, *a, **kw)
+     return _makeGetterFactory(
+
+=== modified file 'twisted/web/test/test_webclient.py'
+--- twisted/web/test/test_webclient.py	2012-06-07 14:09:07 +0000
++++ twisted/web/test/test_webclient.py	2012-10-12 16:31:54 +0000
+@@ -507,6 +507,43 @@
+             defer.TimeoutError)
+ 
+ 
++    def test_getPageCancelImmediately(self):
++        """
++        Call L{getPage} and cancel it before it has chance to try to
++        connect to the server. The L{Deferred} returned by L{getPage}
++        fails with L{defer.CancelledError}.
++        """
++        d = client.getPage(self.getURL("wait"), timeout=10)
++        d.cancel()
++        return self.assertFailure(d, defer.CancelledError)
++
++
++    def test_getPageCancelLater(self):
++        """
++        Call L{getPage} and cancel it after it has connected to the server,
++        but before it was able to deliver the results. The L{Deferred}
++        returned by L{getPage} fails with L{defer.CancelledError}.
++        """
++        d = client.getPage(self.getURL("wait"), timeout=10)
++        reactor.callLater(0.01, d.cancel)
++        return self.assertFailure(d, defer.CancelledError)
++
++
++    def test_getPageCancelAfter(self):
++        """
++        Call L{getPage} and attempt to cancel it after it has delivered
++        the results. The cancellation is ignored and the L{Deferred}
++        returned by L{getPage} is called back with the page contents.
++        """
++        d = client.getPage(self.getURL("file"))
++        def cancelRequest(content):
++            d.cancel()
++            return content
++        d.addCallback(cancelRequest)
++        d.addCallback(self.assertEqual, "0123456789")
++        return d
++
++
+     def testDownloadPage(self):
+         downloads = []
+         downloadData = [("file", self.mktemp(), "0123456789"),
+

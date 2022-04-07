@@ -1,0 +1,169 @@
+--- trunk/twisted/web2/xmlrpc.py	Sat Mar 11 14:39:27 2006
++++ xmlrpc_proxy-1895/twisted/web2/xmlrpc.py	Tue Jul  4 03:25:36 2006
+@@ -18,8 +18,10 @@
+ # Sibling Imports
+ from twisted.web2 import resource, stream
+ from twisted.web2 import responsecode, http, http_headers 
++from twisted.web2.client.http import ClientRequest
++from twisted.web2.client.http import HTTPClientProtocol
+ from twisted.internet import defer, protocol, reactor
+-from twisted.python import log, reflect
++from twisted.python import log, reflect, failure
+ 
+ # Useful so people don't need to import xmlrpclib directly
+ Fault = xmlrpclib.Fault
+@@ -208,5 +210,153 @@
+     """
+     xmlrpc.putSubHandler('system', XMLRPCIntrospection(xmlrpc))
+ 
++class QueryProtocol(HTTPClientProtocol):
+ 
+-__all__ = ["XMLRPC", "NoSuchFunction", "Fault"]
++    def connectionMade(self):
++        rawHeaders = {
++            'User-Agent': ['Twisted Web2/XMLRPClib'],
++            'Host': [self.factory.host],
++            'Content-Type': ['text/xml'],
++            'Content-Length': [str(len(self.factory.payload))],
++        }
++        if self.factory.user:
++            auth = '%s:%s' % (self.factory.user, self.factory.password)
++            auth = auth.encode('base64').strip()
++            rawHeaders.update({
++                'Authorization': ['Basic %s' % (auth,)],
++            })
++        headers = http_headers.Headers(rawHeaders=rawHeaders)
++        req = ClientRequest('POST', self.factory.path, headers,
++            self.factory.payload)
++        d = self.submitRequest(req)
++        d.addCallback(self._cbGotResponse)
++        d.addErrback(self._ebGotError)
++        return d
++
++    def _cbGotResponse(self, resp):
++        if resp.code != 200:
++            msg = responsecode.RESPONSES[resp.code]
++            self.factory.badStatus(resp.code, msg)
++        d = defer.maybeDeferred(resp.stream.read)
++        d.addCallback(self.handleResponse)
++        return d
++
++    def _ebGotError(self, error):
++        # XXX what's the best way to do this?
++        print error.getErrorMessage()
++
++    def handleResponse(self, contents):
++        self.factory.parseResponse(contents)
++
++
++payloadTemplate = """<?xml version="1.0"?>
++<methodCall>
++<methodName>%s</methodName>
++%s
++</methodCall>
++"""
++
++
++class QueryFactory(protocol.ClientFactory):
++
++    deferred = None
++    protocol = QueryProtocol
++
++    def __init__(self, path, host, method, user=None, password=None, *args):
++        self.path, self.host = path, host
++        self.user, self.password = user, password
++        self.payload = payloadTemplate % (method, xmlrpclib.dumps(args))
++        self.deferred = defer.Deferred()
++
++    def parseResponse(self, contents):
++        if not self.deferred:
++            return
++        try:
++            response = xmlrpclib.loads(contents)
++        except:
++            self.deferred.errback(failure.Failure())
++            self.deferred = None
++        else:
++            self.deferred.callback(response[0][0])
++            self.deferred = None
++
++    def clientConnectionLost(self, _, reason):
++        if self.deferred is not None:
++            self.deferred.errback(reason)
++            self.deferred = None
++
++    clientConnectionFailed = clientConnectionLost
++
++    def badStatus(self, status, message):
++        self.deferred.errback(ValueError(status, message))
++        self.deferred = None
++
++
++class Proxy:
++    """A Proxy for making remote XML-RPC calls.
++
++    Pass the URL of the remote XML-RPC server to the constructor.
++
++    Use proxy.callRemote('foobar', *args) to call remote method
++    'foobar' with *args.
++
++    """
++
++    def __init__(self, url, user=None, password=None):
++        """
++        @type url: C{str}
++        @param url: The URL to which to post method calls.  Calls will be made
++        over SSL if the scheme is HTTPS.  If netloc contains username or
++        password information, these will be used to authenticate, as long as
++        the C{user} and C{password} arguments are not specified.
++
++        @type user: C{str} or None
++        @param user: The username with which to authenticate with the server
++        when making calls.  If specified, overrides any username information
++        embedded in C{url}.  If not specified, a value may be taken from C{url}
++        if present.
++
++        @type password: C{str} or None
++        @param password: The password with which to authenticate with the
++        server when making calls.  If specified, overrides any password
++        information embedded in C{url}.  If not specified, a value may be taken
++        from C{url} if present.
++        """
++        scheme, netloc, path, params, query, fragment = urlparse.urlparse(url)
++        netlocParts = netloc.split('@')
++        if len(netlocParts) == 2:
++            userpass = netlocParts.pop(0).split(':')
++            self.user = userpass.pop(0)
++            try:
++                self.password = userpass.pop(0)
++            except:
++                self.password = None
++        else:
++            self.user = self.password = None
++        hostport = netlocParts[0].split(':')
++        self.host = hostport.pop(0)
++        try:
++            self.port = int(hostport.pop(0))
++        except:
++            self.port = None
++        self.path = path
++        if self.path in ['', None]:
++            self.path = '/'
++        self.secure = (scheme == 'https')
++        if user is not None:
++            self.user = user
++        if password is not None:
++            self.password = password
++
++    def callRemote(self, method, *args):
++        factory = QueryFactory(self.path, self.host, method, self.user,
++            self.password, *args)
++        if self.secure:
++            from twisted.internet import ssl
++            reactor.connectSSL(self.host, self.port or 443,
++                               factory, ssl.ClientContextFactory())
++        else:
++            reactor.connectTCP(self.host, self.port or 80, factory)
++        return factory.deferred
++
++__all__ = ["XMLRPC", "NoSuchFunction", "Fault", "Proxy"]

@@ -1,0 +1,95 @@
+Index: twisted/web/test/test_webclient.py
+===================================================================
+--- twisted/web/test/test_webclient.py	(revision 22369)
++++ twisted/web/test/test_webclient.py	(working copy)
+@@ -24,11 +24,12 @@
+ class LongTimeTakingResource(resource.Resource):
+     def render(self, request):
+         global serverCallID
++        request.write("head");
+         serverCallID =  reactor.callLater(1, self.writeIt, request)
+         return server.NOT_DONE_YET
+ 
+     def writeIt(self, request):
+-        request.write("hello!!!")
++        request.write("&body")
+         request.finish()
+ 
+ class CookieMirrorResource(resource.Resource):
+@@ -175,7 +176,7 @@
+     def testTimeoutNotTriggering(self):
+         # Test that when the timeout doesn't trigger, things work as expected.
+         d = client.getPage(self.getURL("wait"), timeout=100)
+-        d.addCallback(self.assertEquals, "hello!!!")
++        d.addCallback(self.assertEquals, "head&body")
+         return d
+ 
+     def testTimeoutTriggering(self):
+@@ -309,6 +310,22 @@
+         bytes = file(filename, "rb").read()
+         self.assertEquals(bytes, expectedData)
+ 
++    def testDownloadTimeout(self):
++        return self.assertFailure(client.downloadPage(self.getURL("wait"), 
++            self.mktemp(), timeout=0.5), defer.TimeoutError)
++
++    def testDownloadHeaders(self):
++        def checkHeaders(factory):
++            self.assertEquals(factory.status, '200')
++            self.assertEquals(factory.response_headers['content-type'][0], 'text/html')
++            self.assertEquals(factory.response_headers['content-length'][0], '10')
++            os.unlink(factory.fileName)
++        url = self.getURL('file')
++        scheme, host, port, path = client._parse(url)
++        factory = client.HTTPDownloader(url, self.mktemp())
++        reactor.connectTCP(host, port, factory)
++        return factory.deferred.addCallback(lambda _: checkHeaders(factory))
++
+ class WebClientSSLTestCase(WebClientTestCase):
+     def _listen(self, site):
+         from twisted import test
+Index: twisted/web/client.py
+===================================================================
+--- twisted/web/client.py	(revision 22369)
++++ twisted/web/client.py	(working copy)
+@@ -289,7 +289,8 @@
+ 
+     def __init__(self, url, fileOrName,
+                  method='GET', postdata=None, headers=None,
+-                 agent="Twisted client", supportPartial=0):
++                 agent="Twisted client", supportPartial=0,
++                 timeout=0, cookies=None, followRedirect=1):
+         self.requestedPartial = 0
+         if isinstance(fileOrName, types.StringTypes):
+             self.fileName = fileOrName
+@@ -303,11 +304,11 @@
+                     headers["range"] = "bytes=%d-" % fileLength
+         else:
+             self.file = fileOrName
+-        HTTPClientFactory.__init__(self, url, method=method, postdata=postdata, headers=headers, agent=agent)
+-        self.deferred = defer.Deferred()
+-        self.waiting = 1
++        HTTPClientFactory.__init__(self, url, method=method, postdata=postdata, headers=headers, agent=agent, 
++            timeout=timeout, cookies=cookies, followRedirect=followRedirect)
+ 
+     def gotHeaders(self, headers):
++        HTTPClientFactory.gotHeaders(self, headers)
+         if self.requestedPartial:
+             contentRange = headers.get("content-range", None)
+             if not contentRange:
+@@ -335,7 +336,6 @@
+         if partialContent and not self.requestedPartial:
+             raise ValueError, "we shouldn't get partial content response if we didn't want it!"
+         if self.waiting:
+-            self.waiting = 0
+             try:
+                 if not self.file:
+                     self.file = self.openFile(partialContent)
+@@ -354,6 +354,7 @@
+             self.deferred.errback(failure.Failure())
+ 
+     def pageEnd(self):
++        self.waiting = 0
+         if not self.file:
+             return
+         try:

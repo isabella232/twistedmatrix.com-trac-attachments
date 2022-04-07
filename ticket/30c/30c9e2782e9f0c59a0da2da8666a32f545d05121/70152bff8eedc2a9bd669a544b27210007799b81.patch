@@ -1,0 +1,233 @@
+Index: twisted/conch/test/test_ssh.py
+===================================================================
+--- twisted/conch/test/test_ssh.py	(revision 17497)
++++ twisted/conch/test/test_ssh.py	(working copy)
+@@ -313,6 +313,14 @@
+         def getService(self, trans, name):
+             return factory.SSHFactory.getService(self, trans, name)
+ 
++    class ConchTestBuggyServerFactory(ConchTestServerFactory):
++        def buildProtocol(self, addr):
++            proto = ConchTestBuggyServer()
++            proto.supportPublicKeys = self.privateKeys.keys()
++            proto.factory = self
++            self.proto = proto
++            return proto
++        
+     class ConchTestBase:
+ 
+         done = 0
+@@ -343,6 +351,44 @@
+             ConchTestBase.connectionLost(self, reason)
+             transport.SSHServerTransport.connectionLost(self, reason)
+ 
++    class BuggyKeyFuncs:
++        def __init__(self):
++            # Dirty hack. An instance of this class pretends to be the
++            # keys module, and provides various buggy behaviours to
++            # emulate various crappy SSH implementations
++
++            # Copy the key funcs we *don't* have from "keys" 
++            from twisted.conch.ssh import keys
++            for o in dir(keys):
++                if not hasattr(self, o):
++                    setattr(self, o, getattr(keys, o))
++                    
++        def signData(self, obj, data):
++            mapping = {
++                'ssh-rsa': self.signData_rsa,
++                'ssh-dss': self.signData_dsa
++            }
++            objType = self.objectType(obj)
++            #return common.NS(objType)+mapping[objType](obj, data)
++            # SSH.com does not return the sigtype - just the sigdata
++            return mapping[objType](obj, data)
++            
++    class ConchTestBuggyServer(ConchTestBase, transport.SSHServerTransport):
++        supportedPublicKeys = ['ssh-dss',]
++        
++        def connectionMade(self):
++            self.keys = BuggyKeyFuncs()
++            # FIXME: should be a super().connectionMade() call?
++            transport.SSHServerTransport.connectionMade(self)
++
++        def sendPacket(self, messageType, payload):
++            if messageType==transport.MSG_SERVICE_ACCEPT:
++                # EMULATE BUG - SSH.com does not put the service name in the accept
++                payload = ''
++
++            # FIXME: should be a super().sendPacket() call?
++            transport.SSHServerTransport.sendPacket(self, messageType, payload)
++            
+     class ConchTestClient(ConchTestBase, transport.SSHClientTransport):
+ 
+         def connectionLost(self, reason):
+@@ -350,8 +396,20 @@
+             transport.SSHClientTransport.connectionLost(self, reason)
+ 
+         def verifyHostKey(self, key, fp):
+-            unittest.assertEquals(key, keys.getPublicKeyString(data = publicRSA_openssh))
+-            unittest.assertEquals(fp,'3d:13:5f:cb:c9:79:8a:93:06:27:65:bc:3d:0b:8f:af')
++            unittest.assertIn(
++                    key,
++                    (
++                        keys.getPublicKeyString(data = publicRSA_openssh),
++                        keys.getPublicKeyString(data = publicDSA_openssh),
++                    )
++                )
++            unittest.assertIn(
++                    fp,
++                    (
++                        '3d:13:5f:cb:c9:79:8a:93:06:27:65:bc:3d:0b:8f:af',
++                        '16:af:52:0e:e1:a9:0b:78:e7:e8:51:52:91:13:ae:6a',
++                    )
++                )
+             return defer.succeed(1)
+ 
+         def connectionSecure(self):
+@@ -698,6 +756,33 @@
+     if not Crypto:
+         skip = "can't run w/o PyCrypto"
+ 
++    def testBuggyServerOurClient(self):
++        """test a fake/buggy server against the Conch client
++        """
++        realm = ConchTestRealm()
++        p = portal.Portal(realm)
++        sshpc = ConchTestSSHChecker()
++        sshpc.registerChecker(ConchTestPasswordChecker())
++        sshpc.registerChecker(ConchTestPublicKeyChecker())
++        p.registerChecker(sshpc)
++        fac = ConchTestBuggyServerFactory()
++        fac.portal = p
++        fac.startFactory()
++        self.server = fac.buildProtocol(None)
++        self.clientTransport = LoopbackRelay(self.server)
++        self.client = ConchTestClient()
++        self.serverTransport = LoopbackRelay(self.client)
++
++        self.server.makeConnection(self.serverTransport)
++        self.client.makeConnection(self.clientTransport)
++
++        while self.serverTransport.buffer or self.clientTransport.buffer:
++            log.callWithContext({'system': 'serverTransport'},
++                                self.serverTransport.clearBuffer)
++            log.callWithContext({'system': 'clientTransport'},
++                                self.clientTransport.clearBuffer)
++        self.failIf(self.server.done and self.client.done)
++        
+     def testOurServerOurClient(self):
+         """test the Conch server against the Conch client
+         """
+Index: twisted/conch/ssh/transport.py
+===================================================================
+--- twisted/conch/ssh/transport.py	(revision 17497)
++++ twisted/conch/ssh/transport.py	(working copy)
+@@ -35,7 +35,6 @@
+ 
+ # sibling importsa
+ from common import NS, getNS, MP, getMP, _MPpow, ffs, entropy # ease of use
+-import keys
+ 
+ 
+ class SSHTransportBase(protocol.Protocol):
+@@ -80,6 +79,12 @@
+         log.msg('connection lost')
+ 
+     def connectionMade(self):
++        # Get our key/signature functions - subclasses may override these
++        # by setting the instance/class variable first e.g. test cases
++        if not hasattr(self, 'keys'):
++            import keys
++            self.keys = keys
++            
+         self.transport.write('%s\r\n'%(self.ourVersionString))
+         self.sendKexInit()
+ 
+@@ -345,7 +350,7 @@
+             h.update(sharedSecret)
+             exchangeHash = h.digest()
+             self.sendPacket(MSG_KEXDH_REPLY, NS(self.factory.publicKeys[self.keyAlg])+ \
+-                           MP(f)+NS(keys.signData(self.factory.privateKeys[self.keyAlg], exchangeHash)))
++                           MP(f)+NS(self.keys.signData(self.factory.privateKeys[self.keyAlg], exchangeHash)))
+             self._keySetup(sharedSecret, exchangeHash)
+         elif self.kexAlg == 'diffie-hellman-group-exchange-sha1':
+             self.kexAlg = 'diffie-hellman-group-exchange-sha1-old'
+@@ -408,7 +413,7 @@
+         h.update(sharedSecret)
+         exchangeHash = h.digest()
+         self.sendPacket(MSG_KEX_DH_GEX_REPLY, NS(self.factory.publicKeys[self.keyAlg])+ \
+-                       MP(f)+NS(keys.signData(self.factory.privateKeys[self.keyAlg], exchangeHash)))
++                       MP(f)+NS(self.keys.signData(self.factory.privateKeys[self.keyAlg], exchangeHash)))
+         self._keySetup(sharedSecret, exchangeHash)
+ 
+     def ssh_NEWKEYS(self, packet):
+@@ -510,7 +515,7 @@
+             self.sendPacket(MSG_KEX_DH_GEX_INIT, MP(self.DHpubKey))
+ 
+     def _continueGEX_GROUP(self, ignored, pubKey, f, signature):
+-        serverKey = keys.getPublicKeyObject(pubKey)
++        serverKey = self.keys.getPublicKeyObject(pubKey)
+         sharedSecret = _MPpow(f, self.x, DH_PRIME)
+         h = sha.new()
+         h.update(NS(self.ourVersionString))
+@@ -522,7 +527,7 @@
+         h.update(MP(f))
+         h.update(sharedSecret)
+         exchangeHash = h.digest()
+-        if not keys.verifySignature(serverKey, signature, exchangeHash):
++        if not self.keys.verifySignature(serverKey, signature, exchangeHash):
+             self.sendDisconnect(DISCONNECT_KEY_EXCHANGE_FAILED, 'bad signature')
+             return
+         self._keySetup(sharedSecret, exchangeHash)
+@@ -537,7 +542,7 @@
+         d.addErrback(lambda unused, self=self: self.sendDisconnect(DISCONNECT_HOST_KEY_NOT_VERIFIABLE, 'bad host key'))
+ 
+     def _continueGEX_REPLY(self, ignored, pubKey, f, signature):
+-        serverKey = keys.getPublicKeyObject(pubKey)
++        serverKey = self.keys.getPublicKeyObject(pubKey)
+         sharedSecret = _MPpow(f, self.x, self.p)
+         h = sha.new()
+         h.update(NS(self.ourVersionString))
+@@ -552,7 +557,7 @@
+         h.update(MP(f))
+         h.update(sharedSecret)
+         exchangeHash = h.digest()
+-        if not keys.verifySignature(serverKey, signature, exchangeHash):
++        if not self.keys.verifySignature(serverKey, signature, exchangeHash):
+             self.sendDisconnect(DISCONNECT_KEY_EXCHANGE_FAILED, 'bad signature')
+             return
+         self._keySetup(sharedSecret, exchangeHash)
+@@ -591,6 +596,9 @@
+         self.connectionSecure()
+ 
+     def ssh_SERVICE_ACCEPT(self, packet):
++        if len(packet) == 0: # SSH.com bug, empty SERVICE ACCEPT packet
++            self.setService(self.instance)
++            return
+         name = getNS(packet)[0]
+         if name != self.instance.name:
+             self.sendDisconnect(DISCONNECT_PROTOCOL_ERROR, "received accept for service we did not request")
+Index: twisted/conch/ssh/keys.py
+===================================================================
+--- twisted/conch/ssh/keys.py	(revision 17497)
++++ twisted/conch/ssh/keys.py	(working copy)
+@@ -429,6 +429,8 @@
+         'ssh-dss': verifySignature_dsa, 
+      }
+     objType = objectType(obj)
++    if len(sig) == 40: # SSH.com bug, no header
++        return mapping[objType](obj, sig, data)
+     sigType, sigData = common.getNS(sig)
+     if objType != sigType: # object and signature are not of same type
+         return 0
+@@ -439,7 +441,8 @@
+     return obj.verify(pkcs1Digest(data, lenSig(obj)), sigTuple)
+ 
+ def verifySignature_dsa(obj, sig, data):
+-    sig = common.getNS(sig)[0]
++    if len(sig) != 40: # SSH.com bug, no header
++        sig = common.getNS(sig)[0]
+     assert(len(sig) == 40)
+     l = len(sig)/2
+     sigTuple = map(Util.number.bytes_to_long, [sig[: l], sig[l:]])

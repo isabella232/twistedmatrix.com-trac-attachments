@@ -1,0 +1,107 @@
+Index: twistd.py
+===================================================================
+--- twistd.py	(revision 16877)
++++ twistd.py	(working copy)
+@@ -8,6 +8,7 @@
+ from twisted.application import app, service
+ from twisted.scripts import mktap
+ from twisted import copyright
++from twisted.plugin import getPlugins
+ 
+ import os, errno, sys
+ 
+@@ -25,6 +26,9 @@
+                  "after binding ports, retaining the option to regain "
+                  "privileges in cases such as spawning processes. "
+                  "Use with caution.)"],
++                ['listlogobservers',None,
++                 "List the available log observers on your system"
++                ]
+                ]
+ 
+     optParameters = [
+@@ -36,6 +40,9 @@
+                       'Chroot to a supplied directory before running'],
+                      ['uid', 'u', None, "The uid to run as."],
+                      ['gid', 'g', None, "The gid to run as."],
++                     ['logobserver',None,None,
++                      "use a custom logobserver plugin."
++                     ]
+                     ]
+     zsh_altArgDescr = {"prefix":"Use the given prefix when syslogging (default: twisted)",
+                        "pidfile":"Name of the pidfile (default: twistd.pid)",}
+@@ -98,14 +105,29 @@
+         log.msg("Failed to unlink PID file:")
+         log.deferr()
+ 
+-def startLogging(logfilename, sysLog, prefix, nodaemon):
++def getCustomLogger(logObserver):
++    """
++    lookup a custom log plugin and match against the name of the plugin class.
++    """
++    for logger in getPlugins(log.ILogObserver):
++        if logger.__class__.__name__ == logObserver:
++            return logger
++    print 'log plugin not found.  did you try --listlogobservers?'
++    sys.exit()
++    
++
++def startLogging(logfilename, logObserver,sysLog, prefix, nodaemon):
+     if logfilename == '-':
+         if not nodaemon:
+             print 'daemons cannot log to stdout'
+             os._exit(1)
+         logFile = sys.stdout
+     elif sysLog:
+-        syslog.startLogging(prefix)
++        if logObserver:
++            print 'logobserver plugin can not be used with syslog'
++            sys.exit()
++        else:
++            syslog.startLogging(prefix)
+     elif nodaemon and not logfilename:
+         logFile = sys.stdout
+     else:
+@@ -121,7 +143,12 @@
+             signal.signal(signal.SIGUSR1, rotateLog)
+         
+     if not sysLog:
+-        log.startLogging(logFile)
++        if logObserver:
++            customlogger = getCustomLogger(logObserver)
++            customlogger.setFile(logFile)
++            log.startLoggingWithObserver(customlogger.emit,logFile)
++        else:
++            log.startLogging(logFile)
+     sys.stdout.flush()
+ 
+ 
+@@ -181,15 +208,27 @@
+     shedPrivileges(config['euid'], uid, gid)
+     app.startApplication(application, not config['no_save'])
+ 
++def checkLogObservers(listobs):
++    if not listobs:
++        return
++    print 'your system has the following log file plugins installed: '
++    any = False
++    for logobs in getPlugins(log.ILogObserver):
++        any = True
++        print '%s:%s' % (logobs.__class__.__name__,repr(logobs))
++    if not any:
++        print 'No log plugins found.'
++    sys.exit()
+ 
+ def runApp(config):
+     checkPID(config['pidfile'])
++    checkLogObservers(config['listlogobservers'])
+     passphrase = app.getPassphrase(config['encrypted'])
+     app.installReactor(config['reactor'])
+     config['nodaemon'] = config['nodaemon'] or config['debug']
+     oldstdout = sys.stdout
+     oldstderr = sys.stderr
+-    startLogging(config['logfile'], config['syslog'], config['prefix'],
++    startLogging(config['logfile'], config['logobserver'],config['syslog'], config['prefix'],
+                  config['nodaemon'])
+     app.initialLog()
+     application = app.getApplication(config, passphrase)

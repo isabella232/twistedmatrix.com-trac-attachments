@@ -1,0 +1,104 @@
+Index: twisted/names/test/test_cache.py
+===================================================================
+--- twisted/names/test/test_cache.py	(revision 34216)
++++ twisted/names/test/test_cache.py	(working copy)
+@@ -18,7 +18,33 @@
+             dns.Query(name='example.com', type=dns.MX, cls=dns.IN): (time.time(), ([], [], []))})
+         return c.lookupMailExchange('example.com').addCallback(self.assertEqual, ([], [], []))
+ 
++    
++    def test_consructorExpires(self):
++        """
++        Cached entries passed into L{cache.CacheResolver.__init__} get
++        cancelled just like entries added with cacheResult
++        """
++        
++        r = ([dns.RRHeader("example.com", dns.A, dns.IN, 60,
++                           dns.Record_A("127.0.0.1", 60))],
++             [dns.RRHeader("example.com", dns.A, dns.IN, 50,
++                           dns.Record_A("127.0.0.1", 50))],
++             [dns.RRHeader("example.com", dns.A, dns.IN, 40,
++                           dns.Record_A("127.0.0.1", 40))])
+ 
++        clock = task.Clock()
++        query = dns.Query(name="example.com", type=dns.A, cls=dns.IN)
++
++        c = cache.CacheResolver({ query : (clock.seconds(), r)}, reactor=clock)
++
++        clock.advance(40)
++        
++        self.assertNotIn(query, c.cache)
++        
++        return self.assertFailure(
++            c.lookupAddress("example.com"), dns.DomainError)
++
++
+     def test_normalLookup(self):
+         """
+         When a cache lookup finds a cached entry from 1 second ago, it is
+@@ -33,9 +59,8 @@
+ 
+         clock = task.Clock()
+ 
+-        c = cache.CacheResolver({
+-                dns.Query(name="example.com", type=dns.A, cls=dns.IN) :
+-                    (clock.seconds(), r)}, reactor=clock)
++        c = cache.CacheResolver(reactor=clock)
++        c.cacheResult(dns.Query(name="example.com", type=dns.A, cls=dns.IN), r)
+ 
+         clock.advance(1)
+ 
+Index: twisted/names/cache.py
+===================================================================
+--- twisted/names/cache.py	(revision 34216)
++++ twisted/names/cache.py	(working copy)
+@@ -24,16 +24,18 @@
+     def __init__(self, cache=None, verbose=0, reactor=None):
+         common.ResolverBase.__init__(self)
+ 
+-        if cache is None:
+-            cache = {}
+-        self.cache = cache
++        self.cache = {}
+         self.verbose = verbose
+         self.cancel = {}
+         if reactor is None:
+             from twisted.internet import reactor
+         self._reactor = reactor
+ 
++        if cache:
++            for query, (seconds, payload) in cache.items():
++                self.cacheResult(query, payload, seconds)
+ 
++
+     def __setstate__(self, state):
+         self.__dict__ = state
+ 
+@@ -77,19 +79,22 @@
+         return defer.fail(failure.Failure(dns.DomainError(name)))
+ 
+ 
+-    def cacheResult(self, query, payload):
++    def cacheResult(self, query, payload, seconds=None):
+         if self.verbose > 1:
+             log.msg('Adding %r to cache' % query)
+ 
+-        self.cache[query] = (self._reactor.seconds(), payload)
++        self.cache[query] = (seconds or self._reactor.seconds(), payload)
+ 
+         if self.cancel.has_key(query):
+             self.cancel[query].cancel()
+ 
+         s = list(payload[0]) + list(payload[1]) + list(payload[2])
+-        m = s[0].ttl
+-        for r in s:
+-            m = min(m, r.ttl)
++        if s:
++            m = s[0].ttl
++            for r in s:
++                m = min(m, r.ttl)
++        else:
++            m = 0
+ 
+         self.cancel[query] = self._reactor.callLater(m, self.clearEntry, query)
+ 

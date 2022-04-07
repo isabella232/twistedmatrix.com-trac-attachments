@@ -1,0 +1,182 @@
+Index: twisted/topfiles/2618.misc
+===================================================================
+--- twisted/topfiles/2618.misc	(revision 0)
++++ twisted/topfiles/2618.misc	(revision 0)
+@@ -0,0 +1 @@
++twisted.words.xish.xmlstream.XmlStream.connectionLost and twisted.words.protocols.jabber.xmlstream.StreamManager now pass the twisted.python.failure.Failure reason when dispatching the STREAM_END_EVENT
+Index: twisted/words/test/test_xmlstream.py
+===================================================================
+--- twisted/words/test/test_xmlstream.py	(revision 30799)
++++ twisted/words/test/test_xmlstream.py	(working copy)
+@@ -5,12 +5,14 @@
+ Tests for L{twisted.words.xish.xmlstream}.
+ """
+ 
++from twisted.python import failure
+ from twisted.internet import protocol
+ from twisted.trial import unittest
+ from twisted.words.xish import domish, utility, xmlstream
+ 
+ class XmlStreamTest(unittest.TestCase):
+     def setUp(self):
++        self.connectionLostMsg=u"no reason"
+         self.outlist = []
+         self.xmlstream = xmlstream.XmlStream()
+         self.xmlstream.transport = self
+@@ -21,12 +23,13 @@
+         """
+         Stub loseConnection because we are a transport.
+         """
+-        self.xmlstream.connectionLost("no reason")
++        self.xmlstream.connectionLost(failure.Failure(
++            Exception(self.connectionLostMsg)))
+ 
+ 
+     def test_send(self):
+         """
+-        Sending data should result into it being written to the transport.
++        Sending data results into it being written to the transport.
+         """
+         self.xmlstream.connectionMade()
+         self.xmlstream.send("<root>")
+@@ -51,7 +54,7 @@
+ 
+     def test_receiveBadXML(self):
+         """
+-        Receiving malformed XML should result in in error.
++        Receiving malformed XML results in an L{STREAM_ERROR_EVENT}.
+         """
+         streamError = []
+         streamEnd = []
+@@ -78,7 +81,25 @@
+         self.assertEquals(1, len(streamEnd))
+ 
+ 
++    def test_streamEnd(self):
++        """
++        Ending the stream fires a L{STREAM_END_EVENT}.
++        """
++        streamEnd = []
+ 
++        def streamEndEvent(reason):
++            streamEnd.append(reason)
++
++        self.xmlstream.addObserver(xmlstream.STREAM_END_EVENT,
++                                   streamEndEvent)
++        self.xmlstream.connectionMade()
++        self.loseConnection()
++        self.assertEquals(1, len(streamEnd))
++        self.assertTrue(type(streamEnd[0]), failure.Failure)
++        self.assertTrue(streamEnd[0].getErrorMessage, self.connectionLostMsg)
++
++
++
+ class DummyProtocol(protocol.Protocol, utility.EventDispatcher):
+     """
+     I am a protocol with an event dispatcher without further processing.
+@@ -109,7 +130,7 @@
+ 
+     def test_installBootstraps(self):
+         """
+-        Dispatching an event should fire registered bootstrap observers.
++        Dispatching an event fires registered bootstrap observers.
+         """
+         called = []
+ 
+@@ -192,7 +213,7 @@
+ 
+     def test_buildProtocolFactoryArguments(self):
+         """
+-        Arguments passed to the factory should be passed to protocol on
++        Arguments passed to the factory are passed to protocol on
+         instantiation.
+         """
+         xs = self.factory.buildProtocol(None)
+Index: twisted/words/test/test_jabberxmlstream.py
+===================================================================
+--- twisted/words/test/test_jabberxmlstream.py	(revision 30799)
++++ twisted/words/test/test_jabberxmlstream.py	(working copy)
+@@ -9,6 +9,7 @@
+ 
+ from zope.interface.verify import verifyObject
+ 
++from twisted.python import failure
+ from twisted.internet import defer, task
+ from twisted.internet.error import ConnectionLost
+ from twisted.internet.interfaces import IProtocolFactory
+@@ -923,6 +924,20 @@
+ 
+ 
+ 
++class FailureReasonXMPPHandler(xmlstream.XMPPHandler):
++    """
++    Dummy handler specifically for failure Reason tests.
++    """
++    def __init__(self):
++        self.gotFailureReason = False
++
++
++    def connectionLost(self, reason):
++        if isinstance(reason, failure.Failure):
++            self.gotFailureReason = True
++
++
++
+ class XMPPHandlerTest(unittest.TestCase):
+     """
+     Tests for L{xmlstream.XMPPHandler}.
+@@ -1116,6 +1131,19 @@
+         self.assertEquals(1, handler.doneLost)
+ 
+ 
++    def test_disconnectedReason(self):
++        """
++        A L{STREAM_END_EVENT} results in L{StreamManager} firing the handlers
++        L{connectionLost} methods, passing a L{failure.Failure} reason.
++        """
++        sm = self.streamManager
++        handler = FailureReasonXMPPHandler()
++        handler.setHandlerParent(sm)
++        xs = xmlstream.XmlStream(xmlstream.Authenticator())
++        sm._disconnected(failure.Failure(Exception("no reason")))
++        self.assertEquals(True, handler.gotFailureReason)
++
++
+     def test_addHandler(self):
+         """
+         Test the addition of a protocol handler while not connected.
+Index: twisted/words/protocols/jabber/xmlstream.py
+===================================================================
+--- twisted/words/protocols/jabber/xmlstream.py	(revision 30799)
++++ twisted/words/protocols/jabber/xmlstream.py	(working copy)
+@@ -1090,7 +1090,7 @@
+         """
+ 
+ 
+-    def _disconnected(self, _):
++    def _disconnected(self, reason):
+         """
+         Called when the stream has been closed.
+ 
+@@ -1104,7 +1104,7 @@
+         # Notify all child services which implement
+         # the IService interface
+         for e in self:
+-            e.connectionLost(None)
++            e.connectionLost(reason)
+ 
+ 
+     def send(self, obj):
+Index: twisted/words/xish/xmlstream.py
+===================================================================
+--- twisted/words/xish/xmlstream.py	(revision 30799)
++++ twisted/words/xish/xmlstream.py	(working copy)
+@@ -82,7 +82,7 @@
+ 
+         Dispatches the L{STREAM_END_EVENT}.
+         """
+-        self.dispatch(self, STREAM_END_EVENT)
++        self.dispatch(reason,STREAM_END_EVENT)
+         self.stream = None
+ 
+     ### --------------------------------------------------------------

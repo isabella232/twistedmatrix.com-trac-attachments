@@ -1,0 +1,165 @@
+Index: twisted/internet/epollreactor.py
+===================================================================
+--- twisted/internet/epollreactor.py	(révision 23090)
++++ twisted/internet/epollreactor.py	(copie de travail)
+@@ -13,20 +13,27 @@
+ Maintainer: U{Jp Calderone <mailto:exarkun@twistedmatrix.com>}
+ """
+ 
+-import sys, errno
++import sys, errno, select
+ 
+ from zope.interface import implements
+ 
+ from twisted.internet.interfaces import IReactorFDSet
+ 
+-from twisted.python import _epoll
+ from twisted.python import log
+ from twisted.internet import posixbase, error
+ from twisted.internet.main import CONNECTION_LOST
+ 
+ 
+-_POLL_DISCONNECTED = (_epoll.HUP | _epoll.ERR)
++try:
++    select.epoll
++except AttributeError:
++    import select26 as select
+ 
++
++_POLL_DISCONNECTED = (select.EPOLLHUP | select.EPOLLERR)
++
++
++
+ class EPollReactor(posixbase.PosixReactorBase):
+     """
+     A reactor that uses epoll(4).
+@@ -61,7 +68,7 @@
+         """
+         # Create the poller we're going to use.  The 1024 here is just a hint
+         # to the kernel, it is not a hard maximum.
+-        self._poller = _epoll.epoll(1024)
++        self._poller = select.epoll(1024)
+         self._reads = {}
+         self._writes = {}
+         self._selectables = {}
+@@ -77,11 +84,11 @@
+         """
+         fd = xer.fileno()
+         if fd not in primary:
+-            cmd = _epoll.CTL_ADD
++            cmd = "register"
+             flags = event
+             if fd in other:
+                 flags |= antievent
+-                cmd = _epoll.CTL_MOD
++                cmd = "modify"
+             primary[fd] = 1
+             selectables[fd] = xer
+             # epoll_ctl can raise all kinds of IOErrors, and every one
+@@ -89,21 +96,23 @@
+             # Let them all through so someone sees a traceback and fixes
+             # something.  We'll do the same thing for every other call to
+             # this method in this file.
+-            self._poller._control(cmd, fd, flags)
++            getattr(self._poller, cmd)(fd, flags)
+ 
+ 
+     def addReader(self, reader):
+         """
+         Add a FileDescriptor for notification of data available to read.
+         """
+-        self._add(reader, self._reads, self._writes, self._selectables, _epoll.IN, _epoll.OUT)
++        self._add(reader, self._reads, self._writes, self._selectables,
++                  select.EPOLLIN, select.EPOLLOUT)
+ 
+ 
+     def addWriter(self, writer):
+         """
+         Add a FileDescriptor for notification of data available to write.
+         """
+-        self._add(writer, self._writes, self._reads, self._selectables, _epoll.OUT, _epoll.IN)
++        self._add(writer, self._writes, self._reads, self._selectables,
++                  select.EPOLLOUT, select.EPOLLIN)
+ 
+ 
+     def _remove(self, xer, primary, other, selectables, event, antievent):
+@@ -121,30 +130,31 @@
+             else:
+                 return
+         if fd in primary:
+-            cmd = _epoll.CTL_DEL
+             flags = event
+             if fd in other:
+                 flags = antievent
+-                cmd = _epoll.CTL_MOD
++                self._poller.modify(fd, flags)
+             else:
+                 del selectables[fd]
++                self._poller.unregister(fd)
+             del primary[fd]
+             # See comment above _control call in _add.
+-            self._poller._control(cmd, fd, flags)
+ 
+ 
+     def removeReader(self, reader):
+         """
+         Remove a Selectable for notification of data available to read.
+         """
+-        self._remove(reader, self._reads, self._writes, self._selectables, _epoll.IN, _epoll.OUT)
++        self._remove(reader, self._reads, self._writes, self._selectables,
++                select.EPOLLIN, select.EPOLLOUT)
+ 
+ 
+     def removeWriter(self, writer):
+         """
+         Remove a Selectable for notification of data available to write.
+         """
+-        self._remove(writer, self._writes, self._reads, self._selectables, _epoll.OUT, _epoll.IN)
++        self._remove(writer, self._writes, self._reads, self._selectables,
++                    select.EPOLLOUT, select.EPOLLIN)
+ 
+     def removeAll(self):
+         """
+@@ -164,7 +174,7 @@
+             try:
+                 # Actually, we'll ignore all errors from this, since it's
+                 # just last-chance cleanup.
+-                self._poller._control(_epoll.CTL_DEL, fd, 0)
++                self._poller.unregister(fd, 0)
+             except IOError:
+                 pass
+         if self.waker is not None:
+@@ -188,14 +198,13 @@
+         """
+         if timeout is None:
+             timeout = 1
+-        timeout = int(timeout * 1000) # convert seconds to milliseconds
+ 
+         try:
+             # Limit the number of events to the number of io objects we're
+             # currently tracking (because that's maybe a good heuristic) and
+             # the amount of time we block to the value specified by our
+             # caller.
+-            l = self._poller.wait(len(self._selectables), timeout)
++            l = self._poller.poll(timeout, max(1, len(self._selectables)))
+         except IOError, err:
+             if err.errno == errno.EINTR:
+                 return
+@@ -223,14 +232,14 @@
+         """
+         why = None
+         inRead = False
+-        if event & _POLL_DISCONNECTED and not (event & _epoll.IN):
++        if event & _POLL_DISCONNECTED and not (event & select.EPOLLIN):
+             why = CONNECTION_LOST
+         else:
+             try:
+-                if event & _epoll.IN:
++                if event & select.EPOLLIN:
+                     why = selectable.doRead()
+                     inRead = True
+-                if not why and event & _epoll.OUT:
++                if not why and event & select.EPOLLOUT:
+                     why = selectable.doWrite()
+                     inRead = False
+                 if selectable.fileno() != fd:

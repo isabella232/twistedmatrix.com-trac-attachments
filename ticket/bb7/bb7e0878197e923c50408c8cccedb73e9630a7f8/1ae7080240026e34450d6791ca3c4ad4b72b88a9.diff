@@ -1,0 +1,202 @@
+Index: static.py
+===================================================================
+--- static.py	(Revision 22798)
++++ static.py	(Arbeitskopie)
+@@ -286,7 +286,56 @@
+         """Return file size."""
+         return self.getsize()
+ 
++    def _handleRangeRequest(self, request, file):
++        """Performs (simple) Range-Header requests.
+ 
++        Simple means, that only the first byte range is handled.
++
++        @param file: file handle for the corresponding ressource
++        @type file: file object
++        @return: content-length and the number of the last byte to transmit.
++        @rtype: C{int}, C{int}
++        """
++
++        size = self.getFileSize()
++        range = request.getHeader('range')
++        try:
++            if range is not None:
++                bytesrange = string.split(range, '=')
++                assert bytesrange[0] == 'bytes',\
++                       "Syntactically invalid http range header!"
++
++                start, stop = string.split(bytesrange[1], ',', 1)[0].split('-')
++                
++                if start:
++                    start = int(start)
++                    if stop:
++                        stop = int(stop)
++                    else:
++                        stop = size
++                else:
++                    lastbytes = int(stop)
++                    if size < lastbytes:
++                        lastbytes = size
++                    start = size - lastbytes
++                    stop = size
++
++                file.seek(start)
++                content_length = stop - start + 1
++
++                if content_length <= 0:
++                    request.setResponseCode(http.REQUESTED_RANGE_NOT_STATISFIABLE)
++                    content_length = size
++                    request.method = 'HEAD' # no msg body will be transferred
++                else:
++                    request.setResponseCode(http.PARTIAL_CONTENT)
++                    request.setHeader('content-range', "bytes %s-%s/%s " % (str(start), str(stop), str(size)))
++
++                return content_length, stop
++        except:
++            traceback.print_exc(file=log.logfile)
++
++
+     def render(self, request):
+         """You know what you doing."""
+         self.restat()
+@@ -303,11 +352,8 @@
+         if self.isdir():
+             return self.redirect(request)
+ 
+-        #for content-length
+-        fsize = size = self.getFileSize()
++        request.setHeader('accept-ranges','bytes')
+ 
+-#         request.setHeader('accept-ranges','bytes')
+-
+         if self.type:
+             request.setHeader('content-type', self.type)
+         if self.encoding:
+@@ -325,40 +371,18 @@
+         if request.setLastModified(self.getmtime()) is http.CACHED:
+             return ''
+ 
+-# Commented out because it's totally broken. --jknight 11/29/04
+-#         try:
+-#             range = request.getHeader('range')
+-# 
+-#             if range is not None:
+-#                 # This is a request for partial data...
+-#                 bytesrange = string.split(range, '=')
+-#                 assert bytesrange[0] == 'bytes',\
+-#                        "Syntactically invalid http range header!"
+-#                 start, end = string.split(bytesrange[1],'-')
+-#                 if start:
+-#                     f.seek(int(start))
+-#                 if end:
+-#                     end = int(end)
+-#                     size = end
+-#                 else:
+-#                     end = size
+-#                 request.setResponseCode(http.PARTIAL_CONTENT)
+-#                 request.setHeader('content-range',"bytes %s-%s/%s " % (
+-#                     str(start), str(end), str(size)))
+-#                 #content-length should be the actual size of the stuff we're
+-#                 #sending, not the full size of the on-server entity.
+-#                 fsize = end - int(start)
+-# 
+-#             request.setHeader('content-length', str(fsize))
+-#         except:
+-#             traceback.print_exc(file=log.logfile)
++        # set the stop byte, and content-length
++        content_length = stop = self.getFileSize()
++        
++        if request.getHeader('range') is not None:
++           content_length, stop = self._handleRangeRequest(request, f)
+ 
+-        request.setHeader('content-length', str(fsize))
++        request.setHeader('content-length', str(content_length))
+         if request.method == 'HEAD':
+             return ''
+ 
+         # return data
+-        FileTransfer(f, size, request)
++        FileTransfer(f, stop, request)
+         # and make sure the connection doesn't get closed
+         return server.NOT_DONE_YET
+ 
+Index: test/test_web.py
+===================================================================
+--- test/test_web.py	(Revision 22798)
++++ test/test_web.py	(Arbeitskopie)
+@@ -15,8 +15,8 @@
+     uri='http://dummy/'
+     method = 'GET'
+ 
+-    def getHeader(self, h):
+-        return None
++    def getHeader(self, name):
++        return self.headers.get(name.lower(), None)
+ 
+     def registerProducer(self, prod,s):
+         self.go = 1
+@@ -36,6 +36,7 @@
+         self.protoSession = session or server.Session(0, self)
+         self.args = {}
+         self.outgoingHeaders = {}
++        self.headers = {}
+ 
+     def setHeader(self, name, value):
+         """TODO: make this assert on write() if the header is content-length
+@@ -311,6 +312,42 @@
+         child_without_ext = f.getChild('AreBelong', dreq)
+         self.assertNotEquals(child_without_ext, f.childNotFound)
+ 
++    def testRangeHeaderSupport(self):
++        """Testing if the Range-Header support works correctly.
++        """
++
++        import tempfile
++        
++        dummy_file = tempfile.NamedTemporaryFile()
++        payload = '\xf8u\xf3E\x8c7\xce\x00\x9e\xb6a0y0S\xf0\xef\xac\xb7\xbe\xb5\x17M\x1e\x136k{\x1e\xbe\x0c\x07\x07\t\xd0\xbckY\xf5I\x0b\xb8\x88oZ\x1d\x85b\x1a\xcdk\xf2\x1d&\xfd%\xdd\x82q/A\x10Y\x8b'
++        dummy_file.write(payload)
++        dummy_file.flush() # write all to disk
++        
++        # create a ressource out of it
++        f = static.File(dummy_file.name)
++        f.isLeaf = 1
++
++        range_req = DummyRequest([''])        
++        range_req.uri = dummy_file.name
++        range_req.headers['range'] = 'bytes=23-42'
++
++        range_req2 = DummyRequest([''])
++        range_req2.uri = dummy_file.name
++        range_req2.headers['range'] = 'bytes=17-'
++
++        range_req3 = DummyRequest([''])
++        range_req3.uri = dummy_file.name
++        range_req3.headers['range'] = 'bytes=-43'
++
++        f.render(range_req)
++        f.render(range_req2)
++        f.render(range_req3)
++
++        dummy_file.close()
++        self.assertEqual(''.join(range_req.written), payload[23:42])
++        self.assertEqual(''.join(range_req2.written), payload[17:])
++        self.assertEqual(''.join(range_req3.written), payload[-43:])
++
+ class DummyChannel:
+     class TCP:
+         port = 80
+@@ -535,13 +572,6 @@
+     clientproto = 'HTTP/1.0'
+     sentLength = None
+ 
+-    def __init__(self, *a, **kw):
+-        DummyRequest.__init__(self, *a, **kw)
+-        self.headers = {}
+-
+-    def getHeader(self, h):
+-        return self.headers.get(h.lower(), None)
+-
+     def getClientIP(self):
+         return self.client
+ 

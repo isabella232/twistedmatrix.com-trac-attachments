@@ -1,0 +1,228 @@
+diff --git a/twisted/python/failure.py b/twisted/python/failure.py
+index ce9b7fb..5c7ffd3 100644
+--- a/twisted/python/failure.py
++++ b/twisted/python/failure.py
+@@ -354,12 +354,6 @@ class Failure:
+                         postMortem(exc[2])
+                     except bdb.BdbQuit:
+                         pass
+-                    except Exception:
+-                        print(
+-                            "Debugging with %r failed. Falling back to pdb." %
+-                            (postMortem,))
+-
+-                        pdb.post_mortem(exc[2])
+ 
+             self._realInit(exc_value, exc_type, exc_tb, captureVars)
+ 
+diff --git a/twisted/test/test_failure.py b/twisted/test/test_failure.py
+index b55507b..731324b 100644
+--- a/twisted/test/test_failure.py
++++ b/twisted/test/test_failure.py
+@@ -835,23 +835,11 @@ class TestDebugMode(SynchronousTestCase):
+         self.assertEqual(self.debugger.mortems, [])
+ 
+ 
+-    def test_postMortemRaisedException(self):
+-        """
+-        If L{Failure.startDebugMode} is called with a post mortem function that
+-        raised an exception, it falls back to L{pdb.post_mortem}.
+-        """
+-        self.patch(pdb, "post_mortem", self.debugger.post_mortem)
+-        failure.startDebugMode(object())
+-
+-        try:
+-            raise ZeroDivisionError()
+-        except:
+-            _, _, tb = sys.exc_info()
+-            f = failure.Failure()
+-        self.assertEqual(self.debugger.mortems, [tb])
+-
+-
+     def test_stopDebugMode(self):
++        """
++        If L{Failure.stopDebugMode} is called, an L{Failure} no longer calls
++        the debugger for an exception.
++        """
+         failure.startDebugMode(self.debugger.post_mortem)
+         failure.stopDebugMode()
+ 
+diff --git a/twisted/topfiles/5795.feature b/twisted/topfiles/5795.feature
+index 7c99f32..69fce6c 100644
+--- a/twisted/topfiles/5795.feature
++++ b/twisted/topfiles/5795.feature
+@@ -1 +1 @@
+-failure.startDebugMode now takes a debugger to drop into, and respects --debugger as provided on the command line.
++failure.startDebugMode now takes a debugger to drop into, which trial --debugger will provide
+diff --git a/twisted/trial/test/test_runner.py b/twisted/trial/test/test_runner.py
+index 1dc5fb7..6f6049f 100644
+--- a/twisted/trial/test/test_runner.py
++++ b/twisted/trial/test/test_runner.py
+@@ -17,6 +17,7 @@ from twisted.scripts import trial
+ from twisted.plugins import twisted_trial
+ from twisted import plugin
+ from twisted.internet import defer
++from twisted.python.test.modules_helpers import TwistedModulesMixin
+ 
+ 
+ pyunit = __import__('unittest')
+@@ -37,31 +38,10 @@ class CapturingDebugger(object):
+ 
+ 
+     def runcall(self, fn, *args, **kwargs):
+-        self.calls.append((args, kwargs))
++        self.calls.append("runcall")
+         fn(*args, **kwargs)
+ 
+ 
+-    @classmethod
+-    def createAndCleanup(cls, test, attr):
+-        """
+-        Create a debugger at the given C{attr} and remove it after the test.
+-
+-        Exists because command line arguments like C{--debugger} will not have
+-        access to the instance, they need to find a debugger by fully qualified
+-        name on the class.
+-
+-        @param test: a test case instance where the debugger will live
+-        @param attr: a L{str} which is the name of the attribute to set and
+-            unset after the test has run. The attribute will be set on the
+-            I{class} of the given test case instance.
+-
+-        """
+-
+-        debugger = cls()
+-        setattr(test.__class__, attr, debugger)
+-        test.addCleanup(delattr, test.__class__, attr)
+-
+-
+ 
+ class CapturingReporter(object):
+     """
+@@ -308,7 +288,7 @@ class PyUnitDryRunTest(DryRunMixin, unittest.SynchronousTestCase):
+ 
+ 
+ 
+-class TestRunner(unittest.SynchronousTestCase):
++class TestRunner(TwistedModulesMixin, unittest.SynchronousTestCase):
+     def setUp(self):
+         self.config = trial.Options()
+         # whitebox hack a reporter in, because plugins are CACHED and will
+@@ -577,19 +557,18 @@ class TestRunner(unittest.SynchronousTestCase):
+         Trial uses specified debugger if the debugger is available.
+         """
+ 
+-        CapturingDebugger.createAndCleanup(self, "capturingDebugger")
+-
++        self.replaceSysModules(dict(sys.modules, dbg=CapturingDebugger()))
+         self.parseOptions([
+             '--reporter', 'capturing',
+             '--debugger',
+-            'twisted.trial.test.test_runner.TestRunner.capturingDebugger',
++            'dbg',
+             '--debug',
+             'twisted.trial.test.sample',
+         ])
+-        my_runner = self.getRunner()
+-        result = self.runSampleSuite(my_runner)
++        myRunner = self.getRunner()
++        result = self.runSampleSuite(myRunner)
+         self.assertEqual(self.standardReport, result._calls)
+-        self.assertEqual(['runcall'], my_runner.debugger.calls)
++        self.assertEqual(['runcall'], myRunner.debugger.calls)
+ 
+ 
+ 
+diff --git a/twisted/trial/test/test_script.py b/twisted/trial/test/test_script.py
+index a93674e..f427fdf 100644
+--- a/twisted/trial/test/test_script.py
++++ b/twisted/trial/test/test_script.py
+@@ -16,6 +16,7 @@ from twisted.python import failure, util
+ from twisted.python.usage import UsageError
+ from twisted.python.filepath import FilePath
+ 
++from twisted.python.test.modules_helpers import TwistedModulesMixin
+ from twisted.trial.test.test_loader import testNames
+ from twisted.trial.test.test_runner import CapturingDebugger
+ 
+@@ -576,7 +577,7 @@ class MakeRunnerTestCase(unittest.TestCase):
+ 
+ 
+ 
+-class TestRun(unittest.TestCase):
++class TestRun(TwistedModulesMixin, unittest.TestCase):
+     """
+     Tests for the L{run} function.
+     """
+@@ -596,15 +597,10 @@ class TestRun(unittest.TestCase):
+ 
+         """
+ 
+-        CapturingDebugger.createAndCleanup(self, "capturingDebugger")
++        debugger = CapturingDebugger()
++        self.replaceSysModules(dict(sys.modules, capturingDebugger=debugger))
+ 
+-        self.argv.extend(
+-            [
+-                "--debug",
+-                "--debugger",
+-                "twisted.trial.test.test_script.TestRun.capturingDebugger",
+-            ],
+-        )
++        self.argv.extend(["--debug", "--debugger", "capturingDebugger"])
+ 
+         def recordPostMortem(postMortem):
+             self.postMortem = postMortem
+@@ -615,7 +611,7 @@ class TestRun(unittest.TestCase):
+         except SystemExit:
+             pass
+ 
+-        self.assertEqual(self.postMortem, self.capturingDebugger.post_mortem)
++        self.assertEqual(self.postMortem, debugger.post_mortem)
+ 
+ 
+     def test_noPostMortemMethod(self):
+@@ -625,18 +621,13 @@ class TestRun(unittest.TestCase):
+ 
+         """
+ 
+-        CapturingDebugger.createAndCleanup(self, "capturingDebugger")
+-        postMortem = CapturingDebugger.post_mortem
+-        del CapturingDebugger.post_mortem
+-        self.addCleanup(setattr, CapturingDebugger, "post_mortem", postMortem)
++        class DebuggerWithoutPM(object):
++            def runcall(self, *args, **kwargs):
++                pass
+ 
+-        self.argv.extend(
+-            [
+-                "--debug",
+-                "--debugger",
+-                "twisted.trial.test.test_script.TestRun.capturingDebugger",
+-            ],
+-        )
++        self.replaceSysModules(dict(sys.modules, debugger=DebuggerWithoutPM()))
++
++        self.argv.extend(["--debug", "--debugger", "debugger"])
+ 
+         def recordPostMortem(postMortem):
+             self.postMortem = postMortem
+@@ -658,16 +649,9 @@ class TestRun(unittest.TestCase):
+ 
+         """
+ 
+-        CapturingDebugger.createAndCleanup(self, "capturingDebugger")
++        self.replaceSysModules(dict(sys.modules, debugger=CapturingDebugger()))
+ 
+-        self.argv.extend(
+-            [
+-                "--debug",
+-                "--debugger",
+-                "twisted.trial.test.test_script.TestRun.capturingDebugger",
+-                "--nopm",
+-            ],
+-        )
++        self.argv.extend(["--debug", "--debugger", "debugger", "--nopm"])
+ 
+         def startDebugMode(postMortem):
+             self.fail("startDebugMode should not have been called!")

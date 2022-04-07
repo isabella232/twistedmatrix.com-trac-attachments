@@ -1,0 +1,389 @@
+=== added file 'doc/names/howto/listings/names/auth_override.py'
+--- doc/names/howto/listings/names/auth_override.py	1970-01-01 00:00:00 +0000
++++ doc/names/howto/listings/names/auth_override.py	2014-01-14 09:11:47 +0000
+@@ -0,0 +1,85 @@
++# Copyright (c) Twisted Matrix Laboratories.
++# See LICENSE for details.
++
++"""
++An example demonstrating how to create a custom DNS server.
++
++The server will calculate the responses to A queries where the name begins with
++the word "host".
++
++Other queries will be handled by a fallback resolver.
++"""
++
++from twisted.internet import reactor
++from twisted.names import dns, resolve, server
++
++
++
++class DynamicResolver(object):
++    """
++    A resolver which calculates the answers to certain queries based on the
++    query type and name.
++
++    Other queries are dispatched to a fallback resolver.
++    """
++    def __init__(self, fallbackResolver=None):
++        if fallbackResolver is None:
++            fallbackResolver = resolve.ResolverChain(resolvers=[])
++        self._fallbackResolver = fallbackResolver
++
++
++    def _dynamicResponseRequired(self, query):
++        """
++        Check the query to determine if a dynamic response is required.
++        """
++        response = False
++        if query.type == dns.A:
++            labels = dns._nameToLabels(query.name.name)
++            if labels[0].startswith('host'):
++                response = True
++
++        return response
++
++
++    def _doDynamicResponse(self, query):
++        """
++        Calculate the response to a query.
++        """
++        name = query.name
++        labels = dns._nameToLabels(query.name.name)
++        parts = labels[0].split('host')
++        lastOctet = int(parts[1])
++        p = dns.Record_A(address=b'172.0.2.%s' % (lastOctet,), ttl=0)
++        return [dns.RRHeader(name=name.name, payload=p)], [], []
++
++
++    def query(self, query, timeout=None):
++        """
++        Check if the query should be answered dynamically, otherwise dispatch to
++        the fallback resolver.
++        """
++        if self._dynamicResponseRequired(query):
++            return self._doDynamicResponse(query)
++        else:
++            return self._fallbackResolver.query(query, timeout)
++
++
++
++def main():
++    """
++    Run the server.
++    """
++    s = server.DNSServerFactory(
++        authorities=[DynamicResolver()],
++    )
++
++    p = dns.DNSDatagramProtocol(controller=s)
++
++    reactor.listenUDP(10053, p)
++
++    reactor.run()
++
++
++
++if __name__ == '__main__':
++    raise SystemExit(main())
+
+=== added file 'doc/names/howto/listings/names/test_authoverride.py'
+--- doc/names/howto/listings/names/test_authoverride.py	1970-01-01 00:00:00 +0000
++++ doc/names/howto/listings/names/test_authoverride.py	2014-01-14 09:11:47 +0000
+@@ -0,0 +1,272 @@
++# Copyright (c) Twisted Matrix Laboratories.
++# See LICENSE for details.
++
++"""
++Tests for docs/names/howto/listings/auth_override.py
++"""
++
++from auth_override import DynamicResolver
++
++from twisted.internet import reactor
++from twisted.names import dns, server, client, resolve
++from twisted.trial.unittest import SynchronousTestCase, TestCase, FailTest
++
++
++
++class RaisedArguments(Exception):
++    """
++    An exception for recording raised arguments.
++    """
++    def __init__(self, args, kwargs):
++        self.args = args
++        self.kwargs = kwargs
++
++
++class DNSAssertionsMixin(object):
++    """
++    A custom assertion and helpers for comparing the results of IResolver.lookup
++    methods.
++
++    Compares the RRHeaders and Record payloads separately.
++    """
++    def _justPayloads(self, headers):
++        """
++        Return only the payloads from a list of headers.
++        """
++        return [h.payload for h in headers]
++
++
++    def _allPayloads(self, sections):
++        """
++        Return all the payloads from the three section lists typically returned from
++        IResolver.lookup methods.
++        """
++        payloads = []
++        for section in sections:
++            payloads.append(self._justPayloads(section))
++        return payloads
++
++
++    def assertEqualResolverResponse(self, expected, actual):
++        """
++        Compare the headers and payloads from the section lists returned by
++        IResolver.lookup methods.
++
++        Failures are accompaned by a print out of the headers and payloads.
++        """
++        try:
++            self.assertEqual(expected, actual)
++        except FailTest:
++            self.fail(
++                'Header / Payload mismatch:\n\n'
++                'Headers: \n%r\n%r\n'
++                'Payloads: \n%r\n%r\n' % (expected,
++                                          actual,
++                                          self._allPayloads(expected),
++                                          self._allPayloads(actual))
++            )
++
++
++
++class Raiser(object):
++    """
++    A fake which can be patched on top of a method under test to verify its call
++    signature.
++    """
++    def __init__(self, exception):
++        self._exception = exception
++
++
++    def call(self, *args, **kwargs):
++        raise self._exception(args, kwargs)
++
++
++
++class DynamicResolverTests(SynchronousTestCase, DNSAssertionsMixin):
++    def test_queryCallsDynamicIp(self):
++        """
++        query calls _dynamicIP with the supplied query to determine whether the
++        answer should be calculated dynamically.
++        """
++        r = DynamicResolver()
++
++        class ExpectedException(RaisedArguments):
++            pass
++
++        r._dynamicResponseRequired = Raiser(ExpectedException).call
++
++        dummyQuery = object()
++
++        e = self.assertRaises(ExpectedException, r.query, dummyQuery)
++        self.assertEqual(
++            ((dummyQuery,), {}),
++            (e.args, e.kwargs)
++        )
++
++
++    def test_dynamicResponseRequired(self):
++        """
++        DynamicResolver._dynamicResponseRequired returns True if query.type == A
++        else False.
++        """
++        r = DynamicResolver()
++        self.assertEqual(
++            (True, False, False),
++            (r._dynamicResponseRequired(dns.Query(name=b'host1.example.com', type=dns.A)),
++             r._dynamicResponseRequired(dns.Query(name=b'host1.example.com', type=dns.SOA)),
++             r._dynamicResponseRequired(dns.Query(name=b'foo1.example.com', type=dns.A)),)
++        )
++
++
++    def test_fallbackResolverDefault(self):
++        """
++        DynamicResolver uses ResolverChain by default
++        """
++        self.assertIsInstance(
++            DynamicResolver()._fallbackResolver,
++            resolve.ResolverChain,
++        )
++
++
++    def test_fallbackResolverOverride(self):
++        """
++        DynamicResolver accepts a fallback resolver.
++        """
++        dummyFallbackResolver = object()
++        self.assertEqual(
++            dummyFallbackResolver,
++            DynamicResolver(fallbackResolver=dummyFallbackResolver)._fallbackResolver
++        )
++
++
++    def test_fallback(self):
++        """
++        If a query can not be handled dynamically, it will be dispatched to the
++        query method of the fallback resolver.
++        """
++        class RaisingResolver(object):
++            class QueryArguments(RaisedArguments):
++                pass
++
++            def query(self, *args, **kwargs):
++                raise self.QueryArguments(args=args, kwargs=kwargs)
++
++        expectedQuery = dns.Query('host1.example.com', type=dns.SOA)
++        expectedTimeout = None
++        r = DynamicResolver(fallbackResolver=RaisingResolver())
++        e = self.assertRaises(
++            RaisingResolver.QueryArguments,
++            r.query,
++            expectedQuery
++        )
++        self.assertEqual(
++            ((expectedQuery, expectedTimeout), {}),
++            (e.args, e.kwargs)
++        )
++
++
++    def test_queryCallsDoDynamicResponse(self):
++        """
++        DynamicResolver.query will call _doDynamicResponse to calculate the response
++        to a dynamic query.
++        """
++        r = DynamicResolver()
++
++        r._dynamicResponseRequired = lambda query: True
++
++        class ExpectedException(RaisedArguments):
++            pass
++
++        r._doDynamicResponse = Raiser(ExpectedException).call
++
++        dummyQuery = object()
++        e = self.assertRaises(
++            ExpectedException,
++            r.query, dummyQuery
++        )
++        self.assertEqual(
++            ((dummyQuery,), {}),
++            (e.args, e.kwargs)
++        )
++
++
++    def test_doDynamicResponseHost1(self):
++        """
++        _doDynamicResponse takes the trailing integer in the first label of the
++        query name and uses it as the last octet of the rerurned IP address.
++        """
++        r = DynamicResolver()
++        self.assertEqualResolverResponse(
++            ([dns.RRHeader(name='host1.example.com', payload=dns.Record_A(address='172.0.2.1', ttl=0))], [], []),
++            r._doDynamicResponse(dns.Query('host1.example.com'))
++        )
++
++
++    def test_doDynamicResponseHost2(self):
++        """
++        """
++        r = DynamicResolver()
++        self.assertEqualResolverResponse(
++            ([dns.RRHeader(name='host2.example.com', payload=dns.Record_A(address='172.0.2.2', ttl=0))], [], []),
++            r._doDynamicResponse(dns.Query('host2.example.com'))
++        )
++
++
++
++class RoundTripTests(TestCase, DNSAssertionsMixin):
++    """
++    Functional tests which setup a listening server and send it requests using a
++    network client.
++    """
++    def buildClientServer(self, fallbackResolver=None):
++        s = server.DNSServerFactory(
++            authorities=[DynamicResolver(fallbackResolver=fallbackResolver)],
++        )
++
++        listeningPort = reactor.listenUDP(0, dns.DNSDatagramProtocol(controller=s))
++        self.addCleanup(listeningPort.stopListening)
++        return client.Resolver(servers=[('127.0.0.1', listeningPort.getHost().port)])
++
++
++    def test_query(self):
++        """
++        """
++        hostname = b'host1.example.com'
++
++        expected = (
++            [dns.RRHeader(name=hostname, payload=dns.Record_A('172.0.2.1', ttl=0))],
++            [],
++            []
++        )
++
++        r = self.buildClientServer()
++
++        return r.lookupAddress(hostname).addCallback(
++            self.assertEqualResolverResponse,
++            expected
++        )
++
++
++    def test_queryOverride(self):
++        """
++        """
++        hostname = b'host1.example.com'
++
++        expectedAnswer = dns.RRHeader(name=hostname, type=dns.TXT, payload=dns.Record_TXT('Foo', ttl=0))
++
++        class FakeFallbackResolver(object):
++            def query(self, query, timeout):
++                return ([expectedAnswer], [], [])
++        fbr = FakeFallbackResolver()
++        r = self.buildClientServer(fallbackResolver=fbr)
++
++        expected = (
++            [expectedAnswer],
++            [],
++            []
++        )
++
++        return r.lookupText(hostname).addCallback(
++            self.assertEqualResolverResponse,
++            expected
++        )
+
+=== modified file 'doc/names/howto/names.xhtml'
+--- doc/names/howto/names.xhtml	2013-03-20 06:23:05 +0000
++++ doc/names/howto/names.xhtml	2014-01-14 09:11:37 +0000
+@@ -50,5 +50,17 @@
+ directives are not yet supported.
+ </p>
+ 
++
++<h2>Creating a custom authoritative server</h2>
++
++<p>Lets start by creating a simple authoritative DNS server<p>
++
++<p>
++  Say we want to create a bespoke DNS server
++  which dynamically converts names to IP addresses.
++</p>
++
++<a href="listings/names/auth-override.py" class="py-listing">Override example</a>
++
+ </body>
+ </html>
+

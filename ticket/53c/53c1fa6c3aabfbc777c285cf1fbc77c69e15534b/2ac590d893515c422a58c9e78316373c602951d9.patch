@@ -1,0 +1,128 @@
+diff --git twisted/web/http.py twisted/web/http.py
+index 309b45f..9557afa 100644
+--- twisted/web/http.py
++++ twisted/web/http.py
+@@ -884,46 +884,14 @@ class Request:
+         return self.notifications[-1]
+ 
+ 
+-    def finish(self):
+-        """
+-        Indicate that all response data has been written to this L{Request}.
+-        """
+-        if self._disconnected:
+-            raise RuntimeError(
+-                "Request.finish called on a request after its connection was lost; "
+-                "use Request.notifyFinish to keep track of this.")
+-        if self.finished:
+-            warnings.warn("Warning! request.finish called twice.", stacklevel=2)
+-            return
+-
+-        if not self.startedWriting:
+-            # write headers
+-            self.write('')
+-
+-        if self.chunked:
+-            # write last chunk and closing CRLF
+-            self.transport.write(b"0\r\n\r\n")
+-
+-        # log request
+-        if hasattr(self.channel, "factory"):
+-            self.channel.factory.log(self)
+-
+-        self.finished = 1
+-        if not self.queued:
+-            self._cleanup()
+-
+-
+-    def write(self, data):
++    def forceHeaderOutput(self):
+         """
+-        Write some data as a result of an HTTP request.  The first
+-        time this is called, it writes out response data.
++        Force writing headers to transport if self.startedWriting is false.
++        Sets self.startedWriting to true.
+ 
+-        @type data: C{bytes}
+-        @param data: Some bytes to be sent as part of the response body.
++        @returns True if data shouldn't be written at all.
++        @rtype C{bool}
+         """
+-        if self.finished:
+-            raise RuntimeError('Request.write called on a request after '
+-                               'Request.finish was called.')
+         if not self.startedWriting:
+             self.startedWriting = 1
+             version = self.clientproto
+@@ -975,12 +943,55 @@ class Request:
+             # if this is a "HEAD" request, we shouldn't return any data
+             if self.method == b"HEAD":
+                 self.write = lambda data: None
+-                return
++                return True
+ 
+             # for certain result codes, we should never return any data
+             if self.code in NO_BODY_CODES:
+                 self.write = lambda data: None
+-                return
++                return True
++
++        return False
++
++    def finish(self):
++        """
++        Indicate that all response data has been written to this L{Request}.
++        """
++        if self._disconnected:
++            raise RuntimeError(
++                "Request.finish called on a request after its connection was lost; "
++                "use Request.notifyFinish to keep track of this.")
++        if self.finished:
++            warnings.warn("Warning! request.finish called twice.", stacklevel=2)
++            return
++
++        self.forceHeaderOutput()
++
++        if self.chunked:
++            # write last chunk and closing CRLF
++            self.transport.write(b"0\r\n\r\n")
++
++        # log request
++        if hasattr(self.channel, "factory"):
++            self.channel.factory.log(self)
++
++        self.finished = 1
++        if not self.queued:
++            self._cleanup()
++
++    def write(self, data):
++        """
++        Write some data as a result of an HTTP request.  The first
++        time this is called, it writes out response data.
++
++        @type data: C{bytes}
++        @param data: Some bytes to be sent as part of the response body.
++        """
++        if self.finished:
++            raise RuntimeError('Request.write called on a request after '
++                               'Request.finish was called.')
++
++        if self.forceHeaderOutput():
++            return
+ 
+         self.sentLength = self.sentLength + len(data)
+         if data:
+diff --git twisted/web/server.py twisted/web/server.py
+index bc3f07c..8cbb4f4 100644
+--- twisted/web/server.py
++++ twisted/web/server.py
+@@ -217,7 +217,8 @@ class Request(Copyable, http.Request, components.Componentized):
+         if not self._inFakeHead:
+             if self._encoder:
+                 data = self._encoder.encode(data)
+-            http.Request.write(self, data)
++            if data is not None:
++                http.Request.write(self, data)
+ 
+ 
+     def finish(self):

@@ -1,0 +1,422 @@
+diff --git a/twisted/web/test/test_wsgi.py b/twisted/web/test/test_wsgi.py
+index ae14467..6705572 100644
+--- a/twisted/web/test/test_wsgi.py
++++ b/twisted/web/test/test_wsgi.py
+@@ -10,6 +10,7 @@ __metaclass__ = type
+ from sys import exc_info
+ import tempfile
+ import traceback
++import warnings
+ 
+ from zope.interface.verify import verifyObject
+ 
+@@ -244,7 +245,7 @@ class WSGITestsMixin:
+                     content = application(environ, startResponse)
+             except:
+                 result.errback()
+-                startResponse('500 Error', [], exc_info())
++                startResponse('500 Error', [])
+                 return iter(())
+             else:
+                 result.callback((environ, startResponse))
+@@ -800,7 +801,8 @@ class EnvironTests(WSGITestsMixin, TestCase):
+     def test_wsgiErrorsAcceptsOnlyNativeStrings(self):
+         """
+         The C{'wsgi.errors'} file-like object from the C{environ} C{dict} will
+-        permit writes of only native strings.
++        permit writes of only native strings in Python 3, and will warn
++        against the use of non-native strings in Python 2.
+         """
+         request, result = self.prepareRequest()
+         request.requestReceived()
+@@ -808,9 +810,21 @@ class EnvironTests(WSGITestsMixin, TestCase):
+         errors = environ["wsgi.errors"]
+ 
+         if _PY3:
+-            self.assertRaises(TypeError, errors.write, b"fred")
++            # In Python 3, TypeError is raised.
++            error = self.assertRaises(TypeError, errors.write, b"fred")
++            self.assertEqual(
++                "write() argument must be str, not b'fred' (bytes)",
++                str(error))
+         else:
+-            self.assertRaises(TypeError, errors.write, u"fred")
++            # In Python 2, only a warning is issued; existing WSGI
++            # applications may rely on this non-compliant behaviour.
++            with warnings.catch_warnings(record=True) as caught:
++                errors.write(u"fred")
++            self.assertEqual(1, len(caught))
++            self.assertEqual(UnicodeWarning, caught[0].category)
++            self.assertEqual(
++                "write() argument should be str, not u'fred' (unicode)",
++                str(caught[0].message))
+ 
+ 
+ 
+@@ -1203,7 +1217,7 @@ class StartResponseTests(WSGITestsMixin, TestCase):
+     def test_statusMustBeNativeString(self):
+         """
+         The response status passed to the I{start_response} callable MUST be a
+-        native string.
++        native string in Python 2 and Python 3.
+         """
+         status = b"200 OK" if _PY3 else u"200 OK"
+ 
+@@ -1275,29 +1289,79 @@ class StartResponseTests(WSGITestsMixin, TestCase):
+             [b'Baz: quux', b'Foo: bar'])
+ 
+ 
+-    def test_headersMustBePlainList(self):
++    def test_headersMustBeSequence(self):
++        """
++        The headers passed to the I{start_response} callable MUST be a
++        sequence.
++        """
++        headers = [("key", "value")]
++
++        def application(environ, startResponse):
++            startResponse("200 OK", iter(headers))
++            return iter(())
++
++        request, result = self.prepareRequest(application)
++        request.requestReceived()
++
++        def checkMessage(error):
++            self.assertRegexpMatches(
++                str(error), "headers must be a list, not "
++                "<list_?iterator .+> [(]list_?iterator[)]")
++
++        return self.assertFailure(result, TypeError).addCallback(checkMessage)
++
++
++    @inlineCallbacks
++    def test_headersShouldBePlainList(self):
+         """
+-        The headers passed to the I{start_response} callable MUST be in a
+-        plain list.
++        The headers passed to the I{start_response} callable SHOULD be a plain
++        list.
+         """
+         def application(environ, startResponse):
+             startResponse("200 OK", (("not", "list"),))
+             return iter(())
+ 
+         request, result = self.prepareRequest(application)
++
++        # In both Python 2 and Python 3, only a warning is issued; existing
++        # WSGI applications may rely on this non-compliant behaviour, and we
++        # can actually work with any sequence type.
++        with warnings.catch_warnings(record=True) as caught:
++            request.requestReceived()
++            yield result
++        self.assertEqual(1, len(caught))
++        self.assertEqual(RuntimeWarning, caught[0].category)
++        self.assertEqual(
++            "headers should be a list, not (('not', 'list'),) (tuple)",
++            str(caught[0].message))
++
++
++    def test_headersMustEachBeSequence(self):
++        """
++        Each header passed to the I{start_response} callable MUST be a
++        sequence.
++        """
++        header = ("key", "value")
++
++        def application(environ, startResponse):
++            startResponse("200 OK", [iter(header)])
++            return iter(())
++
++        request, result = self.prepareRequest(application)
+         request.requestReceived()
+ 
+         def checkMessage(error):
+-            self.assertEqual(
+-                "headers must be a list, not (('not', 'list'),) (tuple)",
+-                str(error))
++            self.assertRegexpMatches(
++                str(error), "header must be a [(]str, str[)] tuple, not "
++                "<tuple_?iterator .+> [(]tuple_?iterator[)]")
+ 
+         return self.assertFailure(result, TypeError).addCallback(checkMessage)
+ 
+ 
+-    def test_headersMustEachBeTuple(self):
++    @inlineCallbacks
++    def test_headersShouldEachBeTuple(self):
+         """
+-        Each header passed to the I{start_response} callable MUST be in a
++        Each header passed to the I{start_response} callable SHOULD be a
+         tuple.
+         """
+         def application(environ, startResponse):
+@@ -1305,12 +1369,36 @@ class StartResponseTests(WSGITestsMixin, TestCase):
+             return iter(())
+ 
+         request, result = self.prepareRequest(application)
++
++        # In both Python 2 and Python 3, only a warning is issued; existing
++        # WSGI applications may rely on this non-compliant behaviour, and we
++        # can actually work with any sequence type.
++        with warnings.catch_warnings(record=True) as caught:
++            request.requestReceived()
++            yield result
++        self.assertEqual(1, len(caught))
++        self.assertEqual(RuntimeWarning, caught[0].category)
++        self.assertEqual(
++            "header should be a (str, str) tuple, not ['not', 'tuple'] (list)",
++            str(caught[0].message))
++
++
++    def test_headersShouldEachHaveKeyAndValue(self):
++        """
++        Each header passed to the I{start_response} callable MUST hold a key
++        and a value, and ONLY a key and a value.
++        """
++        def application(environ, startResponse):
++            startResponse("200 OK", [("too", "many", "cooks")])
++            return iter(())
++
++        request, result = self.prepareRequest(application)
+         request.requestReceived()
+ 
+         def checkMessage(error):
+             self.assertEqual(
+-                "header must be (str, str) tuple, not ['not', 'tuple'] (list)",
+-                str(error))
++                "header must be a (str, str) tuple, not "
++                "('too', 'many', 'cooks')", str(error))
+ 
+         return self.assertFailure(result, TypeError).addCallback(checkMessage)
+ 
+@@ -1318,7 +1406,7 @@ class StartResponseTests(WSGITestsMixin, TestCase):
+     def test_headerKeyMustBeNativeString(self):
+         """
+         Each header key passed to the I{start_response} callable MUST be at
+-        native string.
++        native string in Python 2 and Python 3.
+         """
+         key = b"key" if _PY3 else u"key"
+ 
+@@ -1340,7 +1428,7 @@ class StartResponseTests(WSGITestsMixin, TestCase):
+     def test_headerValueMustBeNativeString(self):
+         """
+         Each header value passed to the I{start_response} callable MUST be at
+-        native string.
++        native string in Python 2 and Python 3.
+         """
+         value = b"value" if _PY3 else u"value"
+ 
+@@ -1652,11 +1740,11 @@ class StartResponseTests(WSGITestsMixin, TestCase):
+         def checkMessage(error):
+             if _PY3:
+                 self.assertEqual(
+-                    "write() argument must be bytes, not 'bogus' (str)",
++                    "Can only write bytes to a transport, not 'bogus'",
+                     str(error))
+             else:
+                 self.assertEqual(
+-                    "write() argument must be bytes, not u'bogus' (unicode)",
++                    "Can only write bytes to a transport, not u'bogus'",
+                     str(error))
+ 
+         return self.assertFailure(result, TypeError).addCallback(checkMessage)
+diff --git a/twisted/web/wsgi.py b/twisted/web/wsgi.py
+index 62fc330..3f30658 100644
+--- a/twisted/web/wsgi.py
++++ b/twisted/web/wsgi.py
+@@ -8,10 +8,13 @@ U{Python Web Server Gateway Interface v1.0.1<http://www.python.org/dev/peps/pep-
+ 
+ __metaclass__ = type
+ 
++from collections import Sequence
+ from sys import exc_info
++from warnings import warn
+ 
+ from zope.interface import implementer
+ 
++from twisted.internet.threads import blockingCallFromThread
+ from twisted.python.compat import reraise
+ from twisted.python.log import msg, err
+ from twisted.python.failure import Failure
+@@ -72,7 +75,7 @@ else:
+         round-trip it to bytes and back using ISO-8859-1 as the encoding.
+ 
+         @type string: C{str} or C{bytes}
+-        @rtype: str
++        @rtype: C{str}
+ 
+         @raise UnicodeEncodeError: If C{string} contains non-ISO-8859-1 chars.
+         """
+@@ -87,10 +90,9 @@ else:
+         ISO-8859-1 byte string.
+ 
+         @type string: C{str}
+-        @rtype: bytes
++        @rtype: C{bytes}
+ 
+         @raise UnicodeEncodeError: If C{string} contains non-ISO-8859-1 chars.
+-        @raise TypeError: If C{string} is not a byte string.
+         """
+         return string.encode("iso-8859-1")
+ 
+@@ -117,12 +119,18 @@ class _ErrorStream:
+ 
+         @type data: str
+ 
+-        @raise TypeError: If C{data} is not a native string.
++        @raise TypeError: On Python 3, if C{data} is not a native string. On
++            Python 2 a warning will be issued.
+         """
+         if not isinstance(data, str):
+-            raise TypeError(
+-                "write() argument must be str, not %r (%s)"
+-                % (data, type(data).__name__))
++            if str is bytes:
++                warn("write() argument should be str, not %r (%s)" % (
++                    data, type(data).__name__), category=UnicodeWarning)
++            else:
++                raise TypeError(
++                    "write() argument must be str, not %r (%s)"
++                    % (data, type(data).__name__))
++
+         msg(data, system='wsgi', isError=True)
+ 
+ 
+@@ -136,7 +144,8 @@ class _ErrorStream:
+         @param iovec: A C{list} of C{'\\n'}-terminated C{str} which will be
+             logged.
+ 
+-        @raise TypeError: If C{iovec} contains any non-native strings.
++        @raise TypeError: On Python 3, if C{iovec} contains any non-native
++            strings. On Python 2 a warning will be issued.
+         """
+         self.write(''.join(iovec))
+ 
+@@ -347,34 +356,56 @@ class _WSGIResponse:
+         if self.started and excInfo is not None:
+             reraise(excInfo[1], excInfo[2])
+ 
+-        # PEP-3333 mandates that status should be a native string.
++        # PEP-3333 mandates that status should be a native string. In practice
++        # this is mandated by Twisted's HTTP implementation too, so we enforce
++        # on both Python 2 and Python 3.
+         if not isinstance(status, str):
+             raise TypeError(
+                 "status must be str, not %r (%s)"
+                 % (status, type(status).__name__))
+ 
+-        # PEP-3333 mandates a plain list.
+-        if not isinstance(headers, list):
++        # PEP-3333 mandates that headers should be a plain list, but in
++        # practice we work with any sequence type and only warn when it's not
++        # a plain list.
++        if isinstance(headers, list):
++            pass  # This is okay.
++        elif isinstance(headers, Sequence):
++            warn("headers should be a list, not %r (%s)" % (
++                headers, type(headers).__name__), category=RuntimeWarning)
++        else:
+             raise TypeError(
+                 "headers must be a list, not %r (%s)"
+                 % (headers, type(headers).__name__))
+ 
+-        # PEP-3333 mandates that each header should be a (str, str) tuple.
++        # PEP-3333 mandates that each header should be a (str, str) tuple, but
++        # in practice we work with any sequence type and only warn when it's
++        # not a plain list.
+         for header in headers:
+             if isinstance(header, tuple):
+-                is_okay = (
+-                    len(header) == 2 and
+-                    isinstance(header[0], str) and
+-                    isinstance(header[1], str)
+-                )
+-                if not is_okay:
+-                    raise TypeError(
+-                        "header must be (str, str) tuple, not %r" % (header, ))
++                pass  # This is okay.
++            elif isinstance(header, Sequence):
++                warn("header should be a (str, str) tuple, not %r (%s)" % (
++                    header, type(header).__name__), category=RuntimeWarning)
+             else:
+                 raise TypeError(
+-                    "header must be (str, str) tuple, not %r (%s)"
++                    "header must be a (str, str) tuple, not %r (%s)"
+                     % (header, type(header).__name__))
+ 
++            # However, the sequence MUST contain only 2 elements.
++            if len(header) != 2:
++                raise TypeError(
++                    "header must be a (str, str) tuple, not %r"
++                    % (header, ))
++
++            # Both elements MUST be native strings. Non-native strings will be
++            # rejected by the underlying HTTP machinery in any case, but we
++            # reject them here in order to provide a more informative error.
++            for elem in header:
++                if not isinstance(elem, str):
++                    raise TypeError(
++                        "header must be (str, str) tuple, not %r"
++                        % (header, ))
++
+         self.status = status
+         self.headers = headers
+         return self.write
+@@ -387,21 +418,7 @@ class _WSGIResponse:
+         the status and headers first.
+ 
+         This will be called in a non-I/O thread.
+-
+-        @raise TypeError: If C{data} is not a byte string.
+         """
+-        # Check that `data` is bytes now because we will not get any feedback
+-        # from callFromThread() later on.
+-        if not isinstance(data, bytes):
+-            raise TypeError(
+-                "write() argument must be bytes, not %r (%s)"
+-                % (data, type(data).__name__))
+-
+-        def wsgiWrite(started):
+-            if not started:
+-                self._sendResponseHeaders()
+-            self.request.write(data)
+-
+         # PEP-3333 states:
+         #
+         #   The server or gateway must transmit the yielded bytestrings to the
+@@ -409,8 +426,12 @@ class _WSGIResponse:
+         #   each bytestring before requesting another one.
+         #
+         # This write() method is used for the imperative and (indirectly) for
+-        # the more familiar iterable-of-bytestrings WSGI mechanism, but offers
+-        # no back-pressure, and so violates this part of PEP-3333.
++        # the more familiar iterable-of-bytestrings WSGI mechanism. It uses
++        # C{blockingCallFromThread} to schedule writes. This allows exceptions
++        # to propagate up from the underlying HTTP implementation. However,
++        # that underlying implementation does not, as yet, provide any way to
++        # know if the written data has been transmitted, so this method
++        # violates the above part of PEP-3333.
+         #
+         # PEP-3333 also says that a server may:
+         #
+@@ -422,8 +443,17 @@ class _WSGIResponse:
+         #
+         # However, providing some back-pressure may nevertheless be a Good
+         # Thing at some point in the future.
+-        self.reactor.callFromThread(wsgiWrite, self.started)
+-        self.started = True
++
++        def wsgiWrite(started):
++            if not started:
++                self._sendResponseHeaders()
++            self.request.write(data)
++
++        try:
++            return blockingCallFromThread(
++                self.reactor, wsgiWrite, self.started)
++        finally:
++            self.started = True
+ 
+ 
+     def _sendResponseHeaders(self):

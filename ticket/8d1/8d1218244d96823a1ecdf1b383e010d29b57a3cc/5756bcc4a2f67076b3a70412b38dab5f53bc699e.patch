@@ -1,0 +1,121 @@
+Index: twisted/internet/base.py
+===================================================================
+--- twisted/internet/base.py	(revision 39103)
++++ twisted/internet/base.py	(working copy)
+@@ -11,7 +11,7 @@
+ import socket # needed only for sync-dns
+ from zope.interface import implementer, classImplements
+ 
+-import sys
++import sys, signal
+ import warnings
+ from heapq import heappush, heappop, heapify
+ 
+@@ -468,6 +468,7 @@
+     installed = False
+     usingThreads = False
+     resolver = BlockingResolver()
++    _exitStatus = 0
+ 
+     __name__ = "twisted.internet.reactor"
+ 
+@@ -601,6 +602,7 @@
+         """
+         log.msg("Received SIGINT, shutting down.")
+         self.callFromThread(self.stop)
++        self._exitStatus = signal.SIGINT
+ 
+     def sigBreak(self, *args):
+         """Handle a SIGBREAK interrupt.
+@@ -613,6 +615,7 @@
+         """
+         log.msg("Received SIGTERM, shutting down.")
+         self.callFromThread(self.stop)
++        self._exitStatus = signal.SIGTERM
+ 
+     def disconnectAll(self):
+         """Disconnect every reader, and writer in the system.
+Index: twisted/internet/test/test_base.py
+===================================================================
+--- twisted/internet/test/test_base.py	(revision 39103)
++++ twisted/internet/test/test_base.py	(working copy)
+@@ -5,7 +5,7 @@
+ Tests for L{twisted.internet.base}.
+ """
+ 
+-import socket
++import socket, signal, os
+ try:
+     from Queue import Queue
+ except ImportError:
+@@ -19,6 +19,7 @@
+ from twisted.internet.base import ThreadedResolver, DelayedCall
+ from twisted.internet.task import Clock
+ from twisted.trial.unittest import TestCase
++from twisted.internet.base import _SignalReactorMixin, ReactorBase
+ 
+ 
+ @implementer(IReactorTime, IReactorThreads)
+@@ -270,3 +271,31 @@
+         self.assertTrue(self.zero != self.one)
+         self.assertFalse(self.zero != self.zero)
+         self.assertFalse(self.one != self.one)
++
++class FakeReactorWithSignalHandlers(FakeReactor, _SignalReactorMixin,
++                                    ReactorBase):
++    def __init__(self):
++        FakeReactor.__init__(self)
++
++class SignalReactorTests(TestCase):
++
++    def test_exitStatusAfterKill(self):
++        """
++        Assert appropriate exit statuses for corresponding signals.
++        """
++        oldIntHandle = signal.getsignal(signal.SIGINT)
++        oldTermHandle = signal.getsignal(signal.SIGTERM)
++        reactor = FakeReactorWithSignalHandlers()
++        reactor._handleSignals()
++        self.addCleanup(reactor._stop)
++        pid = os.getpid()
++        os.kill(pid, signal.SIGINT)
++        intStatus = reactor._exitStatus
++        os.kill(pid, signal.SIGTERM)
++        termStatus = reactor._exitStatus
++
++        self.assertEqual(intStatus, signal.SIGINT)
++        self.assertEqual(termStatus, signal.SIGTERM)
++
++        signal.signal(signal.SIGINT, oldIntHandle)
++        signal.signal(signal.SIGTERM, oldTermHandle)
+Index: twisted/application/app.py
+===================================================================
+--- twisted/application/app.py	(revision 39103)
++++ twisted/application/app.py	(working copy)
+@@ -12,7 +12,7 @@
+ from twisted.python.log import ILogObserver
+ from twisted.persisted import sob
+ from twisted.application import service, reactors
+-from twisted.internet import defer
++from twisted.internet import defer, reactor
+ from twisted import copyright, plugin
+ 
+ # Expose the new implementation of installReactor at the old location.
+Index: twisted/topfiles/761.bugfix
+===================================================================
+--- twisted/topfiles/761.bugfix	(revision 0)
++++ twisted/topfiles/761.bugfix	(working copy)
+@@ -0,0 +1 @@
++Twistd returns SIGINT for SIGINT signal and SIGTERM for SIGTERM signal.
+\ No newline at end of file
+Index: bin/twistd
+===================================================================
+--- bin/twistd	(revision 39103)
++++ bin/twistd	(working copy)
+@@ -11,4 +11,6 @@
+ sys.path.insert(0, os.path.abspath(os.getcwd()))
+ 
+ from twisted.scripts.twistd import run
++from twisted.internet import reactor
+ run()
++sys.exit(reactor._exitStatus)

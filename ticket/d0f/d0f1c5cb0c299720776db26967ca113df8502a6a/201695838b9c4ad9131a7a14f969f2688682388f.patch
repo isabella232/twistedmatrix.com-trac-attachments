@@ -1,0 +1,771 @@
+Index: docs/core/examples/index.rst
+===================================================================
+--- docs/core/examples/index.rst	(revision 45885)
++++ docs/core/examples/index.rst	(working copy)
+@@ -106,3 +106,4 @@
+ - :download:`wxacceptance.py` - acceptance tests for wxreactor
+ - :download:`postfix.py` - test application for PostfixTCPMapServer
+ - :download:`udpbroadcast.py` - broadcasting using UDP
++- :download:`tls_alpn_npn_client.py` - example of TLS next-protocol negotiation using NPN and ALPN.
+Index: docs/core/examples/tls_alpn_npn_client.py
+===================================================================
+--- docs/core/examples/tls_alpn_npn_client.py	(revision 0)
++++ docs/core/examples/tls_alpn_npn_client.py	(working copy)
+@@ -0,0 +1,94 @@
++#!/usr/bin/env python
++# Copyright (c) Twisted Matrix Laboratories.
++# See LICENSE for details.
++"""
++tls_alpn_npn_client
++~~~~~~~~~~~~~~~~~~~
++
++This test script demonstrates the usage of the nextProtocols API as a client
++peer.
++
++It performs next protocol negotiation using NPN and ALPN.
++
++It will print what protocol was negotiated and exit.
++The global variables are provided as input values.
++"""
++from twisted.internet import ssl, protocol, endpoints, task, defer
++
++# The hostname the remote server to contact.
++TARGET_HOST = u'google.com'
++
++# The port to contact.
++TARGET_PORT = 443
++
++# The list of protocols we'd be prepared to speak after the TLS negotiation is
++# complete.
++# The order of the protocols here is an order of preference: most servers will
++# attempt to respect our preferences when doing the negotiation. This indicates
++# that we'd prefer to use HTTP/2 if possible (where HTTP/2 is using the token
++# 'h2'), but would also accept HTTP/1.1.
++# The bytes here are sent literally on the wire, and so there is no room for
++# ambiguity about text encodings.
++# Try changing this list by adding, removing, and reordering protocols to see
++# how it affects the result.
++NEXT_PROTOCOLS = [b'h2', b'http/1.1']
++
++# Some safe initial data to send. This data is specific to HTTP/2: it is part
++# of the HTTP/2 client preface (see RFC 7540 Section 3.5). This is used to
++# signal to the remote server that it is aiming to speak HTTP/2, and to prevent
++# a remote HTTP/1.1 server from expecting a 'proper' HTTP/1.1 request.
++TLS_TRIGGER_DATA = b'PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n'
++
++
++def main(reactor):
++    options = ssl.optionsForClientTLS(
++        hostname=TARGET_HOST,
++        # `nextProtocols` is the targetted option for this example.
++        extraCertificateOptions={'nextProtocols': NEXT_PROTOCOLS},
++    )
++
++    class BasicH2Request(protocol.Protocol):
++        def connectionMade(self):
++            print("Connection made")
++            # Add a deferred that fires where we're done with the connection.
++            # This deferred is returned to the reactor, and when we call it
++            # back the reactor will clean up the protocol.
++            self.complete = defer.Deferred()
++
++            # Write some data to trigger the SSL handshake.
++            self.transport.write(TLS_TRIGGER_DATA)
++
++        def dataReceived(self, data):
++            # We can only safely be sure what the next protocol is when we know
++            # the TLS handshake is over. This is generally *not* in the call to
++            # connectionMade, but instead only when we've received some data
++            # back.
++            print('Next protocol is: %s' % (self.transport.getNextProtocol(),))
++            self.transport.loseConnection()
++
++            # If this is the first data write, we can tell the reactor we're
++            # done here by firing the callback we gave it.
++            if self.complete is not None:
++                self.complete.callback(None)
++                self.complete = None
++
++        def connectionLost(self, reason):
++            # If we haven't received any data, an error occurred. Otherwise,
++            # we lost the connection on purpose.
++            if self.complete is not None:
++                print("Connection lost due to error %s" % (reason,))
++                self.complete.callback(None)
++            else:
++                print("Connection closed cleanly")
++
++    return endpoints.connectProtocol(
++        endpoints.SSL4ClientEndpoint(
++            reactor,
++            TARGET_HOST,
++            TARGET_PORT,
++            options
++        ),
++        BasicH2Request()
++    ).addCallback(lambda protocol: protocol.complete)
++
++task.react(main)
+
+Property changes on: docs/core/examples/tls_alpn_npn_client.py
+___________________________________________________________________
+Added: svn:executable
+## -0,0 +1 ##
++*
+\ No newline at end of property
+Index: docs/core/howto/ssl.rst
+===================================================================
+--- docs/core/howto/ssl.rst	(revision 45885)
++++ docs/core/howto/ssl.rst	(working copy)
+@@ -220,6 +220,40 @@
+ Since Twisted uses a secure cipher configuration by default, it is discouraged to do so unless absolutely necessary.
+ 
+ 
++Application Layer Protocol Negotiation (ALPN) and Next Protocol Negotiation (NPN)
++---------------------------------------------------------------------------------
++
++ALPN and NPN are TLS extensions that can be used by clients and servers to negotiate what application-layer protocol will be spoken once the encrypted connection is established.
++This avoids the need for extra custom round trips once the encrypted connection is established. It is implemented as a standard part of the TLS handshake.
++
++NPN is supported from OpenSSL version 1.0.1.
++ALPN is the newer of the two protocols, supported in OpenSSL versions 1.0.2 onward.
++These functions require pyOpenSSL version 0.15 or higher.
++
++:api:`twisted.internet.ssl.CertificateOptions` allows for selecting the protocols your program is willing to speak after the connection is established.
++Doing so is very simple:
++
++.. code-block:: python
++
++    from twisted.internet.ssl import CertificateOptions
++    options = CertificateOptions(..., nextProtocol=[b'h2', b'http/1.1'])
++
++Twisted will attempt to use both ALPN and NPN if they're available, to maximise compatibility with peers.
++If both ALPN and NPN are supported by the peer, then the result from ALPN is preferred.
++
++For NPN, the client selects the protocol to use;
++For ALPN, the server does.
++If Twisted is acting as the peer who is supposed to select the protocol, it will prefer the earliest protocol in the list that is supported by both peers.
++
++To determine what protocol was negotiated, use :api:`twisted.protocols.tls.TLSMemoryBIOProtocol.getNextProtocol <TLSMemoryBIOProtocol.getNextProtocol>`.
++It will return one of the strings passed to the ``nextProtocol`` parameter.
++It will return ``None`` if the peer did not offer ALPN or NPN, or if no overlap could be found and the connection was established regardless. In this case, the protocol that should be used is whatever protocol would have been used if negotiation had not been attempted at all.
++If ALPN and NPN are used and no overlap can be found, then the remote peer may choose to terminate the connection.
++This may cause the TLS handshake to fail, or may result in the connection being torn down immediately after being made.
++
++An example of using this functionality can be found in :download:`this example script </core/examples/tls_alpn_npn_client.py>`.
++
++
+ Related facilities
+ ------------------
+ 
+Index: twisted/internet/_sslverify.py
+===================================================================
+--- twisted/internet/_sslverify.py	(revision 45885)
++++ twisted/internet/_sslverify.py	(working copy)
+@@ -1293,7 +1293,9 @@
+                  extraCertChain=None,
+                  acceptableCiphers=None,
+                  dhParameters=None,
+-                 trustRoot=None):
++                 trustRoot=None,
++                 nextProtocols=None,
++                 ):
+         """
+         Create an OpenSSL context SSL connection context factory.
+ 
+@@ -1384,6 +1386,14 @@
+ 
+         @type trustRoot: L{IOpenSSLTrustRoot}
+ 
++        @param nextProtocols: The protocols this peer is willing to speak after
++            the TLS negotation has completed, advertised over both ALPN and
++            NPN. If this argument is specified, and no overlap can be found
++            with the other peer, the connection will fail to be established.
++            Protocols earlier in the list are preferred over those later in
++            the list.
++        @type nextProtocols: C{list} of C{bytes}
++
+         @raise ValueError: when C{privateKey} or C{certificate} are set without
+             setting the respective other.
+         @raise ValueError: when C{verify} is L{True} but C{caCerts} doesn't
+@@ -1479,7 +1489,9 @@
+             trustRoot = IOpenSSLTrustRoot(trustRoot)
+         self.trustRoot = trustRoot
+ 
++        self._nextProtocols = nextProtocols
+ 
++
+     def __getstate__(self):
+         d = self.__dict__.copy()
+         try:
+@@ -1496,6 +1508,9 @@
+     def getContext(self):
+         """
+         Return an L{OpenSSL.SSL.Context} object.
++
++        @raises NotImplementedError: If nextProtocols were provided, but NPN is
++            not supported by OpenSSL (requires OpenSSL 1.0.1 or later).
+         """
+         if self._context is None:
+             self._context = self._makeContext()
+@@ -1548,6 +1563,82 @@
+             except BaseException:
+                 pass  # ECDHE support is best effort only.
+ 
++        if self._nextProtocols:
++            # Try to set NPN and ALPN.
++            def protoSelectCallback(conn, protocols):
++                """
++                NPN client-side and ALPN server-side callback used to select
++                the next protocol.
++
++                @param conn: The PyOpenSSL connection object.
++                @type conn: L{OpenSSL.SSL.Connection}
++
++                @param protocols: List of protocols supported by the remote
++                    peer.
++                @type protocols: C{sequence} of C{bytes}
++
++                @return: The selected next protocol or the empty string.
++                @rtype: C{bytes}
++                """
++                overlap = set(protocols) & set(self._nextProtocols)
++
++                for p in self._nextProtocols:
++                    if p in overlap:
++                        return p
++                else:
++                    return b''
++
++            def npnAdvertiseCallback(conn):
++                """
++                Server-side NPN callback used to advertise the supported
++                protocols.
++
++                @param conn: The PyOpenSSL connection object.
++                @type conn: L{OpenSSL.SSL.Connection}
++
++                @return: List of supported protocols.
++                @rype: C{list} of C{bytes}.
++                """
++                return self._nextProtocols
++
++            # If NPN is not supported this will raise a NotImplementedError,
++            # which is ideal.
++            # If PyOpenSSL is too old, this will raise an AttributeError: we
++            # catch it and re-raise a handy NotImplementedError instead.
++            try:
++                ctx.set_npn_advertise_callback(npnAdvertiseCallback)
++                ctx.set_npn_select_callback(protoSelectCallback)
++            except AttributeError:
++                raise NotImplementedError(
++                    "nextProtocols requires PyOpenSSL 0.15 or later"
++                )
++
++            try:
++                # Server side callback
++                ctx.set_alpn_select_callback(protoSelectCallback)
++                # Client side advertisement.
++                ctx.set_alpn_protos(self._nextProtocols)
++            except NotImplementedError:
++                # ALPN is supported by OpenSSL 1.0.2 or later. NPN is supported
++                # by OpenSSL 1.0.1 or later. As a result, if ALPN is not
++                # implemented, either:
++                #
++                # 1. NPN is not supported (OpenSSL < 1.0.1), and so we
++                #    shouldn't even get to this block because the above block
++                #    would have failed; or
++                # 2. NPN *is* supported. In that case, we reach this block. The
++                #    way we support NPN and ALPN is that so long as at least
++                #    NPN is available we will proceed with the negotiation.
++                #
++                # In principle, this could also throw AttributeError for
++                # PyOpenSSL < 0.15, but in that case we should have had it
++                # happen above when we did NPN, and so we shouldn't be able
++                # to reach this block.
++                #
++                # In summary: we don't care about NotImplementedError here,
++                # because to have gotten here we must have set NPN.
++                pass
++
+         return ctx
+ 
+ 
+Index: twisted/protocols/tls.py
+===================================================================
+--- twisted/protocols/tls.py	(revision 45885)
++++ twisted/protocols/tls.py	(working copy)
+@@ -586,6 +586,34 @@
+         return self._tlsConnection.get_peer_certificate()
+ 
+ 
++    def getNextProtocol(self):
++        """
++        Returns the protocol selected to be spoken using ALPN/NPN. This
++        function prefers the result from ALPN. If no protocol was chosen,
++        returns C{None}.
++
++        @return: The selected protocol, or C{None} if none is chosen.
++        @rtype: C{str} or C{None}
++        """
++        protocolName = None
++
++        try:
++            # If ALPN is not implemented that's ok, NPN might be.
++            protocolName = self._tlsConnection.get_alpn_proto_negotiated()
++        except NotImplementedError:
++            pass
++
++        if protocolName not in (b'', None):
++            # A protocol was selected using ALPN.
++            return protocolName
++
++        protocolName = self._tlsConnection.get_next_proto_negotiated()
++        if protocolName != b'':
++            return protocolName
++
++        return None
++
++
+     def registerProducer(self, producer, streaming):
+         # If we've already disconnected, nothing to do here:
+         if self._lostTLSConnection:
+Index: twisted/test/test_sslverify.py
+===================================================================
+--- twisted/test/test_sslverify.py	(revision 45885)
++++ twisted/test/test_sslverify.py	(working copy)
+@@ -15,11 +15,15 @@
+ 
+ skipSSL = None
+ skipSNI = None
++skipNPN = None
++skipALPN = None
+ try:
+     import OpenSSL
+ except ImportError:
+     skipSSL = "OpenSSL is required for SSL tests."
+     skipSNI = skipSSL
++    skipNPN = skipSSL
++    skipALPN = skipSSL
+ else:
+     from OpenSSL import SSL
+     from OpenSSL.crypto import PKey, X509
+@@ -27,6 +31,22 @@
+     if getattr(SSL.Context, "set_tlsext_servername_callback", None) is None:
+         skipSNI = "PyOpenSSL 0.13 or greater required for SNI support."
+ 
++    try:
++        ctx = SSL.Context(SSL.SSLv23_METHOD)
++        ctx.set_npn_advertise_callback(lambda c: None)
++    except AttributeError:
++        skipNPN = "PyOpenSSL 0.15 or greater is required for NPN support"
++    except NotImplementedError:
++        skipNPN = "OpenSSL 1.0.1 or greater required for NPN support"
++
++    try:
++        ctx = SSL.Context(SSL.SSLv23_METHOD)
++        ctx.set_alpn_select_callback(lambda c: None)
++    except AttributeError:
++        skipALPN = "PyOpenSSL 0.15 or greater is required for ALPN support"
++    except NotImplementedError:
++        skipALPN = "OpenSSL 1.0.2 or greater required for ALPN support"
++
+ from twisted.test.test_twisted import SetAsideModule
+ from twisted.test.iosim import connectedServerAndClient
+ 
+@@ -290,6 +310,84 @@
+ 
+ 
+ 
++class NegotiatedProtocol(protocol.Protocol):
++    """
++    A protocol that records the ALPN/NPN protocol negotiated in the TLS
++    handshake.
++
++    This protocol should be used whenever it is useful to know what protocol
++    has been negotiated. It only records the next protocol when data is
++    received, because Twisted makes no guarantees that the TLS handshake will
++    have been completed before then, so if used with another protocol that
++    protocol must send some data.
++
++    @ivar deferred: C{Deferred} that fires with the next protocol negotiated.
++    """
++    def __init__(self):
++        self.deferred = defer.Deferred()
++
++    def connectionMade(self):
++        self.transport.write(b'x')
++
++    def dataReceived(self, data):
++        self.deferred.callback(self.transport.getNextProtocol())
++
++if not skipSSL:
++    class ALPNOnlyOptions(sslverify.OpenSSLCertificateOptions):
++        """
++        An OpenSSLCertificateOptions subclass that only sets ALPN.
++        """
++        def getContext(self):
++            """
++            Gets a SSL Context that does not do NPN.
++
++            There are two things to do here: override the advertise callback to
++            advertise no protocols, and override the select callback to select
++            no protocols in case NPN was advertised.
++            """
++            ctx = super(ALPNOnlyOptions, self).getContext()
++
++            def _advertiseCallback(conn):
++                return []
++
++            def _selectCallback(conn, protocols):
++                return b''
++
++            ctx.set_npn_advertise_callback(_advertiseCallback)
++            ctx.set_npn_select_callback(_selectCallback)
++
++            return ctx
++
++
++    class NPNOnlyOptions(sslverify.OpenSSLCertificateOptions):
++        """
++        An OpenSSLCertificateOptions subclass that only sets NPN.
++        """
++        def getContext(self):
++            """
++            Gets a SSL Context that does not do ALPN.
++
++            There are two things to do here: advertise no protocols, and
++            override the select callback to select no protocols in case ALPN
++            was advertised.
++            """
++            ctx = super(NPNOnlyOptions, self).getContext()
++
++            def _selectCallback(conn, protocols):
++                return b''
++
++            # If ALPN doesn't exist, we can't get it wrong anyway, so who
++            # cares?
++            try:
++                ctx.set_alpn_protos([])
++                ctx.set_alpn_select_callback(_selectCallback)
++            except NotImplementedError:
++                pass
++
++            return ctx
++
++
++
+ class FakeContext(object):
+     """
+     Introspectable fake of an C{OpenSSL.SSL.Context}.
+@@ -1709,7 +1807,303 @@
+         self.assertTrue(errors)
+ 
+ 
++class NPNAndALPNBaseTestCase(unittest.TestCase):
++    """
++    Base class for the NPN and ALPN test cases.
+ 
++    Contains common code re-used throughout these tests.
++    """
++    serverPort = None
++    clientConnection = None
++
++    serverKey = None
++    serverCertificate = None
++    clientKey = None
++    clientCertificate = None
++
++    def setUp(self):
++        """
++        Create class variables of client and server certificates.
++        """
++        self.serverKey, self.serverCertificate = makeCertificate(
++            O=b"Server Test Certificate",
++            CN=b"server")
++        self.clientKey, self.clientCertificate = makeCertificate(
++            O=b"Client Test Certificate",
++            CN=b"client")
++        self.caCert1 = makeCertificate(
++            O=b"CA Test Certificate 1",
++            CN=b"ca1")[1]
++        self.caCert2 = makeCertificate(
++            O=b"CA Test Certificate",
++            CN=b"ca2")[1]
++
++
++    def tearDown(self):
++        if self.serverPort is not None:
++            self.serverPort.stopListening()
++        if self.clientConnection is not None:
++            self.clientConnection.disconnect()
++
++
++    def _buildCertificateOptions(self,
++                                 key,
++                                 certificate,
++                                 ca_certificate,
++                                 nextProtocols,
++                                 options=None):
++        """
++        Build an C{OpenSSLCertificateOptions} object suitable for a peer that
++        will verify the remote certificate, offer one of its own, and that will
++        offer the selected next protocols.
++
++        @param key: The private key to use in this certificate options.
++        @param certificate: The certificate to use with this certificate
++            options.
++        @param ca_certificate: The certificate to use to verify the remote
++            peer.
++        @param nextProtocols: A list of the protocols to negotiate, as a
++            C{list} of C{bytes}
++        @param options: Optionally, a subclass of C{OpenSSLCertificateOptions}
++            to return.
++
++        @return: A new C{OpenSSLCertificateOptions} with the provided
++            parameters.
++        """
++        if options is None:
++            options = sslverify.OpenSSLCertificateOptions
++
++        return options(
++            privateKey=key,
++            certificate=certificate,
++            verify=True,
++            requireCertificate=True,
++            caCerts=[ca_certificate],
++            nextProtocols=nextProtocols,
++        )
++
++
++    def _buildServerCertificateOptions(self, nextProtocols):
++        """
++        Build an C{OpenSSLCertificateOptions} object suitable for a server,
++        that will offer the selected next protocols.
++
++        @param nextProtocols: The protocols the server is willing to negotiate
++            using NPN/ALPN.
++        @return: A new C{OpenSSLCertificateOptions} for a server, using the
++            provided next protocols.
++        """
++        return self._buildCertificateOptions(
++            key=self.serverKey,
++            certificate=self.serverCertificate,
++            ca_certificate=self.clientCertificate,
++            nextProtocols=nextProtocols
++        )
++
++
++    def _buildClientCertificateOptions(self, nextProtocols, clientOptions):
++        """
++        Build an C{OpenSSLCertificateOptions} object suitable for a client,
++        that will offer the selected next protocols.
++
++        @param nextProtocols: The protocols the client is willing to negotiate
++            using NPN/ALPN.
++        @param clientOptions: A subclass of C{OpenSSLCertificateOptions} to
++            instantiate.
++        @return: A new C{OpenSSLCertificateOptions} with the provided next
++            protocols.
++        """
++        return self._buildCertificateOptions(
++            key=self.clientKey,
++            certificate=self.clientCertificate,
++            ca_certificate=self.serverCertificate,
++            nextProtocols=nextProtocols,
++            options=clientOptions
++        )
++
++
++    def connectViaLoopback(self,
++                           serverProtocols,
++                           clientProtocols,
++                           clientOptions=None):
++        """
++        Create the TLS connection, and save the two ends of the connection
++        on the test class.
++
++        @param serverProtocols: The protocols the server is willing to
++            negotiate.
++        @param clientProtocols: The protocols the client is willing to
++            negotiate.
++        @param clientOptions: The type of C{OpenSSLCertificateOptions} class to
++            use for the client. Defaults to C{OpenSSLCertificateOptions}.
++        @return: A C{Deferred} that will fire with the negotiated protocol when
++            negotiation is complete.
++        """
++        if clientOptions is None:
++            clientOptions = sslverify.OpenSSLCertificateOptions
++
++        serverCertOpts = self._buildServerCertificateOptions(
++            serverProtocols
++        )
++        clientCertOpts = self._buildClientCertificateOptions(
++            clientProtocols,
++            clientOptions=clientOptions
++        )
++
++        proto = NegotiatedProtocol()
++
++        serverFactory = protocol.ServerFactory()
++        serverFactory.protocol = lambda: proto
++
++        clientFactory = protocol.ClientFactory()
++        clientFactory.protocol = NegotiatedProtocol
++
++        self.serverPort = reactor.listenSSL(0, serverFactory, serverCertOpts)
++        self.clientConnection = reactor.connectSSL('127.0.0.1',
++                self.serverPort.getHost().port, clientFactory, clientCertOpts)
++
++        return proto
++
++
++
++class NPNOrALPNTests(NPNAndALPNBaseTestCase):
++    """
++    NPN and ALPN protocol selection.
++
++    These tests only run on platforms that have a PyOpenSSL version >= 0.15,
++    and OpenSSL version 1.0.1 or later.
++    """
++    if skipSSL:
++        skip = skipSSL
++    elif skipNPN:
++        skip = skipNPN
++
++
++    def test_NPNAndALPNSuccess(self):
++        """
++        When both ALPN and NPN are used, and both the client and server have
++        overlapping protocol choices, a protocol is successfully negotiated.
++        Further, the negotiated protocol is the first one in the list.
++        """
++        protocols = [b'h2', b'http/1.1']
++        proto = self.connectViaLoopback(
++            serverProtocols=protocols,
++            clientProtocols=protocols
++        )
++
++        return proto.deferred.addCallback(
++            self.assertEqual, b'h2')
++
++
++    def test_NPNAndALPNDifferent(self):
++        """
++        Client and server have different protocol lists: only the common
++        element is chosen.
++        """
++        serverProtocols = [b'h2', b'http/1.1', b'spdy/2']
++        clientProtocols = [b'spdy/3', b'http/1.1']
++        proto = self.connectViaLoopback(
++            serverProtocols=serverProtocols,
++            clientProtocols=clientProtocols
++        )
++
++        return proto.deferred.addCallback(
++            self.assertEqual, b'http/1.1')
++
++
++    def test_NPNAndALPNFailure(self):
++        """
++        When the client and server have no overlap of protocols, no protocol is
++        negotiated.
++        """
++        protocols = [b'h2', b'http/1.1']
++        proto = self.connectViaLoopback(
++            serverProtocols=protocols,
++            clientProtocols=[]
++        )
++
++        return proto.deferred.addCallback(
++            self.assertEqual, None)
++
++
++    def test_NPNRespectsClientPreference(self):
++        """
++        When NPN is used, the client's protocol preference is preferred.
++        """
++        serverProtocols = [b'http/1.1', b'h2']
++        clientProtocols = [b'h2', b'http/1.1']
++        proto = self.connectViaLoopback(
++            serverProtocols=serverProtocols,
++            clientProtocols=clientProtocols,
++            clientOptions=NPNOnlyOptions
++        )
++
++        return proto.deferred.addCallback(
++            self.assertEqual, b'h2')
++
++
++
++class ALPNTests(NPNAndALPNBaseTestCase):
++    """
++    ALPN protocol selection.
++
++    These tests only run on platforms that have a PyOpenSSL version >= 0.15,
++    and OpenSSL version 1.0.2 or later.
++
++    This covers only the ALPN specific logic, as any platform that has ALPN
++    will also have NPN and so will run the NPNAndALPNTest suite as well.
++    """
++    if skipSSL:
++        skip = skipSSL
++    elif skipALPN:
++        skip = skipALPN
++
++
++    def test_ALPNRespectsServerPreference(self):
++        """
++        When ALPN is used, the server's protocol preference is preferred.
++        """
++        serverProtocols = [b'http/1.1', b'h2']
++        clientProtocols = [b'h2', b'http/1.1']
++        proto = self.connectViaLoopback(
++            serverProtocols=serverProtocols,
++            clientProtocols=clientProtocols,
++            clientOptions=ALPNOnlyOptions
++        )
++
++        return proto.deferred.addCallback(
++            self.assertEqual, b'http/1.1')
++
++
++
++class NPNAndALPNAbsentTests(NPNAndALPNBaseTestCase):
++    """
++    NPN/ALPN operations fail on platforms that do not support them.
++
++    These tests only run on platforms that have a PyOpenSSL version < 0.15,
++    or an OpenSSL version earlier than 1.0.1
++    """
++    if skipSSL:
++        skip = skipSSL
++    elif not skipNPN:
++        skip = "NPN/ALPN is present on this platform"
++
++
++    def test_NPNAndALPNNotImplemented(self):
++        """
++        A NotImplementedError is raised when using nextProtocols on a platform
++        that does not support either NPN or ALPN.
++        """
++        protocols = [b'h2', b'http/1.1']
++        self.assertRaises(
++            NotImplementedError,
++            self.connectViaLoopback,
++            serverProtocols=protocols,
++            clientProtocols=protocols,
++        )
++
++
++
+ class _NotSSLTransport:
+     def getHandle(self):
+         return self
+Index: twisted/topfiles/7860.feature
+===================================================================
+--- twisted/topfiles/7860.feature	(revision 0)
++++ twisted/topfiles/7860.feature	(working copy)
+@@ -0,0 +1 @@
++twisted.internet.ssl.CertificateOptions now takes a nextProtocols parameter that enables negotiation of the next protocol to speak after the TLS handshake has completed. This field advertises protocols over both NPN and ALPN.
+\ No newline at end of file

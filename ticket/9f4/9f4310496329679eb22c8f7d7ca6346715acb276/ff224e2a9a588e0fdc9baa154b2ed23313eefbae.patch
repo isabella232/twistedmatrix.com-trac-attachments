@@ -1,0 +1,149 @@
+Index: twisted/mail/test/test_imap.py
+===================================================================
+--- twisted/mail/test/test_imap.py	(revision 35014)
++++ twisted/mail/test/test_imap.py	(working copy)
+@@ -885,6 +885,46 @@
+                 self.assertEqual(L, expected,
+                                   "len(%r) = %r != %r" % (input, L, expected))
+ 
++
++    def test_IfQuotedString(self):
++        """
++        The strings passed to L{imap4._ifQuotedString} are not tokens, so
++        C{True} should be returned.
++        """
++        inputs = [
++            'some ramdom stuff',
++            '(twisted)',
++            '<twisted>',
++            'twisted@',
++            'twisted,',
++            'twisted;',
++            'twisted:',
++            'twisted\\',
++            'twisted"',
++            'twisted/',
++            '[twisted]',
++            'twisted?',
++            'twisted=',
++        ]
++
++        # Add all the control characters
++        for i in range(33):
++            inputs.append('twiste'+ chr(i) + 'd')
++
++        for i in inputs:
++            self.assertEqual(imap4._ifQuotedString(i), True)
++
++
++    def test_IfTokens(self):
++        """
++        The strings passed to L{imap4._ifQuotedString} are tokens, so
++        C{False} should be returned.
++        """
++        result = imap4._ifQuotedString("I'm.a.token!")
++        self.assertEqual(result, False)
++
++
++
+ class SimpleMailbox:
+     implements(imap4.IMailboxInfo, imap4.IMailbox, imap4.ICloseableMailbox)
+ 
+@@ -3457,6 +3497,33 @@
+             structure)
+ 
+ 
++    def test_singlePartDisposition(self):
++        """
++        For some content-disposition parameter values,
++        L{imap4.getBodyStructure} returns quoted-string.
++        """
++        body = 'hello, world'
++        major = 'image'
++        minor = 'jpeg'
++        charset = 'us-ascii'
++        msg = FakeyMessage({
++                'content-type': '%s/%s; charset=%s; x=y' % (
++                    major, minor, charset),
++                'content-disposition': 'attachment; filename=foo (doc).pdf; ' \
++                    'size=bar; creation-date=somedate; ' \
++                    'modification-date=somedate; read-date=somedate',
++                }, (), '', body, 123, None)
++        structure = imap4.getBodyStructure(msg, extended=True)
++        self.assertEqual(
++            [major, minor, ["charset", charset, 'x', 'y'], None,
++             None, None, len(body), None,
++             ['attachment', ['filename', '"foo (doc).pdf"', 'size', 'bar',
++              'creation-date', '"somedate"',
++              'modification-date', '"somedate"',
++              'read-date', '"somedate"']], None, None],
++            structure)
++
++
+     def test_textPart(self):
+         """
+         For a I{text/*} message, the number of lines in the message body are
+Index: twisted/mail/imap4.py
+===================================================================
+--- twisted/mail/imap4.py	(revision 35014)
++++ twisted/mail/imap4.py	(working copy)
+@@ -4327,6 +4327,29 @@
+             return 1
+     return 0
+ 
++# tspecial in RFC 2045
++_TSPECIALS = r'()<>@,;:\"/[]?='
++def _ifQuotedString(s):
++    """
++    It determines if a string is a token or quoted-string.
++    @see: U{http://www.ietf.org/rfc/rfc2045.txt}
++
++    @type s: C{str}
++    @param s: The string needs to be checked
++
++    @return: True if the string needs quotation marks, False if the
++        string is a token.
++    """
++    if s == '':
++        return True
++    for c in s:
++        # ASCII characters without control characters
++        if c <= '\x20' or c > '\x7f':
++            return True
++        if c in _TSPECIALS:
++            return True
++    return False
++
+ def _prepareMailboxName(name):
+     name = name.encode('imap4-utf-7')
+     if _needsQuote(name):
+@@ -4895,6 +4918,11 @@
+         Parse a I{Content-Disposition} header into a two-sequence of the
+         disposition and a flattened list of its parameters.
+ 
++        According to RFC2183, the following parameter values will be quoted:
++            1. Values of date parameters
++            2. Values contain only ASCII characters, but including
++               tspecials characters.
++
+         @return: C{None} if there is no disposition header value, a C{list} with
+             two elements otherwise.
+         """
+@@ -4904,7 +4932,16 @@
+                 disp = (disp[0].lower(), None)
+             elif len(disp) > 1:
+                 # XXX Poorly tested parser
+-                params = [x for param in disp[1:] for x in param.split('=', 1)]
++                date_params = ['creation-date', 'modification-date',
++                               'read-date']
++                params = []
++                for param in disp[1:]:
++                    key, value = param.split('=')
++                    params.append(key)
++                    if key in date_params or _ifQuotedString(value):
++                        params.append(_quote(value))
++                    else:
++                        params.append(value)
+                 disp = [disp[0].lower(), params]
+             return disp
+         else:

@@ -1,0 +1,280 @@
+Index: docs/core/examples/ssl_clientauth_server_endpoints.py
+===================================================================
+--- docs/core/examples/ssl_clientauth_server_endpoints.py	(revision 46067)
++++ docs/core/examples/ssl_clientauth_server_endpoints.py	(working copy)
+@@ -6,6 +6,7 @@
+ 
+ from twisted.internet import defer, endpoints, protocol, task
+ from twisted.python import log
++from twisted.python.filepath import FilePath
+ 
+ import echoserv
+ 
+@@ -13,6 +14,11 @@
+     log.startLogging(sys.stdout)
+     # Set up a factory to create connection handlers for our server
+     factory = protocol.Factory.forProtocol(echoserv.Echo)
++    # Set up a FilePath for this directory so that this example can be run
++    # from wherever
++    thisDirectory = FilePath(__file__).parent()
++    # Set up a second one for just the cert/key file
++    keyFile = thisDirectory.child("server.pem")
+     # Set the descriptor we'll pass to serverFromString.
+     #   ssl: Use SSL for the socket (as opposed to TCP (unsecured) or another
+     #     kind of connection
+@@ -24,7 +30,8 @@
+     #   requireCert=yes: This makes the socket reject client connections that
+     #     do not provide a certificate that passes validation using the CA
+     #     certs in caCertsDir.
+-    descriptor = "ssl:8000:caCertsDir=.:requireCert=yes"
++    descriptor = ("ssl:8000:privateKey={}:clientCACertsPath={}:requireCert=yes"
++                  .format(keyFile.path, thisDirectory.path))
+     # Pass the reactor and descriptor to serverFromString so we can have an
+     # endpoint
+     endpoint = endpoints.serverFromString(reactor, descriptor)
+Index: docs/core/howto/endpoints.rst
+===================================================================
+--- docs/core/howto/endpoints.rst	(revision 46067)
++++ docs/core/howto/endpoints.rst	(working copy)
+@@ -197,7 +197,7 @@
+ 
+    - ``certKey`` (optional, defaults to the value of privateKey) gives a filesystem path to a certificate (PEM format).
+    - ``privateKey`` gives a filesystem path to a private key (PEM format).
+-   - ``extraCertChain`` gives a filesystem path to a file with one or more concatenated certificates in PEM format that establish the chain from a root CA to the one that signed your certificate.
++   - ``extraCertChain`` gives a filesystem path to a file with one or more concatenated certificates in PEM format that establish the chain from a root CA to the one that signed your server's certificate.
+    - ``sslmethod`` indicates which SSL/TLS version to use (a value like ``TLSv1_METHOD``).
+    - ``dhParameters`` gives a filesystem path to a file in PEM format with parameters that are required for Diffie-Hellman key exchange.
+      Since this argument is required for the ``DHE``-family of ciphers that offer perfect forward secrecy (PFS), it is recommended to specify one.
+@@ -205,9 +205,6 @@
+      Please refer to `OpenSSL's documentation on dhparam <http://www.openssl.org/docs/apps/dhparam.html>`_ for further details.
+    - ``caCertsDir`` will verify client certificates using CA certificates in the provided directory if specified. Certificates that pass verification will be accessible from the connection's transport (:api:`twisted.internet.interfaces.ISSLTransport.getPeerCertificate <ISSLTransport.getPeerCertificate>`)
+    - ``requireCert`` will, if set to ``yes``, require clients to have valid certificates and disconnect clients that do not. Certificates must pass verification with a CA cert in ``caCertsDir``. This parameter does nothing when ``caCertsDir`` is not used.
+-   - ``retrieveCerts`` will retrieve client certificates without verifying them. When set to ``yes``, certificates will be retrieved from the client without doing any verification with a certificate authority.
+-     You may use this argument to gain access to certificates to identify users through :api:`twisted.internet.interfaces.ISSLTransport.getPeerCertificate <getPeerCertificate>`,
+-     but you should not use it if you need to use certificates for anything important for security. This parameter does nothing when ``caCertsDir`` is used since ``caCertsDir`` is a more secure alternative.
+ 
+    For example, ``ssl:port=443:privateKey=/etc/ssl/server.pem:extraCertChain=/etc/ssl/chain.pem:sslmethod=SSLv3_METHOD:``
+    ``dhParameters=dh_param_1024.pem:caCertsDir=/etc/ssl/certs:requireCert=yes``.
+Index: twisted/internet/_sslverify.py
+===================================================================
+--- twisted/internet/_sslverify.py	(revision 46067)
++++ twisted/internet/_sslverify.py	(working copy)
+@@ -1264,8 +1264,6 @@
+         ['trustRoot', 'requireCertificate'],
+         ['trustRoot', 'verify'],
+         ['trustRoot', 'caCerts'],
+-        ['trustRoot', 'retrieveCertOnly'],
+-        ['verify', 'retrieveCertOnly'],
+     ])
+     def __init__(self,
+                  privateKey=None,
+@@ -1283,8 +1281,7 @@
+                  extraCertChain=None,
+                  acceptableCiphers=None,
+                  dhParameters=None,
+-                 trustRoot=None,
+-                 retrieveCertOnly=False):
++                 trustRoot=None):
+         """
+         Create an OpenSSL context SSL connection context factory.
+ 
+@@ -1375,10 +1372,6 @@
+ 
+         @type trustRoot: L{IOpenSSLTrustRoot}
+ 
+-        @param retrieveCertOnly: If L{True}, sets the certificate options such
+-        that peer certificates are retrieved. This parameter is L{False} by
+-        default.
+-
+         @raise ValueError: when C{privateKey} or C{certificate} are set without
+             setting the respective other.
+         @raise ValueError: when C{verify} is L{True} but C{caCerts} doesn't
+@@ -1474,12 +1467,7 @@
+             trustRoot = IOpenSSLTrustRoot(trustRoot)
+         self.trustRoot = trustRoot
+ 
+-        if retrieveCertOnly and not self.verify:
+-            self._retrieveCertOnly = True
+-        else:
+-            self._retrieveCertOnly = False
+ 
+-
+     def __getstate__(self):
+         d = self.__dict__.copy()
+         try:
+@@ -1522,7 +1510,7 @@
+             if self.verifyOnce:
+                 verifyFlags |= SSL.VERIFY_CLIENT_ONCE
+             self.trustRoot._addCACertsToContext(ctx)
+-        elif self._retrieveCertOnly:
++        else:
+             verifyFlags = SSL.VERIFY_PEER
+ 
+         # It'd be nice if pyOpenSSL let us pass None here for this behavior (as
+@@ -1538,10 +1526,10 @@
+             returning True here.
+             """
+             return True
+-        if self._retrieveCertOnly:
++        if self.verify:
++            ctx.set_verify(verifyFlags, _verifyCallback)
++        else:
+             ctx.set_verify(verifyFlags, _retrieveCallback)
+-        else:
+-            ctx.set_verify(verifyFlags, _verifyCallback)
+         if self.verifyDepth is not None:
+             ctx.set_verify_depth(self.verifyDepth)
+ 
+Index: twisted/internet/endpoints.py
+===================================================================
+--- twisted/internet/endpoints.py	(revision 46067)
++++ twisted/internet/endpoints.py	(working copy)
+@@ -1053,8 +1053,7 @@
+ 
+ def _parseSSL(factory, port, privateKey="server.pem", certKey=None,
+               sslmethod=None, interface='', backlog=50, extraCertChain=None,
+-              dhParameters=None, caCertsDir=None, requireCert=None,
+-              retrieveCerts=None):
++              dhParameters=None, clientCACertsPath=None, requireCert=None):
+     """
+     Internal parser function for L{_parseServer} to convert the string
+     arguments for an SSL (over TCP/IPv4) stream endpoint into the structured
+@@ -1093,9 +1092,9 @@
+         the forward secret C{DHE} ciphers aren't available for servers.
+     @type dhParameters: L{str}
+ 
+-    @param caCertsDir: The path to a directory containing CA certs against
+-        which to verify peer certificates.
+-    @type caCertsDir: L{str}
++    @param clientCACertsPath: The path to a directory containing CA certs
++        against which to verify peer certificates.
++    @type clientCACertsPath: L{str}
+ 
+     @param requireCert: If this parameter is enabled with certificate
+         verification, clients will be required to present a certificate in
+@@ -1104,13 +1103,6 @@
+         or a "no" value.
+     @type requireCert: L{str}
+ 
+-    @param retrieveCerts: If this parameter is enabled, sets the certificate
+-        options to allow simply retrieving remote certificates without
+-        performing CA verification.
+-        This parameter is a boolean parameter and should take one of a "yes"
+-        or a "no" value.
+-    @type retrieveCerts: L{str}
+-
+     @return: a 2-tuple of (args, kwargs), describing  the parameters to
+         L{IReactorSSL.listenSSL} (or, modulo argument 2, the factory, arguments
+         to L{SSL4ServerEndpoint}.
+@@ -1129,12 +1121,12 @@
+                             "valid certificates in PEM format."
+                             % (extraCertChain,)
+                         )
+-    if caCertsDir is not None:
+-        caCertsDirPath = FilePath(caCertsDir)
+-        verifyCertificates = _loadCAsFromDir(caCertsDirPath)
++    if clientCACertsPath is not None:
++        clientCACertsFilePath = FilePath(clientCACertsPath)
++        verifyCertificates = _loadCAsFromDir(clientCACertsFilePath)
+         if not verifyCertificates:
+             raise ValueError("Specified CA cert directory '%s' doesn't contain "
+-                "any files with certificates in PEM format." % (caCertsDir,))
++                "any files with certificates in PEM format." % (clientCACertsPath,))
+     else:
+         verifyCertificates = None
+     requireCertificate = False
+@@ -1144,16 +1136,8 @@
+         if requireCertificate is None:
+             raise ValueError("The value of requireCert must be a yes/no "
+                              "value.")
+-        retrieveCertOnly = False
+     else:
+         verify = False
+-        requireCertificate = False
+-        retrieveCertOnly = _valueToBool(retrieveCerts, False)
+-        if retrieveCertOnly is None:
+-            raise ValueError("The value of retrieveCerts must be a yes/no "
+-                             "value.")
+-    if retrieveCertOnly and verify:
+-        retrieveCertOnly = False
+     if dhParameters is not None:
+         dhParameters = ssl.DiffieHellmanParameters.fromFile(
+             FilePath(dhParameters),
+@@ -1171,8 +1155,6 @@
+             "requireCertificate": requireCertificate,
+             "caCerts": verifyCertificates
+         })
+-    else:
+-        kw["retrieveCertOnly"] = retrieveCertOnly
+     cf = ssl.CertificateOptions(**kw)
+     return ((int(port), factory, cf),
+             {'interface': interface, 'backlog': int(backlog)})
+Index: twisted/internet/test/test_endpoints.py
+===================================================================
+--- twisted/internet/test/test_endpoints.py	(revision 46067)
++++ twisted/internet/test/test_endpoints.py	(working copy)
+@@ -2583,7 +2583,7 @@
+         """
+         endpoint = endpoints.serverFromString(
+             object(),
+-            "ssl:4321:privateKey={0}:certKey={1}:caCertsDir={2}"
++            "ssl:4321:privateKey={0}:certKey={1}:clientCACertsPath={2}"
+             .format(escapedPEMPathName, escapedPEMPathName, escapedCAsPathName)
+         )
+         cf = endpoint._sslContextFactory
+@@ -2591,37 +2591,6 @@
+         self.assertTrue(cf.caCerts is not None)
+ 
+ 
+-    def test_sslRetrieveCerts(self):
+-        """
+-        If C{retrieveCerts} is specified, we'll retrieve peer certificates
+-        but won't enable full verification.
+-        """
+-        endpoint = endpoints.serverFromString(
+-            object(),
+-            "ssl:4321:privateKey={0}:certKey={1}:retrieveCerts=yes"
+-            .format(escapedPEMPathName, escapedPEMPathName)
+-        )
+-        cf = endpoint._sslContextFactory
+-        self.assertTrue(cf._retrieveCertOnly)
+-
+-
+-    def test_sslRetrieveAndVerifyCerts(self):
+-        """
+-        If both C{retrieveCerts} and C{verifyCACerts} are specified,
+-        C{retrieveCerts} will be ignored since we can do verification,
+-        which also retrieves the certificate.
+-        """
+-        endpoint = endpoints.serverFromString(
+-            object(),
+-            "ssl:4321:privateKey={0}:certKey={1}:caCertsDir={2}"
+-            ":retrieveCerts=yes"
+-            .format(escapedPEMPathName, escapedPEMPathName, escapedCAsPathName)
+-        )
+-        cf = endpoint._sslContextFactory
+-        self.assertTrue(cf.verify)
+-        self.assertFalse(cf._retrieveCertOnly)
+-
+-
+     def test_sslVerifyAndRequireCerts(self):
+         """
+         If C{verifyCACerts} and C{requireCert} are specified, client
+@@ -2629,7 +2598,7 @@
+         """
+         endpoint = endpoints.serverFromString(
+             object(),
+-            "ssl:4321:privateKey={0}:certKey={1}:caCertsDir={2}"
++            "ssl:4321:privateKey={0}:certKey={1}:clientCACertsPath={2}"
+             ":requireCert=yes"
+             .format(escapedPEMPathName, escapedPEMPathName, escapedCAsPathName)
+         )
+@@ -2644,8 +2613,6 @@
+         test_sslChainFileMustContainCert.skip = skipSSL
+         test_sslDHparameters.skip = skipSSL
+         test_sslVerifyCerts.skip = skipSSL
+-        test_sslRetrieveCerts.skip = skipSSL
+-        test_sslRetrieveAndVerifyCerts.skip = skipSSL
+         test_sslVerifyAndRequireCerts.skip = skipSSL
+ 
+ 

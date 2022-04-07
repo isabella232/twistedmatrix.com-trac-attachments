@@ -1,0 +1,121 @@
+Index: smtp.py
+===================================================================
+--- smtp.py	(revision 34646)
++++ smtp.py	(working copy)
+@@ -1009,6 +1009,24 @@
+         self.code = -1
+         self.log = util.LineLog(logsize)
+ 
++    def setResponseHandlers(self, expected, succeeded, failed):
++        """
++        Set the functions that will handle successful and failed responses.
++
++        @param expected: A C{list} of C{int}, response codes indicating success.
++
++        @param succeeded: A callable that takes two arguments, the response
++            code (an C{int}) and a C{bytes} description, which will be called
++            if the response code matches the codes in the expected list.
++
++        @param failed: A callable that takes two arguments, the response code
++            (an C{int}) and a C{bytes} description, which will be called if
++            the response code does not matche the expected list.
++        """
++        self._expected = expected
++        self._okresponse = succeeded
++        self._failresponse = failed
++
+     def sendLine(self, line):
+         # Log sendLine only if you are in debug mode for performance
+         if self.debug:
+@@ -1018,11 +1036,9 @@
+ 
+     def connectionMade(self):
+         self.setTimeout(self.timeout)
++        self.setResponseHandlers([220], self.smtpState_helo,
++                                 self.smtpConnectionFailed)
+ 
+-        self._expected = [ 220 ]
+-        self._okresponse = self.smtpState_helo
+-        self._failresponse = self.smtpConnectionFailed
+-
+     def connectionLost(self, reason=protocol.connectionDone):
+         """We are no longer connected"""
+         self.setTimeout(None)
+@@ -1080,16 +1096,15 @@
+ 
+     def smtpState_helo(self, code, resp):
+         self.sendLine('HELO ' + self.identity)
+-        self._expected = SUCCESS
+-        self._okresponse = self.smtpState_from
++        self.setResponseHandlers(SUCCESS, self.smtpState_from,
++                                 self.smtpConnectionFailed)
+ 
+     def smtpState_from(self, code, resp):
+         self._from = self.getMailFrom()
+-        self._failresponse = self.smtpTransferFailed
+         if self._from is not None:
+             self.sendLine('MAIL FROM:%s' % quoteaddr(self._from))
+-            self._expected = [250]
+-            self._okresponse = self.smtpState_to
++            self.setResponseHandlers([250], self.smtpState_to,
++                                     self.smtpTransferFailed)
+         else:
+             # All messages have been sent, disconnect
+             self._disconnectFromServer()
+@@ -1101,8 +1116,8 @@
+         self.toAddresses = iter(self.getMailTo())
+         self.toAddressesResult = []
+         self.successAddresses = []
+-        self._okresponse = self.smtpState_toOrData
+-        self._expected = xrange(0,1000)
++        self.setResponseHandlers(xrange(0,1000), self.smtpState_toOrData,
++                                 self.smtpTransferFailed)
+         self.lastAddress = None
+         return self.smtpState_toOrData(0, '')
+ 
+@@ -1116,8 +1131,8 @@
+         except StopIteration:
+             if self.successAddresses:
+                 self.sendLine('DATA')
+-                self._expected = [ 354 ]
+-                self._okresponse = self.smtpState_data
++                self.setResponseHandlers([354], self.smtpState_data,
++                                         self.smtpTransferFailed)
+             else:
+                 return self.smtpState_msgSent(code,'No recipients accepted')
+         else:
+@@ -1130,10 +1145,9 @@
+         def ebTransfer(err):
+             self.sendError(err.value)
+         d.addCallbacks(self.finishedFileTransfer, ebTransfer)
+-        self._expected = SUCCESS
+-        self._okresponse = self.smtpState_msgSent
++        self.setResponseHandlers(SUCCESS, self.smtpState_msgSent,
++                                 self.smtpTransferFailed)
+ 
+-
+     def smtpState_msgSent(self, code, resp):
+         if self._from is not None:
+             self.sentMail(code, resp, len(self.successAddresses),
+@@ -1142,8 +1156,8 @@
+         self.toAddressesResult = []
+         self._from = None
+         self.sendLine('RSET')
+-        self._expected = SUCCESS
+-        self._okresponse = self.smtpState_from
++        self.setResponseHandlers(SUCCESS, self.smtpState_from,
++                                 self.smtpConnectionFailed)
+ 
+     ##
+     ## Helpers for FileSender
+@@ -1217,8 +1231,8 @@
+         raise NotImplementedError
+ 
+     def _disconnectFromServer(self):
+-        self._expected = xrange(0, 1000)
+-        self._okresponse = self.smtpState_disconnect
++        self.setResponseHandlers(xrange(0, 1000), self.smtpState_disconnect,
++                                 self.smtpState_disconnect)
+         self.sendLine('QUIT')
+ 
+ 

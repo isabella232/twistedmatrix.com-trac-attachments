@@ -1,0 +1,335 @@
+Index: twisted/mail/test/test_imap.py
+===================================================================
+--- twisted/mail/test/test_imap.py	(revision 27550)
++++ twisted/mail/test/test_imap.py	(working copy)
+@@ -449,6 +449,10 @@
+         s = '\r\n'.join(['xx'] * 4)
+         cases = [
+             '(BODY.PEEK[HEADER.FIELDS.NOT (subject bcc cc)] {%d}\r\n%s)' % (len(s), s,),
++            '(BODY[HEADER.FIELDS ({7}\r\nsubject)] {%d}\r\n%s)' % (len(s), s,),
++            '(BODY[HEADER.FIELDS ("subject")] {%d}\r\n%s)' % (len(s), s,),
++            '(BODY[]<1.10> hello)',
++            '(BODY[] <1.10>)',
+ 
+ #            '(FLAGS (\Seen) INTERNALDATE "17-Jul-1996 02:44:25 -0700" '
+ #            'RFC822.SIZE 4286 ENVELOPE ("Wed, 17 Jul 1996 02:23:25 -0700 (PDT)" '
+@@ -484,7 +488,11 @@
+         ]
+ 
+         answers = [
+-            ['BODY.PEEK', ['HEADER.FIELDS.NOT', ['subject', 'bcc', 'cc']], s],
++            ['BODY.PEEK[HEADER.FIELDS.NOT (subject bcc cc)]', s],
++            ['BODY[HEADER.FIELDS (subject)]', s],
++            ['BODY[HEADER.FIELDS (subject)]', s],
++            ['BODY[]<1.10>', 'hello'],
++            ['BODY[]', '<1.10>'],
+ 
+             ['FLAGS', [r'\Seen'], 'INTERNALDATE',
+             '17-Jul-1996 02:44:25 -0700', 'RFC822.SIZE', '4286', 'ENVELOPE',
+@@ -535,11 +543,25 @@
+         ]
+ 
+         for (inp, outp) in cases:
+-            p = imap4._FetchParser()
++            p = imap4._ServerFetchParser()
+             p.parseString(inp)
+             self.assertEquals(len(p.result), 1)
+             self.failUnless(isinstance(p.result[0], getattr(p, outp)))
+ 
++
++    def test_key(self):
++        """
++        L{imap4._ClientFetchParser.Body.key} returns a tuple representing the body
++        instance and suitable for use as a key in a dictionary.
++        """
++        p = imap4._ClientFetchParser()
++        p.parseString('BODY[HEADER.FIELDS.NOT (SUBJECT MESSAGE-ID)]<30>')
++        body = p.result[0]
++        self.assertEquals(
++            body.key(),
++            ('BODY', ('HEADER.FIELDS.NOT', ('Subject', 'Message-Id')), '<30>'))
++
++
+     def testFetchParserMacros(self):
+         cases = [
+             ['ALL', (4, ['flags', 'internaldate', 'rfc822.size', 'envelope'])],
+@@ -548,7 +570,7 @@
+         ]
+ 
+         for (inp, outp) in cases:
+-            p = imap4._FetchParser()
++            p = imap4._ServerFetchParser()
+             p.parseString(inp)
+             self.assertEquals(len(p.result), outp[0])
+             p = [str(p).lower() for p in p.result]
+@@ -557,7 +579,7 @@
+             self.assertEquals(p, outp[1])
+ 
+     def testFetchParserBody(self):
+-        P = imap4._FetchParser
++        P = imap4._ServerFetchParser
+ 
+         p = P()
+         p.parseString('BODY')
+Index: twisted/mail/imap4.py
+===================================================================
+--- twisted/mail/imap4.py	(revision 27550)
++++ twisted/mail/imap4.py	(working copy)
+@@ -558,9 +558,9 @@
+         if self.blocked is not None:
+             self.blocked.extend(commands)
+ 
+-#    def sendLine(self, line):
+-#        print 'C:', repr(line)
+-#        return basic.LineReceiver.sendLine(self, line)
++    def sendLine(self, line):
++        print 'C:', repr(line)
++        return basic.LineReceiver.sendLine(self, line)
+ 
+     def lineReceived(self, line):
+ #        print 'S:', repr(line)
+@@ -790,7 +790,7 @@
+         """
+         fetch-att
+         """
+-        p = _FetchParser()
++        p = _ServerFetchParser()
+         p.parseString(line)
+         return (p.result, '')
+ 
+@@ -2244,9 +2244,10 @@
+         recent = exists = None
+         for response in lines:
+             elements = len(response)
+-            if elements == 1 and response[0] == ['READ-ONLY']:
++            print response
++            if elements == 1 and response[0] == '[READ-ONLY]':
+                 self.modeChanged(False)
+-            elif elements == 1 and response[0] == ['READ-WRITE']:
++            elif elements == 1 and response[0] == '[READ-WRITE]':
+                 self.modeChanged(True)
+             elif elements == 2 and response[1] == 'EXISTS':
+                 exists = int(response[0])
+@@ -3380,36 +3381,31 @@
+             #
+             # Here, check for these cases and grab as many extra elements as
+             # necessary to retrieve the body information.
+-            if key in ("BODY", "BODY.PEEK") and isinstance(value, list) and len(value) < 3:
+-                if len(value) < 2:
+-                    key = (key, tuple(value))
+-                else:
+-                    key = (key, (value[0], tuple(value[1])))
+-                try:
+-                    value = responseParts.next()
+-                except StopIteration:
+-                    raise IllegalServerResponse(
+-                        "Not enough arguments", fetchResponseList)
++            if key.startswith('BODY['):
++                key, value = self._massageBody(key)
+ 
+-                # Handle partial ranges
+-                if value.startswith('<') and value.endswith('>'):
+-                    key = key + (value,)
+-                    try:
+-                        value = responseParts.next()
+-                    except StopIteration:
+-                        raise IllegalServerResponse(
+-                            "Not enough arguments", fetchResponseList)
+-
++            print 'Adding key/value:', repr(key), repr(value)
+             values[key] = value
+         return values
+ 
+ 
++    def _massageBody(self, bodyString):
++        p = _ClientFetchParser()
++        p.parseString(bodyString)
++        fetch = p.result[0]
++        key = fetch.key()
++        value = parseNestedParens(str(fetch).replace('[', '(').replace(']', ')'))
++        return key, value
++
++
+     def _cbFetch(self, (lines, last), requestedParts, structured):
+         info = {}
+         for parts in lines:
+             if len(parts) == 3 and parts[1] == 'FETCH':
+                 id = self._intOrRaise(parts[0], parts)
+                 if id not in info:
++                    if parts[2][0].startswith('BODY['):
++                        parts[2][:1] = self._massageBody(parts[2][0])[1]
+                     info[id] = [parts[2]]
+                 else:
+                     info[id][0].extend(parts[2])
+@@ -3888,7 +3884,7 @@
+     s = s.strip()
+     result = []
+     word = []
+-    inQuote = inWord = False
++    inQuote = inWord = inBracket = False
+     for i, c in enumerate(s):
+         if c == '"':
+             if i and s[i-1] == '\\':
+@@ -3900,10 +3896,16 @@
+                 inQuote = False
+                 result.append(''.join(word))
+                 word = []
++        elif c == '[':
++            inBracket = True
++            word.append(c)
++        elif c == ']':
++            inBracket = False
++            word.append(c)
+         elif not inWord and not inQuote and c not in ('"' + string.whitespace):
+             inWord = True
+             word.append(c)
+-        elif inWord and not inQuote and c in string.whitespace:
++        elif inWord and not inQuote and not inBracket and c in string.whitespace:
+             w = ''.join(word)
+             if w == 'NIL':
+                 result.append(None)
+@@ -3990,7 +3992,8 @@
+     of opening or closing parenthesis is invalid.
+     """
+     s = s.strip()
+-    inQuote = 0
++    inQuote = False
++    inBracket = False
+     contentStack = [[]]
+     try:
+         i = 0
+@@ -4003,25 +4006,41 @@
+                     i += 2
+                     continue
+                 elif c == '"':
+-                    inQuote = not inQuote
++                    inQuote = False
++                    if inBracket:
++                        i += 1
++                        continue
+                 contentStack[-1].append(c)
+                 i += 1
+             else:
+                 if c == '"':
++                    if not inBracket:
++                        contentStack[-1].append(c)
++                    inQuote = True
++                    i += 1
++                elif c == '[':
+                     contentStack[-1].append(c)
+-                    inQuote = not inQuote
++                    inBracket = True
+                     i += 1
+                 elif handleLiteral and c == '{':
+                     end = s.find('}', i)
+                     if end == -1:
+                         raise ValueError, "Malformed literal"
+-                    literalSize = int(s[i+1:end])
+-                    contentStack[-1].append((s[end+3:end+3+literalSize],))
++                    literalSize = int(s[i + 1:end])
++                    literalValue = s[end + 3:end + 3 + literalSize]
++                    if not inBracket:
++                        literalValue = (literalValue,)
++                    contentStack[-1].append(literalValue)
+                     i = end + 3 + literalSize
+-                elif c == '(' or c == '[':
++                elif inBracket:
++                    contentStack[-1].append(c)
++                    if c == ']':
++                        inBracket = False
++                    i += 1
++                elif c == '(':
+                     contentStack.append([])
+                     i += 1
+-                elif c == ')' or c == ']':
++                elif c == ')':
+                     contentStack[-2].append(contentStack.pop())
+                     i += 1
+                 else:
+@@ -5072,7 +5091,8 @@
+                 ).addCallback(lambda _: self
+                 )
+ 
+-class _FetchParser:
++
++class _FetchParserBase:
+     class Envelope:
+         # Response should be a list of fields from the message:
+         #   date, subject, from, sender, reply-to, to, cc, bcc, in-reply-to,
+@@ -5146,6 +5166,18 @@
+                 base += '<%d.%d>' % (self.partialBegin, self.partialLength)
+             return base
+ 
++        def key(self):
++            result = [self.type.upper()]
++            if self.header:
++                result.append(self.header.key())
++            if self.partialLength is not None:
++                if self.partialBegin is not None:
++                    result.append('<%d.%d>' % (self.partialBegin, self.partialLength))
++                else:
++                    result.append('<%d>' % (self.partialLength,))
++            return tuple(result)
++
++
+     class BodyStructure:
+         type = 'bodystructure'
+         __str__ = lambda self: 'bodystructure'
+@@ -5172,6 +5204,23 @@
+                 base = '.'.join([str(x + 1) for x in self.part]) + '.' + base
+             return base
+ 
++        def key(self):
++            base = ['HEADER']
++            if self.fields:
++                base[0] += '.FIELDS'
++                if self.negate:
++                    base[0] += '.NOT'
++                fields = []
++                for f in self.fields:
++                    f = f.title()
++                    if _needsQuote(f):
++                        f = _quote(f)
++                    fields.append(f)
++                base.append(tuple(fields))
++            if self.part:
++                base.insert(0, tuple(self.part))
++            return tuple(base)
++
+     class Text:
+         pass
+ 
+@@ -5368,6 +5417,9 @@
+         self.pending_body.header.fields = map(str.upper, headers)
+         return end + 1
+ 
++
++
++class _ServerFetchParser(_FetchParserBase):
+     def state_maybe_partial(self, s):
+         # Grab <number.number> or nothing at all
+         if not s.startswith('<'):
+@@ -5386,6 +5438,23 @@
+ 
+         return end + 1
+ 
++
++class _ClientFetchParser(_FetchParserBase):
++    def state_maybe_partial(self, s):
++        # Grab <number> or nothing at all
++        if not s.startswith('<'):
++            return 0
++        end = s.find('>')
++        if end == -1:
++            raise Exception("Found < but not >")
++
++        partial = int(s[1:end])
++        self.pending_body.partialLength = partial
++
++        return end + 1
++
++
++
+ class FileProducer:
+     CHUNK_SIZE = 2 ** 2 ** 2 ** 2
+ 

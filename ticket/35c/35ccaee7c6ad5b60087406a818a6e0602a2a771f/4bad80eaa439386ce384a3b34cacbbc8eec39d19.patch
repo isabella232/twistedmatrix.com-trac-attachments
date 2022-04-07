@@ -1,0 +1,224 @@
+From e5806bd470b9b550c7116e998da64574c3b78fd4 Mon Sep 17 00:00:00 2001
+From: Michael Tharp <gxti@partiallystapled.com>
+Date: Thu, 3 Jun 2010 09:47:50 -0400
+Subject: [PATCH] Deprecate and ignore replies to a NOTICE event in IRCClient.
+
+---
+ twisted/words/protocols/irc.py     |   58 ++++++++++++++++++++++++++++-------
+ twisted/words/test/test_irc.py     |   54 +++++++++++++++++++++++++++++++++
+ twisted/words/topfiles/4419.bugfix |    1 +
+ 3 files changed, 101 insertions(+), 12 deletions(-)
+ create mode 100644 twisted/words/topfiles/4419.bugfix
+
+diff --git a/twisted/words/protocols/irc.py b/twisted/words/protocols/irc.py
+index a96da2c..93dd41c 100644
+--- a/twisted/words/protocols/irc.py
++++ b/twisted/words/protocols/irc.py
+@@ -1037,6 +1037,10 @@ class IRCClient(basic.LineReceiver):
+ 
+     @type supported: L{ServerSupportedFeatures}
+     @ivar supported: Available ISUPPORT features on the server
++
++    @ivar _noticePrefix: If a I{NOTICE} event is in progress, this is the
++        prefix of that event, used to block outgoing replies to it.
++    @type _noticePrefix: C{str}
+     """
+     motd = None
+     nickname = 'irc'
+@@ -1073,6 +1077,8 @@ class IRCClient(basic.LineReceiver):
+     _attemptedNick = ''
+     erroneousNickFallback = 'defaultnick'
+ 
++    _noticePrefix = False
++
+     def _reallySendLine(self, line):
+         return basic.LineReceiver.sendLine(self, lowQuote(line) + '\r')
+ 
+@@ -1199,9 +1205,8 @@ class IRCClient(basic.LineReceiver):
+     def noticed(self, user, channel, message):
+         """Called when I have a notice from a user to me or a channel.
+ 
+-        By default, this is equivalent to IRCClient.privmsg, but if your
+-        client makes any automated replies, you must override this!
+-        From the RFC::
++        If the client makes any automated replies, it must not do so in
++        response to a NOTICE message, per the RFC:
+ 
+             The difference between NOTICE and PRIVMSG is that
+             automatic replies MUST NEVER be sent in response to a
+@@ -1209,7 +1214,6 @@ class IRCClient(basic.LineReceiver):
+             loops between clients automatically sending something in
+             response to something it received.
+         """
+-        self.privmsg(user, channel, message)
+ 
+     def modeChanged(self, user, channel, set, modes, args):
+         """Called when users or channel's modes are changed.
+@@ -1430,6 +1434,9 @@ class IRCClient(basic.LineReceiver):
+         """
+         Send a message to a channel
+ 
++        NOTE: Invoking this method within C{noticed()} is not allowed; such
++        messages may be dropped.
++
+         @type channel: C{str}
+         @param channel: The channel to say the message on. If it has no prefix,
+             C{'#'} will be prepended to it.
+@@ -1451,6 +1458,9 @@ class IRCClient(basic.LineReceiver):
+     def msg(self, user, message, length = None):
+         """Send a message to a user or channel.
+ 
++        NOTE: Invoking this method within C{noticed()} is not allowed; such
++        messages may be dropped.
++
+         @type user: C{str}
+         @param user: The username or channel name to which to direct the
+         message.
+@@ -1467,6 +1477,8 @@ class IRCClient(basic.LineReceiver):
+         message is always send in one command.
+         """
+ 
++        if not self._allowReply(user):
++            return
+         fmt = "PRIVMSG %s :%%s" % (user,)
+ 
+         if length is None:
+@@ -1490,11 +1502,16 @@ class IRCClient(basic.LineReceiver):
+         Notices are like normal message, but should never get automated
+         replies.
+ 
++        NOTE: Invoking this method within C{noticed()} is not allowed; such
++        notices may be dropped.
++
+         @type user: C{str}
+         @param user: The user to send a notice to.
+         @type message: C{str}
+         @param message: The contents of the notice to send.
+         """
++        if not self._allowReply(user):
++            return
+         self.sendLine("NOTICE %s :%s" % (user, message))
+ 
+     def away(self, message=''):
+@@ -1669,6 +1686,19 @@ class IRCClient(basic.LineReceiver):
+         self.ctcpMakeQuery(user, [
+             ('DCC', ['ACCEPT', fileName, port, resumePos])])
+ 
++    def _allowReply(self, user):
++        """Returns C{False} if sending a message to C{user} would constitute an
++        illegal reply to a I{NOTICE} message, or C{True} otherwise.
++        """
++        if user == self._noticePrefix:
++            warnings.warn("Sending messages in response to a notice or CTCP "
++                    "reply is not allowed by the RFC and is "
++                    "deprecated since Twisted 10.1",
++                    DeprecationWarning, stacklevel=3)
++            return False
++        else:
++            return True
++
+     ### server->client messages
+     ### You might want to fiddle with these,
+     ### but it is safe to leave them alone.
+@@ -1822,17 +1852,21 @@ class IRCClient(basic.LineReceiver):
+         channel = params[0]
+         message = params[-1]
+ 
+-        if message[0]==X_DELIM:
+-            m = ctcpExtract(message)
+-            if m['extended']:
+-                self.ctcpReply(user, channel, m['extended'])
++        self._noticePrefix = prefix.split('!')[0]
++        try:
++            if message[0]==X_DELIM:
++                m = ctcpExtract(message)
++                if m['extended']:
++                    self.ctcpReply(user, channel, m['extended'])
+ 
+-            if not m['normal']:
+-                return
++                if not m['normal']:
++                    return
+ 
+-            message = string.join(m['normal'], ' ')
++                message = string.join(m['normal'], ' ')
+ 
+-        self.noticed(user, channel, message)
++            self.noticed(user, channel, message)
++        finally:
++            self._noticePrefix = None
+ 
+     def irc_NICK(self, prefix, params):
+         """
+diff --git a/twisted/words/test/test_irc.py b/twisted/words/test/test_irc.py
+index 7a62ef8..ec24bcf 100644
+--- a/twisted/words/test/test_irc.py
++++ b/twisted/words/test/test_irc.py
+@@ -1564,3 +1564,57 @@ class ClientTests(TestCase):
+             "me() is deprecated since Twisted 9.0. Use IRCClient.describe().")
+         self.assertEquals(warnings[0]['category'], DeprecationWarning)
+         self.assertEquals(len(warnings), 2)
++
++    def test_ignoreNoticeReplies(self):
++        """
++        L{IRCClient.msg} warns and does nothing if replying to a NOTICE.
++        """
++        def noticed(user, channel, message):
++            self.protocol.msg('spam', 'oh noes, illegal reply')
++        self.protocol.noticed = noticed
++
++        self.protocol.irc_NOTICE('spam!foo@bar', 'hello there')
++        self.assertEquals(self.transport.value(), '')
++        warnings = self.flushWarnings(offendingFunctions=[noticed])
++        self.assertEquals(len(warnings), 1)
++        self.assertEquals(warnings[0]['category'], DeprecationWarning)
++        self.assertEquals(warnings[0]['message'],
++                "Sending messages in response to a notice or CTCP "
++                "reply is not allowed by the RFC and is "
++                "deprecated since Twisted 10.1")
++
++    def test_passUnrelatedNotices(self):
++        """
++        L{IRCClient.msg} works if sending a NOTICE in response to a different
++        user's NOTICE.
++        """
++        def noticed(user, channel, message):
++            self.protocol.msg('spam', 'i am replying')
++        self.protocol.noticed = noticed
++
++        self.protocol.irc_NOTICE('eggs!foo@bar', 'hello there')
++        self.assertEquals(self.transport.value(),
++                'PRIVMSG spam :i am replying\r\n')
++        warnings = self.flushWarnings(offendingFunctions=[noticed])
++        self.assertEquals(len(warnings), 0)
++
++    def test_noticedCrash(self):
++        """
++        L{IRCClient.noticed} crashes but the C{_noticePrefix} ivar is cleared
++        correctly.
++        """
++        def noticed(user, channel, message):
++            raise RuntimeError("oops")
++        self.protocol.noticed = noticed
++
++        # "spam" sends a message but the handler crashes
++        self.assertRaises(RuntimeError, self.protocol.irc_NOTICE,
++                'spam!foo@bar', 'hello there')
++
++        # Sending a message to "spam" outside of noticed() still works.
++        self.protocol.msg('spam', "I don't want any spam!")
++        self.assertEquals(self.transport.value(),
++                "PRIVMSG spam :I don't want any spam!\r\n")
++        warnings = self.flushWarnings(
++                offendingFunctions=[self.test_noticedCrash])
++        self.assertEquals(len(warnings), 0)
+diff --git a/twisted/words/topfiles/4419.bugfix b/twisted/words/topfiles/4419.bugfix
+new file mode 100644
+index 0000000..2d77118
+--- /dev/null
++++ b/twisted/words/topfiles/4419.bugfix
+@@ -0,0 +1 @@
++twisted.words.protocols.irc.IRCClient now warns and drops msg() and notice() replies to NOTICE messages.  In a future release, this will raise an exception.
+-- 
+1.7.1
+

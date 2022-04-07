@@ -1,0 +1,183 @@
+diff --git a/twisted/internet/protocol.py b/twisted/internet/protocol.py
+index 0eda004..d7973ca 100644
+--- a/twisted/internet/protocol.py
++++ b/twisted/internet/protocol.py
+@@ -622,7 +622,8 @@ class AbstractDatagramProtocol:
+         This will be called by makeConnection(), users should not call it.
+         """
+         if not self.numPorts:
+-            log.msg(eventSource=self, eventType="start", protocol=self)
++            log.msg(eventSource=self, eventType="start", eventTransport="udp",
++                    address="", protocol=self)
+             self.startProtocol()
+         self.numPorts = self.numPorts + 1
+ 
+@@ -636,7 +637,8 @@ class AbstractDatagramProtocol:
+         self.numPorts = self.numPorts - 1
+         self.transport = None
+         if not self.numPorts:
+-            log.msg(eventSource=self, eventType="stop", protocol=self)
++            log.msg(eventSource=self, eventType="stop", eventTransport="udp",
++                    address="", protocol=self)
+             self.stopProtocol()
+ 
+ 
+diff --git a/twisted/internet/tcp.py b/twisted/internet/tcp.py
+index 44cb5f9..0df7d6f 100644
+--- a/twisted/internet/tcp.py
++++ b/twisted/internet/tcp.py
+@@ -859,9 +859,12 @@ class Port(base.BasePort, _SocketCloser):
+         # Make sure that if we listened on port 0, we update that to
+         # reflect what the OS actually assigned us.
+         self._realPortNumber = skt.getsockname()[1]
++        
++        _ip = self.interface if self.interface else "0.0.0.0"
+ 
+-        log.msg(eventSource=self, eventType="start", factory=self.factory,
+-                portNumber=self._realPortNumber)
++        log.msg(eventSource=self, eventType="start", eventTransport="tcp",
++                factory=self.factory,
++                address="%s:%d" % (_ip,self._realPortNumber))
+ 
+         # The order of the next 6 lines is kind of bizarre.  If no one
+         # can explain it, perhaps we should re-arrange them.
+@@ -976,8 +979,10 @@ class Port(base.BasePort, _SocketCloser):
+         """
+         Log message for closing port
+         """
+-        log.msg(eventSource=self, eventType="stop", factory=self.factory,
+-                portNumber=self._realPortNumber)
++        _ip = self.interface if self.interface else "0.0.0.0"
++        log.msg(eventSource=self, eventType="stop", eventTransport="tcp",
++                factory=self.factory,
++                address="%s:%d" % (_ip,self._realPortNumber))
+ 
+ 
+     def connectionLost(self, reason):
+diff --git a/twisted/internet/test/test_protocol.py b/twisted/internet/test/test_protocol.py
+index 726f02e..780533b 100644
+--- a/twisted/internet/test/test_protocol.py
++++ b/twisted/internet/test/test_protocol.py
+@@ -360,7 +360,9 @@ class AbstractDatagramProtocolTestCase(TestCase, DictSubsetMixin):
+             self.events[0],
+             {"eventSource": self.proto,
+              "protocol": self.proto,
+-             "eventType": "start"})
++             "eventType": "start",
++             "eventTransport" : "udp",
++             "address" : ""})
+ 
+ 
+     def test_doStopLogMessage(self):
+@@ -375,4 +377,6 @@ class AbstractDatagramProtocolTestCase(TestCase, DictSubsetMixin):
+             self.events[0],
+             {"eventSource": self.proto,
+              "protocol": self.proto,
+-             "eventType": "stop"})
++             "eventType": "stop",
++             "eventTransport" : "udp",
++             "address" : ""})
+diff --git a/twisted/internet/test/test_tcp.py b/twisted/internet/test/test_tcp.py
+index 3497b0a..00ffaf8 100644
+--- a/twisted/internet/test/test_tcp.py
++++ b/twisted/internet/test/test_tcp.py
+@@ -325,6 +325,7 @@ class TCPPortTestsBuilder(ReactorBuilder, ObjectModelIntegrationMixin,
+         ReactorBuilder.setUp(self)
+         self.factory = ServerFactory()
+         self.events = []
++        self.transportType = "tcp"
+         log.addObserver(self.events.append)
+         self.addCleanup(log.removeObserver, self.events.append)
+ 
+@@ -341,7 +342,14 @@ class TCPPortTestsBuilder(ReactorBuilder, ObjectModelIntegrationMixin,
+         Get the expected port number for the TCP port that experienced
+         the connection event.
+         """
+-        return port.getHost().port
++        return str(port.getHost().port)
++        
++    def getExpectedConnectionPortHost(self, port):
++        """
++        Get the expected hostname/IP for the TCP port that experienced
++        the connection event.
++        """
++        return port.getHost().host
+ 
+ 
+     def test_portStartStopLogMessage(self):
+@@ -353,6 +361,7 @@ class TCPPortTestsBuilder(ReactorBuilder, ObjectModelIntegrationMixin,
+         reactor = self.buildReactor()
+         p = self.getListeningPort(reactor)
+         listenPort = self.getExpectedConnectionPortNumber(p)
++        listenHost = self.getExpectedConnectionPortHost(p)
+ 
+         def stopReactor(ignored):
+             reactor.stop()
+@@ -364,7 +373,8 @@ class TCPPortTestsBuilder(ReactorBuilder, ObjectModelIntegrationMixin,
+         self.runReactor(reactor)
+ 
+         expected = {
+-            "eventSource": p, "portNumber": listenPort, "factory": self.factory}
++            "eventSource": p, "address": "%s:%s" % (listenHost, listenPort),
++            "eventTransport" : self.transportType, "factory": self.factory}
+ 
+         for event in self.events:
+             if event.get("eventType") == "start":
+diff --git a/twisted/internet/test/test_unix.py b/twisted/internet/test/test_unix.py
+index 293e965..7a3040a 100644
+--- a/twisted/internet/test/test_unix.py
++++ b/twisted/internet/test/test_unix.py
+@@ -147,6 +147,13 @@ class UNIXPortTestsBuilder(TCPPortTestsBuilder):
+     """
+ 
+     requiredInterfaces = [interfaces.IReactorUNIX]
++    
++    def setUp(self):
++        """
++        Extend TCP test setUp to set transportType to 'unix'.
++        """
++        TCPPortTestsBuilder.setUp(self)
++        self.transportType = "unix"
+ 
+     def getListeningPort(self, reactor):
+         """
+@@ -160,6 +167,13 @@ class UNIXPortTestsBuilder(TCPPortTestsBuilder):
+         Get the expected UNIX socket path from the given UNIX listening port.
+         """
+         return port.getHost().name
++    
++    def getExpectedConnectionPortHost(self, port):
++        """
++        Return an empty string, since there is no hostname for a UNIX socket.
++        """
++        
++        return ""
+ 
+ 
+ globals().update(UNIXTestsBuilder.makeTestCaseClasses())
+diff --git a/twisted/internet/unix.py b/twisted/internet/unix.py
+index 1cfe8cd..c84f548 100644
+--- a/twisted/internet/unix.py
++++ b/twisted/internet/unix.py
+@@ -112,8 +112,8 @@ class Port(_UNIXPort, tcp.Port):
+                     except:
+                         pass
+ 
+-        log.msg(eventSource=self, eventType="start", factory=self.factory,
+-                portNumber=self.port)
++        log.msg(eventSource=self, eventType="start", eventTransport="unix",
++                address=":%s" % self.port,factory=self.factory)
+         self.factory.doStart()
+         try:
+             skt = self.createInternetSocket()
+@@ -136,8 +136,8 @@ class Port(_UNIXPort, tcp.Port):
+         """
+         Log message for closing socket
+         """
+-        log.msg(eventSource=self, eventType="stop", factory=self.factory,
+-                portNumber=self.port)
++        log.msg(eventSource=self, eventType="stop", eventTransport="unix",
++                address=":%s" % self.port, factory=self.factory)
+ 
+ 
+     def connectionLost(self, reason):

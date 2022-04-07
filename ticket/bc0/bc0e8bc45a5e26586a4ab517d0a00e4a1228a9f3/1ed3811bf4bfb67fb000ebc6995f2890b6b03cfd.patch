@@ -1,0 +1,208 @@
+diff --git twisted/words/protocols/irc.py twisted/words/protocols/irc.py
+index c6cf072..57f6118 100644
+--- twisted/words/protocols/irc.py
++++ twisted/words/protocols/irc.py
+@@ -2343,12 +2343,6 @@ class IRCClient(basic.LineReceiver):
+         @param data: A 3-list of [fileName, address, port].
+         @type data: L{list}
+         """
+-        ## filename = path.basename(arg)
+-        ## protocol = DccFileReceive(filename, size,
+-        ##                           (user,channel,data),self.dcc_destdir)
+-        ## reactor.clientTCP(address, port, protocol)
+-        ## self.dcc_sessions.append(protocol)
+-        pass
+ 
+ 
+     def dccDoResume(self, user, file, port, resumePos):
+@@ -2963,6 +2957,7 @@ class DccFileReceive(DccFileReceiveBasic):
+         self.filename = filename
+         self.destDir = destDir
+         self.fileSize = fileSize
++        self.resumeOffset = resumeOffset
+ 
+         if queryData:
+             self.queryData = queryData
+@@ -3021,9 +3016,16 @@ class DccFileReceive(DccFileReceiveBasic):
+         if self.resume and exists:
+             # I have been told I want to resume, and a file already
+             # exists - Here we go
+-            self.file = open(dst, 'ab')
++            self.file = open(dst, 'rb+')
++            self.file.seek(self.resumeOffset)
++            self.file.truncate()
+             log.msg("Attempting to resume %s - starting from %d bytes" %
+-                    (self.file, self.file.tell()))
++                    (self.file, self.resumeOffset))
++        elif self.resume and not exists:
++            raise OSError(errno.ENOENT,
++                          "You cannot resume writing to a file "
++                          "that does not exist!",
++                          dst)
+         elif self.overwrite or not exists:
+             self.file = open(dst, 'wb')
+         else:
+diff --git twisted/words/test/test_irc.py twisted/words/test/test_irc.py
+index 086122c..9b9e45c 100644
+--- twisted/words/test/test_irc.py
++++ twisted/words/test/test_irc.py
+@@ -14,6 +14,7 @@ from twisted.words.protocols import irc
+ from twisted.words.protocols.irc import IRCClient, attributes as A
+ from twisted.internet import protocol, task
+ from twisted.test.proto_helpers import StringTransport, StringIOWithoutClosing
++from twisted.python.filepath import FilePath
+ 
+ 
+ 
+@@ -2615,3 +2616,144 @@ class DccDescribeTests(unittest.TestCase):
+         result = irc.dccDescribe('CHAT arg 3232235522 6666')
+         self.assertEqual(result, "CHAT for host 192.168.0.2, port 6666")
+ 
++
++
++class DccFileReceiveTests(unittest.TestCase):
++    """
++    Tests for L{DccFileReceive}.
++    """
++    def makeConnectedDccFileReceive(self, filename, resumeOffset=0,
++                                    overwrite=None):
++        """
++        Factory helper that returns a L{DccFileReceive} instance
++        for a specific test case.
++
++        @param filename: Path to a temporary file as returned by
++             L{TestCase.mktemp}.
++        @type filename: L{str}
++
++        @param resumeOffset: An integer representing the amount of bytes from
++            where the transfer of data should be resumed.
++        @type resumeOffset: L{int}
++
++        @param overwrite: A boolean specifying whether the file to write to
++            should be overwritten by calling L{DccFileReceive.set_overwrite}
++            or not.
++        @type overwrite: L{bool}
++
++        @return: An instance of L{DccFileReceive}.
++        @rtype: L{DccFileReceive}
++        """
++        protocol = irc.DccFileReceive(filename, resumeOffset=resumeOffset)
++        if overwrite:
++            protocol.set_overwrite(True)
++        transport = StringTransport()
++        protocol.makeConnection(transport)
++        return protocol
++
++
++    def allDataReceivedForProtocol(self, protocol, data):
++        """
++        Calls protocol methods of the protocol instance (an instance of
++        L{DccFileReceive}, in this case) that has been passed as an
++        argument to this method.
++
++        @param protocol: An instance of L{DccFileReceive} for a specific
++            test case.
++        @type: L{DccFileReceive}
++
++        @param data: The data that is passed as an argument to
++            L{DccFileReceive.dataReceived}.
++        @type data: L{str}
++        """
++        protocol.dataReceived(data)
++        protocol.connectionLost(None)
++
++
++    def test_resumeFromResumeOffset(self):
++        """
++        If given a resumeOffset argument, L{DccFileReceive} will attempt to
++        resume from that number of bytes if the file exists.
++        """
++        filename = self.mktemp()
++        fp = FilePath(filename)
++        fp.setContent("Twisted is awesome!")
++
++        protocol = self.makeConnectedDccFileReceive(filename, resumeOffset=11)
++        self.allDataReceivedForProtocol(protocol, "amazing!")
++
++        result = fp.getContent()
++        self.assertEqual(result, "Twisted is amazing!")
++
++
++    def test_resumeFromResumeOffsetInTheMiddleOfAlreadyWrittenData(self):
++        """
++        When resuming from an offset somewhere in the middle of the file,
++        for example, if there are 50 bytes in a file, and L{DccFileReceive}
++        is given a resumeOffset of 25, and after that 15 more bytes are
++        written to the file, then the resultant file should have just 40
++        bytes of data, and L{DccFileReceive} should make sure that the
++        old remaining 10 bytes (in what was previously a file with 50 bytes
++        of data in it) are truncated.
++        """
++        filename = self.mktemp()
++        fp = FilePath(filename)
++        fp.setContent("Twisted is amazing!")
++
++        protocol = self.makeConnectedDccFileReceive(filename, resumeOffset=11)
++        self.allDataReceivedForProtocol(protocol, "cool!")
++
++        result = fp.getContent()
++        self.assertEqual(result, "Twisted is cool!")
++
++
++    def test_setOverwrite(self):
++        """
++        We can overwrite the file (or create a new one if there is no file
++        to overwrite) using the L{DccFileReceive.set_overwrite} method.
++        """
++        filename = self.mktemp()
++        fp = FilePath(filename)
++        fp.setContent("I love contributing to Twisted!")
++
++        protocol = self.makeConnectedDccFileReceive(filename, overwrite=True)
++        self.allDataReceivedForProtocol(protocol, "Twisted rocks!")
++
++        result = fp.getContent()
++        self.assertEqual(result, "Twisted rocks!")
++
++
++    def test_fileDoesNotExist(self):
++        """
++        If the file does not already exist, then L{DccFileReceive} will
++        create one and write the data to it.
++        """
++        filename = self.mktemp()
++        fp = FilePath(filename)
++        protocol = self.makeConnectedDccFileReceive(filename)
++        self.allDataReceivedForProtocol(protocol, "I <3 Twisted")
++
++        result = fp.getContent()
++        self.assertEqual(result, "I <3 Twisted")
++
++
++    def test_resumeWhenFileDoesNotExist(self):
++        """
++        If given a resumeOffset to resume writing to a file that does not
++        exist, L{DccFileReceive} will raise L{OSError}.
++        """
++        filename = self.mktemp()
++        self.assertRaises(OSError, self.makeConnectedDccFileReceive,
++                          filename, 11)
++
++
++    def test_cannotOpenFile(self):
++        """
++        If L{DccFileReceive} can't open the file, or if the file already
++        exists, L{OSError} will be raised.
++        """
++        filename = self.mktemp()
++        fp = FilePath(filename)
++        fp.setContent("TWISTED PREVAILS")
++        self.assertRaises(OSError, self.makeConnectedDccFileReceive, filename)
++
+diff --git twisted/words/topfiles/7775.bugfix twisted/words/topfiles/7775.bugfix
+new file mode 100644
+index 0000000..46c3525
+--- /dev/null
++++ twisted/words/topfiles/7775.bugfix
+@@ -0,0 +1 @@
++The resumeOffset argument to twisted.words.protocol.irc.DccFileReceive now works as it is documented.

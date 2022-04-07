@@ -1,0 +1,985 @@
+==== Patch <twisted-process-improvements-2> level 1
+Source: 4ed7e550-c718-0410-ac9a-b82090e61d08:/local/twisted-process-idea-dev:11419
+Target: bbbe8e31-12d6-0310-92fd-ac37d47ddeeb:/trunk:17656
+        (svn://svn.twistedmatrix.com/svn/Twisted/trunk)
+Log:
+ r11396@taby:  naked | 2006-07-19 10:48:04 +0300
+ Branched twisted-trunk to for developing the process module.
+ r11399@taby:  naked | 2006-07-19 20:56:44 +0300
+ Added first helpers for process childFDs.
+ r11400@taby:  naked | 2006-07-19 21:23:05 +0300
+ First version of rework of childFDs handling. We should be in working state
+ again, so let me try testing.
+ r11401@taby:  naked | 2006-07-19 21:56:49 +0300
+ Implemented ProcessPTY as the reader/writer for PTY processes.
+ r11402@taby:  naked | 2006-07-19 22:16:56 +0300
+ Bugfixes to PTY process handling.
+ r11403@taby:  naked | 2006-07-19 22:27:38 +0300
+ Added defaultWriter hack to maybe make Process behave a bit like PTYProces if
+ wanted.
+ r11404@taby:  naked | 2006-07-19 22:34:55 +0300
+ Bugfix.
+ r11405@taby:  naked | 2006-07-19 22:36:24 +0300
+ Modify posixbase to use the new Process PTY interface.
+ r11409@taby:  naked | 2006-07-22 22:51:07 +0300
+ Halfway rework of the process improvements. Now implements a factory.
+ r11410@taby:  naked | 2006-07-22 22:55:37 +0300
+ A tiny rework.
+ r11411@taby:  naked | 2006-07-22 22:58:17 +0300
+ Reorganize file a bit.
+ r11412@taby:  naked | 2006-07-22 23:04:11 +0300
+ Small tunes again.
+ r11413@taby:  naked | 2006-07-23 00:01:08 +0300
+ Severe rework of the process spawning mechanics. Now there's a ChildProcess
+ class as well.
+ r11414@taby:  naked | 2006-07-23 16:15:08 +0300
+ Move changing path before setting up helpers. I'm not sure if it is a good
+ thing or a bad thing.
+
+=== twisted/internet/posixbase.py
+==================================================================
+--- twisted/internet/posixbase.py	(revision 17656)
++++ twisted/internet/posixbase.py	(patch twisted-process-improvements-2 level 1)
+@@ -272,14 +272,8 @@
+                      env={}, path=None,
+                      uid=None, gid=None, usePTY=0, childFDs=None):
+         if platformType == 'posix':
+-            if usePTY:
+-                if childFDs is not None:
+-                    raise ValueError("Using childFDs is not supported with usePTY=True.")
+-                return process.PTYProcess(self, executable, args, env, path,
+-                                          processProtocol, uid, gid, usePTY)
+-            else:
+-                return process.Process(self, executable, args, env, path,
+-                                       processProtocol, uid, gid, childFDs)
++            factory = process.CompatibilityProcessProtocolFactory(processProtocol, path, uid, gid, usePTY, childFDs)
++            return process.Process(self, executable, args, env, factory)
+         elif platformType == "win32":
+             if uid is not None or gid is not None:
+                 raise ValueError("The uid and gid parameters are not supported on Windows.")
+=== twisted/internet/process.py
+==================================================================
+--- twisted/internet/process.py	(revision 17656)
++++ twisted/internet/process.py	(patch twisted-process-improvements-2 level 1)
+@@ -82,6 +82,7 @@
+ # Call at import time
+ detectLinuxBrokenPipeBehavior()
+ 
++
+ class ProcessWriter(abstract.FileDescriptor):
+     """(Internal) Helper class to write into a Process's input pipe.
+ 
+@@ -233,179 +234,290 @@
+         self.proc.childConnectionLost(self.name, reason)
+ 
+ 
+-class Process(styles.Ephemeral):
+-    """An operating-system Process.
++class ProcessPTY(abstract.FileDescriptor):
++    connected = 1
+ 
+-    This represents an operating-system process with arbitrary input/output
+-    pipes connected to it. Those pipes may represent standard input,
+-    standard output, and standard error, or any other file descriptor.
++    def __init__(self, reactor, proc, name, fileno):
++        abstract.FileDescriptor.__init__(self, reactor)
++        fdesc.setNonBlocking(fileno)
++        self.proc = proc
++        self.name = name
++        self.fd = fileno
++        self.startReading()
+ 
+-    On UNIX, this is implemented using fork(), exec(), pipe()
+-    and fcntl(). These calls may not exist elsewhere so this
+-    code is not cross-platform. (also, windows can only select
+-    on sockets...)
+-    """
++    def fileno(self):
++        return self.fd
+ 
+-    debug = False
+-    debug_child = False
++    def writeSomeData(self, data):
++        try:
++            return os.write(self.fd, data)
++        except IOError,io:
++            if io.args[0] == errno.EAGAIN:
++                return 0
++            return CONNECTION_LOST
++        except OSError, ose:
++            if ose.errno == errno.EAGAIN: # MacOS-X does this # FIXME: really needed?
++                return 0
++            raise
+ 
+-    status = -1
+-    pid = None
++    def doRead(self):
++        try:
++            return fdesc.readFromFD(self.fd, self.dataReceived)
++        except OSError: # FIXME: really needed?
++            return CONNECTION_LOST
+ 
+-    def __init__(self,
+-                 reactor, command, args, environment, path, proto,
+-                 uid=None, gid=None, childFDs=None):
+-        """Spawn an operating-system process.
++    def dataReceived(self, data):
++        self.proc.childDataReceived(self.name, data)
+ 
+-        This is where the hard work of disconnecting all currently open
+-        files / forking / executing the new process happens.  (This is
+-        executed automatically when a Process is instantiated.)
++    def connectionLost(self, reason):
++        abstract.FileDescriptor.connectionLost(self, reason)
++        self.proc.childConnectionLost(self.name, reason)
+ 
+-        This will also run the subprocess as a given user ID and group ID, if
+-        specified.  (Implementation Note: this doesn't support all the arcane
+-        nuances of setXXuid on UNIX: it will assume that either your effective
+-        or real UID is 0.)
+-        """
+-        if not proto:
+-            assert 'r' not in childFDs.values()
+-            assert 'w' not in childFDs.values()
+-        if not signal.getsignal(signal.SIGCHLD):
+-            log.msg("spawnProcess called, but the SIGCHLD handler is not "
+-                    "installed. This probably means you have not yet "
+-                    "called reactor.run, or called "
+-                    "reactor.run(installSignalHandler=0). You will probably "
+-                    "never see this process finish, and it may become a "
+-                    "zombie process.")
+-            # if you see this message during a unit test, look in
+-            # test-standard.xhtml or twisted.test.test_process.SignalMixin
+-            # for a workaround
+ 
+-        self.lostProcess = False
++class ProcessHelper:
++    def setupPrefork(self, proc):
++        raise NotImplementedError("%s does not implement setup" %
++                                  reflect.qual(self.__class__))
+ 
+-        settingUID = (uid is not None) or (gid is not None)
+-        if settingUID:
+-            curegid = os.getegid()
+-            currgid = os.getgid()
+-            cureuid = os.geteuid()
+-            curruid = os.getuid()
+-            if uid is None:
+-                uid = cureuid
+-            if gid is None:
+-                gid = curegid
+-            # prepare to change UID in subprocess
+-            os.setuid(0)
+-            os.setgid(0)
++    def setupChild(self, childProc):
++        raise NotImplementedError("%s does not implement setup" %
++                                  reflect.qual(self.__class__))
+ 
+-        self.pipes = {}
+-        # keys are childFDs, we can sense them closing
+-        # values are ProcessReader/ProcessWriters
++    def setupParent(self, proc):
++        raise NotImplementedError("%s does not implement setup" %
++                                  reflect.qual(self.__class__))
+ 
+-        helpers = {}
+-        # keys are childFDs
+-        # values are parentFDs
+ 
+-        if childFDs is None:
+-            childFDs = {0: "w", # we write to the child's stdin
+-                        1: "r", # we read from their stdout
+-                        2: "r", # and we read from their stderr
+-                        }
++class SetuidHelper(ProcessHelper):
++    def __init__(self, uid=None, gid=None):
++        self.uid = uid
++        self.gid = gid
+ 
+-        debug = self.debug
+-        if debug: print "childFDs", childFDs
++    def setupPrefork(self, proc):
++        curegid = os.getegid()
++        currgid = os.getgid()
++        cureuid = os.geteuid()
++        curruid = os.getuid()
++        if uid is None:
++            uid = cureuid
++        if gid is None:
++            gid = curegid
++        # prepare to change UID in subprocess
++        os.setuid(0)
++        os.setgid(0)
+ 
+-        # fdmap.keys() are filenos of pipes that are used by the child.
+-        fdmap = {} # maps childFD to parentFD
+-        for childFD, target in childFDs.items():
+-            if debug: print "[%d]" % childFD, target
+-            if target == "r":
+-                # we need a pipe that the parent can read from
+-                readFD, writeFD = os.pipe()
+-                if debug: print "readFD=%d, writeFD%d" % (readFD, writeFD)
+-                fdmap[childFD] = writeFD     # child writes to this
+-                helpers[childFD] = readFD    # parent reads from this
+-            elif target == "w":
+-                # we need a pipe that the parent can write to
+-                readFD, writeFD = os.pipe()
+-                if debug: print "readFD=%d, writeFD=%d" % (readFD, writeFD)
+-                fdmap[childFD] = readFD      # child reads from this
+-                helpers[childFD] = writeFD   # parent writes to this
+-            else:
+-                assert type(target) == int, '%r should be an int' % (target,)
+-                fdmap[childFD] = target      # parent ignores this
+-        if debug: print "fdmap", fdmap
+-        if debug: print "helpers", helpers
+-        # the child only cares about fdmap.values()
++    def setupChild(self, childProc):
++        switchUID(uid, gid)
+ 
+-        self.pid = os.fork()
+-        if self.pid == 0: # pid is 0 in the child process
++    def setupParent(self, proc):
++        os.setregid(currgid, curegid)
++        os.setreuid(curruid, cureuid)
+ 
+-            # do not put *ANY* code outside the try block. The child process
+-            # must either exec or _exit. If it gets outside this block (due
+-            # to an exception that is not handled here, but which might be
+-            # handled higher up), there will be two copies of the parent
+-            # running in parallel, doing all kinds of damage.
+ 
+-            # After each change to this code, review it to make sure there
+-            # are no exit paths.
++class ChdirHelper(ProcessHelper):
++    def __init__(self, path):
++        self.path = path
+ 
++    def setupPrefork(self, proc):
++        pass
++
++    def setupChild(self, childProc):
++        os.chdir(self.path)
++
++    def setupParent(self, proc):
++        pass
++
++
++class PassthroughFD(ProcessHelper):
++    def __init__(self, fd, dstFDs):
++        self.fd = fd
++        self.dstFDs = dstFDs
++
++    def setupPrefork(self, proc):
++        pass
++
++    def setupChild(self, childProc):
++        for dstFD in self.dstFDs:
++            childProc.mapFD(self.fd, dstFD)
++
++    def setupParent(self, proc):
++        pass
++
++
++class ReadPipe(ProcessHelper):
++    def __init__(self, name, dstFDs):
++        self.name = name
++        self.dstFDs = dstFDs
++    
++    def setupPrefork(self, proc):
++        readFD, writeFD = os.pipe()
++        self.parentFD = readFD
++        self.childFD = writeFD
++
++    def setupChild(self, childProc):
++        os.close(self.parentFD)
++        for dstFD in self.dstFDs:
++            childProc.mapFD(self.childFD, dstFD)
++
++    def setupParent(self, proc):
++        os.close(self.childFD)
++        reader = ProcessReader(proc.reactor, proc, self.name, self.parentFD)
++        proc.addChannel(self.name, reader)
++
++
++class WritePipe(ProcessHelper):
++    def __init__(self, name, dstFDs):
++        self.name = name
++        self.dstFDs = dstFDs
++    
++    def setupPrefork(self, proc):
++        readFD, writeFD = os.pipe()
++        self.parentFD = writeFD
++        self.childFD = readFD
++
++    def setupChild(self, childProc):
++        os.close(self.parentFD)
++        for dstFD in self.dstFDs:
++            childProc.mapFD(self.childFD, dstFD)
++
++    def setupParent(self, proc):
++        os.close(self.childFD)
++        writer = ProcessWriter(proc.reactor, proc, self.name, self.parentFD)
++        proc.addChannel(self.name, writer)
++
++
++class PTY(ProcessHelper):
++    def __init__(self, name, dstFDs, usePTY=None):
++        self.name = name
++        self.dstFDs = dstFDs
++        if not pty and type(usePTY) not in (types.ListType, types.TupleType):
++            # no pty module and we didn't get a pty to use
++            raise NotImplementedError, "cannot use PTYProcess on platforms without the pty module."
++        self.usePTY = usePTY
++
++    def setupPrefork(self, proc):
++        if type(self.usePTY) in (types.ListType, types.TupleType):
++            masterFD, slaveFD, ttyname = self.usePTY
++        else:
++            masterFD, slaveFD = pty.openpty()
++            ttyname = os.ttyname(slaveFD)
++        self.parentFD = masterFD
++        self.childFD = slaveFD
++        self.ttyname = ttyname
++
++    def setupChild(self, childProc):
++        os.close(self.parentFD)
++        if hasattr(termios, 'TIOCNOTTY'):
+             try:
+-                # stop debugging, if I am!  I don't care anymore!
+-                sys.settrace(None)
+-                # close all parent-side pipes
+-                self._setupChild(fdmap)
+-                self._execChild(path, settingUID, uid, gid,
+-                                command, args, environment)
+-            except:
+-                # If there are errors, bail and try to write something
+-                # descriptive to stderr.
+-                # XXX: The parent's stderr isn't necessarily fd 2 anymore, or
+-                #      even still available
+-                # XXXX: however even libc assumes write(2,err) is a useful
+-                #       thing to attempt
++                fd = os.open("/dev/tty", os.O_RDWR | os.O_NOCTTY)
++            except OSError:
++                pass
++            else:
+                 try:
+-                    stderr = os.fdopen(2,'w')
+-                    stderr.write("Upon execvpe %s %s in environment %s\n:" %
+-                                 (command, str(args),
+-                                  "id %s" % id(environment)))
+-                    traceback.print_exc(file=stderr)
+-                    stderr.flush()
+-                    for fd in range(3):
+-                        os.close(fd)
++                    fcntl.ioctl(fd, termios.TIOCNOTTY, '')
+                 except:
+-                    pass # make *sure* the child terminates
+-            # Did you read the comment about not adding code here?
+-            os._exit(1)
++                    pass
++                os.close(fd)
++                    
++        os.setsid()
++                
++        if hasattr(termios, 'TIOCSCTTY'):
++            fcntl.ioctl(self.childFD, termios.TIOCSCTTY, '')
+ 
+-        # we are the parent
++        for dstFD in self.dstFDs:
++            childProc.mapFD(self.childFD, dstFD)
+ 
+-        if settingUID:
+-            os.setregid(currgid, curegid)
+-            os.setreuid(curruid, cureuid)
+-        self.status = -1 # this records the exit status of the child
++    def setupParent(self, proc):
++        os.close(self.childFD)
++        processpty = ProcessPTY(proc.reactor, proc, self.name, self.parentFD)
++        proc.addChannel(self.name, processpty)
+ 
++
++class SocketPair(ProcessHelper):
++    pass
++
++
++class ProcessProtocolFactory(protocol.Factory):
++    protocol = protocol.ProcessProtocol
++
++    def processSetup(self, proc):
++        pass
++
++
++class CompatibilityProcessProtocolFactory(ProcessProtocolFactory):
++    def __init__(self, proto=None, path=None, uid=None, gid=None, usePTY=0, childFDs=None):
++        if usePTY and childFDs is not None:
++            raise ValueError("Using childFDs is not supported with usePTY=True.")
++        if not proto:
++            assert 'r' not in childFDs.values()
++            assert 'w' not in childFDs.values()
+         self.proto = proto
+-        
+-        # arrange for the parent-side pipes to be read and written
+-        for childFD, parentFD in helpers.items():
+-            os.close(fdmap[childFD])
++        self.path = path
++        self.uid = uid
++        self.gid = gid
++        self.usePTY = usePTY
++        self.childFDs = childFDs
++        self.used = False
++    
++    def processSetup(self, proc):
++        if (self.uid is not None) or (self.gid is not None):
++            proc.addHelper(SetuidHelper(self.uid, self.gid))
+ 
+-            if childFDs[childFD] == "r":
+-                reader = ProcessReader(reactor, self, childFD, parentFD)
+-                self.pipes[childFD] = reader
++        if self.path is not None:
++            proc.addHelper(ChdirHelper(self.path))
+ 
+-            if childFDs[childFD] == "w":
+-                writer = ProcessWriter(reactor, self, childFD, parentFD, forceReadHack=True)
+-                self.pipes[childFD] = writer
++        if self.usePTY:
++            proc.addHelper(PTY(1, [0, 1, 2], self.usePTY))
++            proc.setDefaultWriter(1)
++        elif self.childFDs is None:
++            proc.addHelper(WritePipe(0, [0]))
++            proc.addHelper(ReadPipe(1, [1]))
++            proc.addHelper(ReadPipe(2, [2]))
++        else:
++            for childFD, target in self.childFDs.items():
++                if target == "r":
++                    proc.addHelper(ReadPipe(childFD, [childFD]))
++                elif target == "w":
++                    proc.addHelper(WritePipe(childFD, [childFD]))
++                else:
++                    assert type(target) == int, '%r should be an int' % (target,)
++                    proc.addHelper(PassthroughFD(target, [childFD]))
+ 
+-        try:
+-            # the 'transport' is used for some compatibility methods
+-            if self.proto is not None:
+-                self.proto.makeConnection(self)
+-        except:
+-            log.err()
+-        registerReapProcessHandler(self.pid, self)
++    def buildProtocol(self, addr):
++        if self.used:
++            raise ValueError("Cannot use CompatibilityProcessProtocolFactory more than once.")
++        self.used = True
++        if self.proto is None:
++            return protocol.ProcessProtocol()
++        else:
++            return self.proto
+ 
+-    def _setupChild(self, fdmap):
++
++class ChildProcess(styles.Ephemeral):
++    debug = False
++    
++    def __init__(self, command, args, environment, helpers):
++        self.command = command
++        self.args = args
++        self.environment = environment
++        self.helpers = helpers
++        self.fdmap = {}
++    
++    def run(self):
++        # stop debugging, if I am!  I don't care anymore!
++        sys.settrace(None)
++        # call all helpers
++        for helper in self.helpers:
++            helper.setupChild(self)
++        # map all FDs to where they belong
++        self._setupChild()
++        self._execChild()
++
++    def mapFD(self, src, dst):
++        # FIXME: check duplicates?
++        self.fdmap[dst] = src
++
++    def _setupChild(self):
+         """
+         fdmap[childFD] = parentFD
+ 
+@@ -435,7 +547,8 @@
+                    original.
+         """
+ 
+-        debug = self.debug_child
++        fdmap = self.fdmap
++        debug = self.debug
+         if debug:
+             #errfd = open("/tmp/p.err", "a", 0)
+             errfd = sys.stderr
+@@ -509,15 +622,135 @@
+         for fd in old:
+             os.close(fd)
+ 
+-    def _execChild(self, path, settingUID, uid, gid,
+-                   command, args, environment):
+-        if path:
+-            os.chdir(path)
+-        # set the UID before I actually exec the process
+-        if settingUID:
+-            switchUID(uid, gid)
+-        os.execvpe(command, args, environment)
++    def _execChild(self):
++        os.execvpe(self.command, self.args, self.environment)
+ 
++
++class Process(styles.Ephemeral):
++    """An operating-system Process.
++
++    This represents an operating-system process with arbitrary input/output
++    pipes connected to it. Those pipes may represent standard input,
++    standard output, and standard error, or any other file descriptor.
++
++    On UNIX, this is implemented using fork(), exec(), pipe()
++    and fcntl(). These calls may not exist elsewhere so this
++    code is not cross-platform. (also, windows can only select
++    on sockets...)
++    """
++
++    debug = False
++    debug_child = False
++
++    status = -1
++    pid = None
++
++    defaultWriter = 0 # FIXME: hack
++
++    def __init__(self,
++                 reactor, command, args, environment, factory):
++        """Spawn an operating-system process.
++
++        This is where the hard work of disconnecting all currently open
++        files / forking / executing the new process happens.  (This is
++        executed automatically when a Process is instantiated.)
++
++        This will also run the subprocess as a given user ID and group ID, if
++        specified.  (Implementation Note: this doesn't support all the arcane
++        nuances of setXXuid on UNIX: it will assume that either your effective
++        or real UID is 0.)
++        """
++        if not signal.getsignal(signal.SIGCHLD):
++            log.msg("spawnProcess called, but the SIGCHLD handler is not "
++                    "installed. This probably means you have not yet "
++                    "called reactor.run, or called "
++                    "reactor.run(installSignalHandler=0). You will probably "
++                    "never see this process finish, and it may become a "
++                    "zombie process.")
++            # if you see this message during a unit test, look in
++            # test-standard.xhtml or twisted.test.test_process.SignalMixin
++            # for a workaround
++
++        self.reactor = reactor # FIXME: how to handle?
++
++        self.factory = factory
++        
++        self.lostProcess = False
++
++        self.pipes = {}
++        # keys are childFDs, we can sense them closing
++        # values are ProcessReader/ProcessWriters
++
++        self.helpers = []
++        # list of (helper, name, childFDlist)
++
++        factory.processSetup(self)
++
++        for helper in self.helpers:
++            helper.setupPrefork(self)
++
++        # FIXME: check for duplicates in childFD lists?
++
++        self.pid = os.fork()
++        if self.pid == 0: # pid is 0 in the child process
++
++            # do not put *ANY* code outside the try block. The child process
++            # must either exec or _exit. If it gets outside this block (due
++            # to an exception that is not handled here, but which might be
++            # handled higher up), there will be two copies of the parent
++            # running in parallel, doing all kinds of damage.
++
++            # After each change to this code, review it to make sure there
++            # are no exit paths.
++
++            try:
++                child = ChildProcess(command, args, environment, self.helpers)
++                child.run()
++            except:
++                # If there are errors, bail and try to write something
++                # descriptive to stderr.
++                # XXX: The parent's stderr isn't necessarily fd 2 anymore, or
++                #      even still available
++                # XXXX: however even libc assumes write(2,err) is a useful
++                #       thing to attempt
++                try:
++                    stderr = os.fdopen(2,'w')
++                    stderr.write("Upon execvpe %s %s in environment %s\n:" %
++                                 (command, str(args),
++                                  "id %s" % id(environment)))
++                    traceback.print_exc(file=stderr)
++                    stderr.flush()
++                    for fd in range(3):
++                        os.close(fd)
++                except:
++                    pass # make *sure* the child terminates
++            # Did you read the comment about not adding code here?
++            os._exit(1)
++
++        # we are the parent
++
++        self.status = -1 # this records the exit status of the child
++
++        # setup the parent side helpers
++        for helper in self.helpers:
++            helper.setupParent(self)
++
++        try:
++            self.proto = self.factory.buildProtocol(None)
++            self.proto.makeConnection(self)
++        except:
++            log.err()
++        registerReapProcessHandler(self.pid, self)
++
++    def addHelper(self, helper):
++        self.helpers.append(helper)
++
++    def addChannel(self, name, transport):
++        self.pipes[name] = transport
++
++    def setDefaultWriter(self, name):
++        self.defaultWriter = name
++
+     def reapProcess(self):
+         """Try to reap a process (without blocking) via waitpid.
+ 
+@@ -580,8 +813,8 @@
+         
+         NOTE: This will silently lose data if there is no standard input.
+         """
+-        if self.pipes.has_key(0):
+-            self.pipes[0].write(data)
++        if self.pipes.has_key(self.defaultWriter):
++            self.pipes[self.defaultWriter].write(data)
+ 
+     def registerProducer(self, producer, streaming):
+         """Call this to register producer for standard input.
+@@ -589,23 +822,23 @@
+         If there is no standard input producer.stopProducing() will
+         be called immediately.
+         """
+-        if self.pipes.has_key(0):
+-            self.pipes[0].registerProducer(producer, streaming)
++        if self.pipes.has_key(self.defaultWriter):
++            self.pipes[self.defaultWriter].registerProducer(producer, streaming)
+         else:
+             producer.stopProducing()
+ 
+     def unregisterProducer(self):
+         """Call this to unregister producer for standard input."""
+-        if self.pipes.has_key(0):
+-            self.pipes[0].unregisterProducer()
++        if self.pipes.has_key(self.defaultWriter):
++            self.pipes[self.defaultWriter].unregisterProducer()
+     
+     def writeSequence(self, seq):
+         """Call this to write to standard input on this process.
+ 
+         NOTE: This will silently lose data if there is no standard input.
+         """
+-        if self.pipes.has_key(0):
+-            self.pipes[0].writeSequence(seq)
++        if self.pipes.has_key(self.defaultWriter):
++            self.pipes[self.defaultWriter].writeSequence(seq)
+ 
+     def childDataReceived(self, name, data):
+         self.proto.childDataReceived(name, data)
+@@ -673,215 +906,3 @@
+     def __repr__(self):
+         return "<%s pid=%s status=%s>" % (self.__class__.__name__,
+                                           self.pid, self.status)
+-
+-class PTYProcess(abstract.FileDescriptor, styles.Ephemeral):
+-    """An operating-system Process that uses PTY support."""
+-    status = -1
+-    pid = None
+-    
+-    def __init__(self, reactor, command, args, environment, path, proto,
+-                 uid=None, gid=None, usePTY=None):
+-        """Spawn an operating-system process.
+-
+-        This is where the hard work of disconnecting all currently open
+-        files / forking / executing the new process happens.  (This is
+-        executed automatically when a Process is instantiated.)
+-
+-        This will also run the subprocess as a given user ID and group ID, if
+-        specified.  (Implementation Note: this doesn't support all the arcane
+-        nuances of setXXuid on UNIX: it will assume that either your effective
+-        or real UID is 0.)
+-        """
+-        if not pty and type(usePTY) not in (types.ListType, types.TupleType):
+-            # no pty module and we didn't get a pty to use
+-            raise NotImplementedError, "cannot use PTYProcess on platforms without the pty module."
+-        abstract.FileDescriptor.__init__(self, reactor)
+-        settingUID = (uid is not None) or (gid is not None)
+-        if settingUID:
+-            curegid = os.getegid()
+-            currgid = os.getgid()
+-            cureuid = os.geteuid()
+-            curruid = os.getuid()
+-            if uid is None:
+-                uid = cureuid
+-            if gid is None:
+-                gid = curegid
+-            # prepare to change UID in subprocess
+-            os.setuid(0)
+-            os.setgid(0)
+-        if type(usePTY) in (types.TupleType, types.ListType):
+-            masterfd, slavefd, ttyname = usePTY
+-        else:
+-            masterfd, slavefd = pty.openpty()
+-            ttyname = os.ttyname(slavefd)
+-        pid = os.fork()
+-        self.pid = pid
+-        if pid == 0: # pid is 0 in the child process
+-            try:
+-                sys.settrace(None)
+-                os.close(masterfd)
+-                if hasattr(termios, 'TIOCNOTTY'):
+-                    try:
+-                        fd = os.open("/dev/tty", os.O_RDWR | os.O_NOCTTY)
+-                    except OSError:
+-                        pass
+-                    else:
+-                        try:
+-                            fcntl.ioctl(fd, termios.TIOCNOTTY, '')
+-                        except:
+-                            pass
+-                        os.close(fd)
+-                    
+-                os.setsid()
+-                
+-                if hasattr(termios, 'TIOCSCTTY'):
+-                    fcntl.ioctl(slavefd, termios.TIOCSCTTY, '')
+-                
+-                for fd in range(3):
+-                    if fd != slavefd:
+-                        os.close(fd)
+-
+-                os.dup2(slavefd, 0) # stdin
+-                os.dup2(slavefd, 1) # stdout
+-                os.dup2(slavefd, 2) # stderr
+-
+-                if path:
+-                    os.chdir(path)
+-                for fd in range(3, 256):
+-                    try:    os.close(fd)
+-                    except: pass
+-
+-                # set the UID before I actually exec the process
+-                if settingUID:
+-                    switchUID(uid, gid)
+-                os.execvpe(command, args, environment)
+-            except:
+-                stderr = os.fdopen(1, 'w')
+-                stderr.write("Upon execvpe %s %s in environment %s:\n" %
+-                             (command, str(args),
+-                              "id %s" % id(environment)))
+-                traceback.print_exc(file=stderr)
+-                stderr.flush()
+-            os._exit(1)
+-        assert pid!=0
+-        os.close(slavefd)
+-        fdesc.setNonBlocking(masterfd)
+-        self.fd=masterfd
+-        self.startReading()
+-        self.connected = 1
+-        self.proto = proto
+-        self.lostProcess = 0
+-        self.status = -1
+-        try:
+-            self.proto.makeConnection(self)
+-        except:
+-            log.err()
+-        registerReapProcessHandler(self.pid, self)
+-
+-    def reapProcess(self):
+-        """Try to reap a process (without blocking) via waitpid.
+-
+-        This is called when sigchild is caught or a Process object loses its
+-        "connection" (stdout is closed) This ought to result in reaping all
+-        zombie processes, since it will be called twice as often as it needs
+-        to be.
+-
+-        (Unfortunately, this is a slightly experimental approach, since
+-        UNIX has no way to be really sure that your process is going to
+-        go away w/o blocking.  I don't want to block.)
+-        """
+-        try:
+-            pid, status = os.waitpid(self.pid, os.WNOHANG)
+-        except OSError, e:
+-            if e.errno == errno.ECHILD: # no child process
+-                pid = None
+-            else:
+-                raise
+-        except:
+-            log.err()
+-            pid = None
+-        if pid:
+-            self.processEnded(status)
+-            unregisterReapProcessHandler(self.pid, self)
+-
+-    # PTYs do not have stdin/stdout/stderr. They only have in and out, just
+-    # like sockets. You cannot close one without closing off the entire PTY.
+-    def closeStdin(self):
+-        pass
+-
+-    def closeStdout(self):
+-        pass
+-
+-    def closeStderr(self):
+-        pass
+-
+-    def signalProcess(self, signalID):
+-        if signalID in ('HUP', 'STOP', 'INT', 'KILL'):
+-            signalID = getattr(signal, 'SIG'+signalID)
+-        os.kill(self.pid, signalID)
+-
+-    def processEnded(self, status):
+-        self.status = status
+-        self.lostProcess += 1
+-        self.maybeCallProcessEnded()
+-
+-    def doRead(self):
+-        """Called when my standard output stream is ready for reading.
+-        """
+-        try:
+-            return fdesc.readFromFD(self.fd, self.proto.outReceived)
+-        except OSError:
+-            return CONNECTION_LOST
+-
+-    def fileno(self):
+-        """This returns the file number of standard output on this process.
+-        """
+-        return self.fd
+-
+-    def maybeCallProcessEnded(self):
+-        # two things must happen before we call the ProcessProtocol's
+-        # processEnded method. 1: the child process must die and be reaped
+-        # (which calls our own processEnded method). 2: the child must close
+-        # their stdin/stdout/stderr fds, causing the pty to close, causing
+-        # our connectionLost method to be called. #2 can also be triggered
+-        # by calling .loseConnection().
+-        if self.lostProcess == 2:
+-            try:
+-                exitCode = sig = None
+-                if self.status != -1:
+-                    if os.WIFEXITED(self.status):
+-                        exitCode = os.WEXITSTATUS(self.status)
+-                    else:
+-                        sig = os.WTERMSIG(self.status)
+-                else:
+-                    pass # wonder when this happens
+-                if exitCode or sig:
+-                    e = error.ProcessTerminated(exitCode, sig, self.status)
+-                else:
+-                    e = error.ProcessDone(self.status)
+-                self.proto.processEnded(failure.Failure(e))
+-                self.proto = None
+-            except:
+-                log.err()
+-
+-    def connectionLost(self, reason):
+-        """I call this to clean up when one or all of my connections has died.
+-        """
+-        abstract.FileDescriptor.connectionLost(self, reason)
+-        os.close(self.fd)
+-        self.lostProcess +=1
+-        self.maybeCallProcessEnded()
+-
+-    def writeSomeData(self, data):
+-        """Write some data to the open process.
+-        """
+-        try:
+-            return os.write(self.fd, data)
+-        except IOError,io:
+-            if io.args[0] == errno.EAGAIN:
+-                return 0
+-            return CONNECTION_LOST
+-
+-    def __repr__(self):
+-        return "<%s pid=%s status=%s>" % (self.__class__.__name__,
+-                                          self.pid, self.status)
+
+==== BEGIN SVK PATCH BLOCK ====
+Version: svk 1.08 (linux)
+
+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
+AXC9ZTVaEFpovwh72Hl4d5+iS5dp8j+G0uis
+==== END SVK PATCH BLOCK ====

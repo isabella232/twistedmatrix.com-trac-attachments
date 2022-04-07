@@ -1,0 +1,284 @@
+Index: twisted/web/test/test_websocket.py
+===================================================================
+--- twisted/web/test/test_websocket.py	(revision 29310)
++++ twisted/web/test/test_websocket.py	(working copy)
+@@ -67,7 +67,7 @@
+ 
+ 
+     def renderRequest(self, headers=None, url="/test", ssl=False,
+-                      queued=False):
++                      queued=False, body=None):
+         """
+         Render a request against C{self.site}, writing the WebSocket
+         handshake.
+@@ -85,6 +85,8 @@
+             request.requestHeaders.addRawHeader(k, v)
+         request.gotLength(0)
+         request.requestReceived("GET", url, "HTTP/1.1")
++        if body:
++            request.channel._transferDecoder.finishCallback(body)
+         return channel
+ 
+ 
+@@ -214,7 +216,41 @@
+             "WebSocket-Location: ws://localhost/test\r\n\r\n")
+         self.assertFalse(channel.transport.disconnected)
+ 
++    def test_render_handShake76(self):
++        """
++        Test a hixie-76 handShake.
++        """
++        # we need to construct a challenge
++        key1 = '1x0x0 0y00 0'  # 1000000
++        key2 = '1b0b0 000 0'   # 1000000
++        body = '12345678'
++        headers = [
++            ("Upgrade", "WebSocket"), ("Connection", "Upgrade"),
++            ("Host", "localhost"), ("Origin", "http://localhost/"),
++            ("Sec-WebSocket-Key1", key1), ("Sec-WebSocket-Key2", key2)]
++        channel = self.renderRequest(headers=headers, body=body)
+ 
++        self.assertTrue(channel.raw)
++
++        result = channel.transport.written.getvalue()
++
++        headers, response = result.split('\r\n\r\n')
++
++        self.assertEquals(
++            headers,
++            "HTTP/1.1 101 Web Socket Protocol Handshake\r\n"
++            "Upgrade: WebSocket\r\n"
++            "Connection: Upgrade\r\n"
++            "Sec-WebSocket-Origin: http://localhost/\r\n"
++            "Sec-WebSocket-Location: ws://localhost/test")
++
++        # check challenge is correct
++        from hashlib import md5
++        import struct
++        self.assertEquals(md5(struct.pack('>ii8s', 500000, 500000, body)).digest(), response)
++
++        self.assertFalse(channel.transport.disconnected)
++
+     def test_secureRender(self):
+         """
+         If the WebSocket connection is over SSL, the I{WebSocket-Location}
+Index: twisted/web/websocket.py
+===================================================================
+--- twisted/web/websocket.py	(revision 29310)
++++ twisted/web/websocket.py	(working copy)
+@@ -11,11 +11,15 @@
+ @since: 10.1
+ """
+ 
++from hashlib import md5
++import struct
+ 
+ from twisted.web.http import datetimeToString
++from twisted.web.http import _IdentityTransferDecoder
+ from twisted.web.server import Request, Site, version, unquote
+ 
+ 
++_ascii_numbers = frozenset(['0', '1', '2', '3', '4', '5', '6', '7', '8', '9'])
+ 
+ class WebSocketRequest(Request):
+     """
+@@ -47,6 +51,126 @@
+         self.renderWebSocket()
+ 
+ 
++    def _clientHandshake76(self):
++        """
++        Complete hixie-76 handshake, which consists of a challenge and response.
++
++        If the request is not identified with a proper WebSocket handshake, the
++        connection will be closed. Otherwise, the response to the handshake is
++        sent and a C{WebSocketHandler} is created to handle the request.
++        """
++        def finish():
++            self.channel.transport.loseConnection()
++        if self.queued:
++            return finish()
++
++        secKey1 = self.requestHeaders.getRawHeaders("Sec-WebSocket-Key1", [])
++        secKey2 = self.requestHeaders.getRawHeaders("Sec-WebSocket-Key2", [])
++
++        if len(secKey1) != 1 or len(secKey2) != 1:
++            return finish()
++
++        # copied
++        originHeaders = self.requestHeaders.getRawHeaders("Origin", [])
++        if len(originHeaders) != 1:
++            return finish()
++        hostHeaders = self.requestHeaders.getRawHeaders("Host", [])
++        if len(hostHeaders) != 1:
++            return finish()
++        handlerFactory = self.site.handlers.get(self.uri)
++        if not handlerFactory:
++            return finish()
++        transport = WebSocketTransport(self)
++        handler = handlerFactory(transport)
++        transport._attachHandler(handler)
++
++        # key1 and key2 exist and are a string of characters
++        # filter both keys to get a string with all numbers in order
++        key1 = secKey1[0]
++        key2 = secKey2[0]
++        numBuffer1 = ''.join([x for x in key1 if x in _ascii_numbers])
++        numBuffer2 = ''.join([x for x in key2 if x in _ascii_numbers])
++
++        # make sure numbers actually exist
++        if not numBuffer1 or not numBuffer2:
++            return finish()
++
++        # these should be int-like
++        num1 = int(numBuffer1)
++        num2 = int(numBuffer2)
++
++        # count the number of spaces in each character string
++        numSpaces1 = 0
++        for x in key1:
++            if x == ' ':
++                numSpaces1 += 1
++        numSpaces2 = 0
++        for x in key2:
++            if x == ' ':
++                numSpaces2 += 1
++
++        # there should be at least one space in each
++        if numSpaces1 == 0 or numSpaces2 == 0:
++            return finish()
++
++        # get two resulting numbers, as specified in hixie-76
++        num1 = num1 / numSpaces1
++        num2 = num2 / numSpaces2
++
++        self.channel.setRawMode()
++
++        def finishHandshake(nonce):
++            """ Receive nonce value from request body, and calculate repsonse. """
++            protocolHeaders = self.requestHeaders.getRawHeaders(
++                "WebSocket-Protocol", [])
++            if len(protocolHeaders) not in (0,  1):
++                return finish()
++            if protocolHeaders:
++                if protocolHeaders[0] not in self.site.supportedProtocols:
++                    return finish()
++                protocolHeader = protocolHeaders[0]
++            else:
++                protocolHeader = None
++
++            handler = handlerFactory(transport)
++            check = originHeaders[0], hostHeaders[0], protocolHeader, handler
++
++            originHeader, hostHeader, protocolHeader, handler = check
++            self.startedWriting = True
++            handshake = [
++                "HTTP/1.1 101 Web Socket Protocol Handshake",
++                "Upgrade: WebSocket",
++                "Connection: Upgrade"]
++            handshake.append("Sec-WebSocket-Origin: %s" % (originHeader))
++            if self.isSecure():
++                scheme = "wss"
++            else:
++                scheme = "ws"
++            handshake.append(
++                "Sec-WebSocket-Location: %s://%s%s" % (
++                scheme, hostHeader, self.uri))
++
++            if protocolHeader is not None:
++                handshake.append("Sec-WebSocket-Protocol: %s" % protocolHeader)
++
++            for header in handshake:
++                self.write("%s\r\n" % header)
++
++            self.write("\r\n")
++
++            # concatenate num1 (32 bit in), num2 (32 bit int), nonce, and take md5 of result
++            res = struct.pack('>ii8s', num1, num2, nonce)
++            server_response = md5(res).digest()
++            self.write(server_response)
++
++            # XXX we probably don't want to set _transferDecoder
++            self.channel._transferDecoder = WebSocketFrameDecoder(
++                self, handler)
++
++        # we need the nonce from the request body
++        self.channel._transferDecoder = _IdentityTransferDecoder(0, lambda _ : None, finishHandshake)
++
++
+     def _checkClientHandshake(self):
+         """
+         Verify client handshake, closing the connection in case of problem.
+@@ -95,36 +219,41 @@
+         connection will be closed. Otherwise, the response to the handshake is
+         sent and a C{WebSocketHandler} is created to handle the request.
+         """
+-        check =  self._checkClientHandshake()
+-        if check is None:
+-            return
+-        originHeader, hostHeader, protocolHeader, handler = check
+-        self.startedWriting = True
+-        handshake = [
+-            "HTTP/1.1 101 Web Socket Protocol Handshake",
+-            "Upgrade: WebSocket",
+-            "Connection: Upgrade"]
+-        handshake.append("WebSocket-Origin: %s" % (originHeader))
+-        if self.isSecure():
+-            scheme = "wss"
++        # check for post-75 handshake requests
++        isSecHandshake = self.requestHeaders.getRawHeaders("Sec-WebSocket-Key1", [])
++        if isSecHandshake:
++            self._clientHandshake76()
+         else:
+-            scheme = "ws"
+-        handshake.append(
+-            "WebSocket-Location: %s://%s%s" % (
+-            scheme, hostHeader, self.uri))
++            check = self._checkClientHandshake()
++            if check is None:
++                return
++            originHeader, hostHeader, protocolHeader, handler = check
++            self.startedWriting = True
++            handshake = [
++                "HTTP/1.1 101 Web Socket Protocol Handshake",
++                "Upgrade: WebSocket",
++                "Connection: Upgrade"]
++            handshake.append("WebSocket-Origin: %s" % (originHeader))
++            if self.isSecure():
++                scheme = "wss"
++            else:
++                scheme = "ws"
++            handshake.append(
++                "WebSocket-Location: %s://%s%s" % (
++                scheme, hostHeader, self.uri))
+ 
+-        if protocolHeader is not None:
+-            handshake.append("WebSocket-Protocol: %s" % protocolHeader)
++            if protocolHeader is not None:
++                handshake.append("WebSocket-Protocol: %s" % protocolHeader)
+ 
+-        for header in handshake:
+-            self.write("%s\r\n" % header)
++            for header in handshake:
++                self.write("%s\r\n" % header)
+ 
+-        self.write("\r\n")
+-        self.channel.setRawMode()
+-        # XXX we probably don't want to set _transferDecoder
+-        self.channel._transferDecoder = WebSocketFrameDecoder(
+-            self, handler)
+-        return
++            self.write("\r\n")
++            self.channel.setRawMode()
++            # XXX we probably don't want to set _transferDecoder
++            self.channel._transferDecoder = WebSocketFrameDecoder(
++                self, handler)
++            return
+ 
+ 
+ 
+@@ -316,3 +445,4 @@
+ 
+ 
+ ___all__ = ["WebSocketHandler", "WebSocketSite"]
++

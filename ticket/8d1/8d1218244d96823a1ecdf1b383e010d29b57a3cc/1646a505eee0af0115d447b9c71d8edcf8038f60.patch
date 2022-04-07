@@ -1,0 +1,293 @@
+Index: twisted/scripts/twistd.py
+===================================================================
+--- twisted/scripts/twistd.py	(revision 39103)
++++ twisted/scripts/twistd.py	(working copy)
+@@ -8,7 +8,11 @@
+ @author: Christopher Armstrong
+ """
+ 
++import signal
++import os
+ from twisted.application import app
++from twisted.internet import reactor
++from twisted.python import log
+ 
+ from twisted.python.runtime import platformType
+ if platformType == "win32":
+@@ -18,13 +22,56 @@
+     from twisted.scripts._twistd_unix import ServerOptions, \
+         UnixApplicationRunner as _SomeApplicationRunner
+ 
++class TwistdApplicationRunner(_SomeApplicationRunner):
++    """
++    @ivar _exitStatus: preserves exit status of twistd.
++    """
++    def __init__(self, config):
++        self._exitStatus = 0
++        _SomeApplicationRunner.__init__(self, config)
++        signal.signal(signal.SIGINT, self.sigInt)
++        signal.signal(signal.SIGTERM, self.sigTerm)
+ 
++        # Catch Ctrl-Break in windows
++        if hasattr(signal, "SIGBREAK"):
++            signal.signal(signal.SIGBREAK, self.sigBreak)
++
++    def sigInt(self, *args):
++        """Handle a SIGINT interrupt.
++        """
++        log.msg("Received SIGINT, shutting down.")
++        reactor.callFromThread(reactor.stop)
++        self._exitStatus = signal.SIGINT
++
++    def sigBreak(self, *args):
++        """Handle a SIGBREAK interrupt.
++        """
++        log.msg("Received SIGBREAK, shutting down.")
++        reactor.callFromThread(reactor.stop)
++        self._exitStatus = signal.SIGBREAK
++
++    def sigTerm(self, *args):
++        """Handle a SIGTERM interrupt.
++        """
++        log.msg("Received SIGTERM, shutting down.")
++        reactor.callFromThread(reactor.stop)
++        self._exitStatus = signal.SIGTERM
++
+ def runApp(config):
+-    _SomeApplicationRunner(config).run()
++    app = TwistdApplicationRunner(config)
++    app.run()
++    if app._exitStatus:
++        signal.signal(app._exitStatus, signal.SIG_DFL)
++        if platformType == "win32":
++            #The application terminated as a result of a CTRL+C.
++            #for SIGINT and SIGBREAK (572)
++            #The process terminated unexpectedly for SIGTERM (1067)
++            replacements = {signal.SIGINT: 572, signal.SIGBREAK: 572,
++                            signal.SIGTERM: 1067}
++            app._exitStatus = replacements[app._exitStatus]
++        os.kill(os.getpid(), app._exitStatus)
+ 
+-
+ def run():
+     app.run(runApp, ServerOptions)
+ 
+-
+ __all__ = ['run', 'runApp']
+Index: twisted/scripts/test/test_twistd.py
+===================================================================
+--- twisted/scripts/test/test_twistd.py	(revision 0)
++++ twisted/scripts/test/test_twistd.py	(working copy)
+@@ -0,0 +1,130 @@
++import os
++import signal
++from twisted.trial import unittest
++from twisted.test.test_process import MockOS, MockSignal
++from twisted.scripts import twistd
++from twisted.python import runtime
++
++
++class TwistdSignalHandlingTests(unittest.TestCase):
++
++    def patch_functions(self, mockOS, mockSignal):
++        """
++        Replace os and signal functions with mock ones
++        """
++        self.oldKill, self.oldSignal = twistd.os.kill, twistd.signal.signal
++        twistd.os.kill = mockOS.kill
++        twistd.signal.signal = mockSignal.signal
++
++    def cleanup_functions(self):
++        """Get the old functions back"""
++        twistd.os.kill = self.oldKill
++        twistd.signal.signal = self.oldSignal
++
++    def test_overwriteSIGINTHandler(self):
++        """
++        Install new sigint handler.
++        """
++        mockOS = MockOS()
++        mockSignal = MockSignal()
++        self.patch_functions(mockOS, mockSignal)
++        runner = twistd.TwistdApplicationRunner({"nodaemon": True,
++                                                 "logfile": "-"})
++        self.cleanup_functions()
++        self.assertIn((signal.SIGINT, runner.sigInt), mockSignal.signals)
++
++    def test_overwriteSIGTERMHandler(self):
++        """
++        Install new sigterm handler.
++        """
++        mockOS = MockOS()
++        mockSignal = MockSignal()
++        self.patch_functions(mockOS, mockSignal)
++        runner = twistd.TwistdApplicationRunner({"nodaemon": True,
++                                                 "logfile": "-"})
++        self.cleanup_functions()
++        self.assertIn((signal.SIGTERM, runner.sigTerm), mockSignal.signals)
++
++    def test_overwriteSIGBREAKHandler(self):
++        """
++        Install new sigbreak handler.
++        """
++        mockOS = MockOS()
++        mockSignal = MockSignal()
++        self.patch_functions(mockOS, mockSignal)
++        runner = twistd.TwistdApplicationRunner({"nodaemon": True,
++                                                 "logfile": "-"})
++        self.cleanup_functions()
++        self.assertIn((signal.SIGBREAK, runner.sigBreak), mockSignal.signals)
++
++    def runTwistdInFakeEnviroment(self, replaceRun):
++        """
++        Run twistd with replaced os, signal and reactor.stop
++        functions, also replaced run method
++        @param replaceRun: function to replace run.
++        """
++        mockOS = MockOS()
++        mockSignal = MockSignal()
++        self.patch_functions(mockOS, mockSignal)
++        oldRun = twistd.TwistdApplicationRunner.run
++        twistd.TwistdApplicationRunner.run = replaceRun
++        oldStop = twistd.reactor.stop
++        #don't really stop the reactor
++        twistd.reactor.stop = lambda: 0
++        twistd.runApp({"nodaemon": True, "logfile": "-"})
++        twistd.reactor.stop = oldStop
++        twistd.TwistdApplicationRunner.run = oldRun
++        self.cleanup_functions()
++
++        return mockOS, mockSignal
++
++    def getExitStatuses(self):
++        """
++        Returns appropriate reaction to SIGINT, SIGBREAK, SIGTERM in
++        that order.
++        """
++        if runtime.platform.isWindows():
++            return (572, 572, 1067)
++        else:
++            return (signal.SIGINT, -1, signal.SIGTERM)
++
++    def test_exitStatusAfterKillWithSIGINT(self):
++        """
++        Assert appropriate exit status after sending SIGINT.
++        """
++        
++        mockOS, mockSignal = self.runTwistdInFakeEnviroment(
++            twistd.TwistdApplicationRunner.sigInt)
++
++        exitInt = self.getExitStatuses()[0]
++        self.assertEquals((signal.SIGINT, 0), mockSignal.signals[-1])
++        self.assertEquals(('kill', os.getpid(), exitInt),
++                          mockOS.actions[0])
++
++    def test_exitStatusAfterKillWithSIGTERM(self):
++        """
++        Assert appropriate exit status after sending SIGTERM.
++        """
++        mockOS, mockSignal = self.runTwistdInFakeEnviroment(
++            twistd.TwistdApplicationRunner.sigTerm)
++
++        exitTerm = self.getExitStatuses()[2]
++        self.assertEquals((signal.SIGTERM, 0), mockSignal.signals[-1])
++        self.assertEquals(('kill', os.getpid(), exitTerm),
++                          mockOS.actions[0])
++
++    def test_exitStatusAfterKillWithSIGBREAK(self):
++        """
++        Assert appropriate exit status after sending SIGBREAK.
++        """
++        mockOS, mockSignal = self.runTwistdInFakeEnviroment(
++            twistd.TwistdApplicationRunner.sigBreak)
++
++        exitBreak = self.getExitStatuses()[1]
++        self.assertEquals((signal.SIGBREAK, 0), mockSignal.signals[-1])
++        self.assertEquals(('kill', os.getpid(), exitBreak),
++                          mockOS.actions[0])
++
++    if not runtime.platform.isWindows():
++        test_overwriteSIGBREAKHandler.skip = "SIGBREAK only on Windows."
++        test_exitStatusAfterKillWithSIGBREAK.skip = "SIGBREAK only on Windows."
+Index: twisted/test/test_process.py
+===================================================================
+--- twisted/test/test_process.py	(revision 39103)
++++ twisted/test/test_process.py	(working copy)
+@@ -1207,7 +1207,11 @@
+     """
+     Neuter L{signal.signal}, but pass other attributes unscathed
+     """
++    def __init__(self):
++        self.signals = []
++
+     def signal(self, sig, action):
++        self.signals.append((sig, action))
+         return signal.getsignal(sig)
+ 
+     def __getattr__(self, attr):
+Index: twisted/topfiles/761.bugfix
+===================================================================
+--- twisted/topfiles/761.bugfix	(revision 0)
++++ twisted/topfiles/761.bugfix	(working copy)
+@@ -0,0 +1 @@
++Twistd returns SIGINT for SIGINT signal and SIGTERM for SIGTERM signal.
+\ No newline at end of file
+Index: twisted/internet/base.py
+===================================================================
+--- twisted/internet/base.py	(revision 39103)
++++ twisted/internet/base.py	(working copy)
+@@ -11,7 +11,7 @@
+ import socket # needed only for sync-dns
+ from zope.interface import implementer, classImplements
+ 
+-import sys
++import sys, signal
+ import warnings
+ from heapq import heappush, heappop, heapify
+ 
+@@ -601,6 +601,7 @@
+         """
+         log.msg("Received SIGINT, shutting down.")
+         self.callFromThread(self.stop)
++        self._exitStatus = signal.SIGINT
+ 
+     def sigBreak(self, *args):
+         """Handle a SIGBREAK interrupt.
+@@ -613,6 +614,7 @@
+         """
+         log.msg("Received SIGTERM, shutting down.")
+         self.callFromThread(self.stop)
++        self._exitStatus = signal.SIGTERM
+ 
+     def disconnectAll(self):
+         """Disconnect every reader, and writer in the system.
+@@ -1150,13 +1152,12 @@
+         if signal.getsignal(signal.SIGINT) == signal.default_int_handler:
+             # only handle if there isn't already a handler, e.g. for Pdb.
+             signal.signal(signal.SIGINT, self.sigInt)
+-        signal.signal(signal.SIGTERM, self.sigTerm)
++            signal.signal(signal.SIGTERM, self.sigTerm)
++            # Catch Ctrl-Break in windows
++            if hasattr(signal, "SIGBREAK"):
++                signal.signal(signal.SIGBREAK, self.sigBreak)
+ 
+-        # Catch Ctrl-Break in windows
+-        if hasattr(signal, "SIGBREAK"):
+-            signal.signal(signal.SIGBREAK, self.sigBreak)
+ 
+-
+     def startRunning(self, installSignalHandlers=True):
+         """
+         Extend the base implementation in order to remember whether signal
+Index: twisted/internet/test/test_base.py
+===================================================================
+--- twisted/internet/test/test_base.py	(revision 39103)
++++ twisted/internet/test/test_base.py	(working copy)
+@@ -19,6 +19,7 @@
+ from twisted.internet.base import ThreadedResolver, DelayedCall
+ from twisted.internet.task import Clock
+ from twisted.trial.unittest import TestCase
++from twisted.internet.base import _SignalReactorMixin, ReactorBase
+ 
+ 
+ @implementer(IReactorTime, IReactorThreads)

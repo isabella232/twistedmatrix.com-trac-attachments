@@ -1,0 +1,135 @@
+Index: twisted/test/test_ftp.py
+===================================================================
+--- twisted/test/test_ftp.py	(revision 27834)
++++ twisted/test/test_ftp.py	(working copy)
+@@ -493,7 +493,57 @@
+             d.addCallback(checkDownload)
+         return d
+ 
++    def test_NLST(self):
++        """
++        Exercise the various L{FTP.ftp_NLST} cases. NLST with no argument
++        returns the directory listing for the current working directory. NLST
++        with an invalid path returns nothing. NLST with a valid directory path
++        returns the directory listing for that directory. NLST with a valid path
++        to a file returns just that path.
++        """
++        # Touch a file in the current working directory
++        fd = os.open(os.path.join(self.directory, 'test.txt'), 777)
++        os.close(fd)
++        # Make a directory in the current working directory
++        os.mkdir(os.path.join(self.directory, 'foo'))
++        # Touch a file in the subdirectory
++        fd = os.open(os.path.join(
++                os.path.join(self.directory, 'foo'), 'subdirtest.txt'), 777)
++        os.close(fd)
+ 
++        # Login
++        d = self._anonymousLogin()
++
++        # NLST with no argument should return the directory listing for the cwd
++        self._download('NLST ', chainDeferred=d)
++        def checkDownload(download):
++            filenames = download[:-2].split('\r\n')
++            filenames.sort()
++            self.assertEqual(['foo', 'test.txt'], filenames)
++        d.addCallback(checkDownload)
++
++        # NLST on a non-existent file/directory should return nothing
++        self._download('NLST nonexistent.txt', chainDeferred=d)
++        def checkDownload(download):
++            self.assertEqual('', download)
++        d.addCallback(checkDownload)
++
++        # NLST on an existent file should return only the path to that file
++        self._download('NLST test.txt', chainDeferred=d)
++        def checkDownload(download):
++            filenames = download[:-2].split('\r\n')
++            self.assertEqual(['test.txt'], filenames)
++        d.addCallback(checkDownload)
++
++        # NLST on an existent file should return only the path to that file
++        self._download('NLST foo/subdirtest.txt', chainDeferred=d)
++        def checkDownload(download):
++            filenames = download[:-2].split('\r\n')
++            self.assertEqual(['foo/subdirtest.txt'], filenames)
++        return d.addCallback(checkDownload)
++
++
++
+ class FTPServerPortDataConnectionTestCase(FTPServerPasvDataConnectionTestCase):
+     def setUp(self):
+         self.dataPorts = []
+Index: twisted/protocols/ftp.py
+===================================================================
+--- twisted/protocols/ftp.py	(revision 27834)
++++ twisted/protocols/ftp.py	(working copy)
+@@ -926,9 +926,20 @@
+ 
+ 
+     def ftp_NLST(self, path):
+-        # XXX: why is this check different to ftp_RETR/ftp_STOR?
++        """
++        This command causes a directory listing to be sent from the server to
++        the client. The pathname should specify a directory or other
++        system-specific file group descriptor. An empty path implies the current
++        working directory. If the path is non-existent, send nothing. If the
++        path is to a file, send only the file name.
++
++        @type path: C{str}
++        @param path: The path for which a directory listing should be returned.
++        """
++        # XXX: why is this check different from ftp_RETR/ftp_STOR?
+         if self.dtpInstance is None or not self.dtpInstance.isConnected:
+-            return defer.fail(BadCmdSequenceError('must send PORT or PASV before RETR'))
++            return defer.fail(
++                BadCmdSequenceError('must send PORT or PASV before RETR'))
+ 
+         try:
+             segments = toSegments(self.workingDirectory, path)
+@@ -936,6 +947,14 @@
+             return defer.fail(FileNotFoundError(path))
+ 
+         def cbList(results):
++            """
++            Send, line by line, each file in the directory listing, and then
++            close the connection.
++
++            @type results: A C{list} of C{tuple}. The first element of each
++                C{tuple} is a C{str} and the second element is a C{list}.
++            @param results: The names of the files in the directory.
++            """
+             self.reply(DATA_CNX_ALREADY_OPEN_START_XFR)
+             for (name, ignored) in results:
+                 self.dtpInstance.sendLine(name)
+@@ -950,8 +969,19 @@
+             self.dtpInstance.transport.loseConnection()
+             return (TXFR_COMPLETE_OK,)
+ 
+-        # XXX Maybe this globbing is incomplete, but who cares.
+-        # Stupid people probably.
++        def listErr(results):
++            """
++            Send nothing and just close the connection.
++
++            @type results: L{Failure}
++            @param results: The L{Failure} wrapping a L{FileNotFoundError} that
++                occurred while trying to list the contents of a nonexistent
++                directory.
++            """
++            self.dtpInstance.transport.loseConnection()
++            return (TXFR_COMPLETE_OK,)
++
++        # XXX This globbing may be incomplete
+         if segments and (
+             '*' in segments[-1] or '?' in segments[-1] or
+             ('[' in segments[-1] and ']' in segments[-1])):
+@@ -960,6 +990,8 @@
+         else:
+             d = self.shell.list(segments)
+             d.addCallback(cbList)
++            # self.shell.list will generate an error if the path is invalid
++            d.addErrback(listErr)
+         return d
+ 
+ 

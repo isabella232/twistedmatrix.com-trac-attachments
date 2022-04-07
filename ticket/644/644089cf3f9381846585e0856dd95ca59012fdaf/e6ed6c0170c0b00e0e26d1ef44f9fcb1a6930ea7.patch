@@ -1,0 +1,918 @@
+Index: twisted/internet/test/test_pollingfile.py
+===================================================================
+--- twisted/internet/test/test_pollingfile.py	(revision 38323)
++++ twisted/internet/test/test_pollingfile.py	(working copy)
+@@ -5,16 +5,330 @@
+ Tests for L{twisted.internet._pollingfile}.
+ """
+ 
++from zope.interface import implements
+ from twisted.python.runtime import platform
+ from twisted.trial.unittest import TestCase
++from twisted.internet import interfaces, defer
++from twisted.protocols import basic
++from twisted.internet.test.reactormixins import ReactorBuilder
+ 
+ if platform.isWindows():
++    import win32pipe
++    import win32security
++
+     from twisted.internet import _pollingfile
++
++    from twisted.internet._pollingfile import _PollingTimer
++    _skipNotWindows = False
++    _oldPollingFile = hasattr(_pollingfile, "FULL_BUFFER_SIZE")
+ else:
+-    _pollingfile = None
++    _skipNotWindows = True
++    _PollingTimer = object
++ 
++ 
++ 
++class TestProducer(object):
++    """
++    Test producer based on the Produce() class in:
++    doc/core/examples/streaming.py except that it produces a series of
++    integer messages.
++    
++    It is configured as a push-producer if streaming is True otherwise it is
++    configured as a pull-producer.
++    
++    If blockSize isn't None the push-producer uses writeSequence() to write
++    blockSize length sequences of integer messages.
++    """
+ 
++    implements(interfaces.IPushProducer)
+ 
++    PULL, PUSH = range(2)
+ 
++    def __init__(self, streaming, count, msgFormat, blockSize=None):
++        self._goal = count
++        self._produced = 0
++        self._paused = False
++        self._transport = None
++        self.pauseCount = 0
++        self.resumeCount = 0
++        self.stopCount = 0
++        self.msgFormat = msgFormat
++        self.blockSize = blockSize
++        self.streaming = streaming
++        if streaming:
++            self.resumeProducing = self._resumeProducingPush
++        else:
++            self.resumeProducing = self._resumeProducingPull
++
++    def pauseProducing(self):
++        self._paused = True
++        self.pauseCount += 1
++
++
++    def _resumeProducingPush(self):
++        self._paused = False
++        self.resumeCount += 1
++
++        while not self._paused and self._produced < self._goal:
++            if self.blockSize is None:
++                self._transport.writer.write(self.msgFormat % self._produced)
++                self._produced += 1
++            else:
++                block = []
++                nBlocks = min(self.blockSize, self._goal - self._produced)
++                for i in range(nBlocks):
++                    block.append(self.msgFormat % (self._produced + i,))
++                self._transport.writer.writeSequence(block)
++                self._produced += self.blockSize
++
++        if self._produced == self._goal:
++            self._transport.writer.unregisterProducer()
++            self._transport.writer.close()
++
++
++    def _resumeProducingPull(self):
++        self.resumeCount += 1
++
++        if self._produced < self._goal:
++            self._transport.writer.write(self.msgFormat % self._produced)
++            self._produced += 1
++
++        if self._produced == self._goal:
++            self._transport.writer.unregisterProducer()
++            self._transport.writer.close()
++
++
++    def stopProducing(self):
++        self._produced = self._goal
++        self.stopCount += 1
++
++
++
++class PipeRunner(_PollingTimer):
++    """
++    Builds, initializes and runs a pair of read/write pipes.
++    """
++    def __init__(self, pipeSize, doneReadCB, doneWriteCB, receivedCB, reactor):
++        _PollingTimer.__init__(self, reactor)
++        sAttrs = win32security.SECURITY_ATTRIBUTES()
++        sAttrs.bInheritHandle = 1
++        hRead, hWrite = win32pipe.CreatePipe(sAttrs, pipeSize)
++        self.reader = _pollingfile._PollableReadPipe(hRead, receivedCB, doneReadCB)
++        self.writer = _pollingfile._PollableWritePipe(hWrite, doneWriteCB)
++        self._addPollableResource(self.reader)
++        self._addPollableResource(self.writer)
++
++
++
++class TestProtocol(basic.LineReceiver):
++    """
++    Expects a series of ascending integer messages, possibly including
++    a large number of leading zeros.
++
++    Counts the number of messages, records any that aren't in sequence.
++
++    When the count reaches threshold, close() is called on the reader
++    or the writer.
++    """
++    from os import linesep as delimiter
++
++    READ, WRITE = range(2)
++    counter = 0
++    errors = []
++
++    def __init__(self, threshold=0, closer=0):
++        self.threshold = threshold
++        self.closer = closer
++        self._transport = None
++
++
++    def lineReceived(self, line):
++        if int(line) != self.counter:
++            self.errors.append((int(line), self.counter))
++        self.counter += 1
++        if self.counter == self.threshold:
++            op = (self._transport.reader.close, self._transport.writer.close)
++            op[self.closer]()
++
++
++
++class TestPollablePipes(ReactorBuilder):
++    """
++    Tests for L{_pollingfile._PollableWritePipe} and
++    L{_pollingfile._PollableReadPipe}.
++    """
++    def setUp(self):
++        if _oldPollingFile:
++            self._oldBufferSize = _pollingfile.FULL_BUFFER_SIZE
++
++
++    def tearDown(self):
++        if _oldPollingFile:
++            _pollingfile.FULL_BUFFER_SIZE = self._oldBufferSize
++
++
++    def runTest(self, pipeSize, protocol, producer, bufferSize=None, waitWriter=False):
++        reactor = self.buildReactor()
++        r, w = lambda: reactor.stop(), lambda: None
++        if waitWriter:
++            r, w = w, r
++        transport = PipeRunner(pipeSize, r, w, protocol.dataReceived, reactor)
++        protocol._transport = producer._transport = transport
++        if bufferSize is not None:
++            if _oldPollingFile:
++                _pollingfile.FULL_BUFFER_SIZE = bufferSize
++            else:
++                transport.writer.bufferSize = bufferSize
++        transport.writer.registerProducer(producer, producer.streaming)
++        producer.resumeProducing()
++        self.runReactor(reactor)
++
++
++    def test_pullProducerCheckPauseProducing(self):
++        """
++        Test write pipe as a consumer using a pull producer.
++
++        The data received at the other end of the pipe is checked and counted
++        as are the number of producer pause/resume/stop calls.
++
++        When calling registerProducer() with a pull-producer, the streaming
++        parameter is False. The consumer should *not* be calling the producers
++        pauseProducing() method when it's buffer fills as that method is not
++        normally present, causing an error, and is redundant.
++
++        See Ticket #2835: pauseProducing() called erroneously.
++        """
++        pipeSize = 4096
++        totalMessages = 1000
++        msgFormat = '%02048d\r\n'   # long messages trigger buffer full.
++        totalResumeCounts = totalMessages
++        protocol = TestProtocol()
++        producer = TestProducer(TestProducer.PULL, totalMessages, msgFormat)
++        self.runTest(pipeSize, protocol, producer, bufferSize=1024)
++        self.assertEqual(producer.stopCount, 0)
++        self.assertEqual(protocol.counter, totalMessages)
++        self.assertEqual(protocol.errors, [])
++        self.assertEqual(producer.resumeCount, totalResumeCounts)
++        self.assertEqual(producer.pauseCount, 0)
++
++
++    def test_pushProducerDisconnected(self):
++        """
++        Test write pipe as a consumer using a push producer when the 
++        connection is forcibly disconnected.
++        
++        When a consumer is forcibly disconnected it should call the
++        stopProducing() method on the producer.
++
++        See Ticket #2839: stopProducing() not called.
++        """
++        pipeSize = 4096
++        totalMessages = 50000
++        msgFormat = '%d\r\n'
++        protocol = TestProtocol(threshold=1000, closer=TestProtocol.READ)
++        producer = TestProducer(TestProducer.PUSH, totalMessages, msgFormat)
++        self.runTest(pipeSize, protocol, producer, waitWriter=True)
++        self.assertEqual(producer.stopCount, 1)
++        self.assertEqual(protocol.errors, [])
++
++
++    def test_pullProducerPipeBufferSize(self):
++        """
++        This test times-out with the existing _pollingfile implementation.
++
++        See Ticket #5365: _pollingfile assumes that (win32 API) WriteFile()
++        will allow a partial write, but WriteFile() writes either all or 
++        nothing. Which means if you try to write too much at once in a pipe's
++        buffer, the _PollableWritePipe sits there doing nothing.
++        """
++        pipeSize = 512              # set a small pipe buffer size
++        totalMessages = 1000
++        msgFormat  = '%02048d\r\n'  # send long messages
++        totalResumeCounts = totalMessages
++        protocol = TestProtocol()
++        producer = TestProducer(TestProducer.PULL, totalMessages, msgFormat)
++        self.runTest(pipeSize, protocol, producer, bufferSize=1024)
++        self.assertEqual(producer.stopCount, 0)
++        self.assertEqual(protocol.counter, totalMessages)
++        self.assertEqual(protocol.errors, [])
++        self.assertEqual(producer.resumeCount, totalResumeCounts)
++
++
++    def test_pushProducerDataDroppedAtLoseConnection(self):
++        """
++        Test write pipe as a consumer using a push producer.
++
++        If a producer has sent a consumer data, the consumer should
++        honor a disconnect request made using loseConnection() when the data
++        sent by the producer has been written.
++
++        See Ticket #6491: data written gets dropped while the pipe is still
++        disconnecting.
++        """
++        pipeSize = 4096
++        totalMessages = 10000
++        msgFormat = '%08d\r\n'
++        totalPauseCounts = 97
++        protocol = TestProtocol(threshold=1000, closer=TestProtocol.WRITE)
++        producer = TestProducer(TestProducer.PUSH, totalMessages, msgFormat)
++        self.runTest(pipeSize, protocol, producer, bufferSize=1024)
++        self.assertEqual(producer.stopCount, 0)
++        self.assertEqual(protocol.counter, totalMessages)
++        self.assertEqual(protocol.errors, [])
++        self.assertEqual(producer.pauseCount, totalPauseCounts)
++        self.assertEqual(producer.resumeCount, totalPauseCounts+1)
++
++
++    def test_pushProducerCheckResumeProducing(self):
++        """
++        Test write pipe as a consumer using a push producer.
++
++        See Ticket #6492: bufferEmpty sets producerPaused attribute on the
++        producer instead of on itself.
++        """
++        pipeSize = 4096
++        totalMessages = 1000
++        msgFormat  = '%08d\r\n'
++        totalResumeCounts = 19
++        protocol = TestProtocol()
++        producer = TestProducer(TestProducer.PUSH, totalMessages, msgFormat)
++        pre_producer_attribs = set(dir(producer))
++        self.runTest(pipeSize, protocol, producer, bufferSize=512)
++        self.assertEqual(producer.stopCount, 0)
++        self.assertEqual(protocol.counter, totalMessages)
++        self.assertEqual(protocol.errors, [])
++        self.assertEqual(producer.pauseCount, totalResumeCounts)
++        self.assertEqual(producer.resumeCount, totalResumeCounts+1)
++        diff_producer_attribs = set(dir(producer)).difference(pre_producer_attribs)
++        self.assertEqual(diff_producer_attribs, set())
++
++
++    def test_pullProducerUsingWriteSequence(self):
++        """
++        Test write pipe as a consumer with a pull producer using 
++        writeSequence().
++
++        Calling writeSequence() should behave the same as calling write()
++        with each item, including flow control and disconnect handling.
++
++        See Ticket #6493: writeSequence() doesn't pause the producer when
++        outgoing buffer is full.
++        """
++        pipeSize = 4096
++        totalMessages = 10000
++        msgFormat = '%08d\r\n'
++        protocol = TestProtocol()
++        producer = TestProducer(TestProducer.PUSH, totalMessages, msgFormat, 500)
++        self.runTest(pipeSize, protocol, producer, bufferSize=1024)
++        self.assertEqual(producer.stopCount, 0)
++        self.assertEqual(protocol.counter, totalMessages)
++        self.assertEqual(protocol.errors, [])
++        self.assertEqual(producer.pauseCount, 20)
++        self.assertEqual(producer.resumeCount, 20)
++
++globals().update(TestPollablePipes.makeTestCaseClasses())
++
++
+ class TestPollableWritePipe(TestCase):
+     """
+     Tests for L{_pollingfile._PollableWritePipe}.
+@@ -41,6 +355,8 @@
+ 
+ 
+ 
++if _skipNotWindows:
++    skipMessage = "Test will run only on Windows."
++    TestPollablePipes.skip = skipMessage
++    TestPollableWritePipeUnicode.skip = skipMessage
+ 
+-if _pollingfile is None:
+-    TestPollableWritePipe.skip = "Test will run only on Windows."
+Index: twisted/internet/_pollingfile.py
+===================================================================
+--- twisted/internet/_pollingfile.py	(revision 38323)
++++ twisted/internet/_pollingfile.py	(working copy)
+@@ -4,46 +4,111 @@
+ 
+ """
+ Implements a simple polling interface for file descriptors that don't work with
+-select() - this is pretty much only useful on Windows.
++C{select()} - this is pretty much only useful on Windows.
+ """
+ 
++from zope.interface import Interface
+ from zope.interface import implements
+ 
+ from twisted.internet.interfaces import IConsumer, IPushProducer
++from twisted.internet.abstract import FileDescriptor
++from twisted.internet import main
++from twisted.python.compat import lazyByteSlice
++from twisted.python import failure
+ 
++import win32pipe
++import win32file
++import win32api
++import pywintypes
+ 
++
++
+ MIN_TIMEOUT = 0.000000001
+ MAX_TIMEOUT = 0.1
+ 
+ 
+ 
+-class _PollableResource:
++class _PollableResource(object):
++    """
++    A 'resource' that requires polling periodically derives from this (a mixin
++    class).
++
++    @ivar active: determines whether a resource's C{checkWork()} is called
++    from L{_PollingTimer._pollEvent()}
++    @type active: C{bool} or C{int}
++    """
+     active = True
+ 
+     def activate(self):
++        """
++        Resource is eligible for polling.
++        """
+         self.active = True
+ 
+ 
+     def deactivate(self):
++        """
++        Resource polling is disabled.
++        """
+         self.active = False
+ 
+ 
+ 
+-class _PollingTimer:
+-    # Everything is private here because it is really an implementation detail.
++class _PollingTimer(object):
++    """
++    Manages pollable 'resources'.
++    
++    Uses a single L{IReactorTime.callLater()} timer to poll multiple
++    'resources'. If no resources require polling the timer is disabled until a
++    new resource is added or L{_unpause()} or L{_startPolling()} is called.
+ 
++    It looks like a 'resource' calling L{activate()} should probably restart
++    polling, but doesn't.
++
++    @ivar reactor: See L{__init__}
++
++    @ivar _resources: List of 'resources' added by calling 
++    L{_addPollableResource()}.
++    @type _resources: C{list}
++
++    @ivar _pollTimer: None when polling is paused/stopped or an object which
++    can be used to cancel the scheduled call.
++    @type _pollTimer: L{IDelayedCall} or C{None}
++
++    @ivar _currentTimeout: Calculated current polling interval.
++    @type _currentTimeout: C{float}
++
++    @ivar _paused: True if polling is paused, False if polling is occurring.
++    @type _paused: C{bool} or C{int}
++    """
+     def __init__(self, reactor):
++        """
++        @param reactor: 
++        @type reactor: L{IReactorTime}
++        """
+         self.reactor = reactor
+         self._resources = []
+         self._pollTimer = None
+         self._currentTimeout = MAX_TIMEOUT
+         self._paused = False
+ 
++
+     def _addPollableResource(self, res):
++        """
++        Adds a 'resource' to be polled.
++
++        @param res: 
++        @type res: Object derived from L{_PollableResource}.
++        """
+         self._resources.append(res)
+         self._checkPollingState()
+ 
++
+     def _checkPollingState(self):
++        """
++        Scans for active 'resources'. If one is found, polling is restarted,
++        otherwise polling is stopped.
++        """
+         for resource in self._resources:
+             if resource.active:
+                 self._startPolling()
+@@ -51,27 +116,66 @@
+         else:
+             self._stopPolling()
+ 
++
+     def _startPolling(self):
++        """
++        Starts polling if there is no outstanding timer.
++        """
+         if self._pollTimer is None:
+             self._pollTimer = self._reschedule()
+ 
++
+     def _stopPolling(self):
++        """
++        If there is an outstanding timer event, cancel it.
++        """
+         if self._pollTimer is not None:
+             self._pollTimer.cancel()
+             self._pollTimer = None
+ 
++
+     def _pause(self):
++        """
++        Pauses polling.
++        """
+         self._paused = True
+ 
++
+     def _unpause(self):
++        """
++        Resumes polling if there are any active resources.
++        """
+         self._paused = False
+         self._checkPollingState()
+ 
++
+     def _reschedule(self):
++        """
++        If not paused, calls L{IReactorTime.callLater()} with the current
++        timeout.
++
++        @return: L{IDelayedCall}
++        """
+         if not self._paused:
+-            return self.reactor.callLater(self._currentTimeout, self._pollEvent)
++            return self.reactor.callLater(self._currentTimeout,
++                                          self._pollEvent)
+ 
++
+     def _pollEvent(self):
++        """
++        Event callback for L{IReactorTime.callLater()}.
++
++        Iterates through list of resources calling C{checkWork()} making a
++        note of whether they are still active.
++        
++        A calculation is performed using the sum of the returned values from
++        C{checkWork()} that determines a new polling interval. The value is
++        clamped between MIN_TIMEOUT and MAX_TIMEOUT. The more work done the 
++        shorter the time interval and vice-versa.
++
++        If any 'resources' are still active a new callback is scheduled.
++        """
++        self._pollTimer = None
+         workUnits = 0.
+         anyActive = []
+         for resource in self._resources:
+@@ -95,206 +199,246 @@
+             self._pollTimer = self._reschedule()
+ 
+ 
+-# If we ever (let's hope not) need the above functionality on UNIX, this could
+-# be factored into a different module.
+ 
+-import win32pipe
+-import win32file
+-import win32api
+-import pywintypes
++class _PollableReadPipe(_PollableResource, FileDescriptor):
++    """
++    A generic pollable reader implementing C{IPushProducer}.
+ 
+-class _PollableReadPipe(_PollableResource):
++    @ivar pipe: See L{__init__}.
++    @ivar receivedCallback: See L{__init__}.
++    @ivar lostCallback: See L{__init__}.
++    @ivar connected: True if pipe is connected or file open.
++    @type connected: C{bool} or C{int}.
++    """
+ 
+     implements(IPushProducer)
+ 
+     def __init__(self, pipe, receivedCallback, lostCallback):
+-        # security attributes for pipes
++        """
++        @param pipe: Handle to a pipe.
++        @type  pipe: pywin32.PyHandle
++
++        @param receivedCallback: receives read data
++        @type  receivedCallback: C{function} callback(data)
++
++        @param lostCallback: connection lost
++        @type  lostCallback: C{function} callback()
++        """
++        FileDescriptor.__init__(self)
++        self.connected = True
+         self.pipe = pipe
+         self.receivedCallback = receivedCallback
+         self.lostCallback = lostCallback
+ 
++
+     def checkWork(self):
+-        finished = 0
+-        fullDataRead = []
++        """
++        Called by C{_PollingTimer()} to try reading. An error causes the
++        connection to be lost.
+ 
+-        while 1:
+-            try:
+-                buffer, bytesToRead, result = win32pipe.PeekNamedPipe(self.pipe, 1)
+-                # finished = (result == -1)
+-                if not bytesToRead:
+-                    break
+-                hr, data = win32file.ReadFile(self.pipe, bytesToRead, None)
+-                fullDataRead.append(data)
+-            except win32api.error:
+-                finished = 1
+-                break
++        @return: number of bytes read, may be zero.
++        """
++        try:
++            _, bytesToRead, _ = win32pipe.PeekNamedPipe(self.pipe, 1)
++        except pywintypes.error:
++            self.readConnectionLost(main.CONNECTION_DONE)
++            return 0
++        if not bytesToRead:
++            return 0
++        _, data = win32file.ReadFile(self.pipe, bytesToRead, None)
++        if data:
++            self.receivedCallback(data)
++        return len(data)
+ 
+-        dataBuf = ''.join(fullDataRead)
+-        if dataBuf:
+-            self.receivedCallback(dataBuf)
+-        if finished:
+-            self.cleanup()
+-        return len(dataBuf)
+ 
+-    def cleanup(self):
+-        self.deactivate()
+-        self.lostCallback()
++    def loseConnection(self, _connDone=failure.Failure(main.CONNECTION_DONE)):
++        """
++        This is a reader not a writer so we set C{_writeDisconnected} True
++        so that the disconnect is immediate and then call up into
++        C{FileDescriptor}.
++        """
++        self._writeDisconnected = True
++        FileDescriptor.loseConnection(self, _connDone)
+ 
+-    def close(self):
++
++    def connectionLost(self, reason):
++        """
++        Here we clean-up, call up into the C{FileDescriptor} and then call our
++        C{lostCallback()}.
++        """
+         try:
+             win32api.CloseHandle(self.pipe)
+         except pywintypes.error:
+-            # You can't close std handles...?
+             pass
++        FileDescriptor.connectionLost(self, reason)
++        self.lostCallback()
+ 
+-    def stopProducing(self):
+-        self.close()
+ 
+-    def pauseProducing(self):
++    def stopReading(self):
++        """
++        Prevents C{checkWork()} from being called.
++        """
+         self.deactivate()
+ 
+-    def resumeProducing(self):
++
++    def startReading(self):
++        """
++        C{checkWork()} will now be called again.
++        """
+         self.activate()
+ 
+ 
+-FULL_BUFFER_SIZE = 64 * 1024
++    def stopWriting(self):
++        """
++        Prevents this reader from being removed from the reactor.
++        """
++        pass
+ 
+-class _PollableWritePipe(_PollableResource):
+ 
++    def startWriting(self):
++        """
++        Prevents this reader from being added to the reactor.
++        """
++        pass
++
++
++    def close(self):
++        """
++        Provided for backwards compatibility with the old _PollableReadPipe().
++        Calls loseConnection().
++        """
++        self.loseConnection()
++
++
++
++class _PollableWritePipe(_PollableResource, FileDescriptor):
++    """
++    A generic pollable writer implementing C{IConsumer}.
++
++    @ivar writePipe: See L{__init__}.
++    @ivar lostCallback: See L{__init__}.
++    @ivar connected: True if pipe is connected or file open.
++    @type connected: C{bool} or C{int}.
++    """
++
+     implements(IConsumer)
+ 
+     def __init__(self, writePipe, lostCallback):
+-        self.disconnecting = False
+-        self.producer = None
+-        self.producerPaused = 0
+-        self.streamingProducer = 0
+-        self.outQueue = []
++        """
++        @param writePipe: Handle to a pipe.
++        @type  writePipe: pywin32.PyHandle
++
++        @param lostCallback: connection lost
++        @type  lostCallback: C{function} callback()
++        """
++        FileDescriptor.__init__(self)
++        self.connected = True
+         self.writePipe = writePipe
+         self.lostCallback = lostCallback
+         try:
+-            win32pipe.SetNamedPipeHandleState(writePipe,
++            win32pipe.SetNamedPipeHandleState(self.writePipe,
+                                               win32pipe.PIPE_NOWAIT,
+                                               None,
+                                               None)
+         except pywintypes.error:
+-            # Maybe it's an invalid handle.  Who knows.
++            # fails if not a valid pipe handle
+             pass
+ 
+-    def close(self):
+-        self.disconnecting = True
+ 
+-    def bufferFull(self):
+-        if self.producer is not None:
+-            self.producerPaused = 1
+-            self.producer.pauseProducing()
++    def checkWork(self):
++        """
++        Called by C{_PollingTimer()} to process C{FileDescriptor} write
++        buffers and detect closure of the pipe.
+ 
+-    def bufferEmpty(self):
+-        if self.producer is not None and ((not self.streamingProducer) or
+-                                          self.producerPaused):
+-            self.producer.producerPaused = 0
+-            self.producer.resumeProducing()
+-            return True
+-        return False
++        Leverages C{FileDescriptor} to do the heavy lifting. An error causes
++        the connection to be lost.
+ 
+-    # almost-but-not-quite-exact copy-paste from abstract.FileDescriptor... ugh
++        @return: Zero if connection lost, one if still active.
++        """
++        self.doWrite()
++        self.startWriting()
++        try:
++            win32file.WriteFile(self.writePipe, '', None)
++            return 1
++        except pywintypes.error:
++            self.connectionLost(main.CONNECTION_LOST)
++            if self.lostCallback:
++                self.lostCallback()
++                self.lostCallback = None
++            return 0
+ 
+-    def registerProducer(self, producer, streaming):
+-        """Register to receive data from a producer.
+ 
+-        This sets this selectable to be a consumer for a producer.  When this
+-        selectable runs out of data on a write() call, it will ask the producer
+-        to resumeProducing(). A producer should implement the IProducer
+-        interface.
++    def writeSomeData(self, data):
++        """
++        Called from C{FileDescriptor} to do the actual writing.
+ 
+-        FileDescriptor provides some infrastructure for producer methods.
++        Avoids writing more data than the pipe can handle. Excess data is put
++        back into the write buffers by C{FileDescriptor}.
++
++        @return: Number of bytes written or main.CONNECTION_LOST on error.
+         """
+-        if self.producer is not None:
+-            raise RuntimeError(
+-                "Cannot register producer %s, because producer %s was never "
+-                "unregistered." % (producer, self.producer))
+-        if not self.active:
+-            producer.stopProducing()
+-        else:
+-            self.producer = producer
+-            self.streamingProducer = streaming
+-            if not streaming:
+-                producer.resumeProducing()
++        try:
++            _, writeBufferSize, _, _ = win32pipe.GetNamedPipeInfo(self.writePipe)
++            data = lazyByteSlice(data, 0, writeBufferSize)
++        except pywintypes.error:
++            pass
++        try:
++            _, bytesWritten = win32file.WriteFile(self.writePipe, data, None)
++        except pywintypes.error:
++            return main.CONNECTION_LOST
++        return bytesWritten
+ 
+-    def unregisterProducer(self):
+-        """Stop consuming data from a producer, without disconnecting.
++
++    def _postLoseConnection(self):
+         """
+-        self.producer = None
+-
+-    def writeConnectionLost(self):
+-        self.deactivate()
++        Under normal circumstances, clean-up is performed here and the 
++        C{lostCallback()} triggered.
++        """
+         try:
+             win32api.CloseHandle(self.writePipe)
+         except pywintypes.error:
+-            # OMG what
+             pass
+-        self.lostCallback()
++        if self.lostCallback:
++            self.lostCallback()
++            self.lostCallback = None
+ 
+ 
+-    def writeSequence(self, seq):
++    def stopWriting(self):
+         """
+-        Append a C{list} or C{tuple} of bytes to the output buffer.
++        Prevents C{checkWork()} from being called.
++        """
++        self.deactivate()
+ 
+-        @param seq: C{list} or C{tuple} of C{str} instances to be appended to
+-            the output buffer.
+ 
+-        @raise TypeError: If C{seq} contains C{unicode}.
++    def startWriting(self):
+         """
+-        if unicode in map(type, seq):
+-            raise TypeError("Unicode not allowed in output buffer.")
+-        self.outQueue.extend(seq)
++        C{checkWork()} will now be called again.
++        """
++        self.activate()
+ 
+ 
+-    def write(self, data):
++    def stopReading(self):
+         """
+-        Append some bytes to the output buffer.
++        Prevents this writer from being removed from the reactor.
++        """
++        pass
+ 
+-        @param data: C{str} to be appended to the output buffer.
+-        @type data: C{str}.
+ 
+-        @raise TypeError: If C{data} is C{unicode} instead of C{str}.
++    def startReading(self):
+         """
+-        if isinstance(data, unicode):
+-            raise TypeError("Unicode not allowed in output buffer.")
+-        if self.disconnecting:
+-            return
+-        self.outQueue.append(data)
+-        if sum(map(len, self.outQueue)) > FULL_BUFFER_SIZE:
+-            self.bufferFull()
++        Prevents this writer from being added to the reactor.
++        """
++        pass
+ 
+ 
+-    def checkWork(self):
+-        numBytesWritten = 0
+-        if not self.outQueue:
+-            if self.disconnecting:
+-                self.writeConnectionLost()
+-                return 0
+-            try:
+-                win32file.WriteFile(self.writePipe, '', None)
+-            except pywintypes.error:
+-                self.writeConnectionLost()
+-                return numBytesWritten
+-        while self.outQueue:
+-            data = self.outQueue.pop(0)
+-            errCode = 0
+-            try:
+-                errCode, nBytesWritten = win32file.WriteFile(self.writePipe,
+-                                                             data, None)
+-            except win32api.error:
+-                self.writeConnectionLost()
+-                break
+-            else:
+-                # assert not errCode, "wtf an error code???"
+-                numBytesWritten += nBytesWritten
+-                if len(data) > nBytesWritten:
+-                    self.outQueue.insert(0, data[nBytesWritten:])
+-                    break
+-        else:
+-            resumed = self.bufferEmpty()
+-            if not resumed and self.disconnecting:
+-                self.writeConnectionLost()
+-        return numBytesWritten
++    def close(self):
++        """
++        Provided for backwards compatibility with the old _PollableWritePipe().
++        Calls C{loseConnection()}.
++        """
++        self.loseConnection()
++
++
++
++all = [_PollableReadPipe, _PollableWritePipe]
++

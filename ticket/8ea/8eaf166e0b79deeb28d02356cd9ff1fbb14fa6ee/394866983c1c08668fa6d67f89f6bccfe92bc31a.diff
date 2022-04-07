@@ -1,0 +1,239 @@
+diff --git doc/core/howto/endpoints.xhtml doc/core/howto/endpoints.xhtml
+index 6e2ba2a..29a8106 100644
+--- doc/core/howto/endpoints.xhtml
++++ doc/core/howto/endpoints.xhtml
+@@ -101,7 +101,7 @@ particular action, then disposed of.</p>
+ 
+ <p><code class="API" base="twisted.internet.endpoints">connectProtocol</code>
+ connects a <code class="API" base="twisted.internet.protocol">Protocol</code>
+-instance to a given ><code class="API"
++instance to a given <code class="API"
+ base="twisted.internet.interfaces">IStreamClientEndpoint</code>. It returns
+ a <code>Deferred</code> which fires with the <code>Protocol</code> once the
+ connection has been made. Connection attempts may fail, and so
+@@ -238,12 +238,13 @@ available.</p>
+   IPv6 address literal instead.  For example,
+   <code>tcp6:port=80:interface=2001\:0DB8\:f00e\:eb00\:\:1</code>.
+   </li>
+-  <li>SSL.  All TCP arguments are supported, plus: certKey, privateKey, and
+-  sslmethod.  certKey (optional, defaults to the value of privateKey) gives a
++  <li>SSL.  All TCP arguments are supported, plus: certKey, privateKey, extraCertChain, and sslmethod.
++  certKey (optional, defaults to the value of privateKey) gives a
+   filesystem path to a certificate (PEM format).  privateKey gives a filesystem
+-  path to a a private key (PEM format).  sslmethod indicates which SSL/TLS
+-  version to use (a value like TLSv1_METHOD). For example,
+-  <code>ssl:port=443:privateKey=/etc/ssl/server.pem:sslmethod=SSLv3_METHOD</code>.
++  path to a private key (PEM format).
++  extraCertChain gives a filesystem path to a file with one or more concatenated certificates in PEM format that establish the chain from a root CA to the one that signed your certificate.
++  sslmethod indicates which SSL/TLS version to use (a value like TLSv1_METHOD).
++  For example, <code>ssl:port=443:privateKey=/etc/ssl/server.pem:extraCertChain=/etc/ssl/chain.pem:sslmethod=SSLv3_METHOD</code>.
+   </li>
+   <li>UNIX.  Supported arguments: address, mode, backlog, lockfile.  address
+   gives a filesystem path to listen on with a UNIX domain socket server.  mode
+diff --git twisted/internet/endpoints.py twisted/internet/endpoints.py
+index aa8b30b..e94a839 100644
+--- twisted/internet/endpoints.py
++++ twisted/internet/endpoints.py
+@@ -15,6 +15,7 @@ parsed by the L{clientFromString} and L{serverFromString} functions.
+ from __future__ import division, absolute_import
+ 
+ import os
++import re
+ import socket
+ 
+ from zope.interface import implementer, directlyProvides
+@@ -903,7 +904,7 @@ def _parseUNIX(factory, address, mode='666', backlog=50, lockfile=True):
+ 
+ 
+ def _parseSSL(factory, port, privateKey="server.pem", certKey=None,
+-              sslmethod=None, interface='', backlog=50):
++              sslmethod=None, interface='', backlog=50, extraCertChain=None):
+     """
+     Internal parser function for L{_parseServer} to convert the string
+     arguments for an SSL (over TCP/IPv4) stream endpoint into the structured
+@@ -932,6 +933,11 @@ def _parseSSL(factory, port, privateKey="server.pem", certKey=None,
+         "SSLv2_METHOD", "SSLv3_METHOD", "TLSv1_METHOD".
+     @type sslmethod: C{str}
+ 
++    @param extraCertChain: The path of a file containing one or more
++        certificates in PEM format that establish the chain from a root CA to
++        the CA that signed your L{certKey}.
++    @type extraCertChain: L{bytes}
++
+     @return: a 2-tuple of (args, kwargs), describing  the parameters to
+         L{IReactorSSL.listenSSL} (or, modulo argument 2, the factory, arguments
+         to L{SSL4ServerEndpoint}.
+@@ -947,9 +953,26 @@ def _parseSSL(factory, port, privateKey="server.pem", certKey=None,
+     certPEM = FilePath(certKey).getContent()
+     keyPEM = FilePath(privateKey).getContent()
+     privateCertificate = ssl.PrivateCertificate.loadPEM(certPEM + keyPEM)
++    if extraCertChain is not None:
++        matches = re.findall(
++            r'(-----BEGIN CERTIFICATE-----\n.+?\n-----END CERTIFICATE-----)',
++            FilePath(extraCertChain).getContent(),
++            flags=re.DOTALL
++        )
++        chainCertificates = [ssl.Certificate.loadPEM(chainCertPEM).original
++                             for chainCertPEM in matches]
++        if not chainCertificates:
++            raise ValueError(
++                "Specified chain file '%s' doesn't contain any valid "
++                "certificates in PEM format." % (extraCertChain,)
++            )
++    else:
++        chainCertificates = None
++
+     cf = ssl.CertificateOptions(
+         privateKey=privateCertificate.privateKey.original,
+         certificate=privateCertificate.original,
++        extraCertChain=chainCertificates,
+         **kw
+     )
+     return ((int(port), factory, cf),
+@@ -1162,7 +1185,8 @@ _NO_DEFAULT = object()
+ 
+ def _parseServer(description, factory, default=None):
+     """
+-    Parse a stports description into a 2-tuple of arguments and keyword values.
++    Parse a strports description into a 2-tuple of arguments and keyword
++    values.
+ 
+     @param description: A description in the format explained by
+         L{serverFromString}.
+diff --git twisted/internet/test/fake_CAs/chain.pem twisted/internet/test/fake_CAs/chain.pem
+new file mode 100644
+index 0000000..0d28d6a
+--- /dev/null
++++ twisted/internet/test/fake_CAs/chain.pem
+@@ -0,0 +1,37 @@
++
++This is a concatenation of thing1.pem and thing2.pem.
++
++-----BEGIN CERTIFICATE-----
++MIICwjCCAisCAgTSMA0GCSqGSIb3DQEBBAUAMIGoMREwDwYDVQQLEwhTZWN1cml0
++eTEcMBoGA1UEChMTVHdpc3RlZCBNYXRyaXggTGFiczEeMBwGA1UEAxMVZmFrZS1j
++YS0xLmV4YW1wbGUuY29tMREwDwYDVQQIEwhOZXcgWW9yazELMAkGA1UEBhMCVVMx
++IjAgBgkqhkiG9w0BCQEWE25vcmVwbHlAZXhhbXBsZS5jb20xETAPBgNVBAcTCE5l
++dyBZb3JrMB4XDTEwMDkyMTAxMjUxNFoXDTExMDkyMTAxMjUxNFowgagxETAPBgNV
++BAsTCFNlY3VyaXR5MRwwGgYDVQQKExNUd2lzdGVkIE1hdHJpeCBMYWJzMR4wHAYD
++VQQDExVmYWtlLWNhLTEuZXhhbXBsZS5jb20xETAPBgNVBAgTCE5ldyBZb3JrMQsw
++CQYDVQQGEwJVUzEiMCAGCSqGSIb3DQEJARYTbm9yZXBseUBleGFtcGxlLmNvbTER
++MA8GA1UEBxMITmV3IFlvcmswgZ8wDQYJKoZIhvcNAQEBBQADgY0AMIGJAoGBALRb
++VqC0CsaFgq1vbwPfs8zoP3ZYC/0sPMv0RJN+f3Dc7Q6YgNHS7o7TM3uAy/McADeW
++rwVuNJGe9k+4ZBHysmBH1sG64fHT5TlK9saPcUQqkubSWj4cKSDtVbQERWqC5Dy+
++qTQeZGYoPEMlnRXgMpST04DG//Dgzi4PYqUOjwxTAgMBAAEwDQYJKoZIhvcNAQEE
++BQADgYEAqNEdMXWEs8Co76wxL3/cSV3MjiAroVxJdI/3EzlnfPi1JeibbdWw31fC
++bn6428KTjjfhS31zo1yHG3YNXFEJXRscwLAH7ogz5kJwZMy/oS/96EFM10bkNwkK
++v+nWKN8i3t/E5TEIl3BPN8tchtWmH0rycVuzs5LwaewwR1AnUE4=
++-----END CERTIFICATE-----
++-----BEGIN CERTIFICATE-----
++MIICwjCCAisCAgTSMA0GCSqGSIb3DQEBBAUAMIGoMREwDwYDVQQLEwhTZWN1cml0
++eTEcMBoGA1UEChMTVHdpc3RlZCBNYXRyaXggTGFiczEeMBwGA1UEAxMVZmFrZS1j
++YS0yLmV4YW1wbGUuY29tMREwDwYDVQQIEwhOZXcgWW9yazELMAkGA1UEBhMCVVMx
++IjAgBgkqhkiG9w0BCQEWE25vcmVwbHlAZXhhbXBsZS5jb20xETAPBgNVBAcTCE5l
++dyBZb3JrMB4XDTEwMDkyMTAxMjUzMVoXDTExMDkyMTAxMjUzMVowgagxETAPBgNV
++BAsTCFNlY3VyaXR5MRwwGgYDVQQKExNUd2lzdGVkIE1hdHJpeCBMYWJzMR4wHAYD
++VQQDExVmYWtlLWNhLTIuZXhhbXBsZS5jb20xETAPBgNVBAgTCE5ldyBZb3JrMQsw
++CQYDVQQGEwJVUzEiMCAGCSqGSIb3DQEJARYTbm9yZXBseUBleGFtcGxlLmNvbTER
++MA8GA1UEBxMITmV3IFlvcmswgZ8wDQYJKoZIhvcNAQEBBQADgY0AMIGJAoGBAMNn
++b3EcKqBedQed1qJC4uGVx8PYmn2vxL3QwCVW1w0VjpZXyhCq/2VrYBhJAXRzpfvE
++dCqhtJKcdifwavUrTfr4yXu1MvWA0YuaAkj1TbmlHHQYACf3h+MPOXroYzhT72bO
++FSSLDWuitj0ozR+2Fk15QwLWUxaYLmwylxXAf7vpAgMBAAEwDQYJKoZIhvcNAQEE
++BQADgYEADB2N6VHHhm5M2rJqqGDXMm2dU+7abxiuN+PUygN2LXIsqdGBS6U7/rta
++lJNVeRaM423c8imfuklkIBG9Msn5+xm1xIMIULoi/efActDLbsX1x6IyHQrG5aDP
++/RMKBio9RjS8ajgSwyYVUZiCZBsn/T0/JS8K61YLpiv4Tg8uXmM=
++-----END CERTIFICATE-----
+diff --git twisted/internet/test/test_endpoints.py twisted/internet/test/test_endpoints.py
+index 19554f6..1504421 100644
+--- twisted/internet/test/test_endpoints.py
++++ twisted/internet/test/test_endpoints.py
+@@ -41,8 +41,11 @@ if not _PY3:
+     from twisted.internet.endpoints import StandardErrorBehavior
+ 
+     casPath = getModule(__name__).filePath.sibling("fake_CAs")
++    chainPath = casPath.child("chain.pem")
+     escapedPEMPathName = endpoints.quoteStringArgument(pemPath.path)
+     escapedCAsPathName = endpoints.quoteStringArgument(casPath.path)
++    escapedChainPathName = endpoints.quoteStringArgument(chainPath.path)
++
+ 
+ try:
+     from twisted.test.test_sslverify import makeCertificate
+@@ -1819,8 +1822,8 @@ class ServerStringTests(unittest.TestCase):
+ 
+     def test_sslWithDefaults(self):
+         """
+-        An SSL strport description with minimal arguments returns a properly
+-        initialized L{SSL4ServerEndpoint} instance.
++        An SSL string endpoint description with minimal arguments returns
++        a properly initialized L{SSL4ServerEndpoint} instance.
+         """
+         reactor = object()
+         server = endpoints.serverFromString(
+@@ -1834,8 +1837,59 @@ class ServerStringTests(unittest.TestCase):
+         ctx = server._sslContextFactory.getContext()
+         self.assertIsInstance(ctx, ContextType)
+ 
++
++    # Use a class variable to ensure we use the exactly same endpoint string
++    # except for the chain file itself.
++    SSL_CHAIN_TEMPLATE = ("ssl:1234:privateKey=%s:extraCertChain=%%s"
++                          % (escapedPEMPathName,))
++
++
++    def test_sslChainLoads(self):
++        """
++        Specifying a chain file loads the contained certificates in the right
++        order.
++        """
++        server = endpoints.serverFromString(
++            object(),
++            self.SSL_CHAIN_TEMPLATE % (escapedChainPathName,)
++        )
++        # Test chain file is just a concatenation of thing1.pem and thing2.pem
++        # so we can check that loading has succeeded and order has been
++        # preserved.
++        expectedChainCerts = [
++            Certificate.loadPEM(casPath.child("thing%d.pem" % (n,))
++                                .getContent())
++            for n in [1, 2]
++        ]
++        cf = server._sslContextFactory
++        self.assertEqual(cf.extraCertChain[0].digest('sha1'),
++                         expectedChainCerts[0].digest('sha1'))
++        self.assertEqual(cf.extraCertChain[1].digest('sha1'),
++                         expectedChainCerts[1].digest('sha1'))
++
++
++    def test_sslChainFileMustContainCert(self):
++        """
++        If C{extraCertChain} is passed, it has to contain at least one valid
++        certificate in PEM format.
++        """
++        fp = FilePath(self.mktemp())
++        fp.create()
++        # The endpoint string is the same as in the valid case except for
++        # a different chain file.  We use an empty temp file which obviously
++        # will never contain any certificates.
++        self.assertRaises(
++            ValueError,
++            endpoints.serverFromString,
++            object(),
++            self.SSL_CHAIN_TEMPLATE % (fp.path,)
++        )
++
++
+     if skipSSL:
+         test_ssl.skip = test_sslWithDefaults.skip = skipSSL
++        test_sslChainLoads.skip = skipSSL
++        test_sslChainFileMustContainCert.skip = skipSSL
+ 
+ 
+     def test_unix(self):
+diff --git twisted/topfiles/6499.feature twisted/topfiles/6499.feature
+new file mode 100644
+index 0000000..d212c2b
+--- /dev/null
++++ twisted/topfiles/6499.feature
+@@ -0,0 +1 @@
++SSL server endpoint string descriptions now support the specification of chain certificates.

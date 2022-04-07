@@ -1,0 +1,564 @@
+> --- /dev/null	2006-05-22 10:25:23.000000000 -0400
+> +++ /srv/trac/DiffResource/Twisted/trunk/twisted/conch/client/knownhosts.py	2008-11-15 17:59:21.000000000 -0500
+> @@ -0,0 +1,476 @@
+> +# -*- test-case-name: twisted.conch.test.test_knownhosts -*-
+> +# Copyright (c) 2008 Twisted Matrix Laboratories.
+> +# See LICENSE for details.
+> +
+> +"""
+> +An implementation of the OpenSSH known_hosts database.
+> +
+> +@since: 8.2
+> +"""
+> +
+> +import sha
+> +from binascii import Error as DecodeError, b2a_base64
+> +
+> +from zope.interface import implements
+> +
+> +from Crypto.Hash.HMAC import HMAC
+> +
+> +from twisted.python.randbytes import secureRandom
+> +
+> +from twisted.internet import defer
+> +
+> +from twisted.python import log
+> +from twisted.conch.interfaces import IKnownHostEntry
+> +from twisted.conch.error import HostKeyChanged, UserRejectedKey, InvalidEntry
+> +from twisted.conch.ssh.keys import Key, BadKeyError
+> +
+> +
+> +def _b64encode(s):
+> +    """
+> +    Encode a binary string as base64 with no trailing newline.
+> +    """
+> +    return b2a_base64(s).strip()
+> +
+
+Why not use base64.encodestring?
+
+> +
+> +
+> +def _extractCommon(string):
+> +    """
+> +    Extract common elements of base64 keys from an entry in a hosts file.
+> +
+> +    @return: a 4-tuple of hostname data (L{str}), key-type (L{str}), key
+> +    (L{Key}), and comment (L{str} or L{None}).  The hostname data is simply the
+> +    beginning of the line up to the first occurrence of whitespace.
+> +    """
+
+The contents of key-type is ambiguous, since Conch has more than one way of
+referring to type.  I think the way to talk about this key-type in Conch is to
+say "ssh key type" (see Key.sshType for example.)
+
+> +    elements = string.split(None, 2)
+> +    if len(elements) != 3:
+> +        raise InvalidEntry()
+> +    hostnames, keytype, keyAndComment = elements
+> +    splitkey = keyAndComment.split(None, 1)
+> +    if len(splitkey) == 2:
+> +        keyString, comment = splitkey
+> +        comment = comment.rstrip("\n")
+> +    else:
+> +        keyString = splitkey[0]
+> +        comment = None
+> +    key = Key.fromString(keyString.decode('base64'))
+> +    return hostnames, keytype, key, comment
+> +
+> +
+> +
+> +class _BaseEntry(object):
+> +    """
+> +    Abstract base of both hashed and non-hashed entry objects, since they
+> +    represent keys and key types the same way.
+> +
+> +    @ivar keyType: The type of the key; either ssh-dss or ssh-rsa.
+> +    @type keyType: L{str}
+> +
+> +    @ivar publicKey: The server public key indicated by this line.
+> +    @type publicKey: L{twisted.conch.ssh.keys.Key}
+> +
+> +    @ivar comment: Trailing garbage after the key line.
+> +    @type comment: L{str}
+> +    """
+> +
+> +    def __init__(self, keyType, publicKey, comment):
+> +        self.keyType = keyType
+> +        self.publicKey = publicKey
+> +        self.comment = comment
+> +
+> +
+> +    def matchesKey(self, keyObject):
+> +        """
+> +        Check to see if this entry matches a given key object.
+> +
+> +        @type keyObject: L{Key}
+> +
+> +        @rtype: bool
+> +        """
+> +        return self.publicKey == keyObject
+> +
+> +
+> +
+> +class PlainEntry(_BaseEntry):
+> +    """
+> +    A L{PlainEntry} is a representation of a plain-text entry in a known_hosts
+> +    file.
+> +
+> +    @ivar _hostname: the host-name associated with this entry.
+> +    @type _hostname: L{str}
+> +    """
+> +
+> +    implements(IKnownHostEntry)
+> +
+> +    def __init__(self, hostnames, keyType, publicKey, comment):
+> +        self._hostnames = hostnames
+> +        super(PlainEntry, self).__init__(keyType, publicKey, comment)
+> +
+> +
+> +    def fromString(cls, string):
+> +        """
+> +        Parse a plain-text entry in a known_hosts file, and return a
+> +        corresponding L{PlainEntry}.
+> +
+> +        @param string: a space-separated string formatted like "hostname
+> +        key-type base64-key-data comment".
+> +
+> +        @type string: L{str}
+> +
+> +        @raise DecodeError: if the key is not valid encoded as valid base64.
+> +
+> +        @raise InvalidEntry: if the entry does not have the right number of
+> +        elements and is therefore invalid.
+> +
+> +        @raise BadKeyError: if the key, once decoded from base64, is not
+> +        actually an SSH key.
+> +
+> +        @return: an IKnownHostEntry representing the hostname and key in the
+> +        input line.
+> +
+> +        @rtype: L{PlainEntry}
+> +        """
+> +        hostnames, keytype, key, comment = _extractCommon(string)
+
+keyType, not keytype.
+
+> +        self = cls(hostnames.split(","), keytype, key, comment)
+> +        return self
+> +
+> +    fromString = classmethod(fromString)
+> +
+
+I was just thinking, shouldn't this be a classmethod. Too much Python 2.4. :\
+
+> +
+> +    def matchesHost(self, hostname):
+> +        """
+> +        Check to see if this entry matches a given hostname.
+> +
+> +        @type hostname: L{str}
+> +
+> +        @rtype: bool
+> +        """
+> +        return hostname in self._hostnames
+> +
+> +
+> +    def toString(self):
+> +        """
+> +        Implement L{IKnownHostEntry.toString} by recording the comma-separated
+> +        hostnames, key type, and base-64 encoded key.
+> +        """
+> +        fields = [','.join(self._hostnames),
+> +                  self.keyType,
+> +                  _b64encode(self.publicKey.blob())]
+> +        if self.comment is not None:
+> +            fields.append(self.comment)
+> +        return ' '.join(fields)
+> +
+> +
+> +class UnparsedEntry(object):
+> +    """
+> +    L{UnparsedEntry} is an entry in a L{KnownHostsFile} which can't actually be
+> +    parsed; therefore it matches no keys and no hosts.
+> +    """
+> +
+> +    implements(IKnownHostEntry)
+> +
+> +    def __init__(self, string):
+> +        """
+> +        Create an unparsed entry from a line in a known_hosts file which cannot
+> +        otherwise be parsed.
+> +        """
+> +        self._string = string
+> +
+> +
+> +    def matchesHost(self, hostname):
+> +        """
+> +        Always returns False.
+> +        """
+> +        return False
+> +
+> +
+> +    def matchesKey(self, key):
+> +        """
+> +        Always returns False.
+> +        """
+> +        return False
+> +
+> +
+> +    def toString(self):
+> +        """
+> +        Returns the input line, without its newline if one was given.
+> +        """
+> +        return self._string.rstrip("\n")
+> +
+> +
+> +
+> +def _hmacedString(key, string):
+> +    """
+> +    Return the SHA-1 HMAC hash of the given key and string.
+> +    """
+> +    hash = HMAC(key, digestmod=sha)
+> +    hash.update(string)
+> +    return hash.digest()
+> +
+> +
+> +
+> +class HashedEntry(_BaseEntry):
+> +    """
+> +    A L{HashedEntry} is a representation of an entry in a known_hosts file
+> +    where the hostname has been hashed and salted.
+> +
+> +    @ivar _hostSalt: the salt to combine with a hostname for hashing.
+> +
+> +    @ivar _hostHash: the hashed representation of the hostname.
+> +
+> +    @cvar MAGIC: the 'hash magic' string used to identify a hashed line in a
+> +    known_hosts file as opposed to a plaintext one.
+> +    """
+> +
+> +    implements(IKnownHostEntry)
+> +
+> +    MAGIC = '|1|'
+> +
+
+Oh, I've seen this in tests. You should probably use HashedEntry.MAGIC rather
+than '|1|' when you want to include this in strings for testing -- most of the
+time anyway.
+
+
+> +    def __init__(self, hostSalt, hostHash, keyType, publicKey, comment):
+> +        self._hostSalt = hostSalt
+> +        self._hostHash = hostHash
+> +        super(HashedEntry, self).__init__(keyType, publicKey, comment)
+> +
+> +
+> +    def fromString(cls, string):
+> +        """
+> +        Load a hashed entry from a string representing a line in a known_hosts
+> +        file.
+> +
+> +        @raise DecodeError: if the key, the hostname, or the is not valid
+> +        encoded as valid base64
+> +
+> +        @raise InvalidEntry: if the entry does not have the right number of
+> +        elements and is therefore invalid, or the host/hash portion contains
+> +        more items than just the host and hash.
+> +
+> +        @raise BadKeyError: if the key, once decoded from base64, is not
+> +        actually an SSH key.
+> +        """
+> +        stuff, keytype, key, comment = _extractCommon(string)
+
+keyType.
+
+> +        saltAndHash = stuff[len(cls.MAGIC):].split("|")
+> +        if len(saltAndHash) != 2:
+> +            raise InvalidEntry()
+> +        hostSalt, hostHash = saltAndHash
+> +        self = cls(hostSalt.decode("base64"), hostHash.decode("base64"),
+> +                   keytype, key, comment)
+> +        return self
+> +
+> +    fromString = classmethod(fromString)
+> +
+> +
+> +    def matchesHost(self, hostname):
+> +        """
+> +        Implement L{IKnownHostEntry.matchesHost} to compare the hash of the
+> +        input to the stored hash.
+> +        """
+> +        return (_hmacedString(self._hostSalt, hostname) == self._hostHash)
+> +
+> +
+> +    def toString(self):
+> +        """
+> +        Implement L{IKnownHostEntry.toString} by base64-encoding the salt, host
+> +        hash, and key.
+> +        """
+> +        fields = [self.MAGIC + '|'.join([_b64encode(self._hostSalt),
+> +                                         _b64encode(self._hostHash)]),
+> +                  self.keyType,
+> +                  _b64encode(self.publicKey.blob())]
+> +        if self.comment is not None:
+> +            fields.append(self.comment)
+> +        return ' '.join(fields)
+> +
+> +
+> +
+> +class KnownHostsFile(object):
+> +    """
+> +    A structured representation of an OpenSSH-format ~/.ssh/known_hosts file.
+> +
+> +    @ivar _entries: a list of L{IKnownHostEntry} providers.
+> +
+> +    @ivar _savePath: the L{FilePath} to save new entries to.
+> +    """
+> +
+> +    def __init__(self, savePath):
+> +        """
+> +        Create a new, empty KnownHostsFile.
+> +
+> +        You want to use L{KnownHostsFile.fromPath} to parse one of these.
+> +        """
+> +        self._entries = []
+> +        self._savePath = savePath
+> +
+> +
+> +    def hasHostKey(self, hostname, key):
+> +        """
+> +        @return: True if the given hostname and key are present in this file,
+> +        False if they are not.
+> +
+> +        @rtype: L{bool}
+> +
+> +        @raise HostKeyChanged: if the host key found for the given hostname
+> +        does not match the given key.
+> +        """
+> +        lineno = 0
+> +        for entry in self._entries:
+> +            lineno += 1
+
+Why not use enumerate?
+
+> +            if entry.matchesHost(hostname):
+> +                if entry.matchesKey(key):
+> +                    return True
+> +                else:
+> +                    raise HostKeyChanged(entry, self._savePath, lineno)
+> +        return False
+> +
+> +
+> +    def verifyHostKey(self, ui, hostname, ip, key):
+> +        """
+> +        Verify the given host key for the given IP and host, asking for
+> +        confirmation from, and notifying, the given UI about changes to this
+> +        file.
+> +
+> +        @param ui: The user interface to request an IP address from.
+> +
+> +        @param hostname: The hostname that the user requested to connect to.
+> +
+> +        @param ip: The string representation of the IP address that is actually
+> +        being connected to.
+> +
+> +        @param key: The public key of the server.
+> +
+> +        @return: a L{Deferred} that fires with True when the key has been
+> +        verified, or fires with an errback when the key either cannot be
+> +        verified or has changed.
+> +
+> +        @rtype: L{Deferred}
+> +        """
+> +        hhk = defer.maybeDeferred(self.hasHostKey, hostname, key)
+> +        def gotHasKey(result):
+> +            if result:
+> +                if not self.hasHostKey(ip, key):
+> +                    ui.warn("Warning: Permanently added the %s host key for "
+> +                            "IP address '%s' to the list of known hosts." %
+> +                            (key.type(), ip))
+> +                    self.addHostKey(ip, key)
+> +                    self.save()
+> +                return result
+> +            else:
+> +                def promptResponse(response):
+> +                    if response:
+> +                        self.addHostKey(hostname, key)
+> +                        self.addHostKey(ip, key)
+> +                        self.save()
+> +                        return response
+> +                    else:
+> +                        raise UserRejectedKey()
+> +                return ui.prompt(
+> +                    "The authenticity of host '%s (%s)' "
+> +                    "can't be established.\n"
+> +                    "RSA key fingerprint is %s.\n"
+> +                    "Are you sure you want to continue connecting (yes/no)? " %
+> +                    (hostname, ip, key.fingerprint())).addCallback(promptResponse)
+> +        return hhk.addCallback(gotHasKey)
+> +
+> +
+> +    def addHostKey(self, hostname, key):
+> +        """
+> +        Add a new L{HashedEntry} to the key database.
+> +
+> +        Note that you still need to call L{KnownHostsFile.save} if you wish
+> +        these changes to be persisted.
+> +
+> +        @return: the L{HashedEntry} that was added.
+> +        """
+> +        salt = secureRandom(20)
+> +        keyType = "ssh-"+key.type().lower()
+
+Spaces around +.
+
+> +        entry = HashedEntry(salt, _hmacedString(salt, hostname),
+> +                            keyType, key, None)
+> +        self._entries.append(entry)
+> +        return entry
+> +
+> +
+> +    def save(self):
+> +        """
+> +        Save this L{KnownHostsFile} to the path it was loaded from.
+> +        """
+> +        p = self._savePath.parent()
+> +        if not p.isdir():
+> +            p.makedirs()
+> +        self._savePath.setContent('\n'.join(
+> +                [entry.toString() for entry in self._entries])+"\n")
+> +
+
+Spaces around +.
+
+> +
+> +    def fromPath(cls, path):
+> +        """
+> +        @param path: A path object to use for both reading contents from and
+> +        later saving to.
+> +
+> +        @type path: L{FilePath}
+> +        """
+> +        self = cls(path)
+> +        try:
+> +            fp = path.open()
+> +        except IOError:
+> +            return self
+> +        for line in fp:
+> +            if line.startswith(HashedEntry.MAGIC):
+> +                entry = HashedEntry.fromString(line)
+> +            else:
+> +                try:
+> +                    entry = PlainEntry.fromString(line)
+> +                except (DecodeError, InvalidEntry, BadKeyError):
+> +                    entry = UnparsedEntry(line)
+> +            self._entries.append(entry)
+> +        return self
+> +
+> +    fromPath = classmethod(fromPath)
+> +
+> +
+> +class ConsoleUI(object):
+> +    """
+> +    A UI object that can ask true/false questions and post notifications on the
+> +    console, to be used during key verification.
+> +
+> +    @ivar opener: a no-argument callable which should open a console file-like
+> +    object to be used for reading and writing.
+> +    """
+> +
+
+This is cool.  I guess someday it should find a home elsewhere.
+
+
+> Index: /srv/trac/DiffResource/Twisted/trunk/twisted/conch/test/test_keys.py
+> ===================================================================
+> --- /srv/trac/DiffResource/Twisted/trunk/twisted/conch/test/test_keys.py	(revision 25354)
+> +++ /srv/trac/DiffResource/Twisted/trunk/twisted/conch/test/test_keys.py	(working copy)
+> @@ -1,7 +1,10 @@
+> -# -*- test-case-name: twisted.conch.test.test_keys -*-
+>  # Copyright (c) 2001-2008 Twisted Matrix Laboratories.
+>  # See LICENSE for details.
+>  
+> +"""
+> +Tests for L{twisted.conch.ssh.keys}.
+> +"""
+> +
+>  try:
+>      import Crypto.Cipher.DES3
+>  except ImportError:
+> @@ -77,6 +80,17 @@
+>          self._testGeneratePrivateKey(obj, keydata.privateRSA_agentv3,
+>                  'agentv3')
+>  
+> +
+> +    def test_fingerprint(self):
+> +        """
+> +        L{Key.fingerprint} returns a hex-encoded colon-separated md5 sum of the
+> +        public key.
+> +        """
+> +        self.assertEquals(
+> +            '3d:13:5f:cb:c9:79:8a:93:06:27:65:bc:3d:0b:8f:af',
+> +            keys.Key.fromString(keydata.publicRSA_openssh).fingerprint())
+> +
+> +
+
+I mentioned the "Mystery Guest" thing in a previous review. However that works
+itself out applies here.
+
+>      def _testKey(self, pubStr, privStr, data, keyType):
+>          """
+>          Run each of the key tests with the public/private keypairs.
+> Index: /srv/trac/DiffResource/Twisted/trunk/twisted/conch/error.py
+> ===================================================================
+> --- /srv/trac/DiffResource/Twisted/trunk/twisted/conch/error.py	(revision 25354)
+> +++ /srv/trac/DiffResource/Twisted/trunk/twisted/conch/error.py	(working copy)
+> @@ -46,3 +46,43 @@
+>      Raised if an SSHAgentServer starts receiving data without its factory
+>      providing a keys dict on which to read/write key data.
+>      """
+> +
+> +
+> +
+> +class UserRejectedKey(Exception):
+> +    """
+> +    The user interactively rejected a key.
+> +    """
+> +
+> +
+> +
+> +class InvalidEntry(Exception):
+> +    """
+> +    An entry in a known_hosts file could not be interpreted as a valid entry.
+> +    """
+> +
+> +
+> +
+> +class HostKeyChanged(Exception):
+> +    """
+> +    The host key of a remote host has changed.
+> +
+> +    @ivar offendingEntry: The entry which contains the persistent host key that
+> +    disagrees with the given host key.
+> +
+> +    @type offendingEntry: L{twisted.conch.interfaces.IKnownHostEntry}
+> +
+> +    @ivar path: a reference to the known_hosts file that the offending entry
+> +    was loaded from
+> +
+> +    @type path: L{twisted.python.filepath.FilePath}
+> +
+> +    @ivar lineno: The line number of the offending entry in the given path.
+> +
+> +    @type lineno: L{int}
+> +    """
+
+Is all that VWS part of the standard? It's quite disconcerting seeing the type
+split from the variable description like that.
+
+> +    def __init__(self, offendingEntry, path, lineno):
+> +        Exception.__init__(self)
+> +        self.offendingEntry = offendingEntry
+> +        self.path = path
+> +        self.lineno = lineno

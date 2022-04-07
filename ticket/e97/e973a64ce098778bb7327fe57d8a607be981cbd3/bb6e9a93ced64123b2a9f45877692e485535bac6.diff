@@ -1,0 +1,245 @@
+Index: doc/core/examples/dbcred.py
+===================================================================
+--- doc/core/examples/dbcred.py	(révision 0)
++++ doc/core/examples/dbcred.py	(révision 0)
+@@ -0,0 +1,240 @@
++"""
++Simple example of a db checker.
++"""
++
++from twisted.cred import error
++from twisted.cred.credentials import IUsernameHashedPassword, IUsernamePassword
++from twisted.cred.checkers import ICredentialsChecker
++from twisted.internet.defer import Deferred
++
++from zope.interface import implements
++
++class DBCredentialsChecker:
++    """
++    This class checks the credentials of incoming connections
++    against a user table in a database.
++    """
++    implements(ICredentialsChecker)
++
++    def __init__(self, runQuery, userTableName='user', usernameField='username', passwordField='password',
++                 customCheckFunc=None, caseSensitiveUsernames=False, caseSensitivePasswords=True, escapeChar='%s'):
++        """
++        @type runQuery: Callable that takes arguments as follows: (sqlStr, *args, **kwargs)
++        @param runQuery: This will be called to get the info from the db. The code is written
++            for PyPgSQL so it expects the callable to automatically quote params. The function should return a
++            deferred just like twisted.enterprice.adbapi.ConnectionPool.runQuery. In fact if you're using
++            PyPgSQL, just create a twisted.enterprice.adbapi.ConnectionPool instance and pass it's
++            runQuery method here.
++
++        @type userTableName: C{str}
++        @param userTableName: This is the name of the table in the database that contains
++           the usernames and passwords
++
++        @type usernameField: C{str}
++        @param usernameField: This is the name of the field in the above table that contains
++            the username (id) of the entity attempting to log in (authenticate)
++
++        @type passwordField: C{str}
++        @param passwordField: This is the name of the field in the above table that contains
++            the password (shared secret) of the entity attempting to log in (authenticate)
++
++        @type customCheckFunc: Callable that takes the following params: (username, suppliedPass, dbPass)
++            and returns a boolean
++        @param customCheckFunc: Use this if the passwords in the db are stored as hashes. We'll just call this,
++            so you can do the checking yourself.
++
++        @type caseSensitiveUsernames: C{bool}
++        @param caseSensitiveUsernames: If true requires that every letter in 'credentials.username'
++            is exactly the same case as the it's counterpart letter in the database.
++
++        @type caseSensitivePasswords: C{bool}
++        @param caseSensitivePasswords: If true requires that every letter in 'credentials.password'
++            is exactly the same case as the it's counterpart letter in the database.
++            This is only relevent if 'customCheckFunc' is emtpy.
++
++        @type escapeChar: C{str}
++        @param escapeChar: string used to escape queries parameters, usually '%s' or '?'.
++        """
++        self.runQuery = runQuery
++        self.caseSensitivePasswords = caseSensitivePasswords
++        self.customCheckFunc = customCheckFunc
++        # We can't support hashed password credentials if we only have a hash in the DB
++        if customCheckFunc:
++            self.credentialInterfaces = (IUsernamePassword,)
++        else:
++            self.credentialInterfaces = (IUsernamePassword, IUsernameHashedPassword,)
++
++        # Make up our sql
++        if caseSensitiveUsernames:
++            self.sql = 'SELECT %s, %s FROM %s WHERE lower(%s) = lower(%s)' % (usernameField,
++                passwordField, userTableName, usernameField, escapeChar)
++        else:
++            self.sql = 'SELECT %s, %s FROM %s WHERE %s = %s' % (usernameField,
++                passwordField, userTableName, usernameField, escapeChar)
++
++    def requestAvatarId(self, credentials):
++        """
++        Authenticates the kiosk against the database.
++        """
++        # Check that the credentials instance implements at least one of our interfaces
++        for interface in self.credentialInterfaces:
++            if interface.providedBy(credentials):
++                break
++        else:
++            raise error.UnhandledCredentials()
++        # Ask the database for the username and password
++        db_deferred = self.runQuery(self.sql, (credentials.username,))
++        # Setup our deferred result
++        deferred = Deferred()
++        db_deferred.addCallbacks(self._cbAuthenticate, self._ebAuthenticate,
++                callbackArgs=(credentials, deferred),
++                errbackArgs=(credentials, deferred))
++        return deferred
++
++    def _cbAuthenticate(self, result, credentials, deferred):
++        """
++        Checks to see if authentication was good. Called once the info has been retrieved from the DB.
++        """
++        if len(result) == 0:
++            deferred.errback(error.UnauthorizedLogin('Username unknown')) # Username not found in db
++        else:
++            username, password = result[0]
++            if self.customCheckFunc:
++                # Let the owner do the checking
++                if self.customCheckFunc(username, credentials.password, password): deferred.callback(credentials.username)
++                else: deferred.errback(error.UnauthorizedLogin('Password mismatch'))
++            else:
++                # It's up to us or the credentials object to do the checking now
++                if IUsernameHashedPassword.providedBy(credentials):
++                    # Let the hashed password checker do the checking
++                    if credentials.checkPassword(password):
++                        deferred.callback(credentials.username)
++                    else:
++                        deferred.errback(error.UnauthorizedLogin('Password mismatch'))
++                elif IUsernamePassword.providedBy(credentials):
++                    # Compare the passwords, deciging whether or not to use case sensitivity
++                    if self.caseSensitivePasswords:
++                        passOk = password.lower() == credentials.password.lower()
++                    else:
++                        passOk = password == credentials.password
++                    # See if they match
++                    if passOk:
++                        deferred.callback(credentials.username)
++                    else:
++                        deferred.errback(error.UnauthorizedLogin('Password mismatch'))
++                else: deferred.errback(error.UnhandledCredentials()) # OK, we don't know how to check this
++
++    def _ebAuthenticate(self, message, credentials, deferred):
++        """
++        The database lookup failed for some reason.
++        """
++        deferred.errback(error.LoginFailed(message))
++
++def main():
++    """
++    Run a simple echo ssh server to test the checker.
++    """
++    import sys
++    from twisted.python import log
++    log.startLogging(sys.stdout)
++    import os
++    if os.path.isfile('testcred'):
++        os.remove('testcred')
++    from twisted.enterprise import adbapi
++    pool = adbapi.ConnectionPool('pysqlite2.dbapi2', 'testcred')
++    query1 = """CREATE TABLE user (
++            username string,
++            password string
++        )"""
++    query2 = """INSERT INTO user VALUES ('foo', 'bar')"""
++    def cb(res):
++        pool.runQuery(query2)
++    pool.runQuery(query1).addCallback(cb)
++
++    checker = DBCredentialsChecker(pool.runQuery, caseSensitiveUsernames=False, escapeChar='?')
++    from twisted.cred.portal import Portal, IRealm
++    from twisted.conch import avatar
++
++    class ExampleAvatar(avatar.ConchUser):
++
++        def __init__(self, username):
++            avatar.ConchUser.__init__(self)
++            self.username = username
++            self.channelLookup.update({'session':session.SSHSession})
++
++    class TestRealm:
++        implements(IRealm)
++        def requestAvatar(self, avatarId, mind, *interfaces):
++            a = ExampleAvatar(avatarId)
++            return interfaces[0], a, lambda: None
++
++    portal = Portal(TestRealm())
++    portal.registerChecker(checker)
++    from twisted.conch.ssh import factory, userauth, connection, keys, session
++    from twisted.internet import protocol
++    class EchoProtocol(protocol.Protocol):
++        def dataReceived(self, data):
++            if data == '\r':
++                data = '\r\n'
++            elif data == '\x03': #^C
++                self.transport.loseConnection()
++                return
++            self.transport.write(data)
++
++    class ExampleSession:
++        def __init__(self, avatar):
++            pass
++        def getPty(self, term, windowSize, attrs):
++            pass
++        def execCommand(self, proto, cmd):
++            raise Exception("no executing commands")
++        def openShell(self, trans):
++            ep = EchoProtocol()
++            ep.makeConnection(trans)
++            trans.makeConnection(session.wrapProtocol(ep))
++        def eofReceived(self):
++            pass
++        def closed(self):
++            pass
++
++    from twisted.python import components
++    components.registerAdapter(ExampleSession, ExampleAvatar, session.ISession)
++
++    publicKey = 'ssh-rsa AAAAB3NzaC1yc2EAAAABIwAAAGEArzJx8OYOnJmzf4tfBEvLi8DVPrJ3/c9k2I/Az64fxjHf9imyRJbixtQhlH9lfNjUIx+4LmrJH5QNRsFporcHDKOTwTTYLh5KmRpslkYHRivcJSkbh/C+BR3utDS555mV'
++
++    privateKey = """-----BEGIN RSA PRIVATE KEY-----
++    MIIByAIBAAJhAK8ycfDmDpyZs3+LXwRLy4vA1T6yd/3PZNiPwM+uH8Yx3/YpskSW
++    4sbUIZR/ZXzY1CMfuC5qyR+UDUbBaaK3Bwyjk8E02C4eSpkabJZGB0Yr3CUpG4fw
++    vgUd7rQ0ueeZlQIBIwJgbh+1VZfr7WftK5lu7MHtqE1S1vPWZQYE3+VUn8yJADyb
++    Z4fsZaCrzW9lkIqXkE3GIY+ojdhZhkO1gbG0118sIgphwSWKRxK0mvh6ERxKqIt1
++    xJEJO74EykXZV4oNJ8sjAjEA3J9r2ZghVhGN6V8DnQrTk24Td0E8hU8AcP0FVP+8
++    PQm/g/aXf2QQkQT+omdHVEJrAjEAy0pL0EBH6EVS98evDCBtQw22OZT52qXlAwZ2
++    gyTriKFVoqjeEjt3SZKKqXHSApP/AjBLpF99zcJJZRq2abgYlf9lv1chkrWqDHUu
++    DZttmYJeEfiFBBavVYIF1dOlZT0G8jMCMBc7sOSZodFnAiryP+Qg9otSBjJ3bQML
++    pSTqy7c3a2AScC/YyOwkDaICHnnD3XyjMwIxALRzl0tQEKMXs6hH8ToUdlLROCrP
++    EhQ0wahUTCk1gKA4uPD6TMTChavbh4K63OvbKg==
++    -----END RSA PRIVATE KEY-----"""
++
++    class ExampleFactory(factory.SSHFactory):
++        publicKeys = {
++            'ssh-rsa': keys.getPublicKeyString(data=publicKey)
++        }
++        privateKeys = {
++            'ssh-rsa': keys.getPrivateKeyObject(data=privateKey)
++        }
++        services = {
++            'ssh-userauth': userauth.SSHUserAuthServer,
++            'ssh-connection': connection.SSHConnection
++        }
++
++    fac = ExampleFactory()
++
++
++    fac.portal = portal
++    reactor.listenTCP(2030, fac)
++
++if __name__ == "__main__":
++    from twisted.internet import reactor
++    reactor.callWhenRunning(main)
++    reactor.run()
++

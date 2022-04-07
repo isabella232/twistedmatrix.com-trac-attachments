@@ -1,0 +1,135 @@
+Index: twisted/test/test_udp.py
+===================================================================
+--- twisted/test/test_udp.py	(revision 25104)
++++ twisted/test/test_udp.py	(working copy)
+@@ -10,7 +10,10 @@
+ 
+ from twisted.internet.defer import Deferred, gatherResults, maybeDeferred
+ from twisted.internet import protocol, reactor, error, defer, interfaces
++from twisted.internet.udp import Port
+ from twisted.python import runtime
++from twisted.python.runtime import platformType
++import socket
+ 
+ 
+ class Mixin:
+@@ -249,6 +252,23 @@
+ 
+ 
+ 
++class MockSocket(object):
++    def __init__(self, retvals):
++        self.retvals = retvals
++    def recvfrom(self, size):
++        ret = self.retvals.pop(0)
++        if isinstance(ret, socket.error):
++            raise ret
++        return ret, None
++
++
++
++class MockProtocol(object):
++    def datagramReceived(self, data, addr):
++        pass
++
++
++
+ class UDPTestCase(unittest.TestCase):
+ 
+     def testOldAddress(self):
+@@ -545,6 +565,28 @@
+         return d
+ 
+ 
++    def testRawSocketReads(self):
++        if platformType == 'win32':
++            from errno import WSAEWOULDBLOCK as EWOULDBLOCK
++            from errno import WSAECONNREFUSED as ECONNREFUSED
++        else:
++            from errno import EWOULDBLOCK, ECONNREFUSED
++
++        port = Port(None, MockProtocol())
++
++        # Normal result, no errors
++        port.socket = MockSocket(["result", "123", socket.error(EWOULDBLOCK)])
++        port.doRead()
++
++        # Try an immediate "connection refused"
++        port.socket = MockSocket([socket.error(ECONNREFUSED)])
++        port.doRead()
++
++        # Some good data, followed by an unknown error
++        port.socket = MockSocket(["good", socket.error(1337)])
++        self.assertRaises(socket.error, port.doRead)
++
++
+ class ReactorShutdownInteraction(unittest.TestCase):
+     """Test reactor shutdown interaction"""
+ 
+Index: twisted/internet/udp.py
+===================================================================
+--- twisted/internet/udp.py	(revision 25104)
++++ twisted/internet/udp.py	(working copy)
+@@ -22,14 +22,21 @@
+ 
+ from twisted.python.runtime import platformType
+ if platformType == 'win32':
+-    from errno import WSAEWOULDBLOCK as EWOULDBLOCK
+-    from errno import WSAEINTR as EINTR
+-    from errno import WSAEMSGSIZE as EMSGSIZE
+-    from errno import WSAECONNREFUSED as ECONNREFUSED
+-    from errno import WSAECONNRESET
+-    EAGAIN=EWOULDBLOCK
++    from errno import WSAEWOULDBLOCK, WSAEINTR, WSAEMSGSIZE
++    from errno import WSAECONNREFUSED, WSAECONNRESET, WSAENETRESET
++
++    # Classify read errors
++    _sockErrReadIgnore = (WSAEINTR, WSAEWOULDBLOCK, WSAEMSGSIZE)
++    _sockErrReadRefuse = (WSAECONNREFUSED, WSAECONNRESET, WSAENETRESET)
++
++    # POSIX-compatible write errors
++    EINTR = WSAEINTR
++    EMSGSIZE = WSAEMSGSIZE
++    ECONNREFUSED = WSAECONNREFUSED
+ else:
+     from errno import EWOULDBLOCK, EINTR, EMSGSIZE, ECONNREFUSED, EAGAIN
++    _sockErrReadIgnore = (EAGAIN, EINTR, EWOULDBLOCK)
++    _sockErrReadRefuse = (ECONNREFUSED,)
+ 
+ # Twisted Imports
+ from twisted.internet import protocol, base, defer, address
+@@ -113,13 +120,13 @@
+                 data, addr = self.socket.recvfrom(self.maxPacketSize)
+             except socket.error, se:
+                 no = se.args[0]
+-                if no in (EAGAIN, EINTR, EWOULDBLOCK):
++                if no in _sockErrReadIgnore:
+                     return
+-                if (no == ECONNREFUSED) or (platformType == "win32" and no == WSAECONNRESET):
++                if no in _sockErrReadRefuse:
+                     if self._connectedAddr:
+                         self.protocol.connectionRefused()
+-                else:
+-                    raise
++                    return
++                raise
+             else:
+                 read += len(data)
+                 try:
+@@ -273,12 +280,12 @@
+                 self.protocol.datagramReceived(data)
+             except socket.error, se:
+                 no = se.args[0]
+-                if no in (EAGAIN, EINTR, EWOULDBLOCK):
++                if no in _sockErrReadIgnore:
+                     return
+-                if (no == ECONNREFUSED) or (platformType == "win32" and no == WSAECONNRESET):
++                if no in _sockErrReadRefuse:
+                     self.protocol.connectionRefused()
+-                else:
+-                    raise
++                    return
++                raise
+             except:
+                 log.deferr()
+ 

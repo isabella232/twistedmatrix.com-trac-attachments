@@ -1,0 +1,373 @@
+diff --git a/docs/core/howto/systemd.rst b/docs/core/howto/systemd.rst
+index f51ee68..39fd8be 100644
+--- a/docs/core/howto/systemd.rst
++++ b/docs/core/howto/systemd.rst
+@@ -371,7 +371,7 @@ You have also learned how the service can be started on demand, using socket act
+ 
+ Limitations and Known Issues
+ ----------------------------
+-#. Twisted can not accept UNIX or datagram sockets from ``systemd``\ .
++#. Twisted can not accept datagram sockets from ``systemd``\ .
+ #. Twisted does not support listening for SSL connections on sockets inherited from ``systemd``\ .
+ 
+ Further Reading
+diff --git a/twisted/internet/interfaces.py b/twisted/internet/interfaces.py
+index fad315b..f0cc312 100644
+--- a/twisted/internet/interfaces.py
++++ b/twisted/internet/interfaces.py
+@@ -929,7 +929,6 @@ class IReactorSocket(Interface):
+ 
+     Some plans for extending this interface exist.  See:
+ 
+-        - U{http://twistedmatrix.com/trac/ticket/5573}: AF_UNIX SOCK_STREAM ports
+         - U{http://twistedmatrix.com/trac/ticket/6594}: AF_UNIX SOCK_DGRAM ports
+     """
+ 
+diff --git a/twisted/internet/posixbase.py b/twisted/internet/posixbase.py
+index 3b4d150..1d92bb7 100644
+--- a/twisted/internet/posixbase.py
++++ b/twisted/internet/posixbase.py
+@@ -455,11 +455,17 @@ class PosixReactorBase(_SignalReactorMixin, _DisconnectSelectableMixin,
+ 
+         @see: L{twisted.internet.interfaces.IReactorSocket.adoptStreamPort}
+         """
+-        if addressFamily not in (socket.AF_INET, socket.AF_INET6):
++        if addressFamily not in (socket.AF_INET, socket.AF_INET6, socket.AF_UNIX):
+             raise error.UnsupportedAddressFamily(addressFamily)
+ 
+-        p = tcp.Port._fromListeningDescriptor(
+-            self, fileDescriptor, addressFamily, factory)
++        if addressFamily == socket.AF_UNIX:
++            assert unixEnabled, "UNIX support is not present"
++            from twisted.internet import unix
++            p = unix.Port._fromListeningDescriptor(
++                self, fileDescriptor, factory)
++        else:
++            p = tcp.Port._fromListeningDescriptor(
++                self, fileDescriptor, addressFamily, factory)
+         p.startListening()
+         return p
+ 
+@@ -468,11 +474,17 @@ class PosixReactorBase(_SignalReactorMixin, _DisconnectSelectableMixin,
+         @see:
+             L{twisted.internet.interfaces.IReactorSocket.adoptStreamConnection}
+         """
+-        if addressFamily not in (socket.AF_INET, socket.AF_INET6):
++        if addressFamily not in (socket.AF_INET, socket.AF_INET6, socket.AF_UNIX):
+             raise error.UnsupportedAddressFamily(addressFamily)
+ 
+-        return tcp.Server._fromConnectedSocket(
+-            fileDescriptor, addressFamily, factory, self)
++        if addressFamily == socket.AF_UNIX:
++            assert unixEnabled, "UNIX support is not present"
++            from twisted.internet import unix
++            return unix.Server._fromConnectedSocket(
++                fileDescriptor, factory, self)
++        else:
++            return tcp.Server._fromConnectedSocket(
++                fileDescriptor, addressFamily, factory, self)
+ 
+ 
+     def adoptDatagramPort(self, fileDescriptor, addressFamily, protocol,
+diff --git a/twisted/internet/test/test_unix.py b/twisted/internet/test/test_unix.py
+index eeb5b4b..a50d602 100644
+--- a/twisted/internet/test/test_unix.py
++++ b/twisted/internet/test/test_unix.py
+@@ -19,11 +19,13 @@ except ImportError:
+ 
+ from zope.interface import implements
+ 
+-from twisted.python.log import addObserver, removeObserver, err
++from twisted.trial.unittest import SkipTest
++from twisted.python.log import addObserver, removeObserver, err, msg
+ from twisted.python.failure import Failure
+ from twisted.python.reflect import requireModule
+ from twisted.python.runtime import platform
+-from twisted.internet.interfaces import IFileDescriptorReceiver, IReactorUNIX
++from twisted.internet.interfaces import (
++    IFileDescriptorReceiver, IReactorFDSet, IReactorUNIX, IReactorSocket)
+ from twisted.internet.error import ConnectionClosed, FileDescriptorOverrun
+ from twisted.internet.address import UNIXAddress
+ from twisted.internet.endpoints import UNIXServerEndpoint, UNIXClientEndpoint
+@@ -33,7 +35,7 @@ from twisted.internet import interfaces
+ from twisted.internet.protocol import (
+     ServerFactory, ClientFactory, DatagramProtocol)
+ from twisted.internet.test.test_core import ObjectModelIntegrationMixin
+-from twisted.internet.test.test_tcp import StreamTransportTestsMixin
++from twisted.internet.test.test_tcp import StreamTransportTestsMixin, WriteSequenceTestsMixin
+ from twisted.internet.test.connectionmixins import (
+     EndpointCreator, ConnectableProtocol, runProtocolsWithReactor,
+     ConnectionTestsMixin, StreamClientTestsMixin)
+@@ -513,13 +515,44 @@ class UNIXDatagramTestsBuilder(UNIXFamilyMixin, ReactorBuilder):
+ 
+ 
+ 
+-class UNIXPortTestsBuilder(ReactorBuilder, ObjectModelIntegrationMixin,
+-                           StreamTransportTestsMixin):
++class SocketUNIXMixin(object):
+     """
+-    Tests for L{IReactorUNIX.listenUnix}
++    Mixin which uses L{IReactorSocket.adoptStreamPort} to hand out listening
++    UNIX ports.
+     """
+-    requiredInterfaces = (interfaces.IReactorUNIX,)
++    def getListeningPort(self, reactor, factory):
++        """
++        Get a UNIX port from a reactor, wrapping an already-initialized file
++        descriptor.
++        """
++        if IReactorSocket.providedBy(reactor):
++            portSock = socket(AF_UNIX)
++            # self.mktemp() often returns a path which is too long to be used.
++            path = mktemp(suffix='.sock', dir='.')
++            portSock.bind(path)
++            portSock.listen(3)
++            portSock.setblocking(False)
++            try:
++                return reactor.adoptStreamPort(
++                    portSock.fileno(), portSock.family, factory)
++            finally:
++                pass
++                # The socket should still be open; fileno will raise if it is
++                # not.
++                portSock.fileno()
++                # Now clean it up, because the rest of the test does not need
++                # it.
++                portSock.close()
++        else:
++            raise SkipTest("Reactor does not provide IReactorSocket")
++
+ 
++
++class ListenUNIXMixin(object):
++    """
++    Mixin which uses L{IReactorTCP.listenUNIX} to hand out listening UNIX
++    ports.
++    """
+     def getListeningPort(self, reactor, factory):
+         """
+         Get a UNIX port from a reactor
+@@ -529,6 +562,10 @@ class UNIXPortTestsBuilder(ReactorBuilder, ObjectModelIntegrationMixin,
+         return reactor.listenUNIX(path, factory)
+ 
+ 
++
++class UNIXPortTestsMixin(object):
++    requiredInterfaces = (interfaces.IReactorUNIX,)
++
+     def getExpectedStartListeningLogMessage(self, port, factory):
+         """
+         Get the message expected to be logged when a UNIX port starts listening.
+@@ -544,9 +581,120 @@ class UNIXPortTestsBuilder(ReactorBuilder, ObjectModelIntegrationMixin,
+ 
+ 
+ 
++class UNIXPortTestsBuilder(ReactorBuilder, UNIXPortTestsMixin,
++                           ObjectModelIntegrationMixin,
++                           StreamTransportTestsMixin, ListenUNIXMixin):
++    """
++    Tests for L{IReactorUNIX.listenUnix}
++    """
++
++
++class UNIXFDPortTestsBuilder(ReactorBuilder, UNIXPortTestsMixin,
++                             ObjectModelIntegrationMixin,
++                             StreamTransportTestsMixin,
++                             SocketUNIXMixin):
++    """
++    Tests for L{IReactorUNIX.adoptStreamPort}
++    """
++
++
++class UNIXAdoptStreamConnectionTestsBuilder(WriteSequenceTestsMixin, ReactorBuilder):
++    requiredInterfaces = (IReactorFDSet, IReactorSocket)
++
++    def test_ServerAddressUNIX(self):
++        """
++        Helper method to test TCP server addresses on either IPv4 or IPv6.
++        """
++
++        def connected(protocols):
++            client, server, port = protocols
++            try:
++                self.assertEqual(
++                    "<AccumulatingProtocol #%s on %s>" %
++                        (server.transport.sessionno, port.getHost().name),
++                    str(server.transport))
++
++                self.assertEqual(
++                    "AccumulatingProtocol,%s," %
++                        (server.transport.sessionno),
++                    server.transport.logstr)
++
++                [peerAddress] = server.factory.peerAddresses
++                self.assertIsInstance(peerAddress, UNIXAddress)
++            finally:
++                # Be certain to drop the connection so the test completes.
++                server.transport.loseConnection()
++
++        reactor = self.buildReactor()
++        d = self.getConnectedClientAndServer(reactor, interface=None, addressFamily=None)
++        d.addCallback(connected)
++        d.addErrback(err)
++        self.runReactor(reactor)
++
++
++    def getConnectedClientAndServer(self, reactor, interface, addressFamily):
++        """
++        Return a L{Deferred} firing with a L{MyClientFactory} and
++        L{MyServerFactory} connected pair, and the listening C{Port}. The
++        particularity is that the server protocol has been obtained after doing
++        a C{adoptStreamConnection} against the original server connection.
++        """
++        from twisted.test.test_tcp import MyClientFactory, MyServerFactory
++        from twisted.internet.defer import gatherResults
++        firstServer = MyServerFactory()
++        firstServer.protocolConnectionMade = Deferred()
++
++        server = MyServerFactory()
++        server.protocolConnectionMade = Deferred()
++        server.protocolConnectionLost = Deferred()
++
++        client = MyClientFactory()
++        client.protocolConnectionMade = Deferred()
++        client.protocolConnectionLost = Deferred()
++
++        # self.mktemp() often returns a path which is too long to be used.
++        path = mktemp(suffix='.sock', dir='.')
++        port = reactor.listenUNIX(path, firstServer)
++
++        def firstServerConnected(proto):
++            reactor.removeReader(proto.transport)
++            reactor.removeWriter(proto.transport)
++            reactor.adoptStreamConnection(
++                proto.transport.fileno(), AF_UNIX, server)
++
++        firstServer.protocolConnectionMade.addCallback(firstServerConnected)
++
++        lostDeferred = gatherResults([client.protocolConnectionLost,
++                                      server.protocolConnectionLost])
++        def stop(result):
++            if reactor.running:
++                reactor.stop()
++            return result
++
++        lostDeferred.addBoth(stop)
++
++        deferred = Deferred()
++        deferred.addErrback(stop)
++
++        startDeferred = gatherResults([client.protocolConnectionMade,
++                                       server.protocolConnectionMade])
++        def start(protocols):
++            client, server = protocols
++            msg("client connected %s" % client)
++            msg("server connected %s" % server)
++            deferred.callback((client, server, port))
++
++        startDeferred.addCallback(start)
++
++        reactor.connectUNIX(port.getHost().name, client)
++        return deferred
++
++
+ globals().update(UNIXTestsBuilder.makeTestCaseClasses())
+ globals().update(UNIXDatagramTestsBuilder.makeTestCaseClasses())
+ globals().update(UNIXPortTestsBuilder.makeTestCaseClasses())
++globals().update(UNIXFDPortTestsBuilder.makeTestCaseClasses())
++globals().update(UNIXAdoptStreamConnectionTestsBuilder.makeTestCaseClasses())
+ 
+ 
+ 
+diff --git a/twisted/internet/unix.py b/twisted/internet/unix.py
+index 86a084e..c286bfc 100644
+--- a/twisted/internet/unix.py
++++ b/twisted/internet/unix.py
+@@ -208,6 +208,37 @@ class Server(_SendmsgMixin, tcp.Server):
+         _SendmsgMixin.__init__(self)
+         tcp.Server.__init__(self, sock, protocol, (client, None), server, sessionno, reactor)
+ 
++    @classmethod
++    def _fromConnectedSocket(cls, fileDescriptor, factory, reactor):
++        """
++        Create a new L{Server} based on an existing connected I{SOCK_STREAM}
++        socket.
++
++        Arguments are the same as to L{Server.__init__}, except where noted.
++
++        @param fileDescriptor: An integer file descriptor associated with a
++            connected socket.  The socket must be in non-blocking mode.  Any
++            additional attributes desired, such as I{FD_CLOEXEC}, must also be
++            set already.
++
++        @return: A new instance of C{cls} wrapping the socket given by
++            C{fileDescriptor}.
++        """
++        skt = socket.fromfd(fileDescriptor, socket.AF_UNIX, socket.SOCK_STREAM)
++        protocolAddr = address.UNIXAddress(skt.getsockname())
++
++        proto = factory.buildProtocol(protocolAddr)
++        if proto is None:
++            skt.close()
++            return
++
++        # FIXME: is this a suitable sessionno?
++        sessionno = 0
++        self = cls(skt, proto, skt.getpeername(), None, sessionno, reactor)
++        self.repstr = "<%s #%s on %s>" % (
++            self.protocol.__class__.__name__, self.sessionno, skt.getsockname())
++        proto.makeConnection(self)
++        return self
+ 
+     def getHost(self):
+         return address.UNIXAddress(self.socket.getsockname())
+@@ -258,6 +289,25 @@ class Port(_UNIXPort, tcp.Port):
+         self.mode = mode
+         self.wantPID = wantPID
+ 
++    @classmethod
++    def _fromListeningDescriptor(cls, reactor, fd, factory):
++        """
++        Create a new L{Port} based on an existing listening I{SOCK_STREAM}
++        socket.
++
++        Arguments are the same as to L{Port.__init__}, except where noted.
++
++        @param fd: An integer file descriptor associated with a listening
++            socket.  The socket must be in non-blocking mode.  Any additional
++            attributes desired, such as I{FD_CLOEXEC}, must also be set already.
++
++        @return: A new instance of C{cls} wrapping the socket given by C{fd}.
++        """
++        port = socket.fromfd(fd, cls.addressFamily, cls.socketType)
++        self = cls(port.getsockname(), factory, reactor=reactor)
++        self._preexistingSocket = port
++        return self
++
+     def __repr__(self):
+         factoryName = reflect.qual(self.factory.__class__)
+         if hasattr(self, 'socket'):
+@@ -295,9 +345,13 @@ class Port(_UNIXPort, tcp.Port):
+                         pass
+ 
+         self.factory.doStart()
++
+         try:
+-            skt = self.createInternetSocket()
+-            skt.bind(self.port)
++            if self._preexistingSocket is not None:
++                skt, self._preexistingSocket = self._preexistingSocket, None
++            else:
++                skt = self.createInternetSocket()
++                skt.bind(self.port)
+         except socket.error, le:
+             raise CannotListenError, (None, self.port, le)
+         else:
+diff --git a/twisted/topfiles/5573.misc b/twisted/topfiles/5573.misc
+new file mode 100644
+index 0000000..a218cc4
+--- /dev/null
++++ b/twisted/topfiles/5573.misc
+@@ -0,0 +1,2 @@
++twisted.internet.posixbase.PosixReactorBase.adoptStreamPort now supports UNIX SOCK_STREAM socket types.
++twisted.internet.posixbase.PosixReactorBase.adoptStreamConnection now supports UNIX SOCK_STREAM socket types.

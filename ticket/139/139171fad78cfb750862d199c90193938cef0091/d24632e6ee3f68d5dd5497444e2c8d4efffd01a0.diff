@@ -1,0 +1,331 @@
+=== modified file 'twisted/words/protocols/irc.py'
+--- twisted/words/protocols/irc.py	2008-05-22 18:08:21 +0000
++++ twisted/words/protocols/irc.py	2008-06-10 01:07:46 +0000
+@@ -30,7 +30,7 @@
+ 
+ __version__ = '$Revision: 1.94 $'[11:-2]
+ 
+-from twisted.internet import reactor, protocol
++from twisted.internet import reactor, protocol, defer
+ from twisted.persisted import styles
+ from twisted.protocols import basic
+ from twisted.python import log, reflect, text
+@@ -804,6 +804,16 @@
+         """
+         pass
+ 
++    def channelNames(self, channel, names):
++        """Called when a list of users in the channel has been requested.
++
++        Also called when first joining a channel.
++
++        @param channel: the name of the channel where the users are in.
++        @param names: a list of users that are in the specified channel.
++        """
++        pass
++
+     ### Information from the server.
+ 
+     def receivedMOTD(self, motd):
+@@ -822,12 +832,25 @@
+     ### Your client will want to invoke these.
+ 
+     def join(self, channel, key=None):
++        # two events will be fired: JOIN and NAMES
++        joinedChannel, channelNames = [defer.Deferred() for i in xrange(2)]
++
++        channelEvents = self._events.setdefault('NAMES', {}).\
++            setdefault(channel, [])
++        joinEvents = self._events.setdefault('JOIN', {}).\
++            setdefault(channel, joinedChannel)
++
+         if channel[0] not in '&#!+': channel = '#' + channel
+         if key:
+             self.sendLine("JOIN %s %s" % (channel, key))
+         else:
+             self.sendLine("JOIN %s" % (channel,))
+ 
++        # append the NAMES deferred
++        channelEvents.append(channelNames)
++        # return both deferreds
++        return (joinedChannel, channelNames)
++
+     def leave(self, channel, reason=None):
+         if channel[0] not in '&#!+': channel = '#' + channel
+         if reason:
+@@ -930,6 +953,33 @@
+         self.nickname = nickname
+         self.sendLine("NICK %s" % nickname)
+ 
++    def names(self, *channels):
++        """
++        Tells the server to give a list of users in the specified channels.
++
++        Multiple channels can be specified at one time, `channelNames` will be 
++        called multiple times for each channel.
++        """
++        currentDeferred = defer.Deferred()
++        queue = self._events.setdefault('NAMES', {})
++        # dump all names of all visible channels
++        if not channels:
++            allChannels = queue.setdefault('ALL', [])
++            allChannels.append(currentDeferred)
++            self.sendLine("NAMES")
++        elif len(channels) == 1:
++            channel = channels[0]
++            self.sendLine("NAMES %s" % channel)
++            queue.setdefault(channel, []).append(currentDeferred)
++        else:
++            # some servers do not support multiple channel names at once
++            for channel in channels:
++                self.sendLine("NAMES %s" % channel)
++                # append it multiple times for each channel
++                queue.setdefault('ALL', []).append(currentDeferred)
++
++        return currentDeferred
++
+     def quit(self, message = ''):
+         self.sendLine("QUIT :%s" % message)
+ 
+@@ -1016,13 +1066,55 @@
+     def irc_RPL_WELCOME(self, prefix, params):
+         self.signedOn()
+ 
++    def irc_RPL_NAMREPLY(self, prefix, params):
++        """
++        Handles the raw NAMREPLY that is returned as answer to
++        the NAMES command. Accumulates users until ENDOFNAMES.
++        """
++        channel = params[2]
++        users = params[3].split()
++        self._namreply.setdefault(channel, [])
++        self._namreply[channel].extend(users)
++
++    def irc_RPL_ENDOFNAMES(self, prefix, params):
++        """
++        Handles the end of the NAMREPLY. This is called when all
++        NAMREPLYs have finished. It calls the higher-level
++        functions as well as fires the deferreds.
++        """
++        channel = params[1]
++        # is there an ongoing ALL event?
++        if 'ALL' not in self._events['NAMES']:
++            users = self._namreply.pop(channel, [])
++            # get the deferred and fire it
++            currentDeferred = self._events['NAMES'][channel].pop(0)
++            currentDeferred.callback({channel : users})
++            # traditional callback
++            self.channelNames(channel, users)
++        else:
++            currentDeferred = self._events['NAMES']['ALL'].pop(0)
++            # only call when that one was the last one in the queue
++            if not self._events['NAMES']['ALL']:
++                # fire callback
++                currentDeferred.callback(self._namreply)
++                # also call the traditional callback
++                for channel, users in self._namreply.iteritems():
++                    self.channelNames(channel, users)
++
++                # reset the NAMES reply now
++                self._namreply = {}
++
+     def irc_JOIN(self, prefix, params):
+         nick = string.split(prefix,'!')[0]
+         channel = params[-1]
++        joinSuccessful = self._events['JOIN'][channel]
+         if nick == self.nickname:
+             self.joined(channel)
+         else:
+             self.userJoined(nick, channel)
++        # yet the callback has always nick, channel because it's hard
++        # to write callbacks that have to react on both possibilities
++        joinSuccessful.callback((nick, channel))
+ 
+     def irc_PART(self, prefix, params):
+         nick = string.split(prefix,'!')[0]
+@@ -1523,6 +1615,10 @@
+     ### Protocool methods
+ 
+     def connectionMade(self):
++        # container for deferreds
++        self._events = {}
++        # container for NAME replies
++        self._namreply = {}
+         self._queue = []
+         if self.performLogin:
+             self.register(self.nickname)
+
+=== modified file 'twisted/words/test/test_irc.py'
+--- twisted/words/test/test_irc.py	2008-05-22 18:08:21 +0000
++++ twisted/words/test/test_irc.py	2008-06-10 01:04:02 +0000
+@@ -6,9 +6,10 @@
+ 
+ from twisted.trial import unittest
+ from twisted.trial.unittest import TestCase
++from twisted.test.proto_helpers import StringTransport
+ from twisted.words.protocols import irc
+ from twisted.words.protocols.irc import IRCClient
+-from twisted.internet import protocol
++from twisted.internet import defer, protocol
+ 
+ 
+ class StringIOWithoutClosing(StringIO):
+@@ -105,7 +106,8 @@
+         'userKicked': ('user', 'channel', 'kicker', 'message'),
+         'action': ('user', 'channel', 'data'),
+         'topicUpdated': ('user', 'channel', 'newTopic'),
+-        'userRenamed': ('oldname', 'newname')}
++        'userRenamed': ('oldname', 'newname'),
++        'channelNames' : ('channel', 'users')}
+ 
+     def __init__(self, *a, **kw):
+         object.__init__(self)
+@@ -603,3 +605,147 @@
+                 username, hostname, servername, self.protocol.realname),
+             '']
+         self.assertEqual(self.transport.getvalue().split('\r\n'), expected)
++
++class DeferredClientTestCase(unittest.TestCase):
++    """
++    Tests for some extensions of the IRCClient like adding deferreds or
++    improved support for IRC NAMES command.
++    """
++
++    def setUp(self):
++        # mock up transport and connection
++        self.transport = StringTransport()
++        self.client = NoticingClient()
++        self.client.nickname = 'testuser'
++        self.client.makeConnection(self.transport)
++
++    def test_join(self):
++        """
++        Verify that join works, calls the proper callables (joined and
++        channelNames) and returns the proper two deferreds (JOIN and NAMES).
++        """
++        def _checkJoinDeferred(args):
++            self.assertEqual(args, ('testuser', '#channel'))
++
++        def _checkNamesDeferred(names):
++            self.assertEqual(names, {'#channel' : ['testuser', 'Leonidas']})
++
++        # the actual call returning deferreds
++        joined, names = self.client.join('#channel')
++        joined.addCallback(_checkJoinDeferred)
++        names.addCallback(_checkNamesDeferred)
++        # mock up the server's response
++        server_resp = [
++            ':testuser!~twist@localhost JOIN :#channel',
++            ':host.name 353 testuser = #channel :testuser Leonidas',
++            ':host.name 366 testuser #channel :End of NAMES list'
++        ]
++        for resp in server_resp:
++            self.client.lineReceived(resp)
++
++        self.assertEqual(self.client.calls,
++            [
++                ('joined', {'channel' : '#channel'}),
++                ('channelNames', {'channel': '#channel', 'users' :
++                        ['testuser', 'Leonidas']})
++            ])
++        return defer.DeferredList([joined, names])
++
++    def test_names_single(self):
++        """
++        Test whether getting names for a single channel works properly.
++        """
++
++        def _checkNames(args):
++            self.assertEquals(args, {'#channel' :
++                ['Leonidas', '@glyph', '+exarkun', '+therve']})
++
++        completed = self.client.names('#channel')
++        completed.addCallback(_checkNames)
++        # make it trickier by splitting the reponse into parts
++        server_resp = [
++            ":host.name 353 testuser = #channel :Leonidas @glyph",
++            ":host.name 353 testuser = #channel :+exarkun +therve",
++            ":host.name 366 testuser #channel :End of NAMES list"
++        ]
++        for resp in server_resp:
++            self.client.lineReceived(resp)
++
++        # check the channelNames call
++        self.assertEquals(self.client.calls,
++            [
++                ('channelNames', {'users' :
++                    ['Leonidas', '@glyph', '+exarkun', '+therve'],
++                    'channel' : '#channel'})
++            ])
++        # check the deferred
++        return completed
++
++    def test_names_multiple(self):
++        """
++        Test whether getting names for a multiple channel works properly.
++        """
++
++        def _checkNames(args):
++            self.assertEquals(args, {
++                '#channel' : ['Leonidas', '@glyph'],
++                '#channel2' : ['+Leonidas', '@exarkun']})
++
++        completed = self.client.names('#channel', '#channel2')
++        completed.addCallback(_checkNames)
++        # make it trickier by splitting the reponse into parts
++        server_resp = [
++            ":host.name 353 testuser = #channel :Leonidas @glyph",
++            ":host.name 366 testuser #channel :End of NAMES list",
++            ":host.name 353 testuser = #channel2 :+Leonidas @exarkun",
++            ":host.name 366 testuser #channel2 :End of NAMES list"
++        ]
++        for resp in server_resp:
++            self.client.lineReceived(resp)
++
++        # check the channelNames call
++        self.assertEquals(self.client.calls,
++            [
++                ('channelNames', {'users' : ['Leonidas', '@glyph'],
++                    'channel' : '#channel'}),
++                ('channelNames', {'users' : ['+Leonidas', '@exarkun'],
++                    'channel' : '#channel2'})
++            ])
++        # check the deferred
++        return completed
++
++    def test_names_all(self):
++        """
++        Test whether getting names for all public channels works properly.
++        """
++
++        def _checkNames(args):
++            self.assertEquals(args, {
++                '#channel' : ['Leonidas', '@glyph'],
++                '#channel2' : ['Leonidas', '@exarkun'],
++                '#unknown' : ['@Leonidas']})
++
++        completed = self.client.names()
++        completed.addCallback(_checkNames)
++        # make it trickier by splitting the reponse into parts
++        server_resp = [
++            ":host.name 353 testuser = #unknown :@Leonidas",
++            ":host.name 353 testuser = #channel2 :Leonidas @exarkun",
++            ":host.name 353 testuser = #channel :Leonidas @glyph",
++            ":host.name 366 testuser * :End of NAMES list"
++        ]
++        for resp in server_resp:
++            self.client.lineReceived(resp)
++
++        # check the channelNames call
++        self.assertEquals(self.client.calls,
++            [
++                ('channelNames', {'users' : ['Leonidas', '@glyph'],
++                    'channel' : '#channel'}),
++                ('channelNames', {'users' : ['Leonidas', '@exarkun'],
++                    'channel' : '#channel2'}),
++                ('channelNames', {'users' : ['@Leonidas'],
++                    'channel' : '#unknown'})
++            ])
++        # check the deferred
++        return completed
+

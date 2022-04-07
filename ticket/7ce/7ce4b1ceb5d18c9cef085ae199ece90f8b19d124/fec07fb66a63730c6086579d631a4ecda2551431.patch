@@ -1,0 +1,144 @@
+Index: twisted/mail/test/test_smtp.py
+===================================================================
+--- twisted/mail/test/test_smtp.py	(revision 35091)
++++ twisted/mail/test/test_smtp.py	(working copy)
+@@ -11,9 +11,9 @@
+ from twisted.trial import unittest, util
+ from twisted.protocols import basic, loopback
+ from twisted.mail import smtp
+-from twisted.internet import defer, protocol, reactor, interfaces
++from twisted.internet import defer, protocol, reactor, interfaces, ssl
+ from twisted.internet import address, error, task
+-from twisted.test.proto_helpers import StringTransport
++from twisted.test.proto_helpers import StringTransport, MemoryReactor
+ 
+ from twisted import cred
+ import twisted.cred.error
+@@ -1518,3 +1518,73 @@
+         client.sentMail(199, "Test response", 1, addresses, client.log)
+ 
+         return onDone
++
++
++
++class SSLStringTransport(StringTransport):
++    """
++    Faking a string transport that implements C{ISSLTransport}.
++    """
++    from twisted.internet.interfaces import ISSLTransport
++    implements(ISSLTransport) # not really, just faking it
++
++
++
++class CustomMemoryReactor(MemoryReactor):
++    def connectSSL(self, host, port, factory, contextFactory):
++        """
++        Returns a client for our testing purpose.
++        """
++        conn = MemoryReactor.connectSSL(self, host, port,
++                                        factory, contextFactory)
++        client = factory.buildProtocol(None)
++        client.makeConnection(SSLStringTransport())
++        return conn, client
++
++
++
++class SSLTestCase(unittest.TestCase):
++    """
++    We need to simulate a reactor.connectSSL to test if the ESMTP client
++    works well with connectSSL while requireTransportSecurity is True.
++    """
++    reactor = CustomMemoryReactor()
++
++    def test_connectSSL(self):
++        """
++        When requireTransportSecurity is true and the client is connected
++        via SSL, the server would choose to authenticate an user over the
++        ssl transport.
++        """
++        # Set up a test client
++        clientCTX = ssl.ClientContextFactory()
++        sentDeferred = defer.Deferred()
++
++        # Although specifying requireTransportSecurity is not required (
++        # it's the default value), I think it's better to be explicit here.
++        clientFactory = smtp.ESMTPSenderFactory(
++            "testuser", 'testpassword', "test@example.org",
++            "alice@example.org", StringIO("message"),
++            sentDeferred, requireTransportSecurity = True)
++        clientConnector, client = self.reactor.connectSSL(
++            'localhost', 3422, clientFactory, clientCTX)
++
++        # Feed some server messages to our client
++        client.dataReceived(
++            "220 localhost NO UCE NO UBE NO RELAY PROBES ESMTP\r\n"
++            "250-localhost Hello 127.0.0.1, nice to meet you\r\n"
++            "250 AUTH LOGIN\r\n"
++            "334 VXNlciBOYW1lAA==\r\n"
++            "235 Authentication successful.\r\n"
++        )
++
++        expected = (
++            "EHLO localhost\r\n"
++            "AUTH LOGIN\r\n"
++            "dGVzdHVzZXI=\r\n"
++            "MAIL FROM:<test@example.org>\r\n"
++        )
++        data = client.transport.value()
++        client.transport.clear()
++        self.assertEqual(data, expected)
++        self.addCleanup(clientConnector.disconnect)
+Index: twisted/mail/smtp.py
+===================================================================
+--- twisted/mail/smtp.py	(revision 35091)
++++ twisted/mail/smtp.py	(working copy)
+@@ -19,7 +19,7 @@
+ from twisted.internet import defer
+ from twisted.internet import error
+ from twisted.internet import reactor
+-from twisted.internet.interfaces import ITLSTransport
++from twisted.internet.interfaces import ITLSTransport, ISSLTransport
+ from twisted.python import log
+ from twisted.python import util
+ 
+@@ -1244,7 +1244,6 @@
+         self.authenticators = []
+         self.secret = secret
+         self.context = contextFactory
+-        self.tlsMode = False
+ 
+ 
+     def esmtpEHLORequired(self, code=-1, resp=None):
+@@ -1316,28 +1315,24 @@
+             else:
+                 items[e[0]] = None
+ 
+-        if self.tlsMode:
+-            self.authenticate(code, resp, items)
+-        else:
+-            self.tryTLS(code, resp, items)
++        self.tryTLS(code, resp, items)
+ 
+     def tryTLS(self, code, resp, items):
++        sslTransport = ISSLTransport.providedBy(self.transport)
++
+         if self.context and 'STARTTLS' in items:
+             self._expected = [220]
+             self._okresponse = self.esmtpState_starttls
+             self._failresponse = self.esmtpTLSFailed
+             self.sendLine('STARTTLS')
+-        elif self.requireTransportSecurity:
+-            self.tlsMode = False
++        elif self.requireTransportSecurity and not sslTransport:
+             self.esmtpTLSRequired()
+         else:
+-            self.tlsMode = False
+             self.authenticate(code, resp, items)
+ 
+     def esmtpState_starttls(self, code, resp):
+         try:
+             self.transport.startTLS(self.context)
+-            self.tlsMode = True
+         except:
+             log.err()
+             self.esmtpTLSFailed(451)

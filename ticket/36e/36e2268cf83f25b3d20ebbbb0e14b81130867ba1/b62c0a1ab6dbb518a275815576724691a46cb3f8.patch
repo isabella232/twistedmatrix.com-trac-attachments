@@ -1,0 +1,217 @@
+Index: twisted/python/test/test_dist.py
+===================================================================
+--- twisted/python/test/test_dist.py	(revision 34845)
++++ twisted/python/test/test_dist.py	(working copy)
+@@ -7,7 +7,6 @@
+ 
+ 
+ import os
+-import shutil
+ import sys
+ 
+ from distutils.core import Distribution
+@@ -15,10 +14,12 @@
+ from twisted.trial.unittest import TestCase
+ 
+ from twisted.python import dist
+-from twisted.python.dist import get_setup_args, ConditionalExtension
++from twisted.python.dist import (get_setup_args, ConditionalExtension,
++    build_scripts_twisted)
+ from twisted.python.filepath import FilePath
+ 
+ 
++
+ class SetupTest(TestCase):
+     """
+     Tests for L{get_setup_args}.
+@@ -57,6 +58,7 @@
+         self.assertEqual(ext.define_macros, [("whatever", 2), ("WIN32", 1)])
+ 
+ 
++
+ class GetExtensionsTest(TestCase):
+     """
+     Tests for L{dist.getExtensions}.
+@@ -195,6 +197,7 @@
+         self.assertEqual(dist.getVersion("blat", base=self.dirname), "9.8.10")
+ 
+ 
++
+ class GetScriptsTest(TestCase):
+     """
+     Tests for L{dist.getScripts} which returns the scripts which should be
+@@ -295,6 +298,111 @@
+ 
+ 
+ 
++class DummyCommand:
++    """
++    A fake Command.
++    """
++    def __init__(self, **kwargs):
++        for kw, val in kwargs.items():
++            setattr(self, kw, val)
++
++    def ensure_finalized(self):
++        pass
++
++
++
++class BuildScriptsTest(TestCase):
++    """
++    Tests for L{dist.build_scripts_twisted}.
++    """
++
++    def setUp(self):
++        self.source = FilePath(self.mktemp())
++        self.target = FilePath(self.mktemp())
++        self.source.makedirs()
++        self.addCleanup(os.chdir, os.getcwd())
++        os.chdir(self.source.path)
++
++
++    def test_notWindows(self):
++        """
++        L{build_scripts_twisted} does not rename scripts on non-Windows
++        platforms.
++        """
++        self.patch(os, "name", "twisted")
++        built = self.buildScripts()
++        for name in ['script1', 'script2.py', 'shell.sh']:
++            self.assertTrue(name in built)
++
++
++    def test_windows(self):
++        """
++        L{build_scripts_twisted} renames scripts so they end with '.py' on
++        the Windows platform.
++        """
++        self.patch(os, "name", "nt")
++        built = self.buildScripts()
++        for name in ['script1.py', 'script2.py', 'shell.sh.py']:
++            self.assertTrue(name in built)
++
++
++    def buildScripts(self):
++        """
++        Writes 3 types of scripts and runs the L{build_scripts_twisted}
++        command.
++        """
++        self.writeScript(self.source, "script1",
++                          ("#! /usr/bin/env python2.3\n"
++                           "# bogus script w/ Python sh-bang\n"
++                           "pass\n"))
++
++        self.writeScript(self.source, "script2.py",
++                        ("#!/usr/bin/python\n"
++                         "# bogus script w/ Python sh-bang\n"
++                         "pass\n"))
++
++        self.writeScript(self.source, "shell.sh",
++                        ("#!/bin/sh\n"
++                         "# bogus shell script w/ sh-bang\n"
++                         "exit 0\n"))
++
++        expected = ['script1', 'script2.py', 'shell.sh']
++        cmd = self.getBuildScriptsCmd(self.target,
++                                     [self.source.child(fn).path
++                                      for fn in expected])
++        cmd.finalize_options()
++        cmd.run()
++
++        return self.target.listdir()
++
++
++    def getBuildScriptsCmd(self, target, scripts):
++        """
++        Create a distribution with a dummy command and wrap it in
++        L{build_scripts_twisted}.
++        """
++        dist = Distribution()
++        dist.scripts = scripts
++        dist.command_obj["build"] = DummyCommand(
++            build_scripts = target.path,
++            force = 1,
++            executable = sys.executable
++        )
++        return build_scripts_twisted(dist)
++
++
++    def writeScript(self, dir, name, text):
++        """
++        Write the script to disk.
++        """
++        f = open(dir.child(name).path, "w")
++        try:
++            f.write(text)
++        finally:
++            f.close()
++
++
++
+ class FakeModule(object):
+     """
+     A fake module, suitable for dependency injection in testing.
+@@ -308,6 +416,7 @@
+         """
+         self._attrs = attrs
+ 
++
+     def __getattr__(self, name):
+         """
+         Gets an attribute of this fake module from its attrs.
+Index: twisted/python/dist.py
+===================================================================
+--- twisted/python/dist.py	(revision 34845)
++++ twisted/python/dist.py	(working copy)
+@@ -1,3 +1,7 @@
++# -*- test-case-name: twisted.python.test.test_dist -*-
++# Copyright (c) Twisted Matrix Laboratories.
++# See LICENSE for details.
++
+ """
+ Distutils convenience functionality.
+ 
+@@ -282,19 +286,20 @@
+ ## Helpers and distutil tweaks
+ 
+ class build_scripts_twisted(build_scripts.build_scripts):
+-    """Renames scripts so they end with '.py' on Windows."""
+-
++    """
++    Renames scripts so they end with '.py' on Windows.
++    """
+     def run(self):
+         build_scripts.build_scripts.run(self)
+         if not os.name == "nt":
+             return
+         for f in os.listdir(self.build_dir):
+-            fpath=os.path.join(self.build_dir, f)
++            fpath = os.path.join(self.build_dir, f)
+             if not fpath.endswith(".py"):
+                 try:
+                     os.unlink(fpath + ".py")
+-                except EnvironmentError, e:
+-                    if e.args[1]=='No such file or directory':
++                except EnvironmentError as e:
++                    if e.args[1] == 'No such file or directory':
+                         pass
+                 os.rename(fpath, fpath + ".py")
+ 
+Index: setup.py
+===================================================================
+--- setup.py	(revision 34845)
++++ setup.py	(working copy)
+@@ -67,10 +67,10 @@
+         try:
+             list(parse_requirements(requirements))
+         except:
+-            print """You seem to be running a very old version of setuptools.
++            print("""You seem to be running a very old version of setuptools.
+ This version of setuptools has a bug parsing dependencies, so automatic
+ dependency resolution is disabled.
+-"""
++""")
+         else:
+             setup_args['install_requires'] = requirements
+         setup_args['include_package_data'] = True

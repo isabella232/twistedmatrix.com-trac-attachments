@@ -1,0 +1,134 @@
+Index: twisted/protocols/tls.py
+===================================================================
+--- twisted/protocols/tls.py	(revision 40245)
++++ twisted/protocols/tls.py	(working copy)
+@@ -37,7 +37,7 @@
+ 
+ from __future__ import division, absolute_import
+ 
+-from OpenSSL.SSL import Error, ZeroReturnError, WantReadError
++from OpenSSL.SSL import Error, ZeroReturnError, WantReadError, WantWriteError
+ from OpenSSL.SSL import TLSv1_METHOD, Context, Connection
+ 
+ try:
+@@ -316,17 +316,33 @@
+         # Now that we ourselves have a transport (initialized by the
+         # ProtocolWrapper.makeConnection call above), kick off the TLS
+         # handshake.
+-        try:
+-            self._tlsConnection.do_handshake()
+-        except WantReadError:
+-            # This is the expected case - there's no data in the connection's
+-            # input buffer yet, so it won't be able to complete the whole
+-            # handshake now.  If this is the speak-first side of the
+-            # connection, then some bytes will be in the send buffer now; flush
+-            # them.
+-            self._flushSendBIO()
++        self.__tryHandshake()
+ 
+ 
++    def __tryHandshake(self):
++        """
++        Attempts to handshake.  OpenSSL wants us to keep trying to
++        handshake until either it works or fails (as opposed to needing
++        to do I/O).
++        """
++        while True:
++            try:
++                self._tlsConnection.do_handshake()
++            except WantReadError:
++                self._flushSendBIO()  # do_handshake may have queued up a send
++                return
++            except WantWriteError:
++                self._flushSendBIO()
++                # And try again immediately
++            except Error as e:
++                self._handshakeDone = True
++                self._tlsShutdownFinished(Failure())
++                return
++            else:
++                self._handshakeDone = True
++                return
++
++
+     def _flushSendBIO(self):
+         """
+         Read any bytes out of the send BIO and write them to the underlying
+@@ -336,11 +352,14 @@
+             bytes = self._tlsConnection.bio_read(2 ** 15)
+         except WantReadError:
+             # There may be nothing in the send BIO right now.
+-            pass
+-        else:
+-            self.transport.write(bytes)
++            return
+ 
++        self.transport.write(bytes)
++        # XXX: This could unblock a recv call, so we should call
++        # self._tlsConnection.recv.  It should also probably loop.
++        # (The OpenSSL BIO interface sucks.)
+ 
++
+     def _flushReceiveBIO(self):
+         """
+         Try to receive any application-level bytes which are now available
+@@ -358,7 +377,7 @@
+                 bytes = self._tlsConnection.recv(2 ** 15)
+             except WantReadError:
+                 # The newly received bytes might not have been enough to produce
+-                # any application data.
++                # any application data or finish a handshake.
+                 break
+             except ZeroReturnError:
+                 # TLS has shut down and no more TLS data will be received over
+@@ -368,13 +387,10 @@
+                 # will get called with reason from underlying transport:
+                 self._tlsShutdownFinished(None)
+             except Error as e:
+-                # Something went pretty wrong.  For example, this might be a
+-                # handshake failure (because there were no shared ciphers, because
+-                # a certificate failed to verify, etc).  TLS can no longer proceed.
+-
+-                # Squash EOF in violation of protocol into ConnectionLost; we
+-                # create Failure before calling _flushSendBio so that no new
+-                # exception will get thrown in the interim.
++                # Something went pretty wrong.  Squash EOF in violation of
++                # protocol into ConnectionLost; we create Failure before calling
++                # _flushSendBio so that no new exception will get thrown in the
++                # interim.
+                 if e.args[0] == -1 and e.args[1] == 'Unexpected EOF':
+                     failure = Failure(CONNECTION_LOST)
+                 else:
+@@ -383,14 +399,10 @@
+                 self._flushSendBIO()
+                 self._tlsShutdownFinished(failure)
+             else:
+-                # If we got application bytes, the handshake must be done by
+-                # now.  Keep track of this to control error reporting later.
+-                self._handshakeDone = True
+                 ProtocolWrapper.dataReceived(self, bytes)
+ 
+         # The received bytes might have generated a response which needs to be
+-        # sent now.  For example, the handshake involves several round-trip
+-        # exchanges without ever producing application-bytes.
++        # sent now.  This is most likely to occur during renegotiation.
+         self._flushSendBIO()
+ 
+ 
+@@ -402,6 +414,9 @@
+         """
+         self._tlsConnection.bio_write(bytes)
+ 
++        if not self._handshakeDone:
++            self.__tryHandshake()
++
+         if self._writeBlockedOnRead:
+             # A read just happened, so we might not be blocked anymore.  Try to
+             # flush all the pending application bytes.
+Index: twisted/web/topfiles/6768.feature
+===================================================================
+--- twisted/web/topfiles/6768.feature	(revision 0)
++++ twisted/web/topfiles/6768.feature	(working copy)
+@@ -0,0 +1 @@
++twisted.web.proxy.ProxyClient (and all of its users in twisted.web.proxy) will now close HTTP connections that they initiate if the incoming connection to the proxy dies before receiving a response.
+\ No newline at end of file

@@ -1,0 +1,109 @@
+--- Twisted-10.0.0/twisted/python/logfile.py	2010-02-21 15:57:49.000000000 -0700
++++ logfile.py	2010-03-17 13:28:29.000000000 -0600
+@@ -8,10 +8,10 @@
+ """
+ 
+ # System Imports
+-import os, glob, time, stat
++import os, glob, time, stat, time
+ 
+ from twisted.python import threadable
+-
++from twisted.internet import threads
+ 
+ 
+ class BaseLogFile:
+@@ -141,6 +141,9 @@
+ 
+     A rotateLength of None disables automatic log rotation.
+     """
++    
++    rotationInProgress = 0 # 0: not in progress, 1: rotating old logs, 2: rotating current log
++    
+     def __init__(self, name, directory, rotateLength=1000000, defaultMode=None,
+                  maxRotatedFiles=None):
+         """
+@@ -171,7 +174,7 @@
+         """
+         Rotate when the log file size is larger than rotateLength.
+         """
+-        return self.rotateLength and self.size >= self.rotateLength
++        return self.rotateLength and (self.size >= self.rotateLength) and not self.rotationInProgress
+ 
+     def getLog(self, identifier):
+         """
+@@ -186,6 +189,10 @@
+         """
+         Write some data to the file.
+         """
++        writeRetries = 0
++        while (self.rotationInProgress == 2) and (writeRetries <= 2):
++            time.sleep(2)
++            writeRetries = writeRetries + 1
+         BaseLogFile.write(self, data)
+         self.size += len(data)
+ 
+@@ -196,18 +203,51 @@
+         If it's not possible to open new logfile, this will fail silently,
+         and continue logging to old logfile.
+         """
+-        if not (os.access(self.directory, os.W_OK) and os.access(self.path, os.W_OK)):
+-            return
+-        logs = self.listLogs()
+-        logs.reverse()
+-        for i in logs:
+-            if self.maxRotatedFiles is not None and i >= self.maxRotatedFiles:
+-                os.remove("%s.%d" % (self.path, i))
+-            else:
+-                os.rename("%s.%d" % (self.path, i), "%s.%d" % (self.path, i + 1))
+-        self._file.close()
+-        os.rename(self.path, "%s.1" % self.path)
+-        self._openFile()
++        
++        def rotateOldLogs():
++            """
++            Rotate log files that aren't the current, and remove any
++            that exceed maxRotatedFiles.
++            """
++            if self.rotationInProgress:
++                return False
++            self.rotationInProgress = 1
++            
++            if not (os.access(self.directory, os.W_OK) and os.access(self.path, os.W_OK)):
++                self.rotationInProgress = 0
++                return False
++            logs = self.listLogs()
++            logs.reverse()
++            for i in logs:
++                if self.maxRotatedFiles is not None and i >= self.maxRotatedFiles:
++                        os.remove("%s.%d" % (self.path, i))
++                else:
++                        os.rename("%s.%d" % (self.path, i), "%s.%d" % (self.path, i + 1))
++            return True
++        
++        def cb_rotateCurrLog(rotateOldLogsSuccess):
++            """
++            Rotate the currently open log file.
++            """
++            if not rotateOldLogsSuccess:
++                return
++            
++            self.rotationInProgress = 2
++            self._file.close()
++            os.rename(self.path, "%s.1" % self.path)
++            self._openFile()
++            
++            self.rotationInProgress = 0
++            
++        def eb_rotateFailed(failure):
++            """
++            Rotation failed. Consume the error.
++            """
++            self.rotationInProgress = 0
++            failure.trap(OSError, IOError)
++        
++        return threads.deferToThread(rotateOldLogs).addCallback(cb_rotateCurrLog
++                                                  ).addErrback(eb_rotateFailed)
+ 
+     def listLogs(self):
+         """

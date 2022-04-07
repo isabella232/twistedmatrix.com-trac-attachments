@@ -1,0 +1,100 @@
+Index: twisted/names/test/test_cache.py
+===================================================================
+--- twisted/names/test/test_cache.py	(revision 34146)
++++ twisted/names/test/test_cache.py	(working copy)
+@@ -6,6 +6,7 @@
+ from twisted.trial import unittest
+ 
+ from twisted.names import dns, cache
++from twisted.internet import task
+ 
+ class Caching(unittest.TestCase):
+     def testLookup(self):
+@@ -20,10 +21,14 @@
+         """
+         r = ([dns.RRHeader("example.com", dns.A, dns.IN, 60,
+                 dns.Record_A("127.0.0.1", 60))], [], [])
++        
++        clock = task.Clock()
+ 
+         c = cache.CacheResolver({
+             dns.Query(name="example.com", type=dns.A, cls=dns.IN) : (
+-                time.time() - 1, r)})
++                clock.seconds(), r)}, clock=clock)
++        
++        clock.advance(1)
+ 
+         def cbLookup(result):
+             self.failUnless(result[0][0].ttl >= 0)
+@@ -40,9 +45,13 @@
+         r = ([dns.RRHeader("example.com", dns.A, dns.IN, 60,
+                 dns.Record_A("127.0.0.1", 60))], [], [])
+ 
++        clock = task.Clock()
++        
+         c = cache.CacheResolver({
+             dns.Query(name="example.com", type=dns.A, cls=dns.IN) : (
+-                time.time() - 60.0001, r)})
++                clock.seconds(), r)}, clock=clock)
++        
++        clock.advance(60.0001)
+ 
+         def cbLookup(result):
+             self.failUnless(result[0][0].ttl >= 0)
+Index: twisted/names/cache.py
+===================================================================
+--- twisted/names/cache.py	(revision 34146)
++++ twisted/names/cache.py	(working copy)
+@@ -20,7 +20,7 @@
+ 
+     cache = None
+ 
+-    def __init__(self, cache = None, verbose = 0):
++    def __init__(self, cache=None, verbose=0, clock=None):
+         common.ResolverBase.__init__(self)
+ 
+         if cache is None:
+@@ -28,12 +28,14 @@
+         self.cache = cache
+         self.verbose = verbose
+         self.cancel = {}
++        from twisted.internet import reactor
++        self.clock = clock or reactor
+ 
+ 
+     def __setstate__(self, state):
+         self.__dict__ = state
+ 
+-        now = time.time()
++        now = self.clock.seconds()
+         for (k, (when, (ans, add, ns))) in self.cache.items():
+             diff = now - when
+             for rec in ans + add + ns:
+@@ -50,7 +52,7 @@
+ 
+ 
+     def _lookup(self, name, cls, type, timeout):
+-        now = time.time()
++        now = self.clock.seconds()
+         q = dns.Query(name, type, cls)
+         try:
+             when, (ans, auth, add) = self.cache[q]
+@@ -77,7 +79,7 @@
+         if self.verbose > 1:
+             log.msg('Adding %r to cache' % query)
+ 
+-        self.cache[query] = (time.time(), payload)
++        self.cache[query] = (self.clock.seconds(), payload)
+ 
+         if self.cancel.has_key(query):
+             self.cancel[query].cancel()
+@@ -87,8 +89,7 @@
+         for r in s:
+             m = min(m, r.ttl)
+ 
+-        from twisted.internet import reactor
+-        self.cancel[query] = reactor.callLater(m, self.clearEntry, query)
++        self.cancel[query] = self.clock.callLater(m, self.clearEntry, query)
+ 
+ 
+     def clearEntry(self, query):

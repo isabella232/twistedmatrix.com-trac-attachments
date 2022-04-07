@@ -1,0 +1,341 @@
+=== modified file 'twisted/web/http.py' (properties changed: -x to +x)
+--- twisted/web/http.py	2009-04-21 12:41:39 +0000
++++ twisted/web/http.py	2009-04-23 22:59:09 +0000
+@@ -9,7 +9,6 @@
+ 
+ Future Plans:
+  - HTTP client support will at some point be refactored to support HTTP/1.1.
+- - Accept chunked data from clients in server.
+  - Other missing HTTP features from the RFC.
+ 
+ Maintainer: Itamar Shtull-Trauring
+@@ -36,6 +35,7 @@
+ from twisted.python import log
+ try: # try importing the fast, C version
+     from twisted.protocols._c_urlarg import unquote
++    unquote # shut up pyflakes
+ except ImportError:
+     from urllib import unquote
+ 
+@@ -1313,14 +1313,23 @@
+     @ivar finish: A flag indicating that the last chunk has been started.  When
+         it finishes, the state will change to C{'finished'} and no more data
+         will be accepted.
++
++    @ivar _maximumChunkSize: The maximum size (in bytes) of chunk to
++        support. The implementation MAY accept larger chunks.
+     """
+     state = 'chunk-length'
+     finish = False
+ 
++    # 2**64 in hex is 10000000000000000 and requires 17 bytes to represent
++    # in chunked encoding. This is used only to limit the amount of (non-data)
++    # bytes to be buffered.
++    _maximumChunkSize = 2**64
++
+     def __init__(self, dataCallback, finishCallback):
+         self.dataCallback = dataCallback
+         self.finishCallback = finishCallback
+         self._buffer = ''
++        self._maximumChunkLengthBytes = len(hex(self._maximumChunkSize)[2:])
+ 
+ 
+     def dataReceived(self, data):
+@@ -1331,32 +1340,81 @@
+         data = self._buffer + data
+         self._buffer = ''
+         while data:
+-            if self.state == 'chunk-length':
++            if self.state == 'ignore-extension':
++                if '\r' in data:
++                    if '\r\n' in data:
++                        self.state = 'chunk-length'
++                    else:
++                        self._buffer = self._savedPreExtensionChunkBytes
++                        if data[-1] == '\r':
++                            # The next byte to arrive could be a \n.
++                            # In that case, the 'ignore-extension' logic will run again
++                            # and switch to state 'chunk-length'.
++
++                            # The next byte to arrive could be NOT \n.
++                            # In that case, the stray \r in the chunk extension will be
++                            # ignored, and self._buffer will be reset back to
++                            # self._savedPreExtensionChunkBytes
++
++                            self._buffer += '\r'
++                        data = ''
++                else:
++                    self._buffer = self._savedPreExtensionChunkBytes
++                    data = ''
++            elif self.state == 'chunk-length':
+                 if '\r\n' in data:
+                     line, rest = data.split('\r\n', 1)
+                     parts = line.split(';')
+-                    self.length = int(parts[0], 16)
+-                    if self.length == 0:
++                    if len(parts[0].strip()) > self._maximumChunkLengthBytes:
++                        raise RuntimeError(
++                            "_ChunkedTransferDecoder.dataReceived got strange bytes for "
++                            "chunk size in parts %s" % (repr(parts),))
++                    try:
++                        length = int(parts[0], 16)
++                    except ValueError:
++                        raise RuntimeError(
++                            "_ChunkedTransferDecoder.dataReceived got invalid "
++                            "chunk size in parts %s" % (repr(parts),))
++                    self.length = length
++                    if self.length < 0:
++                        raise RuntimeError(
++                            "_ChunkedTransferDecoder.dataReceived got negative "
++                            "chunk size in parts %s" % (repr(parts),))
++                    elif self.length == 0:
+                         self.state = 'trailer'
+                         self.finish = True
+                     else:
+                         self.state = 'body'
+                     data = rest
+                 else:
+-                    self._buffer = data
+-                    data = ''
++                    beforeSemicolon = data.split(';', 1)[0].strip()
++                    if len(beforeSemicolon) > self._maximumChunkLengthBytes:
++                        raise RuntimeError(
++                            "_ChunkedTransferDecoder.dataReceived"
++                            "got too many bytes for chunk-length.")
++                    if ';' in data:
++                        self._savedPreExtensionChunkBytes = beforeSemicolon
++                        self.state = 'ignore-extension'
++                        data = ''
++                    else:
++                        self._buffer = data
++                        data = ''
+             elif self.state == 'trailer':
+                 if data.startswith('\r\n'):
+                     data = data[2:]
+                     if self.finish:
+                         self.state = 'finished'
+-                        self.finishCallback(data)
++                        self.finishCallback(data) # here, data is the terminal chunk
+                         data = ''
+                     else:
+                         self.state = 'chunk-length'
+-                else:
++                elif data == '\r':
+                     self._buffer = data
+                     data = ''
++                else:
++                    raise RuntimeError(
++                        "_ChunkedTransferDecoder.dataReceived got bytes %s "
++                        "instead of the desired CRLF trailer." % (repr(data),))
+             elif self.state == 'body':
+                 if len(data) >= self.length:
+                     chunk, data = data[:self.length], data[self.length:]
+
+=== modified file 'twisted/web/test/test_http.py' (properties changed: -x to +x)
+--- twisted/web/test/test_http.py	2009-01-26 00:53:09 +0000
++++ twisted/web/test/test_http.py	2009-04-23 22:56:07 +0000
+@@ -461,6 +461,145 @@
+         self.assertEqual(L, ['abc', '12345', '0123456789'])
+ 
+ 
++    def test_decodingBadTrailerFirstByte(self):
++        """
++        L{_ChunkedTransferDecoder.dataReceived} raises RuntimeError when
++        it expects the first byte of the trailer but gets something else.
++        """
++        L = []
++        p = http._ChunkedTransferDecoder(L.append, None)
++        p.dataReceived('3\r\nabc\r\n4\r\n1234')
++        self.assertRaises(RuntimeError, lambda: p.dataReceived('5'))
++
++
++    def test_decodingButBadSecondByte(self):
++        """
++        L{_ChunkedTransferDecoder.dataReceived} raises RuntimeError when
++        it expects the second byte of the trailer but gets something else.
++        """
++        L = []
++        p = http._ChunkedTransferDecoder(L.append, None)
++        p.dataReceived('3\r\nabc\r\n4\r\n1234')
++        p.dataReceived('\r')
++        self.assertRaises(RuntimeError, lambda: p.dataReceived('x'))
++
++
++    def test_chunkLengthNegative(self):
++        """
++        L{_ChunkedTransferDecoder.dataReceived} raises RuntimeError
++        when the chunk length string is negative.
++        """
++        L = []
++        p = http._ChunkedTransferDecoder(L.append, None)
++        self.assertRaises(RuntimeError, lambda: p.dataReceived('-3\r\nsomething'))
++
++
++    def test_chunkLengthNegativeZero(self):
++        """
++        L{_ChunkedTransferDecoder.dataReceived} does not raise RuntimeError
++        when the chunk length is "-0".
++
++        At this time, stricter RFC2616 validation would bring no benefits.
++        """
++        L = []
++        finished = []
++        p = http._ChunkedTransferDecoder(L.append, finished.append)
++        p.dataReceived('1\r\nX\r\n-0\r\n\r\n')
++        self.assertEqual(L, ['X'])
++        self.assertEqual(finished, [''])
++
++
++    def test_tooLongChunkLength(self):
++        """
++        L{_ChunkedTransferDecoder.dataReceived} raises RuntimeError
++        when the chunk length string is too long.
++        """
++        L = []
++        p = http._ChunkedTransferDecoder(L.append, None)
++        max = p._maximumChunkLengthBytes
++
++        self.assertRaises(RuntimeError, lambda: p.dataReceived(
++            ('9' * (max+1)) + '\r\n' + ('s' * (max+1))))
++
++
++    def test_tooLongChunkLengthWithExtension(self):
++        """
++        L{_ChunkedTransferDecoder.dataReceived} immediately raises
++        RuntimeError when the chunk length string is too long, even when
++        it contains the beginning of a chunk extension.
++        """
++        L = []
++        p = http._ChunkedTransferDecoder(L.append, None)
++        max = p._maximumChunkLengthBytes
++
++        self.assertRaises(RuntimeError, lambda: p.dataReceived(
++            (('9' * (max+1)) + ';')))
++
++
++    def test_tooLongChunkLengthWithExtensionGoodMath(self):
++        """
++        L{_ChunkedTransferDecoder.dataReceived} doesn't include
++        the length of the semicolon when determining the length
++        of the chunked length string.
++        """
++        L = []
++        p = http._ChunkedTransferDecoder(L.append, None)
++        max = p._maximumChunkLengthBytes
++
++        p.dataReceived((('9' * (max)) + ';'))
++
++
++    def test_chunkTooLongSeparate(self):
++        """
++        L{_ChunkedTransferDecoder.dataReceived} raises RuntimeError
++        when the chunk length string is too long, even when the last byte
++        is sent separately.
++        """
++        L = []
++        p = http._ChunkedTransferDecoder(L.append, None)
++        max = p._maximumChunkLengthBytes
++
++        p.dataReceived(('9' * max))
++
++        self.assertRaises(RuntimeError, lambda: p.dataReceived('9'))
++
++
++    def test_chunkInvalidHex(self):
++        """
++        L{_ChunkedTransferDecoder.dataReceived} raises RuntimeError
++        when the chunk is invalid hex.
++        """
++        L = []
++        p = http._ChunkedTransferDecoder(L.append, None)
++        self.assertRaises(RuntimeError, lambda: p.dataReceived(
++            '9G\r\nsomething'))
++
++
++    def test_chunkInvalidGarbage(self):
++        """
++        L{_ChunkedTransferDecoder.dataReceived} raises RuntimeError
++        when the chunk is garbage.
++        """
++        L = []
++        p = http._ChunkedTransferDecoder(L.append, None)
++        self.assertRaises(RuntimeError, lambda: p.dataReceived(
++            '#$\][,.\'!@#*&\r\nsomething'))
++
++
++    def test_shortStrayCRInExtension(self):
++        """
++        L{_ChunkedTransferDecoder.dataReceived} ignores CR in chunk
++        extensions.
++        """
++        L = []
++        finished = []
++        p = http._ChunkedTransferDecoder(L.append, finished.append)
++        for s in '3\r\nabc\r\n5; extension=some\rthing\r\n12345\r\n0\r\n\r\n':
++            p.dataReceived(s)
++        self.assertEqual(L, ['a', 'b', 'c', '1', '2', '3', '4', '5'])
++        self.assertEqual(finished, [''])
++
++
+     def test_short(self):
+         """
+         L{_ChunkedTransferDecoder.dataReceived} decodes chunks broken up and
+@@ -497,6 +636,57 @@
+         self.assertEqual(L, ['abc'])
+ 
+ 
++    def test_extensions(self):
++        """
++        L{_ChunkedTransferDecoder.dataReceived} disregards chunk-extension
++        fields, even when they are long.
++        """
++        L = []
++        p = http._ChunkedTransferDecoder(L.append, None)
++        p.dataReceived('3; x-foo-long-long-long=bar-pretty-long\r\nabc\r\n')
++        self.assertEqual(L, ['abc'])
++
++
++    def test_extensionsShortDelivery(self):
++        """
++        L{_ChunkedTransferDecoder.dataReceived} disregards chunk-extension
++        fields, even when delivered in multiple calls.
++        """
++        L = []
++        p = http._ChunkedTransferDecoder(L.append, None)
++        for s in '3; x-foo-long-long-long=bar-pretty-long\r\nabc\r\n':
++            p.dataReceived(s)
++        self.assertEqual(L, ['a', 'b', 'c'])
++
++
++    def test_extensionsShortDeliveryVariant(self):
++        """
++        L{_ChunkedTransferDecoder.dataReceived} disregards chunk-extension
++        fields, even when delivered in multiple calls, with the first call including
++        the semicolon and space.
++        """
++        L = []
++        p = http._ChunkedTransferDecoder(L.append, None)
++        p.dataReceived('3; ')
++        for s in 'x-foo-long-long-long=bar-pretty-long\r\nabc\r\n':
++            p.dataReceived(s)
++        self.assertEqual(L, ['a', 'b', 'c'])
++
++
++    def test_extensionsShortDeliveryTwoBytes(self):
++        """
++        L{_ChunkedTransferDecoder.dataReceived} disregards chunk-extension
++        fields, even when the chunk requires two bytes of chunk-length bytes to
++        represent the length.
++        """
++        L = []
++        p = http._ChunkedTransferDecoder(L.append, None)
++        # 0x14 == 20
++        for s in '14; x-foo-long-long-long=bar-pretty-long\r\n'+('a'*20)+'\r\n':
++            p.dataReceived(s)
++        self.assertEqual(L, ['a']*20)
++
++
+     def test_finish(self):
+         """
+         L{_ChunkedTransferDecoder.dataReceived} interprets a zero-length
+

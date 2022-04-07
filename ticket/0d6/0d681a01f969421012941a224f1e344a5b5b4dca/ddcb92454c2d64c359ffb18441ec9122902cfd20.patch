@@ -1,0 +1,139 @@
+Index: twisted/test/test_sslverify.py
+===================================================================
+--- twisted/test/test_sslverify.py	(revision 43586)
++++ twisted/test/test_sslverify.py	(working copy)
+@@ -27,6 +27,12 @@
+     if getattr(SSL.Context, "set_tlsext_servername_callback", None) is None:
+         skipSNI = "PyOpenSSL 0.13 or greater required for SNI support."
+ 
++skipWincertstore = False
++try:
++   import wincertstore
++except ImportError:
++   skipWincertstore = True
++
+ from twisted.test.test_twisted import SetAsideModule
+ from twisted.test.iosim import connectedServerAndClient
+ 
+@@ -289,6 +295,11 @@
+         self.factory.onLost.errback(reason)
+ 
+ 
++class FakeCertStore(object):
++    def __init__(self):
++        self._certs = []
++    def add_cert(self, cert):
++        self._certs.append(cert)
+ 
+ class FakeContext(object):
+     """
+@@ -328,6 +339,7 @@
+         self._method = method
+         self._extraCertChain = []
+         self._defaultVerifyPathsSet = False
++        self._store = FakeCertStore()
+ 
+ 
+     def set_options(self, options):
+@@ -376,8 +388,11 @@
+         """
+         self._defaultVerifyPathsSet = True
+ 
++    def get_cert_store(self):
++        return self._store
+ 
+ 
++
+ class ClientOptions(unittest.SynchronousTestCase):
+     """
+     Tests for L{sslverify.optionsForClientTLS}.
+@@ -1257,6 +1272,20 @@
+         opts.getContext()
+         self.assertTrue(fc._defaultVerifyPathsSet)
+ 
++    def test_caCertsWindows(self):
++        """
++        Specifying a C{trustRoot} of L{sslverify.OpenSSLDefaultPaths} when
++        initializing L{sslverify.OpenSSLCertificateOptions} loads the
++        platform-provided trusted certificates via C{set_default_verify_paths}.
++        """
++        opts = sslverify.OpenSSLCertificateOptions(
++            trustRoot=platformTrust()
++        )
++        fc = FakeContext(SSL.TLSv1_METHOD)
++        opts._contextFactory = lambda method: fc
++        opts.getContext()
++        self.assertTrue(len(fc._store._certs) > 0)
++    test_caCertsWindows.skip = skipWincertstore
+ 
+     def test_trustRootPlatformRejectsUntrustedCA(self):
+         """
+Index: twisted/internet/_sslverify.py
+===================================================================
+--- twisted/internet/_sslverify.py	(revision 43586)
++++ twisted/internet/_sslverify.py	(working copy)
+@@ -6,6 +6,7 @@
+ from __future__ import division, absolute_import
+ 
+ import itertools
++import sys
+ import warnings
+ 
+ from binascii import a2b_base64
+@@ -19,6 +20,25 @@
+     SSL_CB_HANDSHAKE_START = 0x10
+     SSL_CB_HANDSHAKE_DONE = 0x20
+ 
++wincertstore = None
++if "win32" == sys.platform:
++    try:
++        import wincertstore
++    except ImportError as e:
++        whatsWrong = (
++            "Without the wincertstore module Twisted can not automatically verify "
++            " SSL/TLS certificates on Windows"
++        )
++
++        warnings.warn_explicit("You do not have a working installation of the "
++                               "wincertstore module: '" + str(e) + "'.  "
++                               "Please install it from "
++                               "<https://pypi.python.org/pypi/service_identity> and make "
++                               "sure all of its dependencies are satisfied.  "
++                               + whatsWrong,
++                               # Unfortunately the lineno is required.
++                               category = UserWarning, filename = "", lineno = 0)
++
+ from twisted.python import log
+ 
+ 
+@@ -958,7 +978,21 @@
+         context.set_default_verify_paths()
+ 
+ 
++@implementer(IOpenSSLTrustRoot)
++class OpenSSLWindowsCertificateAuthorities(object):
++    """
++    Use wincertstore package to interface with the Windows CA certificates.
++    """
++    def _addCACertsToContext(self, context):
++        # Get all certificates and store them in a set to remove duplicates.
++        win_store = wincertstore.CertSystemStore("ROOT")
++        encoded = {cert.get_encoded() for cert in win_store.itercerts()}
+ 
++        for cert in encoded:
++           store = context.get_cert_store()
++           store.add_cert(Certificate.load(cert).original)
++
++
+ def platformTrust():
+     """
+     Attempt to discover a set of trusted certificate authority certificates
+@@ -1026,6 +1060,8 @@
+     @raise NotImplementedError: if this platform is not yet supported by
+         Twisted.  At present, only OpenSSL is supported.
+     """
++    if wincertstore:
++        return OpenSSLWindowsCertificateAuthorities()
+     return OpenSSLDefaultPaths()
+ 
+ 

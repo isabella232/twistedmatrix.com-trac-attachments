@@ -1,0 +1,88 @@
+Index: twisted/topfiles/4748.bugfix
+===================================================================
+--- twisted/topfiles/4748.bugfix	(revision 0)
++++ twisted/topfiles/4748.bugfix	(revision 0)
+@@ -0,0 +1,2 @@
++when some whacky stuff in sys.modules import stuff if you set attributes on them
++don't explode "ValueError: dictionary size changed during iteration"
+Index: twisted/trial/test/test_warning.py
+===================================================================
+--- twisted/trial/test/test_warning.py	(revision 32093)
++++ twisted/trial/test/test_warning.py	(working copy)
+@@ -9,7 +9,8 @@
+ from StringIO import StringIO
+ 
+ from twisted.python.filepath import FilePath
+-from twisted.trial.unittest import TestCase, _collectWarnings
++from twisted.trial.unittest import (TestCase, _collectWarnings,
++                                    _setWarningRegistryToNone)
+ from twisted.trial.reporter import TestResult
+ 
+ class Mask(object):
+@@ -434,3 +435,21 @@
+         sys.modules[key] = key
+         self.addCleanup(sys.modules.pop, key)
+         self.test_duplicateWarningCollected()
++
++
++    def test_collectWarningsChangeWhileIterating(self):
++        """
++        Test that L{_collectWarnings} can't modify a dictionary while
++        iterating. Typically that would be a thing in sys.modules
++        that's not really a module and does some imports on setattr.
++        An example is py.test, but I believe there are others.
++        """
++        d = sys.modules.copy()
++        key1 = object()
++        key2 = object()
++        class A(object):
++            def __setattr__(self, value, item):
++                d[key2] = None
++        d[key1] = A()
++        _setWarningRegistryToNone(d)
++        # assert did not explode
+Index: twisted/trial/unittest.py
+===================================================================
+--- twisted/trial/unittest.py	(revision 32093)
++++ twisted/trial/unittest.py	(working copy)
+@@ -132,7 +132,23 @@
+         self.lineno = lineno
+ 
+ 
++def _setWarningRegistryToNone(d):
++    """ Disable the per-module cache for ever module found in C{d}, typically
++    sys.modules.
++    
++    @ivar d: Dictionary of modules, typically sys.module dict
++    """
++    for v in d.values():
++        if v is not None:
++            try:
++                v.__warningregistry__ = None
++            except:
++                # Don't specify a particular exception type to handle in case
++                # some wacky object raises some wacky exception in response to
++                # the setattr attempt.
++                pass
+ 
++
+ def _collectWarnings(observeWarning, f, *args, **kwargs):
+     """
+     Call C{f} with C{args} positional arguments and C{kwargs} keyword arguments
+@@ -151,15 +167,7 @@
+     # Disable the per-module cache for every module otherwise if the warning
+     # which the caller is expecting us to collect was already emitted it won't
+     # be re-emitted by the call to f which happens below.
+-    for v in sys.modules.itervalues():
+-        if v is not None:
+-            try:
+-                v.__warningregistry__ = None
+-            except:
+-                # Don't specify a particular exception type to handle in case
+-                # some wacky object raises some wacky exception in response to
+-                # the setattr attempt.
+-                pass
++    _setWarningRegistryToNone(sys.modules)
+ 
+     origFilters = warnings.filters[:]
+     origShow = warnings.showwarning

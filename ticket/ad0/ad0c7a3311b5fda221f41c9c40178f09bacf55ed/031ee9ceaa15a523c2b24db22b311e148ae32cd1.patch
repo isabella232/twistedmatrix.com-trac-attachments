@@ -1,0 +1,77 @@
+Index: twisted/internet/abstract.py
+===================================================================
+--- twisted/internet/abstract.py	(revisione 30184)
++++ twisted/internet/abstract.py	(copia locale)
+@@ -322,6 +322,8 @@
+         """Stop consuming data from a producer, without disconnecting.
+         """
+         self.producer = None
++        if self.disconnecting:
++            self.startWriting()
+ 
+     def stopConsuming(self):
+         """Stop consuming data.
+Index: twisted/internet/test/test_tcp.py
+===================================================================
+--- twisted/internet/test/test_tcp.py	(revisione 30184)
++++ twisted/internet/test/test_tcp.py	(copia locale)
+@@ -152,7 +152,59 @@
+         self.assertTrue(connected)
+ 
+ 
++    def test_disconnectEvent(self):
++        """
++        This test checks that we correctly get notifications event for a
++        lost connection. This ought to prevent that sockets get stuck in
++        CLOSE_WAIT state. See #4719.
++        """
++        reactor = self.buildReactor()
+ 
++        state = {}
++        disconnected = []
++
++        class FakeProducer(object):
++            def resumeProducing(self):
++                pass
++            def pauseProducing(self):
++                pass
++
++        def start():
++            producer = FakeProducer()
++            state["A"].transport.registerProducer(producer, True)
++            state["A"].transport.write("a" * (2**16 +1))
++            state["A"].transport.stopProducing()
++            reactor.callLater(0.1, stop)
++
++        def stop():
++            state["A"].transport.unregisterProducer()
++            state["B"].transport.loseConnection()
++            reactor.stop()
++
++        class CheckDisconnectionA(Protocol):
++            def connectionMade(self):
++                state[self.__class__.__name__[-1]] = self
++                if len(state) == 2:
++                    start()
++            def connectionLost(self, reason):
++                disconnected.append(self)
++
++        class CheckDisconnectionB(CheckDisconnectionA):
++            pass
++
++        serverFactory = ServerFactory()
++        serverFactory.protocol = CheckDisconnectionA
++        server = reactor.listenTCP(0, serverFactory)
++        clientFactory = Stop(reactor)
++        clientFactory.protocol = CheckDisconnectionB
++        reactor.connectTCP(
++            '127.0.0.1', server.getHost().port, clientFactory)
++
++        reactor.run()
++
++        self.assertEquals(2, len(disconnected))
++
++
+ class TCPPortTestsBuilder(ReactorBuilder, ObjectModelIntegrationMixin):
+     """
+     Tests for L{IReactorRCP.listenTCP}

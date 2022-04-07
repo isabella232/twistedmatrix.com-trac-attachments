@@ -1,0 +1,227 @@
+Index: twisted/internet/defer.py
+===================================================================
+--- twisted/internet/defer.py	(revision 37563)
++++ twisted/internet/defer.py	(working copy)
+@@ -1097,33 +1097,15 @@
+             return deferred
+ 
+         if isinstance(result, Deferred):
+-            def extendErrbackStack(r):
++            def extendErrbackStack(f):
+                 """
+                 A failure was yielded by the generator, so for the failure's
+                 traceback to be useful insert the current yield line into the
+                 stack of frames.
+                 """
+-                f = g.gi_frame
+-
+-                # The following code is lifted almost straight from
+-                # twisted.python.failure.Failure.__init__()
+-                localz = f.f_locals.copy()
+-                if f.f_locals is f.f_globals:
+-                    globalz = {}
+-                else:
+-                    globalz = f.f_globals.copy()
+-                for d in globalz, localz:
+-                    if d.has_key("__builtins__"):
+-                        del d["__builtins__"]
+-
+-                r.frames.insert(0, [
+-                    f.f_code.co_name,
+-                    f.f_code.co_filename,
+-                    f.f_lineno,
+-                    localz.items(),
+-                    globalz.items(),
+-                    ])
+-                return r
++                f.frames.insert(0, failure.buildFrameRecord(g.gi_frame,
++                    f.captureVars))
++                return f
+             result.addErrback(extendErrbackStack)
+ 
+             # a deferred was yielded, get the result.
+Index: twisted/internet/test/test_inlinecb.py
+===================================================================
+--- twisted/internet/test/test_inlinecb.py	(revision 37563)
++++ twisted/internet/test/test_inlinecb.py	(working copy)
+@@ -12,6 +12,7 @@
+ from __future__ import division, absolute_import
+ 
+ from twisted.trial.unittest import TestCase
++from twisted.internet import defer
+ from twisted.internet.defer import Deferred, returnValue, inlineCallbacks
+ from twisted.python.failure import Failure
+ 
+@@ -90,6 +91,10 @@
+ 
+ 
+ class FrameStackTests(TestCase):
++    def setUp(self):
++        # Restore the debug flag to its original state when done.
++        self.addCleanup(defer.setDebugging, defer.getDebugging())
++
+     def test_failureContainsCallingFrames(self):
+         """
+         When L{inlineCallbacks} yields a failure, it should add itself to the
+@@ -121,3 +126,57 @@
+         self.assertIn('inline2', functionNames)
+         self.assertIn('inline3', functionNames)
+ 
++    def test_framesDoNotIncludeLocalsOrGlobalsWhenDebuggingIsDisabled(self):
++        """
++        When a failure is caught from an L{inlineCallbacks} stack, by default
++        the locals and globals of the intermediate stack frames should not be
++        saved.
++        """
++        defer.setDebugging(False)
++
++        @inlineCallbacks
++        def inline1():
++            yield 1/0
++
++        @inlineCallbacks
++        def inline2(someLocal=3):
++            yield inline1()
++
++        d = inline2()
++        results = []
++        d.addBoth(results.append)
++
++        failure = results[0]
++        self.assertIsInstance(failure, Failure)
++
++        for funcName, filename, lineno, localVars, globalVars in failure.frames:
++            self.assertEqual(len(localVars), 0)
++            self.assertEqual(len(globalVars), 0)
++
++    def test_framesIncludeLocalsAndGlobalsWhenDebuggingIsEnabled(self):
++        """
++        When a failure is caught from an L{inlineCallbacks} stack, if that
++        failure has the captureVars flag set, the flag should be respected.
++        """
++        defer.setDebugging(True)
++
++        @inlineCallbacks
++        def inline1():
++            yield 1/0
++
++        @inlineCallbacks
++        def inline2(someLocal=3):
++            yield inline1()
++
++        d = inline2()
++        results = []
++        d.addBoth(results.append)
++
++        failure = results[0]
++        self.assertIsInstance(failure, Failure)
++
++        for funcName, filename, lineno, localVars, globalVars in failure.frames:
++            self.assertNotEqual(len(globalVars), 0)
++            if funcName == 'inline2':
++                self.assertIn(('someLocal', 3), localVars)
++
+Index: twisted/python/failure.py
+===================================================================
+--- twisted/python/failure.py	(revision 37563)
++++ twisted/python/failure.py	(working copy)
+@@ -73,6 +73,43 @@
+             for name, val in globalVars:
+                 w("  %s : %s\n" %  (name, repr(val)))
+ 
++
++def buildFrameRecord(frame, captureVars, lineno=None):
++    """Builds a frame record, optionally capturing local and global variables.
++
++    @param frame: the frame from which to build the record
++    @type frame: python stack frame
++    @param captureVars: whether or not to capture locals and globals
++    @type captureVars: bool
++    @param lineno: if given, overrides the line number in the stack frame
++    @param lineno: int
++    @returns: (funcName, fileName, lineNumber, locals.items(), globals.items())
++    """
++    if captureVars:
++        localz = frame.f_locals.copy()
++        if frame.f_locals is frame.f_globals:
++            globalz = {}
++        else:
++            globalz = frame.f_globals.copy()
++        for d in globalz, localz:
++            if "__builtins__" in d:
++                del d["__builtins__"]
++        localz = list(localz.items())
++        globalz = list(globalz.items())
++    else:
++        localz = globalz = ()
++
++    if lineno is None:
++        lineno = frame.f_lineno
++    return (
++        frame.f_code.co_name,
++        frame.f_code.co_filename,
++        lineno,
++        localz,
++        globalz,
++        )
++
++
+ # slyphon: i have a need to check for this value in trial
+ #          so I made it a module-level constant
+ EXCEPTION_CAUGHT_HERE = "--- <exception caught here> ---"
+@@ -262,50 +299,14 @@
+         #   what called upon the PB object.
+ 
+         while f:
+-            if captureVars:
+-                localz = f.f_locals.copy()
+-                if f.f_locals is f.f_globals:
+-                    globalz = {}
+-                else:
+-                    globalz = f.f_globals.copy()
+-                for d in globalz, localz:
+-                    if "__builtins__" in d:
+-                        del d["__builtins__"]
+-                localz = localz.items()
+-                globalz = globalz.items()
+-            else:
+-                localz = globalz = ()
+-            stack.insert(0, (
+-                f.f_code.co_name,
+-                f.f_code.co_filename,
+-                f.f_lineno,
+-                localz,
+-                globalz,
+-                ))
++            frameRecord = buildFrameRecord(f, captureVars)
++            stack.insert(0, frameRecord)
+             f = f.f_back
+ 
+         while tb is not None:
+-            f = tb.tb_frame
+-            if captureVars:
+-                localz = f.f_locals.copy()
+-                if f.f_locals is f.f_globals:
+-                    globalz = {}
+-                else:
+-                    globalz = f.f_globals.copy()
+-                for d in globalz, localz:
+-                    if "__builtins__" in d:
+-                        del d["__builtins__"]
+-                localz = list(localz.items())
+-                globalz = list(globalz.items())
+-            else:
+-                localz = globalz = ()
+-            frames.append((
+-                f.f_code.co_name,
+-                f.f_code.co_filename,
+-                tb.tb_lineno,
+-                localz,
+-                globalz,
+-                ))
++            frameRecord = buildFrameRecord(tb.tb_frame, captureVars,
++                lineno=tb.tb_lineno)
++            frames.append(frameRecord)
+             tb = tb.tb_next
+         if inspect.isclass(self.type) and issubclass(self.type, Exception):
+             parentCs = getmro(self.type)

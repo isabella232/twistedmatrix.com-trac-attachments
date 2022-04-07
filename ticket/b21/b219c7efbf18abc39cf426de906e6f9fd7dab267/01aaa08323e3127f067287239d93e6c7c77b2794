@@ -1,0 +1,107 @@
+diff --git twisted/web/test/test_xmlrpc.py twisted/web/test/test_xmlrpc.py
+index bfedd93..3d77d9c 100644
+--- twisted/web/test/test_xmlrpc.py
++++ twisted/web/test/test_xmlrpc.py
+@@ -16,7 +16,7 @@ import datetime
+ from twisted.trial import unittest
+ from twisted.web import xmlrpc
+ from twisted.web.xmlrpc import XMLRPC, payloadTemplate, addIntrospection
+-from twisted.web.xmlrpc import _QueryFactory, withRequest, xmlrpclib
++from twisted.web.xmlrpc import _QueryFactory, withRequest, xmlrpclib, Handler
+ from twisted.web import server, client, error, http, resource as Resource
+ from twisted.internet import reactor, defer
+ from twisted.internet.error import ConnectionDone
+@@ -149,6 +149,15 @@ class Test(XMLRPC):
+             return xmlrpc.Fault(13, "Payload not unicode snowman")
+         return snowman
+ 
++    def xmlrpc_handler(self):
++        """
++        Used to test that returning a Handler subclass works.
++        """
++        class TrueHandler(Handler):
++            def run(self, *args):
++                self.result.callback(True)
++        return TrueHandler(self)
++
+     def xmlrpc_complex(self):
+         return {"a": ["b", "c", 12, []], "D": "foo"}
+ 
+@@ -316,6 +325,7 @@ class XMLRPCTests(unittest.TestCase):
+             ("dict", ({"a": 1}, "a"), 1),
+             ("pair", ("a", 1), ["a", 1]),
+             ("snowman", (u"\u2603"), u"\u2603"),
++            ("handler", (), True),
+             ("complex", (), {"a": ["b", "c", 12, []], "D": "foo"})]
+ 
+         dl = []
+@@ -707,7 +717,7 @@ class XMLRPCIntrospectionTests(XMLRPCTests):
+             self.assertEqual(
+                 meths,
+                 ['add', 'complex', 'defer', 'deferFail',
+-                 'deferFault', 'dict', 'echo', 'fail', 'fault',
++                 'deferFault', 'dict', 'echo', 'fail', 'fault', 'handler',
+                  'pair', 'snowman', 'system.listMethods',
+                  'system.methodHelp',
+                  'system.methodSignature', 'withRequest'])
+diff --git twisted/web/xmlrpc.py twisted/web/xmlrpc.py
+index 3f7a79b..c514a00 100644
+--- twisted/web/xmlrpc.py
++++ twisted/web/xmlrpc.py
+@@ -176,28 +176,35 @@ class XMLRPC(resource.Resource):
+         if responseFailed:
+             return
+ 
+-        if isinstance(result, Handler):
+-            result = result.result
+-        if not isinstance(result, Fault):
+-            result = (result,)
+-        try:
++        def render(result):
+             try:
+-                content = xmlrpclib.dumps(
+-                    result, methodresponse=True,
+-                    allow_none=self.allowNone)
+-            except Exception as e:
+-                f = Fault(self.FAILURE, "Can't serialize output: %s" % (e,))
+-                content = xmlrpclib.dumps(f, methodresponse=True,
+-                                          allow_none=self.allowNone)
+-
+-            if isinstance(content, unicode):
+-                content = content.encode('utf8')
+-            request.setHeader(
+-                b"content-length", intToBytes(len(content)))
+-            request.write(content)
+-        except:
+-            log.err()
+-        request.finish()
++                try:
++                    content = xmlrpclib.dumps(
++                        result, methodresponse=True,
++                        allow_none=self.allowNone)
++                except Exception as e:
++                    f = Fault(
++                        self.FAILURE, "Can't serialize output: %s" % (e,))
++                    content = xmlrpclib.dumps(f, methodresponse=True,
++                                              allow_none=self.allowNone)
++
++                if isinstance(content, unicode):
++                    content = content.encode('utf8')
++                request.setHeader(
++                    b"content-length", intToBytes(len(content)))
++                request.write(content)
++            except:
++                log.err()
++            request.finish()
++
++        if isinstance(result, Handler):
++            d = result.result
++            d.addCallback(lambda result: (result,))
++            d.addCallback(render)
++        else:
++            if not isinstance(result, Fault):
++                result = (result,)
++            render(result)
+ 
+ 
+     def _ebRender(self, failure):

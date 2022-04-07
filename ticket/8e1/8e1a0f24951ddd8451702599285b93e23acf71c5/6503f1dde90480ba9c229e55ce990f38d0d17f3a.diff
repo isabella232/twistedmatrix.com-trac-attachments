@@ -1,0 +1,183 @@
+Index: protocols/socks.py
+===================================================================
+--- protocols/socks.py	(revision 27161)
++++ protocols/socks.py	(working copy)
+@@ -83,25 +83,37 @@
+                     self.buf = complete_buffer
+                     return
+                 server,self.buf=self.buf.split("\000",1)
+-                server = socket.gethostbyname(server) # we need to resolve the host name since the IP is invalid
+-                                                      # you probably will want to use asynchronous DNS, but its a big change.
++                
++                # Resolve the host name asynchronously
++                reactor.resolve(server).addCallback(self.dataReceived2, user,
++                                                    head, version, code, port)
++                return
+             else:
+                 server=socket.inet_ntoa(head[4:8])
+-            assert version==4, "Bad version code: %s"%version
+-            if not self.authorize(code,server,port,user):
+-                self.makeReply(91)
+-                return
+-            if code==1: # CONNECT
+-                d = self.connectClass(server, port, SOCKSv4Outgoing, self)
+-                d.addErrback(lambda result, self=self: self.makeReply(91))
+-            elif code==2: # BIND
+-                ip = socket.gethostbyname(server)
+-                d = self.listenClass(0, SOCKSv4IncomingFactory, self, ip)
+-                d.addCallback(lambda (h, p), self=self: self.makeReply(90, 0, p, h))
+-            else:
+-                raise RuntimeError, "Bad Connect Code: %s" % code
+-            assert self.buf=="","hmm, still stuff in buffer... %s" % repr(self.buf)
++                
++            # We then move to the second stage of setting up the connection
++            # it is put in a seperate function so we avoid duplicating code
++            # for when we need to do a deferred callback.
++            self.dataReceived2(server, user, head, version, code, port)
+ 
++    def dataReceived2(self, server, user, head, version, code, port):
++        
++        assert version==4, "Bad version code: %s"%version
++        
++        if not self.authorize(code,server,port,user):
++            self.makeReply(91)
++            return
++        if code==1: # CONNECT
++            d = self.connectClass(server, port, SOCKSv4Outgoing, self)
++            d.addErrback(lambda result, self=self: self.makeReply(91))
++        elif code==2: # BIND
++            ip = socket.gethostbyname(server)
++            d = self.listenClass(0, SOCKSv4IncomingFactory, self, ip)
++            d.addCallback(lambda (h, p), self=self: self.makeReply(90, 0, p, h))
++        else:
++            raise RuntimeError, "Bad Connect Code: %s" % code
++        assert self.buf=="","hmm, still stuff in buffer... %s" % repr(self.buf)
++
+     def connectionLost(self, reason):
+         if self.otherConn:
+             self.otherConn.transport.loseConnection()
+Index: test/test_socks.py
+===================================================================
+--- test/test_socks.py	(revision 27161)
++++ test/test_socks.py	(working copy)
+@@ -3,7 +3,7 @@
+ from twisted.trial import unittest
+ from twisted.test import proto_helpers
+ import struct, socket
+-from twisted.internet import defer, address
++from twisted.internet import defer, address, reactor
+ from twisted.protocols import socks
+ 
+ class StringTCPTransport(proto_helpers.StringTransport):
+@@ -82,31 +82,44 @@
+         self.sock.connectionLost('fake reason')
+         
+     def test_socks4a(self):
++        
+         # send the domain name "localhost" to be resolved
+         self.sock.dataReceived(
+             struct.pack('!BBH', 4, 1, 34)
+             + socket.inet_aton('0.0.0.1')
+             + 'fooBAZ\0'
+             + 'localhost\0')
+-        sent = self.sock.transport.value()
+-        self.sock.transport.clear()
+-        self.assertEqual(sent,
+-                         struct.pack('!BBH', 0, 90, 34)
+-                         + socket.inet_aton('127.0.0.1'))
+-        self.assert_(not self.sock.transport.stringTCPTransport_closing)
+-        self.assert_(self.sock.driver_outgoing is not None)
+         
+-        # pass some data through
+-        self.sock.dataReceived('hello, world')
+-        self.assertEqual(self.sock.driver_outgoing.transport.value(),
+-                         'hello, world')
+-
+-        # the other way around
+-        self.sock.driver_outgoing.dataReceived('hi there')
+-        self.assertEqual(self.sock.transport.value(), 'hi there')
+-
+-        self.sock.connectionLost('fake reason')
++        # Now we must defer our test because the host name resolution is waiting
++        # in the deferred pipeline.
++        # We require the dummy argument because calling a deferred without any
++        # arguments causes a permanent stall. (I don't know why)
+         
++        def after_resolution(dummy):
++            sent = self.sock.transport.value()
++            self.sock.transport.clear()
++            self.assertEqual(sent,
++                             struct.pack('!BBH', 0, 90, 34)
++                             + socket.inet_aton('127.0.0.1'))
++            self.assert_(not self.sock.transport.stringTCPTransport_closing)
++            self.assert_(self.sock.driver_outgoing is not None)
++                
++            # pass some data through
++            self.sock.dataReceived('hello, world')
++            self.assertEqual(self.sock.driver_outgoing.transport.value(),
++                             'hello, world')
++                
++            # the other way around
++            self.sock.driver_outgoing.dataReceived('hi there')
++            self.assertEqual(self.sock.transport.value(), 'hi there')
++            
++            self.sock.connectionLost('fake reason')
++            
++        d = defer.Deferred()
++        d.addCallback(after_resolution)
++        reactor.callLater(0.1, d.callback, "foo") # the delay can't be too small
++        return d
++        
+     def test_socks4a_firefox_split(self):
+         # Test Firefox behavior - Sometimes Firefox will split the handshake
+         #
+@@ -128,24 +141,32 @@
+         
+         # Now we send the domain
+         self.sock.dataReceived("localhost\0")
+-        sent = self.sock.transport.value()
+-        self.sock.transport.clear()
+-        self.assertEqual(sent,
+-                         struct.pack('!BBH', 0, 90, 34)
+-                         + socket.inet_aton('127.0.0.1'))
+-        self.assert_(not self.sock.transport.stringTCPTransport_closing)
+-        self.assert_(self.sock.driver_outgoing is not None)
+         
+-        # pass some data through
+-        self.sock.dataReceived('hello, world')
+-        self.assertEqual(self.sock.driver_outgoing.transport.value(),
+-                         'hello, world')
+-
+-        # the other way around
+-        self.sock.driver_outgoing.dataReceived('hi there')
+-        self.assertEqual(self.sock.transport.value(), 'hi there')
+-
+-        self.sock.connectionLost('fake reason')
++        # Again we must defer our test because host name resolution is deferred
++        def after_resolution(dummy):
++            sent = self.sock.transport.value()
++            self.sock.transport.clear()
++            self.assertEqual(sent,
++                             struct.pack('!BBH', 0, 90, 34)
++                             + socket.inet_aton('127.0.0.1'))
++            self.assert_(not self.sock.transport.stringTCPTransport_closing)
++            self.assert_(self.sock.driver_outgoing is not None)
++            
++            # pass some data through
++            self.sock.dataReceived('hello, world')
++            self.assertEqual(self.sock.driver_outgoing.transport.value(),
++                             'hello, world')
++            
++            # the other way around
++            self.sock.driver_outgoing.dataReceived('hi there')
++            self.assertEqual(self.sock.transport.value(), 'hi there')
++            
++            self.sock.connectionLost('fake reason')
++            
++        d = defer.Deferred()
++        d.addCallback(after_resolution)
++        reactor.callLater(0.1, d.callback, "foo")
++        return d
+         
+ 
+     def test_access_denied(self):

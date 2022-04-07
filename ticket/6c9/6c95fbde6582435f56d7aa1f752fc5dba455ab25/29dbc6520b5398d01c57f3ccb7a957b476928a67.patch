@@ -1,0 +1,456 @@
+diff --git a/twisted/internet/protocol.py b/twisted/internet/protocol.py
+index 79b0718..fbeefad 100644
+--- a/twisted/internet/protocol.py
++++ b/twisted/internet/protocol.py
+@@ -624,8 +624,9 @@ class AbstractDatagramProtocol:
+         This will be called by makeConnection(), users should not call it.
+         """
+         if not self.numPorts:
+-            if self.noisy:
+-                log.msg("Starting protocol %s" % self)
++            log.msg(eventSource=self,
++                    eventType="start",
++                    protocol=self)
+             self.startProtocol()
+         self.numPorts = self.numPorts + 1
+ 
+@@ -638,8 +639,9 @@ class AbstractDatagramProtocol:
+         self.numPorts = self.numPorts - 1
+         self.transport = None
+         if not self.numPorts:
+-            if self.noisy:
+-                log.msg("Stopping protocol %s" % self)
++            log.msg(eventSource=self,
++                    eventType="stop",
++                    protocol=self)
+             self.stopProtocol()
+ 
+     def startProtocol(self):
+diff --git a/twisted/internet/tcp.py b/twisted/internet/tcp.py
+index 222ae9b..d9602ba 100644
+--- a/twisted/internet/tcp.py
++++ b/twisted/internet/tcp.py
+@@ -860,7 +860,10 @@ class Port(base.BasePort, _SocketCloser):
+         # reflect what the OS actually assigned us.
+         self._realPortNumber = skt.getsockname()[1]
+ 
+-        log.msg("%s starting on %s" % (self.factory.__class__, self._realPortNumber))
++        log.msg(eventSource=self,
++                eventType="start",
++                protocol=self.factory,
++                portNumber=self._realPortNumber)
+ 
+         # The order of the next 6 lines is kind of bizarre.  If no one
+         # can explain it, perhaps we should re-arrange them.
+@@ -975,7 +978,10 @@ class Port(base.BasePort, _SocketCloser):
+         """
+         Log message for closing port
+         """
+-        log.msg('(TCP Port %s Closed)' % (self._realPortNumber,))
++        log.msg(eventSource=self,
++                eventType="stop",
++                protocol=self.factory,
++                portNumber=self._realPortNumber)
+ 
+ 
+     def connectionLost(self, reason):
+diff --git a/twisted/internet/test/test_protocol.py b/twisted/internet/test/test_protocol.py
+index 238a6f9..eb5fa22 100644
+--- a/twisted/internet/test/test_protocol.py
++++ b/twisted/internet/test/test_protocol.py
+@@ -7,11 +7,11 @@ Tests for L{twisted.internet.protocol}.
+ 
+ from twisted.python.failure import Failure
+ from twisted.internet.defer import CancelledError
+-from twisted.internet.protocol import Protocol, ClientCreator
++from twisted.internet.protocol import Protocol, ClientCreator, AbstractDatagramProtocol
+ from twisted.internet.task import Clock
+ from twisted.trial.unittest import TestCase
+ from twisted.test.proto_helpers import MemoryReactor, StringTransport
+-
++from twisted.python import log
+ 
+ 
+ class MemoryConnector:
+@@ -331,3 +331,52 @@ class ClientCreatorTests(TestCase):
+             return d, factory
+         return self._cancelConnectFailedTimeoutTest(connect)
+ 
++
++class AbstractDatagramProtocolTestCase(TestCase):
++    
++    def setUp(self):
++        """
++        Setup L{twisted.internet.protocol.AbstractDatagramProtocol} object.
++        """
++        self.proto = AbstractDatagramProtocol()
++    
++    def test_doStartLogMsg(self):
++        """
++        Verify that L{twisted.internet.protocol.AbstractDatagramProtocol.doStart}
++        logs an event dictionary with the correct parameters.
++        """
++        
++        loggedDicts = []
++        
++        def logDoStartMsg(eventDict):
++            loggedDicts.append(eventDict)
++        
++        log.addObserver(logDoStartMsg)
++        self.proto.doStart()
++        
++        self.assertTrue(isinstance(loggedDicts[0]["eventSource"],
++                                   AbstractDatagramProtocol))
++        self.assertTrue(isinstance(loggedDicts[0]["protocol"],
++                                   AbstractDatagramProtocol))
++        self.assertEquals(loggedDicts[0]["eventType"], "start")
++    
++    def test_doStopLogMsg(self):
++        """
++        Verify that L{twisted.internet.protocol.AbstractDatagramProtocol.doStop}
++        logs an event dictionary with the correct parameters.
++        """
++        
++        loggedDicts = []
++        
++        def logDoStopMsg(eventDict):
++            loggedDicts.append(eventDict)
++        
++        log.addObserver(logDoStopMsg)
++        self.proto.numPorts = 1
++        self.proto.doStop()
++        
++        self.assertTrue(isinstance(loggedDicts[0]["eventSource"],
++                                   AbstractDatagramProtocol))
++        self.assertTrue(isinstance(loggedDicts[0]["protocol"],
++                                   AbstractDatagramProtocol))
++        self.assertEquals(loggedDicts[0]["eventType"], "stop")
+\ No newline at end of file
+diff --git a/twisted/internet/test/test_tcp.py b/twisted/internet/test/test_tcp.py
+index 19f861d..3000889 100644
+--- a/twisted/internet/test/test_tcp.py
++++ b/twisted/internet/test/test_tcp.py
+@@ -23,6 +23,7 @@ from twisted.python.runtime import platform
+ from twisted.python.failure import Failure
+ from twisted.python import log
+ from twisted.trial.unittest import SkipTest
++from twisted.internet.tcp import Port
+ 
+ from twisted.test.test_tcp import ClosingProtocol
+ from twisted.internet.test.test_core import ObjectModelIntegrationMixin
+@@ -322,29 +323,69 @@ class TCPPortTestsBuilder(ReactorBuilder, ObjectModelIntegrationMixin):
+         Get a TCP port from a reactor
+         """
+         return reactor.listenTCP(0, ServerFactory())
+-
+-
+-    def getExpectedConnectionLostLogMsg(self, port):
++    
++    def getExpectedConnectionPortNumber(self, port):
++        """
++        Get the expected port number for the TCP port that experienced
++        the connection event.
++        """
++        return port.getHost().port
++    
++    def test_connectionListeningLogMsg(self):
+         """
+-        Get the expected connection lost message for a TCP port
++        When a connection is made, an informative log dict should be logged
++        (see L{getExpectedConnectionLostLogMsg}) containing: the event source,
++        event type, protocol, and port number.
+         """
+-        return "(TCP Port %s Closed)" % (port.getHost().port,)
+ 
++        loggedDicts = []
++        def logConnectionListeningMsg(eventDict):
++            loggedDicts.append(eventDict)
++        
++        log.addObserver(logConnectionListeningMsg)
++        reactor = self.buildReactor()
++        p = self.getListeningPort(reactor)
++        listenPort = self.getExpectedConnectionPortNumber(p)
++        
++
++        def stopReactor(ignored):
++            log.removeObserver(logConnectionListeningMsg)
++            reactor.stop()
++
++        def doStopListening():
++            maybeDeferred(p.stopListening).addCallback(stopReactor)
++
++        reactor.callWhenRunning(doStopListening)
++        reactor.run()
++        
++        dictHits = 0
++        for eventDict in loggedDicts:
++            if eventDict.has_key("portNumber") and \
++               eventDict.has_key("eventSource") and \
++               eventDict.has_key("protocol") and \
++               eventDict.has_key("eventType") and \
++               eventDict["portNumber"] == listenPort and \
++               eventDict["eventType"] == "start" and \
++               isinstance(eventDict["eventSource"], Port) and \
++               isinstance(eventDict["protocol"], ServerFactory):
++                dictHits = dictHits + 1
++        
++        self.assertTrue(dictHits > 0)
+ 
+     def test_connectionLostLogMsg(self):
+         """
+-        When a connection is lost, an informative message should be logged
+-        (see L{getExpectedConnectionLostLogMsg}): an address identifying
+-        the port and the fact that it was closed.
++        When a connection is lost, an informative log dict should be logged
++        (see L{getExpectedConnectionLostLogMsg}) containing: the event source,
++        event type, protocol, and port number.
+         """
+ 
+-        loggedMessages = []
++        loggedDicts = []
+         def logConnectionLostMsg(eventDict):
+-            loggedMessages.append(log.textFromEventDict(eventDict))
++            loggedDicts.append(eventDict)
+ 
+         reactor = self.buildReactor()
+         p = self.getListeningPort(reactor)
+-        expectedMessage = self.getExpectedConnectionLostLogMsg(p)
++        listenPort = self.getExpectedConnectionPortNumber(p)
+         log.addObserver(logConnectionLostMsg)
+ 
+         def stopReactor(ignored):
+@@ -357,8 +398,20 @@ class TCPPortTestsBuilder(ReactorBuilder, ObjectModelIntegrationMixin):
+ 
+         reactor.callWhenRunning(doStopListening)
+         reactor.run()
+-
+-        self.assertIn(expectedMessage, loggedMessages)
++        
++        dictHits = 0
++        for eventDict in loggedDicts:
++            if eventDict.has_key("portNumber") and \
++               eventDict.has_key("eventSource") and \
++               eventDict.has_key("protocol") and \
++               eventDict.has_key("eventType") and \
++               eventDict["portNumber"] == listenPort and \
++               eventDict["eventType"] == "stop" and \
++               isinstance(eventDict["eventSource"], Port) and \
++               isinstance(eventDict["protocol"], ServerFactory):
++                dictHits = dictHits + 1
++        
++        self.assertTrue(dictHits > 0)
+ 
+ 
+     def test_allNewStyle(self):
+diff --git a/twisted/internet/test/test_udp.py b/twisted/internet/test/test_udp.py
+index 5a6ae53..dc7042e 100644
+--- a/twisted/internet/test/test_udp.py
++++ b/twisted/internet/test/test_udp.py
+@@ -12,6 +12,10 @@ from zope.interface.verify import verifyObject
+ from twisted.internet.test.reactormixins import ReactorBuilder
+ from twisted.internet.interfaces import IListeningPort
+ from twisted.internet.protocol import DatagramProtocol
++from twisted.internet.defer import maybeDeferred
++from twisted.internet.udp import Port
++from twisted.python import log
++
+ 
+ class UDPServerTestsBuilder(ReactorBuilder):
+     """
+@@ -24,5 +28,93 @@ class UDPServerTestsBuilder(ReactorBuilder):
+         reactor = self.buildReactor()
+         port = reactor.listenUDP(0, DatagramProtocol())
+         self.assertTrue(verifyObject(IListeningPort, port))
++    
++    def getListeningPort(self, reactor):
++        """
++        Get a TCP port from a reactor
++        """
++        return reactor.listenUDP(0, DatagramProtocol())
++    
++    def getExpectedConnectionPortNumber(self, port):
++        """
++        Get the expected port number for the TCP port that experienced
++        the connection event.
++        """
++        return port.getHost().port
++    
++    def test_connectionListeningLogMsg(self):
++        """
++        When a connection is made, an informative log dict should be logged
++        (see L{getExpectedConnectionLostLogMsg}) containing: the event source,
++        event type, protocol, and port number.
++        """
++
++        loggedDicts = []
++        def logConnectionListeningMsg(eventDict):
++            loggedDicts.append(eventDict)
++        
++        log.addObserver(logConnectionListeningMsg)
++        reactor = self.buildReactor()
++        p = self.getListeningPort(reactor)
++        listenPort = self.getExpectedConnectionPortNumber(p)
++
++        def stopReactor(*ignored):
++            log.removeObserver(logConnectionListeningMsg)
++            reactor.stop()
++
++        reactor.callWhenRunning(stopReactor)
++        reactor.run()
++        
++        dictHits = 0
++        for eventDict in loggedDicts:
++            if eventDict.has_key("portNumber") and \
++               eventDict.has_key("eventSource") and \
++               eventDict.has_key("protocol") and \
++               eventDict.has_key("eventType") and \
++               eventDict["portNumber"] == listenPort and \
++               eventDict["eventType"] == "start" and \
++               isinstance(eventDict["eventSource"], Port) and \
++               isinstance(eventDict["protocol"], DatagramProtocol):
++                dictHits = dictHits + 1
++        
++        self.assertTrue(dictHits > 0)
++
++    def test_connectionLostLogMsg(self):
++        """
++        When a connection is made, an informative log dict should be logged
++        (see L{getExpectedConnectionLostLogMsg}) containing: the event source,
++        event type, protocol, and port number.
++        """
++
++        loggedDicts = []
++        def logConnectionListeningMsg(eventDict):
++            loggedDicts.append(eventDict)
++        
++        log.addObserver(logConnectionListeningMsg)
++        reactor = self.buildReactor()
++        p = self.getListeningPort(reactor)
++        listenPort = self.getExpectedConnectionPortNumber(p)
++
++        def stopReactor(*ignored):
++            p.connectionLost()
++            log.removeObserver(logConnectionListeningMsg)
++            reactor.stop()
++
++        reactor.callWhenRunning(stopReactor)
++        reactor.run()
++        
++        dictHits = 0
++        for eventDict in loggedDicts:
++            if eventDict.has_key("portNumber") and \
++               eventDict.has_key("eventSource") and \
++               eventDict.has_key("protocol") and \
++               eventDict.has_key("eventType") and \
++               eventDict["portNumber"] == listenPort and \
++               eventDict["eventType"] == "stop" and \
++               isinstance(eventDict["eventSource"], Port) and \
++               isinstance(eventDict["protocol"], DatagramProtocol):
++                dictHits = dictHits + 1
++        
++        self.assertTrue(dictHits > 0)
+ 
+ globals().update(UDPServerTestsBuilder.makeTestCaseClasses())
+diff --git a/twisted/internet/test/test_unix.py b/twisted/internet/test/test_unix.py
+index 8485285..356007d 100644
+--- a/twisted/internet/test/test_unix.py
++++ b/twisted/internet/test/test_unix.py
+@@ -22,10 +22,11 @@ from twisted.internet.address import UNIXAddress
+ from twisted.internet import interfaces
+ from twisted.internet.protocol import (
+     ServerFactory, ClientFactory, DatagramProtocol)
++from twisted.internet.defer import maybeDeferred
+ from twisted.internet.test.reactormixins import ReactorBuilder
+ from twisted.internet.test.test_tcp import TCPPortTestsBuilder
+-
+-
++from twisted.python import log
++from twisted.trial import unittest
+ 
+ class UNIXFamilyMixin:
+     """
+@@ -152,13 +153,52 @@ class UNIXPortTestsBuilder(TCPPortTestsBuilder):
+         Get a UNIX port from a reactor
+         """
+         return reactor.listenUNIX(self.mktemp(), ServerFactory())
+-
+-
++    
+     def getExpectedConnectionLostLogMsg(self, port):
+         """
+         Get the expected connection lost message for a UNIX port
+         """
+         return "(UNIX Port %s Closed)" % (repr(port.port),)
++    
++    def test_connectionListeningLogMsg(self):
++        """
++        When a connection is lost, an informative log dict should be logged
++        (see L{getExpectedConnectionLostLogMsg}) containing: the event source,
++        event type, protocol, and port number.
++        
++        """
++        raise unittest.SkipTest("SKIPPED until UNIX socket protocol adopts" + \
++                                "the passing of an event dictionary to " + \
++                                "log.msg() on start.")
++    
++    def test_connectionLostLogMsg(self):
++        """
++        When a connection is lost, an informative message should be logged
++        (see L{getExpectedConnectionLostLogMsg}): an address identifying
++        the port and the fact that it was closed.
++        """
++
++        loggedMessages = []
++        def logConnectionLostMsg(eventDict):
++            loggedMessages.append(log.textFromEventDict(eventDict))
++
++        reactor = self.buildReactor()
++        p = self.getListeningPort(reactor)
++        expectedMessage = self.getExpectedConnectionLostLogMsg(p)
++        log.addObserver(logConnectionLostMsg)
++
++        def stopReactor(ignored):
++            log.removeObserver(logConnectionLostMsg)
++            reactor.stop()
++
++        def doStopListening():
++            log.addObserver(logConnectionLostMsg)
++            maybeDeferred(p.stopListening).addCallback(stopReactor)
++
++        reactor.callWhenRunning(doStopListening)
++        reactor.run()
++
++        self.assertIn(expectedMessage, loggedMessages)
+ 
+ 
+ 
+diff --git a/twisted/internet/udp.py b/twisted/internet/udp.py
+index 3a21453..c4d4eda 100644
+--- a/twisted/internet/udp.py
++++ b/twisted/internet/udp.py
+@@ -95,8 +95,11 @@ class Port(base.BasePort):
+         # Make sure that if we listened on port 0, we update that to
+         # reflect what the OS actually assigned us.
+         self._realPortNumber = skt.getsockname()[1]
+-
+-        log.msg("%s starting on %s"%(self.protocol.__class__, self._realPortNumber))
++        
++        log.msg(eventSource=self,
++                eventType="start",
++                protocol=self.protocol,
++                portNumber=self._realPortNumber)
+ 
+         self.connected = 1
+         self.socket = skt
+@@ -215,7 +218,10 @@ class Port(base.BasePort):
+         """
+         Cleans up my socket.
+         """
+-        log.msg('(Port %s Closed)' % self._realPortNumber)
++        log.msg(eventSource=self,
++                eventType="stop",
++                protocol=self.protocol,
++                portNumber=self._realPortNumber)
+         self._realPortNumber = None
+         base.BasePort.connectionLost(self, reason)
+         self.protocol.doStop()

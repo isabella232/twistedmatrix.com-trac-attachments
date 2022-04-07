@@ -1,0 +1,2355 @@
+diff --git a/twisted/protocols/amp.py b/twisted/protocols/amp.py
+index a744882..35a81b6 100644
+--- a/twisted/protocols/amp.py
++++ b/twisted/protocols/amp.py
+@@ -171,16 +171,19 @@ has several features:
+       which always issue NUL as the first byte.
+ """
+ 
++from __future__ import unicode_literals
++
+ __metaclass__ = type
+ 
+ import types, warnings
+ 
+-from cStringIO import StringIO
++from io import BytesIO
+ from struct import pack
+ import decimal, datetime
++from functools import partial
+ from itertools import count
+ 
+-from zope.interface import Interface, implements
++from zope.interface import Interface, implementer
+ 
+ from twisted.python.reflect import accumulateClassDict
+ from twisted.python.failure import Failure
+@@ -196,6 +199,9 @@ from twisted.internet.error import PeerVerifyError, ConnectionLost
+ from twisted.internet.error import ConnectionClosed
+ from twisted.internet.defer import Deferred, maybeDeferred, fail
+ from twisted.protocols.basic import Int16StringReceiver, StatefulStringProtocol
++from twisted.python.compat import (
++    iteritems, unicode, nativeString, intToBytes, _PY3, long,
++)
+ 
+ try:
+     from twisted.internet import ssl
+@@ -269,19 +275,20 @@ __all__ = [
+ 
+ 
+ 
+-ASK = '_ask'
+-ANSWER = '_answer'
+-COMMAND = '_command'
+-ERROR = '_error'
+-ERROR_CODE = '_error_code'
+-ERROR_DESCRIPTION = '_error_description'
+-UNKNOWN_ERROR_CODE = 'UNKNOWN'
+-UNHANDLED_ERROR_CODE = 'UNHANDLED'
++ASK = b'_ask'
++ANSWER = b'_answer'
++COMMAND = b'_command'
++ERROR = b'_error'
++ERROR_CODE = b'_error_code'
++ERROR_DESCRIPTION = b'_error_description'
++UNKNOWN_ERROR_CODE = b'UNKNOWN'
++UNHANDLED_ERROR_CODE = b'UNHANDLED'
+ 
+ MAX_KEY_LENGTH = 0xff
+ MAX_VALUE_LENGTH = 0xffff
+ 
+ 
++
+ class IArgumentType(Interface):
+     """
+     An L{IArgumentType} can serialize a Python object into an AMP box and
+@@ -295,18 +302,19 @@ class IArgumentType(Interface):
+         extract one or more Python objects and add them to the C{objects}
+         dictionary.
+ 
+-        @param name: The name associated with this argument.  Most commonly,
++        @param name: The name associated with this argument. Most commonly
+             this is the key which can be used to find a serialized value in
+-            C{strings} and which should be used as the key in C{objects} to
+-            associate with a structured Python object.
+-        @type name: C{str}
++            C{strings}.
++        @type name: C{bytes}
+ 
+         @param strings: The AMP box from which to extract one or more
+             values.
+         @type strings: C{dict}
+ 
+         @param objects: The output dictionary to populate with the value for
+-            this argument.
++            this argument. The key used will be derived from C{name}. It may
++            differ; in Python 3, for example, the key will be a Unicode/native
++            string. See L{_wireNameToPythonIdentifier}.
+         @type objects: C{dict}
+ 
+         @param proto: The protocol instance which received the AMP box being
+@@ -323,19 +331,18 @@ class IArgumentType(Interface):
+         objects, serialize values into one or more strings and add them to
+         the C{strings} dictionary.
+ 
+-        @param name: The name associated with this argument.  Most commonly,
+-            this is the key which can be used to find an object in
+-            C{objects} and which should be used as the key in C{strings} to
+-            associate with a C{str} giving the serialized form of that
+-            object.
+-        @type name: C{str}
++        @param name: The name associated with this argument. Most commonly
++            this is the key in C{strings} to associate with a C{bytes} giving
++            the serialized form of that object.
++        @type name: C{bytes}
+ 
+-        @param strings: The AMP box into which to insert one or more
+-            strings.
++        @param strings: The AMP box into which to insert one or more strings.
+         @type strings: C{dict}
+ 
+         @param objects: The input dictionary from which to extract Python
+-            objects to serialize.
++            objects to serialize. The key used will be derived from C{name}.
++            It may differ; in Python 3, for example, the key will be a
++            Unicode/native string. See L{_wireNameToPythonIdentifier}.
+         @type objects: C{dict}
+ 
+         @param proto: The protocol instance which will send the AMP box once
+@@ -415,6 +422,7 @@ class IResponderLocator(Interface):
+ 
+         @param name: the wire-level name (commandName) of the AMP command to be
+         responded to.
++        @type name: C{bytes}
+ 
+         @return: a 1-argument callable that takes an L{AmpBox} with argument
+         values for the given command, and returns an L{AmpBox} containing
+@@ -522,8 +530,10 @@ class RemoteAmpError(AmpError):
+         """Create a remote error with an error code and description.
+ 
+         @param errorCode: the AMP error code of this error.
++        @type errorCode: C{bytes}
+ 
+         @param description: some text to show to the user.
++        @type description: C{str}
+ 
+         @param fatal: a boolean, true if this error should terminate the
+         connection.
+@@ -536,9 +546,26 @@ class RemoteAmpError(AmpError):
+         else:
+             localwhat = ''
+             othertb = ''
+-        Exception.__init__(self, "Code<%s>%s: %s%s" % (
+-                errorCode, localwhat,
+-                description, othertb))
++
++        # Backslash-escape errorCode. Python 3.5 can do this natively
++        # ("backslashescape") but Python 2.7 and Python 3.4 can't.
++        if _PY3:
++            errorCodeForMessage = "".join(
++                "\\x%2x" % c if c >= 0x80 else chr(c)
++                for c in errorCode)
++        else:
++            errorCodeForMessage = "".join(
++                "\\x%2x" % ord(c) if ord(c) >= 0x80 else c
++                for c in errorCode)
++
++        if othertb:
++            message = "Code<%s>%s: %s\n%s" % (
++                errorCodeForMessage, localwhat, description, othertb)
++        else:
++            message = "Code<%s>%s: %s" % (
++                errorCodeForMessage, localwhat, description)
++
++        super(RemoteAmpError, self).__init__(message)
+         self.local = local
+         self.errorCode = errorCode
+         self.description = description
+@@ -582,12 +609,45 @@ PROTOCOL_ERRORS = {UNHANDLED_ERROR_CODE: UnhandledCommand}
+ 
+ class AmpBox(dict):
+     """
+-    I am a packet in the AMP protocol, much like a regular str:str dictionary.
++    I am a packet in the AMP protocol, much like a regular bytes:bytes dictionary.
+     """
+     __slots__ = []              # be like a regular dictionary, don't magically
+                                 # acquire a __dict__...
+ 
+ 
++    def __init__(self, *args, **kw):
++        """
++        Initialize a new L{AmpBox}.
++
++        In Python 3, keyword arguments MUST be Unicode/native strings whereas
++        in Python 2 they could be either byte strings or Unicode strings.
++
++        However, all keys of an L{AmpBox} MUST be byte strings, or possible to
++        transparently coerce into byte strings (i.e. Python 2).
++
++        In Python 3, therefore, native string keys are coerced to byte strings
++        by encoding as ASCII. This can result in C{UnicodeEncodeError} being
++        raised.
++
++        @param args: See C{dict}, but all keys and values should be C{bytes}.
++            On Python 3, native strings may be used as keys provided they
++            contain only ASCII characters.
++
++        @param kw: See C{dict}, but all keys and values should be C{bytes}.
++            On Python 3, native strings may be used as keys provided they
++            contain only ASCII characters.
++
++        @raise UnicodeEncodeError: When a native string key cannot be coerced
++            to an ASCII byte string (Python 3 only).
++        """
++        super(AmpBox, self).__init__(*args, **kw)
++        if _PY3:
++            nonByteNames = [n for n in self if not isinstance(n, bytes)]
++            for nonByteName in nonByteNames:
++                byteName = nonByteName.encode("ascii")
++                self[byteName] = self.pop(nonByteName)
++
++
+     def copy(self):
+         """
+         Return another AmpBox just like me.
+@@ -601,11 +661,10 @@ class AmpBox(dict):
+         """
+         Convert me into a wire-encoded string.
+ 
+-        @return: a str encoded according to the rules described in the module
+-        docstring.
++        @return: a C{bytes} encoded according to the rules described in the
++            module docstring.
+         """
+-        i = self.items()
+-        i.sort()
++        i = sorted(iteritems(self))
+         L = []
+         w = L.append
+         for k, v in i:
+@@ -622,7 +681,7 @@ class AmpBox(dict):
+                 w(pack("!H", len(kv)))
+                 w(kv)
+         w(pack("!H", 0))
+-        return ''.join(L)
++        return b''.join(L)
+ 
+ 
+     def _sendTo(self, proto):
+@@ -703,6 +762,7 @@ class _SwitchBox(AmpBox):
+ 
+ 
+ 
++@implementer(IBoxReceiver)
+ class BoxDispatcher:
+     """
+     A L{BoxDispatcher} dispatches '_ask', '_answer', and '_error' L{AmpBox}es,
+@@ -728,11 +788,9 @@ class BoxDispatcher:
+     @type boxSender: L{IBoxSender}
+     """
+ 
+-    implements(IBoxReceiver)
+-
+     _failAllReason = None
+     _outstandingRequests = None
+-    _counter = 0L
++    _counter = long(0)
+     boxSender = None
+ 
+     def __init__(self, locator):
+@@ -778,7 +836,12 @@ class BoxDispatcher:
+         @return: a string that has not yet been used on this connection.
+         """
+         self._counter += 1
+-        return '%x' % (self._counter,)
++        if _PY3:
++            # Python 3.4 cannot do % interpolation on byte strings so we must
++            # work with a Unicode string and then encode.
++            return (u'%x' % (self._counter,)).encode("ascii")
++        else:
++            return (b'%x' % (self._counter,))
+ 
+ 
+     def _sendBoxCommand(self, command, box, requiresAnswer=True):
+@@ -795,7 +858,7 @@ class BoxDispatcher:
+         If the Deferred fails and the error is not handled by the caller of
+         this method, the failure will be logged and the connection dropped.
+ 
+-        @param command: a str, the name of the command to issue.
++        @param command: a C{bytes}, the name of the command to issue.
+ 
+         @param box: an AmpBox with the arguments for the command.
+ 
+@@ -827,7 +890,7 @@ class BoxDispatcher:
+         This is a low-level API, designed only for optimizing simple messages
+         for which the overhead of parsing is too great.
+ 
+-        @param command: a str naming the command.
++        @param command: a C{bytes} naming the command.
+ 
+         @param kw: arguments to the amp box.
+ 
+@@ -918,6 +981,8 @@ class BoxDispatcher:
+         question.addErrback(self.unhandledError)
+         errorCode = box[ERROR_CODE]
+         description = box[ERROR_DESCRIPTION]
++        if isinstance(description, bytes):
++            description = description.decode("utf-8", "replace")
+         if errorCode in PROTOCOL_ERRORS:
+             exc = PROTOCOL_ERRORS[errorCode](errorCode, description)
+         else:
+@@ -937,6 +1002,8 @@ class BoxDispatcher:
+             if error.check(RemoteAmpError):
+                 code = error.value.errorCode
+                 desc = error.value.description
++                if isinstance(desc, unicode):
++                    desc = desc.encode("utf-8", "replace")
+                 if error.value.fatal:
+                     errorBox = QuitBox()
+                 else:
+@@ -946,7 +1013,7 @@ class BoxDispatcher:
+                 log.err(error) # here is where server-side logging happens
+                                # if the error isn't handled
+                 code = UNKNOWN_ERROR_CODE
+-                desc = "Unknown Error"
++                desc = b"Unknown Error"
+             errorBox[ERROR] = box[ASK]
+             errorBox[ERROR_DESCRIPTION] = desc
+             errorBox[ERROR_CODE] = code
+@@ -1003,15 +1070,17 @@ class BoxDispatcher:
+         cmd = box[COMMAND]
+         responder = self.locator.locateResponder(cmd)
+         if responder is None:
++            description = "Unhandled Command: %r" % (cmd,)
+             return fail(RemoteAmpError(
+                     UNHANDLED_ERROR_CODE,
+-                    "Unhandled Command: %r" % (cmd,),
++                    description,
+                     False,
+                     local=Failure(UnhandledCommand())))
+         return maybeDeferred(responder, box)
+ 
+ 
+ 
++@implementer(IResponderLocator)
+ class CommandLocator:
+     """
+     A L{CommandLocator} is a collection of responders to AMP L{Command}s, with
+@@ -1059,9 +1128,6 @@ class CommandLocator:
+             return subcls
+ 
+ 
+-    implements(IResponderLocator)
+-
+-
+     def _wrapWithSerialization(self, aCallable, command):
+         """
+         Wrap aCallable with its command's argument de-serialization
+@@ -1121,6 +1187,7 @@ class CommandLocator:
+         Locate a callable to invoke when executing the named command.
+ 
+         @param name: the normalized name (from the wire) of the command.
++        @type name: C{bytes}
+ 
+         @return: a 1-argument function that takes a Box and returns a box or a
+         Deferred which fires a Box, for handling the command identified by the
+@@ -1131,21 +1198,34 @@ class CommandLocator:
+         cd = self._commandDispatch
+         if name in cd:
+             commandClass, responderFunc = cd[name]
+-            responderMethod = types.MethodType(
+-                responderFunc, self, self.__class__)
++            if _PY3:
++                responderMethod = types.MethodType(
++                    responderFunc, self)
++            else:
++                responderMethod = types.MethodType(
++                    responderFunc, self, self.__class__)
+             return self._wrapWithSerialization(responderMethod, commandClass)
+ 
+ 
+ 
++if _PY3:
++    # Python 3 ignores the __metaclass__ attribute and has instead new syntax
++    # for setting the metaclass. Unfortunately it's not valid Python 2 syntax
++    # so we work-around it by recreating CommandLocator using the metaclass
++    # here.
++    CommandLocator = CommandLocator.__metaclass__(
++        "CommandLocator", (CommandLocator, ), {})
++
++
++
++@implementer(IResponderLocator)
+ class SimpleStringLocator(object):
+     """
+     Implement the L{locateResponder} method to do simple, string-based
+     dispatch.
+     """
+ 
+-    implements(IResponderLocator)
+-
+-    baseDispatchPrefix = 'amp_'
++    baseDispatchPrefix = b'amp_'
+ 
+     def locateResponder(self, name):
+         """
+@@ -1156,8 +1236,9 @@ class SimpleStringLocator(object):
+         L{AmpBox} itself as an argument.
+ 
+         @param name: the normalized name (from the wire) of the command.
++        @type name: C{bytes}
+         """
+-        fName = self.baseDispatchPrefix + (name.upper())
++        fName = nativeString(self.baseDispatchPrefix + name.upper())
+         return getattr(self, fName, None)
+ 
+ 
+@@ -1188,18 +1269,20 @@ def _wireNameToPythonIdentifier(key):
+     implemented in a lisp amp dialect may use dashes in argument or command
+     names.
+ 
+-    @param key: a str, looking something like 'foo-bar-baz' or 'from'
++    @param key: a C{bytes}, looking something like 'foo-bar-baz' or 'from'
++    @type key: C{bytes}
+ 
+-    @return: a str which is a valid python identifier, looking something like
+-    'foo_bar_baz' or 'From'.
++    @return: a native string which is a valid python identifier, looking
++    something like 'foo_bar_baz' or 'From'.
+     """
+-    lkey = key.replace("-", "_")
++    lkey = nativeString(key.replace(b"-", b"_"))
+     if lkey in PYTHON_KEYWORDS:
+         return lkey.title()
+     return lkey
+ 
+ 
+ 
++@implementer(IArgumentType)
+ class Argument:
+     """
+     Base-class of all objects that take values from Amp packets and convert
+@@ -1210,7 +1293,6 @@ class Argument:
+     which will be used to define the behavior of L{IArgumentType.toBox} and
+     L{IArgumentType.fromBox}, respectively.
+     """
+-    implements(IArgumentType)
+ 
+     optional = False
+ 
+@@ -1254,14 +1336,14 @@ class Argument:
+         decoded from an 'in' AmpBox mapping strings to string values.
+ 
+         @param name: the argument name to retrieve
+-        @type name: str
++        @type name: C{bytes}
+ 
+         @param strings: The AmpBox to read string(s) from, a mapping of
+         argument names to string values.
+         @type strings: AmpBox
+ 
+         @param objects: The dictionary to write object(s) to, a mapping of
+-        names to Python objects.
++        names to Python objects. Keys will be native strings.
+         @type objects: dict
+ 
+         @param proto: an AMP instance.
+@@ -1280,14 +1362,14 @@ class Argument:
+         mapping names to Python values.
+ 
+         @param name: the argument name to retrieve
+-        @type name: str
++        @type name: C{bytes}
+ 
+         @param strings: The AmpBox to write string(s) to, a mapping of
+         argument names to string values.
+         @type strings: AmpBox
+ 
+         @param objects: The dictionary to read object(s) from, a mapping of
+-        names to Python objects.
++        names to Python objects. Keys should be native strings.
+ 
+         @type objects: dict
+ 
+@@ -1307,6 +1389,7 @@ class Argument:
+         Convert a string to a Python value.
+ 
+         @param inString: the string to convert.
++        @type inString: C{bytes}
+ 
+         @param proto: the protocol we are converting for.
+         @type proto: AMP
+@@ -1333,9 +1416,9 @@ class Argument:
+         Convert a string to a Python object.  Subclasses must implement this.
+ 
+         @param inString: the string to convert.
+-        @type inString: str
++        @type inString: C{bytes}
+ 
+-        @return: the decoded value from inString
++        @return: the decoded value from L{inString}
+         """
+ 
+ 
+@@ -1347,7 +1430,7 @@ class Argument:
+         to deal with.
+ 
+         @return: the wire encoding of inObject
+-        @rtype: str
++        @rtype: C{bytes}
+         """
+ 
+ 
+@@ -1361,7 +1444,7 @@ class Integer(Argument):
+     """
+     fromString = int
+     def toString(self, inObject):
+-        return str(int(inObject))
++        return intToBytes(inObject)
+ 
+ 
+ 
+@@ -1372,7 +1455,6 @@ class String(Argument):
+     def toString(self, inObject):
+         return inObject
+ 
+-
+     def fromString(self, inString):
+         return inString
+ 
+@@ -1392,9 +1474,9 @@ class Boolean(Argument):
+     Encode True or False as "True" or "False" on the wire.
+     """
+     def fromString(self, inString):
+-        if inString == 'True':
++        if inString == b'True':
+             return True
+-        elif inString == 'False':
++        elif inString == b'False':
+             return False
+         else:
+             raise TypeError("Bad boolean value: %r" % (inString,))
+@@ -1402,9 +1484,9 @@ class Boolean(Argument):
+ 
+     def toString(self, inObject):
+         if inObject:
+-            return 'True'
++            return b'True'
+         else:
+-            return 'False'
++            return b'False'
+ 
+ 
+ 
+@@ -1414,12 +1496,10 @@ class Unicode(String):
+     """
+ 
+     def toString(self, inObject):
+-        # assert isinstance(inObject, unicode)
+         return String.toString(self, inObject.encode('utf-8'))
+ 
+ 
+     def fromString(self, inString):
+-        # assert isinstance(inString, str)
+         return String.fromString(self, inString).decode('utf-8')
+ 
+ 
+@@ -1438,7 +1518,7 @@ class Path(Unicode):
+ 
+ 
+     def toString(self, inObject):
+-        return Unicode.toString(self, inObject.path)
++        return Unicode.toString(self, inObject.asTextMode().path)
+ 
+ 
+ 
+@@ -1483,7 +1563,8 @@ class ListOf(Argument):
+         parser = Int16StringReceiver()
+         parser.stringReceived = strings.append
+         parser.dataReceived(inString)
+-        return map(self.elementType.fromString, strings)
++        elementFromString = self.elementType.fromString
++        return [elementFromString(string) for string in strings]
+ 
+ 
+     def toString(self, inObject):
+@@ -1495,7 +1576,7 @@ class ListOf(Argument):
+             serialized = self.elementType.toString(obj)
+             strings.append(pack('!H', len(serialized)))
+             strings.append(serialized)
+-        return ''.join(strings)
++        return b''.join(strings)
+ 
+ 
+ 
+@@ -1518,10 +1599,14 @@ class AmpList(Argument):
+ 
+         @param subargs: a list of 2-tuples of ('name', argument) describing the
+         schema of the dictionaries in the sequence of amp boxes.
++        @type subargs: A C{list} of (C{bytes}, L{Argument}) tuples.
+ 
+         @param optional: a boolean indicating whether this argument can be
+         omitted in the protocol.
+         """
++        assert all(isinstance(name, bytes) for name, _ in subargs), (
++            "AmpList should be defined with a list of (name, argument) "
++            "tuples where `name' is a byte string, got: %r" % (subargs, ))
+         self.subargs = subargs
+         Argument.__init__(self, optional)
+ 
+@@ -1534,7 +1619,7 @@ class AmpList(Argument):
+ 
+ 
+     def toStringProto(self, inObject, proto):
+-        return ''.join([_objectsToStrings(
++        return b''.join([_objectsToStrings(
+                     objects, self.subargs, Box(), proto
+                     ).serialize() for objects in inObject])
+ 
+@@ -1656,18 +1741,55 @@ class Command:
+             reverseErrors = attrs['reverseErrors'] = {}
+             er = attrs['allErrors'] = {}
+             if 'commandName' not in attrs:
+-                attrs['commandName'] = name
++                if _PY3:
++                    attrs['commandName'] = name.encode("ascii")
++                else:
++                    attrs['commandName'] = name
+             newtype = type.__new__(cls, name, bases, attrs)
++
++            if not isinstance(newtype.commandName, bytes):
++                raise TypeError(
++                    "Command names must be byte strings, got: %r"
++                    % (newtype.commandName, ))
++            for name, _ in newtype.arguments:
++                if not isinstance(name, bytes):
++                    raise TypeError(
++                        "Argument names must be byte strings, got: %r"
++                        % (name, ))
++            for name, _ in newtype.response:
++                if not isinstance(name, bytes):
++                    raise TypeError(
++                        "Response names must be byte strings, got: %r"
++                        % (name, ))
++
+             errors = {}
+             fatalErrors = {}
+             accumulateClassDict(newtype, 'errors', errors)
+             accumulateClassDict(newtype, 'fatalErrors', fatalErrors)
+-            for v, k in errors.iteritems():
++
++            if not isinstance(newtype.errors, dict):
++                newtype.errors = dict(newtype.errors)
++            if not isinstance(newtype.fatalErrors, dict):
++                newtype.fatalErrors = dict(newtype.fatalErrors)
++
++            for v, k in iteritems(errors):
+                 reverseErrors[k] = v
+                 er[v] = k
+-            for v, k in fatalErrors.iteritems():
++            for v, k in iteritems(fatalErrors):
+                 reverseErrors[k] = v
+                 er[v] = k
++
++            for _, name in iteritems(newtype.errors):
++                if not isinstance(name, bytes):
++                    raise TypeError(
++                        "Error names must be byte strings, got: %r"
++                        % (name, ))
++            for _, name in iteritems(newtype.fatalErrors):
++                if not isinstance(name, bytes):
++                    raise TypeError(
++                        "Fatal error names must be byte strings, got: %r"
++                        % (name, ))
++
+             return newtype
+ 
+     arguments = []
+@@ -1687,21 +1809,29 @@ class Command:
+         Create an instance of this command with specified values for its
+         parameters.
+ 
++        In Python 3, keyword arguments MUST be Unicode/native strings whereas
++        in Python 2 they could be either byte strings or Unicode strings.
++
++        A L{Command}'s arguments are defined in its schema using C{bytes}
++        names. The values for those arguments are plucked from the keyword
++        arguments using the name returned from L{_wireNameToPythonIdentifier}.
++        In other words, keyword arguments should be named using the
++        Python-side equivalent of the on-wire (C{bytes}) name.
++
+         @param kw: a dict containing an appropriate value for each name
+         specified in the L{arguments} attribute of my class.
+ 
+         @raise InvalidSignature: if you forgot any required arguments.
+         """
+         self.structured = kw
+-        givenArgs = kw.keys()
+         forgotten = []
+         for name, arg in self.arguments:
+             pythonName = _wireNameToPythonIdentifier(name)
+-            if pythonName not in givenArgs and not arg.optional:
++            if pythonName not in self.structured and not arg.optional:
+                 forgotten.append(pythonName)
+         if forgotten:
+             raise InvalidSignature("forgot %s for %s" % (
+-                    ', '.join(forgotten), self.commandName))
++                ', '.join(forgotten), self.commandName))
+         forgotten = []
+ 
+ 
+@@ -1850,6 +1980,14 @@ class Command:
+ 
+ 
+ 
++if _PY3:
++    # Python 3 ignores the __metaclass__ attribute and has instead new syntax
++    # for setting the metaclass. Unfortunately it's not valid Python 2 syntax
++    # so we work-around it by recreating Command using the metaclass here.
++    Command = Command.__metaclass__("Command", (Command, ), {})
++
++
++
+ class _NoCertificate:
+     """
+     This is for peers which don't want to use a local certificate.  Used by
+@@ -1912,7 +2050,7 @@ class _TLSBox(AmpBox):
+ 
+     def __init__(self):
+         if ssl is None:
+-            raise RemoteAmpError("TLS_ERROR", "TLS not available")
++            raise RemoteAmpError(b"TLS_ERROR", "TLS not available")
+         AmpBox.__init__(self)
+ 
+ 
+@@ -1921,16 +2059,16 @@ class _TLSBox(AmpBox):
+ 
+ 
+     # These properties are described in startTLS
+-    certificate = _keyprop('tls_localCertificate', _NoCertificate(False))
+-    verify = _keyprop('tls_verifyAuthorities', None)
++    certificate = _keyprop(b'tls_localCertificate', _NoCertificate(False))
++    verify = _keyprop(b'tls_verifyAuthorities', None)
+ 
+     def _sendTo(self, proto):
+         """
+         Send my encoded value to the protocol, then initiate TLS.
+         """
+         ab = AmpBox(self)
+-        for k in ['tls_localCertificate',
+-                  'tls_verifyAuthorities']:
++        for k in [b'tls_localCertificate',
++                  b'tls_verifyAuthorities']:
+             ab.pop(k, None)
+         ab._sendTo(proto)
+         proto._startTLS(self.certificate, self.verify)
+@@ -1968,11 +2106,11 @@ class StartTLS(Command):
+     response dictionary.
+     """
+ 
+-    arguments = [("tls_localCertificate", _LocalArgument(optional=True)),
+-                 ("tls_verifyAuthorities", _LocalArgument(optional=True))]
++    arguments = [(b"tls_localCertificate", _LocalArgument(optional=True)),
++                 (b"tls_verifyAuthorities", _LocalArgument(optional=True))]
+ 
+-    response = [("tls_localCertificate", _LocalArgument(optional=True)),
+-                ("tls_verifyAuthorities", _LocalArgument(optional=True))]
++    response = [(b"tls_localCertificate", _LocalArgument(optional=True)),
++                (b"tls_verifyAuthorities", _LocalArgument(optional=True))]
+ 
+     responseType = _TLSBox
+ 
+@@ -2062,6 +2200,7 @@ class ProtocolSwitchCommand(Command):
+ 
+ 
+ 
++@implementer(IFileDescriptorReceiver)
+ class _DescriptorExchanger(object):
+     """
+     L{_DescriptorExchanger} is a mixin for L{BinaryBoxProtocol} which adds
+@@ -2084,13 +2223,12 @@ class _DescriptorExchanger(object):
+         ordinals, starting from 0.  This is used to construct values for
+         C{fileDescriptorReceived}.
+     """
+-    implements(IFileDescriptorReceiver)
+ 
+     def __init__(self):
+         self._descriptors = {}
+         self._getDescriptor = self._descriptors.pop
+-        self._sendingDescriptorCounter = count().next
+-        self._receivingDescriptorCounter = count().next
++        self._sendingDescriptorCounter = partial(next, count())
++        self._receivingDescriptorCounter = partial(next, count())
+ 
+ 
+     def _sendFileDescriptor(self, descriptor):
+@@ -2113,6 +2251,7 @@ class _DescriptorExchanger(object):
+ 
+ 
+ 
++@implementer(IBoxSender)
+ class BinaryBoxProtocol(StatefulStringProtocol, Int16StringReceiver,
+                         _DescriptorExchanger):
+     """
+@@ -2146,8 +2285,6 @@ class BinaryBoxProtocol(StatefulStringProtocol, Int16StringReceiver,
+     method will be invoked for each L{AmpBox} that is received.
+     """
+ 
+-    implements(IBoxSender)
+-
+     _justStartedTLS = False
+     _startingTLSBuffer = None
+     _locked = False
+@@ -2442,6 +2579,8 @@ class AMP(BinaryBoxProtocol, BoxDispatcher,
+         Unify the implementations of L{CommandLocator} and
+         L{SimpleStringLocator} to perform both kinds of dispatch, preferring
+         L{CommandLocator}.
++
++        @type name: C{bytes}
+         """
+         firstResponder = CommandLocator.locateResponder(self, name)
+         if firstResponder is not None:
+@@ -2547,7 +2686,7 @@ class _ParserHelper:
+ 
+         @return: a list of AmpBoxes encoded in the given string.
+         """
+-        return cls.parse(StringIO(data))
++        return cls.parse(BytesIO(data))
+     parseString = classmethod(parseString)
+ 
+ 
+@@ -2630,7 +2769,10 @@ class Decimal(Argument):
+     U{http://speleotrove.com/decimal/} should be considered the authoritative
+     specification for the format.
+     """
+-    fromString = decimal.Decimal
++
++    def fromString(self, inString):
++        inString = nativeString(inString)
++        return decimal.Decimal(inString)
+ 
+     def toString(self, inObject):
+         """
+@@ -2638,7 +2780,7 @@ class Decimal(Argument):
+         """
+         if isinstance(inObject, decimal.Decimal):
+             # Hopefully decimal.Decimal.__str__ actually does what we want.
+-            return str(inObject)
++            return str(inObject).encode("ascii")
+         raise ValueError(
+             "amp.Decimal can only encode instances of decimal.Decimal")
+ 
+@@ -2676,6 +2818,8 @@ class DateTime(Argument):
+         Parse a string containing a date and time in the wire format into a
+         C{datetime.datetime} instance.
+         """
++        s = nativeString(s)
++
+         if len(s) != 32:
+             raise ValueError('invalid date format %r' % (s,))
+ 
+@@ -2707,7 +2851,9 @@ class DateTime(Argument):
+         # strftime has no way to format the microseconds, or put a ':' in the
+         # timezone. Surprise!
+ 
+-        return '%04i-%02i-%02iT%02i:%02i:%02i.%06i%s%02i:%02i' % (
++        # Python 3.4 cannot do % interpolation on byte strings so we pack into
++        # an explicitly Unicode string then encode as ASCII.
++        packed = u'%04i-%02i-%02iT%02i:%02i:%02i.%06i%s%02i:%02i' % (
+             i.year,
+             i.month,
+             i.day,
+@@ -2718,3 +2864,5 @@ class DateTime(Argument):
+             sign,
+             abs(minutesOffset) // 60,
+             abs(minutesOffset) % 60)
++
++        return packed.encode("ascii")
+diff --git a/twisted/python/dist3.py b/twisted/python/dist3.py
+index 45c46b1..9a46625 100644
+--- a/twisted/python/dist3.py
++++ b/twisted/python/dist3.py
+@@ -145,6 +145,7 @@ modules = [
+     "twisted.positioning.ipositioning",
+     "twisted.positioning.nmea",
+     "twisted.protocols",
++    "twisted.protocols.amp",
+     "twisted.protocols.basic",
+     "twisted.protocols.policies",
+     "twisted.protocols.test",
+@@ -320,6 +321,7 @@ testModules = [
+     "twisted.python.test.test_versions",
+     "twisted.python.test.test_zippath",
+     "twisted.test.test_abstract",
++    "twisted.test.test_amp",
+     "twisted.test.test_application",
+     "twisted.test.test_compat",
+     "twisted.test.test_context",
+diff --git a/twisted/test/test_amp.py b/twisted/test/test_amp.py
+index be389ee..abc51c4 100644
+--- a/twisted/test/test_amp.py
++++ b/twisted/test/test_amp.py
+@@ -9,10 +9,11 @@ Tests for L{twisted.protocols.amp}.
+ import datetime
+ import decimal
+ 
+-from zope.interface import implements
++from zope.interface import implementer
+ from zope.interface.verify import verifyClass, verifyObject
+ 
+ from twisted.python import filepath
++from twisted.python.compat import intToBytes
+ from twisted.python.failure import Failure
+ from twisted.protocols import amp
+ from twisted.trial import unittest
+@@ -53,6 +54,7 @@ class TestProto(protocol.Protocol):
+     instanceCount = 0
+ 
+     def __init__(self, onConnLost, dataToSend):
++        assert isinstance(dataToSend, bytes), repr(dataToSend)
+         self.onConnLost = onConnLost
+         self.dataToSend = dataToSend
+         self.instanceId = TestProto.instanceCount
+@@ -90,14 +92,11 @@ class SimpleSymmetricProtocol(amp.AMP):
+ 
+     def sendHello(self, text):
+         return self.callRemoteString(
+-            "hello",
++            b"hello",
+             hello=text)
+ 
+     def amp_HELLO(self, box):
+-        return amp.Box(hello=box['hello'])
+-
+-    def amp_HOWDOYOUDO(self, box):
+-        return amp.QuitBox(howdoyoudo='world')
++        return amp.Box(hello=box[b'hello'])
+ 
+ 
+ 
+@@ -118,7 +117,7 @@ class TransportPeer(amp.Argument):
+     # this serves as some informal documentation for how to get variables from
+     # the protocol or your environment and pass them to methods as arguments.
+     def retrieve(self, d, name, proto):
+-        return ''
++        return b''
+ 
+     def fromStringProto(self, notAString, proto):
+         return proto.transport.getPeer()
+@@ -130,44 +129,44 @@ class TransportPeer(amp.Argument):
+ 
+ class Hello(amp.Command):
+ 
+-    commandName = 'hello'
++    commandName = b'hello'
+ 
+-    arguments = [('hello', amp.String()),
+-                 ('optional', amp.Boolean(optional=True)),
+-                 ('print', amp.Unicode(optional=True)),
+-                 ('from', TransportPeer(optional=True)),
+-                 ('mixedCase', amp.String(optional=True)),
+-                 ('dash-arg', amp.String(optional=True)),
+-                 ('underscore_arg', amp.String(optional=True))]
++    arguments = [(b'hello', amp.String()),
++                 (b'optional', amp.Boolean(optional=True)),
++                 (b'print', amp.Unicode(optional=True)),
++                 (b'from', TransportPeer(optional=True)),
++                 (b'mixedCase', amp.String(optional=True)),
++                 (b'dash-arg', amp.String(optional=True)),
++                 (b'underscore_arg', amp.String(optional=True))]
+ 
+-    response = [('hello', amp.String()),
+-                ('print', amp.Unicode(optional=True))]
++    response = [(b'hello', amp.String()),
++                (b'print', amp.Unicode(optional=True))]
+ 
+-    errors = {UnfriendlyGreeting: 'UNFRIENDLY'}
++    errors = {UnfriendlyGreeting: b'UNFRIENDLY'}
+ 
+-    fatalErrors = {DeathThreat: 'DEAD'}
++    fatalErrors = {DeathThreat: b'DEAD'}
+ 
+ class NoAnswerHello(Hello):
+     commandName = Hello.commandName
+     requiresAnswer = False
+ 
+ class FutureHello(amp.Command):
+-    commandName = 'hello'
+-
+-    arguments = [('hello', amp.String()),
+-                 ('optional', amp.Boolean(optional=True)),
+-                 ('print', amp.Unicode(optional=True)),
+-                 ('from', TransportPeer(optional=True)),
+-                 ('bonus', amp.String(optional=True)), # addt'l arguments
+-                                                       # should generally be
+-                                                       # added at the end, and
+-                                                       # be optional...
++    commandName = b'hello'
++
++    arguments = [(b'hello', amp.String()),
++                 (b'optional', amp.Boolean(optional=True)),
++                 (b'print', amp.Unicode(optional=True)),
++                 (b'from', TransportPeer(optional=True)),
++                 (b'bonus', amp.String(optional=True)), # addt'l arguments
++                                                        # should generally be
++                                                        # added at the end, and
++                                                        # be optional...
+                  ]
+ 
+-    response = [('hello', amp.String()),
+-                ('print', amp.Unicode(optional=True))]
++    response = [(b'hello', amp.String()),
++                (b'print', amp.Unicode(optional=True))]
+ 
+-    errors = {UnfriendlyGreeting: 'UNFRIENDLY'}
++    errors = {UnfriendlyGreeting: b'UNFRIENDLY'}
+ 
+ class WTF(amp.Command):
+     """
+@@ -180,44 +179,40 @@ class BrokenReturn(amp.Command):
+     None...
+     """
+ 
+-    commandName = 'broken_return'
++    commandName = b'broken_return'
+ 
+ class Goodbye(amp.Command):
+     # commandName left blank on purpose: this tests implicit command names.
+-    response = [('goodbye', amp.String())]
++    response = [(b'goodbye', amp.String())]
+     responseType = amp.QuitBox
+ 
+-class Howdoyoudo(amp.Command):
+-    commandName = 'howdoyoudo'
+-    # responseType = amp.QuitBox
+-
+ class WaitForever(amp.Command):
+-    commandName = 'wait_forever'
++    commandName = b'wait_forever'
+ 
+ class GetList(amp.Command):
+-    commandName = 'getlist'
+-    arguments = [('length', amp.Integer())]
+-    response = [('body', amp.AmpList([('x', amp.Integer())]))]
++    commandName = b'getlist'
++    arguments = [(b'length', amp.Integer())]
++    response = [(b'body', amp.AmpList([(b'x', amp.Integer())]))]
+ 
+ class DontRejectMe(amp.Command):
+-    commandName = 'dontrejectme'
++    commandName = b'dontrejectme'
+     arguments = [
+-            ('magicWord', amp.Unicode()),
+-            ('list', amp.AmpList([('name', amp.Unicode())], optional=True)),
++            (b'magicWord', amp.Unicode()),
++            (b'list', amp.AmpList([(b'name', amp.Unicode())], optional=True)),
+             ]
+-    response = [('response', amp.Unicode())]
++    response = [(b'response', amp.Unicode())]
+ 
+ class SecuredPing(amp.Command):
+     # XXX TODO: actually make this refuse to send over an insecure connection
+-    response = [('pinged', amp.Boolean())]
++    response = [(b'pinged', amp.Boolean())]
+ 
+ class TestSwitchProto(amp.ProtocolSwitchCommand):
+-    commandName = 'Switch-Proto'
++    commandName = b'Switch-Proto'
+ 
+     arguments = [
+-        ('name', amp.String()),
++        (b'name', amp.String()),
+         ]
+-    errors = {UnknownProtocol: 'UNKNOWN'}
++    errors = {UnknownProtocol: b'UNKNOWN'}
+ 
+ class SingleUseFactory(protocol.ClientFactory):
+     def __init__(self, proto):
+@@ -234,7 +229,7 @@ class SingleUseFactory(protocol.ClientFactory):
+         self.reasonFailed = reason
+         return
+ 
+-THING_I_DONT_UNDERSTAND = 'gwebol nargo'
++THING_I_DONT_UNDERSTAND = b'gwebol nargo'
+ class ThingIDontUnderstandError(Exception):
+     pass
+ 
+@@ -273,9 +268,9 @@ class SimpleSymmetricCommandProtocol(FactoryNotifier):
+         assert From == self.transport.getPeer()
+         if hello == THING_I_DONT_UNDERSTAND:
+             raise ThingIDontUnderstandError()
+-        if hello.startswith('fuck'):
++        if hello.startswith(b'fuck'):
+             raise UnfriendlyGreeting("Don't be a dick.")
+-        if hello == 'die':
++        if hello == b'die':
+             raise DeathThreat("aieeeeeeeee")
+         result = dict(hello=hello)
+         if Print is not None:
+@@ -301,26 +296,22 @@ class SimpleSymmetricCommandProtocol(FactoryNotifier):
+         return self.waiting
+     WaitForever.responder(waitforit)
+ 
+-    def howdo(self):
+-        return dict(howdoyoudo='world')
+-    Howdoyoudo.responder(howdo)
+-
+     def saybye(self):
+-        return dict(goodbye="everyone")
++        return dict(goodbye=b"everyone")
+     Goodbye.responder(saybye)
+ 
+     def switchToTestProtocol(self, fail=False):
+         if fail:
+-            name = 'no-proto'
++            name = b'no-proto'
+         else:
+-            name = 'test-proto'
++            name = b'test-proto'
+         p = TestProto(self.onConnLost, SWITCH_CLIENT_DATA)
+         return self.callRemote(
+             TestSwitchProto,
+             SingleUseFactory(p), name=name).addCallback(lambda ign: p)
+ 
+     def switchit(self, name):
+-        if name == 'test-proto':
++        if name == b'test-proto':
+             return TestProto(self.onConnLost, SWITCH_SERVER_DATA)
+         raise UnknownProtocol(name)
+     TestSwitchProto.responder(switchit)
+@@ -332,11 +323,10 @@ class SimpleSymmetricCommandProtocol(FactoryNotifier):
+ 
+ class DeferredSymmetricCommandProtocol(SimpleSymmetricCommandProtocol):
+     def switchit(self, name):
+-        if name == 'test-proto':
++        if name == b'test-proto':
+             self.maybeLaterProto = TestProto(self.onConnLost, SWITCH_SERVER_DATA)
+             self.maybeLater = defer.Deferred()
+             return self.maybeLater
+-        raise UnknownProtocol(name)
+     TestSwitchProto.responder(switchit)
+ 
+ class BadNoAnswerCommandProtocol(SimpleSymmetricCommandProtocol):
+@@ -350,7 +340,7 @@ class BadNoAnswerCommandProtocol(SimpleSymmetricCommandProtocol):
+ class NoAnswerCommandProtocol(SimpleSymmetricCommandProtocol):
+     def goodNoAnswerResponder(self, hello, From, optional=None, Print=None,
+                               mixedCase=None, dash_arg=None, underscore_arg=None):
+-        return dict(hello=hello+"-noanswer")
++        return dict(hello=hello+b"-noanswer")
+     NoAnswerHello.responder(goodNoAnswerResponder)
+ 
+ def connectedServerAndClient(ServerClass=SimpleSymmetricProtocol,
+@@ -363,7 +353,7 @@ def connectedServerAndClient(ServerClass=SimpleSymmetricProtocol,
+         *a, **kw)
+ 
+ class TotallyDumbProtocol(protocol.Protocol):
+-    buf = ''
++    buf = b''
+     def dataReceived(self, data):
+         self.buf += data
+ 
+@@ -387,8 +377,8 @@ class AmpBoxTests(unittest.TestCase):
+         """
+         Make sure that strs serialize to strs.
+         """
+-        a = amp.AmpBox(key='value')
+-        self.assertEqual(type(a.serialize()), str)
++        a = amp.AmpBox(key=b'value')
++        self.assertEqual(type(a.serialize()), bytes)
+ 
+     def test_serializeUnicodeKeyRaises(self):
+         """
+@@ -415,13 +405,13 @@ class ParsingTests(unittest.TestCase):
+         else.
+         """
+         b = amp.Boolean()
+-        self.assertEqual(b.fromString("True"), True)
+-        self.assertEqual(b.fromString("False"), False)
+-        self.assertRaises(TypeError, b.fromString, "ninja")
+-        self.assertRaises(TypeError, b.fromString, "true")
+-        self.assertRaises(TypeError, b.fromString, "TRUE")
+-        self.assertEqual(b.toString(True), 'True')
+-        self.assertEqual(b.toString(False), 'False')
++        self.assertEqual(b.fromString(b"True"), True)
++        self.assertEqual(b.fromString(b"False"), False)
++        self.assertRaises(TypeError, b.fromString, b"ninja")
++        self.assertRaises(TypeError, b.fromString, b"true")
++        self.assertRaises(TypeError, b.fromString, b"TRUE")
++        self.assertEqual(b.toString(True), b'True')
++        self.assertEqual(b.toString(False), b'False')
+ 
+     def test_pathValueRoundTrip(self):
+         """
+@@ -452,13 +442,13 @@ class ParsingTests(unittest.TestCase):
+         c, s, p = connectedServerAndClient(ClientClass=LiteralAmp,
+                                            ServerClass=LiteralAmp)
+ 
+-        SIMPLE = ('simple', 'test')
+-        CE = ('ceq', ': ')
+-        CR = ('crtest', 'test\r')
+-        LF = ('lftest', 'hello\n')
+-        NEWLINE = ('newline', 'test\r\none\r\ntwo')
+-        NEWLINE2 = ('newline2', 'test\r\none\r\n two')
+-        BODYTEST = ('body', 'blah\r\n\r\ntesttest')
++        SIMPLE = (b'simple', b'test')
++        CE = (b'ceq', b': ')
++        CR = (b'crtest', b'test\r')
++        LF = (b'lftest', b'hello\n')
++        NEWLINE = (b'newline', b'test\r\none\r\ntwo')
++        NEWLINE2 = (b'newline2', b'test\r\none\r\n two')
++        BODYTEST = (b'body', b'blah\r\n\r\ntesttest')
+ 
+         testData = [
+             [SIMPLE],
+@@ -621,18 +611,18 @@ class CommandDispatchTests(unittest.TestCase):
+         fired, and the results translated via the given L{Command}'s response
+         de-serialization.
+         """
+-        D = self.dispatcher.callRemote(Hello, hello='world')
++        D = self.dispatcher.callRemote(Hello, hello=b'world')
+         self.assertEqual(self.sender.sentBoxes,
+-                          [amp.AmpBox(_command="hello",
+-                                      _ask="1",
+-                                      hello="world")])
++                          [amp.AmpBox(_command=b"hello",
++                                      _ask=b"1",
++                                      hello=b"world")])
+         answers = []
+         D.addCallback(answers.append)
+         self.assertEqual(answers, [])
+-        self.dispatcher.ampBoxReceived(amp.AmpBox({'hello': "yay",
+-                                                   'print': "ignored",
+-                                                   '_answer': "1"}))
+-        self.assertEqual(answers, [dict(hello="yay",
++        self.dispatcher.ampBoxReceived(amp.AmpBox({b'hello': b"yay",
++                                                   b'print': b"ignored",
++                                                   b'_answer': b"1"}))
++        self.assertEqual(answers, [dict(hello=b"yay",
+                                          Print=u"ignored")])
+ 
+ 
+@@ -659,11 +649,11 @@ class CommandDispatchTests(unittest.TestCase):
+         """
+         self.sender.expectError()
+ 
+-        callResult = self.dispatcher.callRemote(Hello, hello='world')
++        callResult = self.dispatcher.callRemote(Hello, hello=b'world')
+         callResult.addCallback(lambda result: 1 // 0)
+ 
+         self.dispatcher.ampBoxReceived(amp.AmpBox({
+-                    'hello': "yay", 'print': "ignored", '_answer': "1"}))
++                    b'hello': b"yay", b'print': b"ignored", b'_answer': b"1"}))
+ 
+         self._localCallbackErrorLoggingTest(callResult)
+ 
+@@ -675,12 +665,12 @@ class CommandDispatchTests(unittest.TestCase):
+         """
+         self.sender.expectError()
+ 
+-        callResult = self.dispatcher.callRemote(Hello, hello='world')
++        callResult = self.dispatcher.callRemote(Hello, hello=b'world')
+         callResult.addErrback(lambda result: 1 // 0)
+ 
+         self.dispatcher.ampBoxReceived(amp.AmpBox({
+-                    '_error': '1', '_error_code': 'bugs',
+-                    '_error_description': 'stuff'}))
++                    b'_error': b'1', b'_error_code': b'bugs',
++                    b'_error_description': b'stuff'}))
+ 
+         self._localCallbackErrorLoggingTest(callResult)
+ 
+@@ -690,10 +680,10 @@ class SimpleGreeting(amp.Command):
+     """
+     A very simple greeting command that uses a few basic argument types.
+     """
+-    commandName = 'simple'
+-    arguments = [('greeting', amp.Unicode()),
+-                 ('cookie', amp.Integer())]
+-    response = [('cookieplus', amp.Integer())]
++    commandName = b'simple'
++    arguments = [(b'greeting', amp.Unicode()),
++                 (b'cookie', amp.Integer())]
++    response = [(b'cookieplus', amp.Integer())]
+ 
+ 
+ 
+@@ -738,7 +728,7 @@ class OverrideLocatorAMP(amp.AMP):
+     def __init__(self):
+         amp.AMP.__init__(self)
+         self.customResponder = object()
+-        self.expectations = {"custom": self.customResponder}
++        self.expectations = {b"custom": self.customResponder}
+         self.greetings = []
+ 
+ 
+@@ -775,10 +765,10 @@ class CommandLocatorTests(unittest.TestCase):
+         command.
+         """
+         locator = locatorClass()
+-        responderCallable = locator.locateResponder("simple")
+-        result = responderCallable(amp.Box(greeting="ni hao", cookie="5"))
++        responderCallable = locator.locateResponder(b"simple")
++        result = responderCallable(amp.Box(greeting=b"ni hao", cookie=b"5"))
+         def done(values):
+-            self.assertEqual(values, amp.AmpBox(cookieplus=str(expected)))
++            self.assertEqual(values, amp.AmpBox(cookieplus=intToBytes(expected)))
+         return result.addCallback(done)
+ 
+ 
+@@ -820,16 +810,16 @@ class CommandLocatorTests(unittest.TestCase):
+         customResponderObject = self.assertWarns(
+             PendingDeprecationWarning,
+             "Override locateResponder, not lookupFunction.",
+-            __file__, lambda : locator.locateResponder("custom"))
++            __file__, lambda : locator.locateResponder(b"custom"))
+         self.assertEqual(locator.customResponder, customResponderObject)
+         # Make sure upcalling works too
+         normalResponderObject = self.assertWarns(
+             PendingDeprecationWarning,
+             "Override locateResponder, not lookupFunction.",
+-            __file__, lambda : locator.locateResponder("simple"))
+-        result = normalResponderObject(amp.Box(greeting="ni hao", cookie="5"))
++            __file__, lambda : locator.locateResponder(b"simple"))
++        result = normalResponderObject(amp.Box(greeting=b"ni hao", cookie=b"5"))
+         def done(values):
+-            self.assertEqual(values, amp.AmpBox(cookieplus='8'))
++            self.assertEqual(values, amp.AmpBox(cookieplus=b'8'))
+         return result.addCallback(done)
+ 
+ 
+@@ -842,16 +832,16 @@ class CommandLocatorTests(unittest.TestCase):
+         responderCallable = self.assertWarns(
+             PendingDeprecationWarning,
+             "Call locateResponder, not lookupFunction.", __file__,
+-            lambda : locator.lookupFunction("simple"))
+-        result = responderCallable(amp.Box(greeting="ni hao", cookie="5"))
++            lambda : locator.lookupFunction(b"simple"))
++        result = responderCallable(amp.Box(greeting=b"ni hao", cookie=b"5"))
+         def done(values):
+-            self.assertEqual(values, amp.AmpBox(cookieplus='8'))
++            self.assertEqual(values, amp.AmpBox(cookieplus=b'8'))
+         return result.addCallback(done)
+ 
+ 
+ 
+-SWITCH_CLIENT_DATA = 'Success!'
+-SWITCH_SERVER_DATA = 'No, really.  Success.'
++SWITCH_CLIENT_DATA = b'Success!'
++SWITCH_SERVER_DATA = b'No, really.  Success.'
+ 
+ 
+ class BinaryProtocolTests(unittest.TestCase):
+@@ -903,6 +893,7 @@ class BinaryProtocolTests(unittest.TestCase):
+ 
+ 
+     def write(self, data):
++        self.assertIsInstance(data, bytes)
+         self.data.append(data)
+ 
+ 
+@@ -926,14 +917,14 @@ class BinaryProtocolTests(unittest.TestCase):
+         """
+         class SynchronouslySendingReceiver:
+             def startReceivingBoxes(self, sender):
+-                sender.sendBox(amp.Box({'foo': 'bar'}))
++                sender.sendBox(amp.Box({b'foo': b'bar'}))
+ 
+         transport = StringTransport()
+         protocol = amp.BinaryBoxProtocol(SynchronouslySendingReceiver())
+         protocol.makeConnection(transport)
+         self.assertEqual(
+             transport.value(),
+-            '\x00\x03foo\x00\x03bar\x00\x00')
++            b'\x00\x03foo\x00\x03bar\x00\x00')
+ 
+ 
+     def test_receiveBoxStateMachine(self):
+@@ -945,10 +936,10 @@ class BinaryProtocolTests(unittest.TestCase):
+         it should emit a box and send it to its boxReceiver.
+         """
+         a = amp.BinaryBoxProtocol(self)
+-        a.stringReceived("hello")
+-        a.stringReceived("world")
+-        a.stringReceived("")
+-        self.assertEqual(self.boxes, [amp.AmpBox(hello="world")])
++        a.stringReceived(b"hello")
++        a.stringReceived(b"world")
++        a.stringReceived(b"")
++        self.assertEqual(self.boxes, [amp.AmpBox(hello=b"world")])
+ 
+ 
+     def test_firstBoxFirstKeyExcessiveLength(self):
+@@ -959,7 +950,7 @@ class BinaryProtocolTests(unittest.TestCase):
+         transport = StringTransport()
+         protocol = amp.BinaryBoxProtocol(self)
+         protocol.makeConnection(transport)
+-        protocol.dataReceived('\x01\x00')
++        protocol.dataReceived(b'\x01\x00')
+         self.assertTrue(transport.disconnecting)
+ 
+ 
+@@ -971,9 +962,9 @@ class BinaryProtocolTests(unittest.TestCase):
+         transport = StringTransport()
+         protocol = amp.BinaryBoxProtocol(self)
+         protocol.makeConnection(transport)
+-        protocol.dataReceived('\x00\x01k\x00\x01v')
++        protocol.dataReceived(b'\x00\x01k\x00\x01v')
+         self.assertFalse(transport.disconnecting)
+-        protocol.dataReceived('\x01\x00')
++        protocol.dataReceived(b'\x01\x00')
+         self.assertTrue(transport.disconnecting)
+ 
+ 
+@@ -985,9 +976,9 @@ class BinaryProtocolTests(unittest.TestCase):
+         transport = StringTransport()
+         protocol = amp.BinaryBoxProtocol(self)
+         protocol.makeConnection(transport)
+-        protocol.dataReceived('\x00\x01k\x00\x01v\x00\x00')
++        protocol.dataReceived(b'\x00\x01k\x00\x01v\x00\x00')
+         self.assertFalse(transport.disconnecting)
+-        protocol.dataReceived('\x01\x00')
++        protocol.dataReceived(b'\x01\x00')
+         self.assertTrue(transport.disconnecting)
+ 
+ 
+@@ -999,7 +990,7 @@ class BinaryProtocolTests(unittest.TestCase):
+         """
+         protocol = amp.BinaryBoxProtocol(self)
+         protocol.makeConnection(StringTransport())
+-        protocol.dataReceived('\x01\x00')
++        protocol.dataReceived(b'\x01\x00')
+         protocol.connectionLost(
+             Failure(error.ConnectionDone("simulated connection done")))
+         self.stopReason.trap(amp.TooLong)
+@@ -1040,11 +1031,11 @@ class BinaryProtocolTests(unittest.TestCase):
+         it should emit a similar box to its boxReceiver.
+         """
+         a = amp.BinaryBoxProtocol(self)
+-        a.dataReceived(amp.Box({"testKey": "valueTest",
+-                                "anotherKey": "anotherValue"}).serialize())
++        a.dataReceived(amp.Box({b"testKey": b"valueTest",
++                                b"anotherKey": b"anotherValue"}).serialize())
+         self.assertEqual(self.boxes,
+-                          [amp.Box({"testKey": "valueTest",
+-                                    "anotherKey": "anotherValue"})])
++                          [amp.Box({b"testKey": b"valueTest",
++                                    b"anotherKey": b"anotherValue"})])
+ 
+ 
+     def test_receiveLongerBoxData(self):
+@@ -1053,7 +1044,7 @@ class BinaryProtocolTests(unittest.TestCase):
+         values of up to (2 ** 16 - 1) bytes.
+         """
+         length = (2 ** 16 - 1)
+-        value = 'x' * length
++        value = b'x' * length
+         transport = StringTransport()
+         protocol = amp.BinaryBoxProtocol(self)
+         protocol.makeConnection(transport)
+@@ -1069,11 +1060,11 @@ class BinaryProtocolTests(unittest.TestCase):
+         """
+         a = amp.BinaryBoxProtocol(self)
+         a.makeConnection(self)
+-        aBox = amp.Box({"testKey": "valueTest",
+-                        "someData": "hello"})
++        aBox = amp.Box({b"testKey": b"valueTest",
++                        b"someData": b"hello"})
+         a.makeConnection(self)
+         a.sendBox(aBox)
+-        self.assertEqual(''.join(self.data), aBox.serialize())
++        self.assertEqual(b''.join(self.data), aBox.serialize())
+ 
+ 
+     def test_connectionLostStopSendingBoxes(self):
+@@ -1094,7 +1085,7 @@ class BinaryProtocolTests(unittest.TestCase):
+         on a box boundary.  When a protocol is in the process of switching, it
+         cannot receive traffic.
+         """
+-        otherProto = TestProto(None, "outgoing data")
++        otherProto = TestProto(None, b"outgoing data")
+         test = self
+         class SwitchyReceiver:
+             switched = False
+@@ -1107,20 +1098,20 @@ class BinaryProtocolTests(unittest.TestCase):
+                 a._lockForSwitch()
+                 a._switchTo(otherProto)
+         a = amp.BinaryBoxProtocol(SwitchyReceiver())
+-        anyOldBox = amp.Box({"include": "lots",
+-                             "of": "data"})
++        anyOldBox = amp.Box({b"include": b"lots",
++                             b"of": b"data"})
+         a.makeConnection(self)
+         # Include a 0-length box at the beginning of the next protocol's data,
+         # to make sure that AMP doesn't eat the data or try to deliver extra
+         # boxes either...
+-        moreThanOneBox = anyOldBox.serialize() + "\x00\x00Hello, world!"
++        moreThanOneBox = anyOldBox.serialize() + b"\x00\x00Hello, world!"
+         a.dataReceived(moreThanOneBox)
+         self.assertIdentical(otherProto.transport, self)
+-        self.assertEqual("".join(otherProto.data), "\x00\x00Hello, world!")
+-        self.assertEqual(self.data, ["outgoing data"])
+-        a.dataReceived("more data")
+-        self.assertEqual("".join(otherProto.data),
+-                          "\x00\x00Hello, world!more data")
++        self.assertEqual(b"".join(otherProto.data), b"\x00\x00Hello, world!")
++        self.assertEqual(self.data, [b"outgoing data"])
++        a.dataReceived(b"more data")
++        self.assertEqual(b"".join(otherProto.data),
++                          b"\x00\x00Hello, world!more data")
+         self.assertRaises(amp.ProtocolSwitched, a.sendBox, anyOldBox)
+ 
+ 
+@@ -1132,7 +1123,7 @@ class BinaryProtocolTests(unittest.TestCase):
+         """
+         a = amp.BinaryBoxProtocol(self)
+         a.makeConnection(self)
+-        otherProto = TestProto(None, "")
++        otherProto = TestProto(None, b"")
+         a._switchTo(otherProto)
+         self.assertEqual(otherProto.data, [])
+ 
+@@ -1146,14 +1137,14 @@ class BinaryProtocolTests(unittest.TestCase):
+         """
+         a = amp.BinaryBoxProtocol(self)
+         a.makeConnection(self)
+-        sampleBox = amp.Box({"some": "data"})
++        sampleBox = amp.Box({b"some": b"data"})
+         a._lockForSwitch()
+         self.assertRaises(amp.ProtocolSwitched, a.sendBox, sampleBox)
+         a._unlockFromSwitch()
+         a.sendBox(sampleBox)
+-        self.assertEqual(''.join(self.data), sampleBox.serialize())
++        self.assertEqual(b''.join(self.data), sampleBox.serialize())
+         a._lockForSwitch()
+-        otherProto = TestProto(None, "outgoing data")
++        otherProto = TestProto(None, b"outgoing data")
+         a._switchTo(otherProto)
+         self.assertRaises(amp.ProtocolSwitched, a._unlockFromSwitch)
+ 
+@@ -1223,10 +1214,10 @@ class AMPTests(unittest.TestCase):
+         """
+         c, s, p = connectedServerAndClient()
+         L = []
+-        HELLO = 'world'
++        HELLO = b'world'
+         c.sendHello(HELLO).addCallback(L.append)
+         p.flush()
+-        self.assertEqual(L[0]['hello'], HELLO)
++        self.assertEqual(L[0][b'hello'], HELLO)
+ 
+ 
+     def test_wireFormatRoundTrip(self):
+@@ -1236,10 +1227,10 @@ class AMPTests(unittest.TestCase):
+         """
+         c, s, p = connectedServerAndClient()
+         L = []
+-        HELLO = 'world'
++        HELLO = b'world'
+         c.sendHello(HELLO).addCallback(L.append)
+         p.flush()
+-        self.assertEqual(L[0]['hello'], HELLO)
++        self.assertEqual(L[0][b'hello'], HELLO)
+ 
+ 
+     def test_helloWorldUnicode(self):
+@@ -1250,8 +1241,8 @@ class AMPTests(unittest.TestCase):
+             ServerClass=SimpleSymmetricCommandProtocol,
+             ClientClass=SimpleSymmetricCommandProtocol)
+         L = []
+-        HELLO = 'world'
+-        HELLO_UNICODE = 'wor\u1234ld'
++        HELLO = b'world'
++        HELLO_UNICODE = u'wor\u1234ld'
+         c.sendUnicodeHello(HELLO, HELLO_UNICODE).addCallback(L.append)
+         p.flush()
+         self.assertEqual(L[0]['hello'], HELLO)
+@@ -1264,7 +1255,7 @@ class AMPTests(unittest.TestCase):
+         is C{False}.
+         """
+         c, s, p = connectedServerAndClient()
+-        ret = c.callRemoteString("WTF", requiresAnswer=False)
++        ret = c.callRemoteString(b"WTF", requiresAnswer=False)
+         self.assertIdentical(ret, None)
+ 
+ 
+@@ -1281,13 +1272,13 @@ class AMPTests(unittest.TestCase):
+             """
+             e.trap(amp.UnhandledCommand)
+             return "OK"
+-        c.callRemoteString("WTF").addErrback(clearAndAdd).addCallback(L.append)
++        c.callRemoteString(b"WTF").addErrback(clearAndAdd).addCallback(L.append)
+         p.flush()
+         self.assertEqual(L.pop(), "OK")
+-        HELLO = 'world'
++        HELLO = b'world'
+         c.sendHello(HELLO).addCallback(L.append)
+         p.flush()
+-        self.assertEqual(L[0]['hello'], HELLO)
++        self.assertEqual(L[0][b'hello'], HELLO)
+ 
+ 
+     def test_unknownCommandHigh(self):
+@@ -1306,10 +1297,10 @@ class AMPTests(unittest.TestCase):
+         c.callRemote(WTF).addErrback(clearAndAdd).addCallback(L.append)
+         p.flush()
+         self.assertEqual(L.pop(), "OK")
+-        HELLO = 'world'
++        HELLO = b'world'
+         c.sendHello(HELLO).addCallback(L.append)
+         p.flush()
+-        self.assertEqual(L[0]['hello'], HELLO)
++        self.assertEqual(L[0][b'hello'], HELLO)
+ 
+ 
+     def test_brokenReturnValue(self):
+@@ -1336,11 +1327,11 @@ class AMPTests(unittest.TestCase):
+             ServerClass=SimpleSymmetricCommandProtocol,
+             ClientClass=SimpleSymmetricCommandProtocol)
+         L = []
+-        HELLO = 'world'
++        HELLO = b'world'
+         # c.sendHello(HELLO).addCallback(L.append)
+         c.callRemote(FutureHello,
+                      hello=HELLO,
+-                     bonus="I'm not in the book!").addCallback(
++                     bonus=b"I'm not in the book!").addCallback(
+             L.append)
+         p.flush()
+         self.assertEqual(L[0]['hello'], HELLO)
+@@ -1360,7 +1351,7 @@ class AMPTests(unittest.TestCase):
+         """
+         Verify that L{AMP} objects output their innerProtocol when set.
+         """
+-        otherProto = TestProto(None, "outgoing data")
++        otherProto = TestProto(None, b"outgoing data")
+         a = amp.AMP()
+         a.innerProtocol = otherProto
+ 
+@@ -1395,12 +1386,12 @@ class AMPTests(unittest.TestCase):
+         c, s, p = connectedServerAndClient()
+         x = "H" * (0xff+1)
+         tl = self.assertRaises(amp.TooLong,
+-                               c.callRemoteString, "Hello",
+-                               **{x: "hi"})
++                               c.callRemoteString, b"Hello",
++                               **{x: b"hi"})
+         self.assertTrue(tl.isKey)
+         self.assertTrue(tl.isLocal)
+         self.assertIdentical(tl.keyName, None)
+-        self.assertEqual(tl.value, x)
++        self.assertEqual(tl.value, x.encode("ascii"))
+         self.assertIn(str(len(x)), repr(tl))
+         self.assertIn("key", repr(tl))
+ 
+@@ -1411,12 +1402,12 @@ class AMPTests(unittest.TestCase):
+         raise an exception.
+         """
+         c, s, p = connectedServerAndClient()
+-        x = "H" * (0xffff+1)
++        x = b"H" * (0xffff+1)
+         tl = self.assertRaises(amp.TooLong, c.sendHello, x)
+         p.flush()
+         self.assertFalse(tl.isKey)
+         self.assertTrue(tl.isLocal)
+-        self.assertEqual(tl.keyName, 'hello')
++        self.assertEqual(tl.keyName, b'hello')
+         self.failUnlessIdentical(tl.value, x)
+         self.assertTrue(str(len(x)) in repr(tl))
+         self.assertTrue("value" in repr(tl))
+@@ -1432,7 +1423,7 @@ class AMPTests(unittest.TestCase):
+             ServerClass=SimpleSymmetricCommandProtocol,
+             ClientClass=SimpleSymmetricCommandProtocol)
+         L = []
+-        HELLO = 'world'
++        HELLO = b'world'
+         c.sendHello(HELLO).addCallback(L.append)
+         p.flush()
+         self.assertEqual(L[0]['hello'], HELLO)
+@@ -1448,7 +1439,7 @@ class AMPTests(unittest.TestCase):
+         c, s, p = connectedServerAndClient(
+             ServerClass=SimpleSymmetricCommandProtocol,
+             ClientClass=SimpleSymmetricCommandProtocol)
+-        HELLO = 'fuck you'
++        HELLO = b'fuck you'
+         c.sendHello(HELLO).addErrback(L.append)
+         p.flush()
+         L[0].trap(UnfriendlyGreeting)
+@@ -1466,7 +1457,7 @@ class AMPTests(unittest.TestCase):
+         c, s, p = connectedServerAndClient(
+             ServerClass=SimpleSymmetricCommandProtocol,
+             ClientClass=SimpleSymmetricCommandProtocol)
+-        HELLO = 'die'
++        HELLO = b'die'
+         c.sendHello(HELLO).addErrback(L.append)
+         p.flush()
+         L.pop().trap(DeathThreat)
+@@ -1526,7 +1517,7 @@ class AMPTests(unittest.TestCase):
+         c, s, p = connectedServerAndClient(
+             ServerClass=SimpleSymmetricCommandProtocol,
+             ClientClass=SimpleSymmetricCommandProtocol)
+-        HELLO = 'world'
++        HELLO = b'world'
+         c.callRemote(NoAnswerHello, hello=HELLO)
+         p.flush()
+         self.assertTrue(s.greeted)
+@@ -1540,12 +1531,12 @@ class AMPTests(unittest.TestCase):
+         c, s, p = connectedServerAndClient(
+             ServerClass=SimpleSymmetricCommandProtocol,
+             ClientClass=SimpleSymmetricCommandProtocol)
+-        HELLO = 'fuck you'
++        HELLO = b'fuck you'
+         c.callRemote(NoAnswerHello, hello=HELLO)
+         p.flush()
+         # This should be logged locally.
+         self.assertTrue(self.flushLoggedErrors(amp.RemoteAmpError))
+-        HELLO = 'world'
++        HELLO = b'world'
+         c.callRemote(Hello, hello=HELLO).addErrback(L.append)
+         p.flush()
+         L.pop().trap(error.ConnectionDone)
+@@ -1564,7 +1555,7 @@ class AMPTests(unittest.TestCase):
+         c, s, p = connectedServerAndClient(
+             ServerClass=BadNoAnswerCommandProtocol,
+             ClientClass=SimpleSymmetricCommandProtocol)
+-        c.callRemote(NoAnswerHello, hello="hello")
++        c.callRemote(NoAnswerHello, hello=b"hello")
+         p.flush()
+         le = self.flushLoggedErrors(amp.BadLocalReturn)
+         self.assertEqual(len(le), 1)
+@@ -1580,10 +1571,10 @@ class AMPTests(unittest.TestCase):
+             ServerClass=NoAnswerCommandProtocol,
+             ClientClass=SimpleSymmetricCommandProtocol)
+         L = []
+-        c.callRemote(Hello, hello="Hello!").addCallback(L.append)
++        c.callRemote(Hello, hello=b"Hello!").addCallback(L.append)
+         p.flush()
+         self.assertEqual(len(L), 1)
+-        self.assertEqual(L, [dict(hello="Hello!-noanswer",
++        self.assertEqual(L, [dict(hello=b"Hello!-noanswer",
+                                    Print=None)])  # Optional response argument
+ 
+ 
+@@ -1625,7 +1616,7 @@ class AMPTests(unittest.TestCase):
+             ClientClass=SimpleSymmetricCommandProtocol)
+         L = []
+         c.callRemote(DontRejectMe, magicWord=u'please',
+-                list=[{'name': 'foo'}]).addCallback(L.append)
++                list=[{'name': u'foo'}]).addCallback(L.append)
+         p.flush()
+         response = L.pop().get('response')
+         self.assertEqual(response, 'foo accepted')
+@@ -1680,14 +1671,14 @@ class AMPTests(unittest.TestCase):
+             c.callRemote(WaitForever).addErrback(wfdr.append)
+         switchDeferred = c.switchToTestProtocol()
+         if spuriousTraffic:
+-            self.assertRaises(amp.ProtocolSwitched, c.sendHello, 'world')
++            self.assertRaises(amp.ProtocolSwitched, c.sendHello, b'world')
+ 
+-        def cbConnsLost(((serverSuccess, serverData),
+-                         (clientSuccess, clientData))):
++        def cbConnsLost(info):
++            ((serverSuccess, serverData), (clientSuccess, clientData)) = info
+             self.assertTrue(serverSuccess)
+             self.assertTrue(clientSuccess)
+-            self.assertEqual(''.join(serverData), SWITCH_CLIENT_DATA)
+-            self.assertEqual(''.join(clientData), SWITCH_SERVER_DATA)
++            self.assertEqual(b''.join(serverData), SWITCH_CLIENT_DATA)
++            self.assertEqual(b''.join(clientData), SWITCH_SERVER_DATA)
+             self.testSucceeded = True
+ 
+         def cbSwitch(proto):
+@@ -1704,7 +1695,7 @@ class AMPTests(unittest.TestCase):
+             # going to corrupt the connection, we do it before it's closed.
+             if spuriousError:
+                 s.waiting.errback(amp.RemoteAmpError(
+-                        "SPURIOUS",
++                        b"SPURIOUS",
+                         "Here's some traffic in the form of an error."))
+             else:
+                 s.waiting.callback({})
+@@ -1742,9 +1733,9 @@ class AMPTests(unittest.TestCase):
+         self.assertFalse(self.testSucceeded)
+         # It's a known error, so let's send a "hello" on the same connection;
+         # it should work.
+-        c.sendHello('world').addCallback(L.append)
++        c.sendHello(b'world').addCallback(L.append)
+         p.flush()
+-        self.assertEqual(L.pop()['hello'], 'world')
++        self.assertEqual(L.pop()['hello'], b'world')
+ 
+ 
+     def test_trafficAfterSwitch(self):
+@@ -1774,8 +1765,8 @@ class AMPTests(unittest.TestCase):
+             ClientClass=SimpleSymmetricCommandProtocol)
+ 
+         L = []
+-        HELLO = 'world'
+-        GOODBYE = 'everyone'
++        HELLO = b'world'
++        GOODBYE = b'everyone'
+         c.sendHello(HELLO).addCallback(L.append)
+         p.flush()
+         self.assertEqual(L.pop()['hello'], HELLO)
+@@ -1794,17 +1785,17 @@ class AMPTests(unittest.TestCase):
+         c, s, p = connectedServerAndClient()
+         L = []
+         s.ampBoxReceived = L.append
+-        c.callRemote(Hello, hello='hello test', mixedCase='mixed case arg test',
+-                     dash_arg='x', underscore_arg='y')
++        c.callRemote(Hello, hello=b'hello test', mixedCase=b'mixed case arg test',
++                     dash_arg=b'x', underscore_arg=b'y')
+         p.flush()
+         self.assertEqual(len(L), 1)
+-        for k, v in [('_command', Hello.commandName),
+-                     ('hello', 'hello test'),
+-                     ('mixedCase', 'mixed case arg test'),
+-                     ('dash-arg', 'x'),
+-                     ('underscore_arg', 'y')]:
++        for k, v in [(b'_command', Hello.commandName),
++                     (b'hello', b'hello test'),
++                     (b'mixedCase', b'mixed case arg test'),
++                     (b'dash-arg', b'x'),
++                     (b'underscore_arg', b'y')]:
+             self.assertEqual(L[-1].pop(k), v)
+-        L[-1].pop('_ask')
++        L[-1].pop(b'_ask')
+         self.assertEqual(L[-1], {})
+ 
+ 
+@@ -1818,19 +1809,19 @@ class AMPTests(unittest.TestCase):
+         class StructuredHello(amp.AMP):
+             def h(self, *a, **k):
+                 L.append((a, k))
+-                return dict(hello='aaa')
++                return dict(hello=b'aaa')
+             Hello.responder(h)
+         c, s, p = connectedServerAndClient(ServerClass=StructuredHello)
+-        c.callRemote(Hello, hello='hello test', mixedCase='mixed case arg test',
+-                     dash_arg='x', underscore_arg='y').addCallback(L.append)
++        c.callRemote(Hello, hello=b'hello test', mixedCase=b'mixed case arg test',
++                     dash_arg=b'x', underscore_arg=b'y').addCallback(L.append)
+         p.flush()
+         self.assertEqual(len(L), 2)
+         self.assertEqual(L[0],
+                           ((), dict(
+-                    hello='hello test',
+-                    mixedCase='mixed case arg test',
+-                    dash_arg='x',
+-                    underscore_arg='y',
++                    hello=b'hello test',
++                    mixedCase=b'mixed case arg test',
++                    dash_arg=b'x',
++                    underscore_arg=b'y',
+                     From=s.transport.getPeer(),
+ 
+                     # XXX - should optional arguments just not be passed?
+@@ -1839,7 +1830,7 @@ class AMPTests(unittest.TestCase):
+                     Print=None,
+                     optional=None,
+                     )))
+-        self.assertEqual(L[1], dict(Print=None, hello='aaa'))
++        self.assertEqual(L[1], dict(Print=None, hello=b'aaa'))
+ 
+ class PretendRemoteCertificateAuthority:
+     def checkIsPretendRemote(self):
+@@ -2052,16 +2043,16 @@ class TLSNotAvailableTests(unittest.TestCase):
+         okc = OKCert()
+         svr.certFactory = lambda : okc
+         box = amp.Box()
+-        box['_command'] = 'StartTLS'
+-        box['_ask'] = '1'
++        box[b'_command'] = b'StartTLS'
++        box[b'_ask'] = b'1'
+         boxes = []
+         svr.sendBox = boxes.append
+         svr.makeConnection(StringTransport())
+         svr.ampBoxReceived(box)
+         self.assertEqual(boxes,
+-            [{'_error_code': 'TLS_ERROR',
+-              '_error': '1',
+-              '_error_description': 'TLS not available'}])
++            [{b'_error_code': b'TLS_ERROR',
++              b'_error': b'1',
++              b'_error_description': b'TLS not available'}])
+ 
+ 
+ 
+@@ -2083,7 +2074,7 @@ class BaseCommand(amp.Command):
+     """
+     This provides a command that will be subclassed.
+     """
+-    errors = {InheritedError: 'INHERITED_ERROR'}
++    errors = {InheritedError: b'INHERITED_ERROR'}
+ 
+ 
+ 
+@@ -2100,8 +2091,8 @@ class AddErrorsCommand(BaseCommand):
+     This is a command which subclasses another command but adds errors to the
+     list.
+     """
+-    arguments = [('other', amp.Boolean())]
+-    errors = {OtherInheritedError: 'OTHER_INHERITED_ERROR'}
++    arguments = [(b'other', amp.Boolean())]
++    errors = {OtherInheritedError: b'OTHER_INHERITED_ERROR'}
+ 
+ 
+ 
+@@ -2382,7 +2373,8 @@ class ProtocolIncludingArgument(amp.Argument):
+         @type obj: L{object}
+         @type protocol: L{amp.AMP}
+         """
+-        return "%s:%s" % (id(obj), id(protocol))
++        ident = u"%d:%d" % (id(obj), id(protocol))
++        return ident.encode("ascii")
+ 
+ 
+ 
+@@ -2391,8 +2383,8 @@ class ProtocolIncludingCommand(amp.Command):
+     A command that has argument and response schemas which use
+     L{ProtocolIncludingArgument}.
+     """
+-    arguments = [('weird', ProtocolIncludingArgument())]
+-    response = [('weird', ProtocolIncludingArgument())]
++    arguments = [(b'weird', ProtocolIncludingArgument())]
++    response = [(b'weird', ProtocolIncludingArgument())]
+ 
+ 
+ 
+@@ -2499,8 +2491,8 @@ class CommandTests(unittest.TestCase):
+         Command's response schema.
+         """
+         protocol = object()
+-        result = 'whatever'
+-        strings = {'weird': result}
++        result = b'whatever'
++        strings = {b'weird': result}
+         self.assertEqual(
+             ProtocolIncludingCommand.parseResponse(strings, protocol),
+             {'weird': (result, protocol)})
+@@ -2513,7 +2505,7 @@ class CommandTests(unittest.TestCase):
+         C{parseResponse} method to get the response.
+         """
+         client = NoNetworkProtocol()
+-        thingy = "weeoo"
++        thingy = b"weeoo"
+         response = client.callRemote(MagicSchemaCommand, weird=thingy)
+         def gotResponse(ign):
+             self.assertEqual(client.parseResponseArguments,
+@@ -2530,8 +2522,8 @@ class CommandTests(unittest.TestCase):
+         command's argument schema.
+         """
+         protocol = object()
+-        result = 'whatever'
+-        strings = {'weird': result}
++        result = b'whatever'
++        strings = {b'weird': result}
+         self.assertEqual(
+             ProtocolIncludingCommand.parseArguments(strings, protocol),
+             {'weird': (result, protocol)})
+@@ -2563,9 +2555,10 @@ class CommandTests(unittest.TestCase):
+         protocol = object()
+         argument = object()
+         objects = {'weird': argument}
++        ident = u"%d:%d" % (id(argument), id(protocol))
+         self.assertEqual(
+             ProtocolIncludingCommand.makeArguments(objects, protocol),
+-            {'weird': "%d:%d" % (id(argument), id(protocol))})
++            {b'weird': ident.encode("ascii")})
+ 
+ 
+     def test_makeArgumentsUsesCommandType(self):
+@@ -2574,7 +2567,7 @@ class CommandTests(unittest.TestCase):
+         of the result of L{amp.Command.commandType}.
+         """
+         protocol = object()
+-        objects = {"weird": "whatever"}
++        objects = {"weird": b"whatever"}
+ 
+         result = ProtocolIncludingCommandWithDifferentCommandType.makeArguments(
+             objects, protocol)
+@@ -2627,6 +2620,100 @@ class CommandTests(unittest.TestCase):
+             None)
+ 
+ 
++    def test_commandNameDefaultsToClassNameAsByteString(self):
++        """
++        A L{Command} subclass without a defined C{commandName} that's
++        not a byte string.
++        """
++        class NewCommand(amp.Command):
++            """A new command."""
++
++        self.assertEqual(b"NewCommand", NewCommand.commandName)
++
++
++    def test_commandNameMustBeAByteString(self):
++        """
++        A L{Command} subclass cannot be defined with a C{commandName} that's
++        not a byte string.
++        """
++        error = self.assertRaises(
++            TypeError, type, "NewCommand", (amp.Command, ),
++            {"commandName": u"FOO"})
++        self.assertRegexpMatches(
++            str(error), "^Command names must be byte strings, got: u?'FOO'$")
++
++
++    def test_commandArgumentsMustBeNamedWithByteStrings(self):
++        """
++        A L{Command} subclass's C{arguments} must have byte string names.
++        """
++        error = self.assertRaises(
++            TypeError, type, "NewCommand", (amp.Command, ),
++            {"arguments": [(u"foo", None)]})
++        self.assertRegexpMatches(
++            str(error), "^Argument names must be byte strings, got: u?'foo'$")
++
++
++    def test_commandResponseMustBeNamedWithByteStrings(self):
++        """
++        A L{Command} subclass's C{response} must have byte string names.
++        """
++        error = self.assertRaises(
++            TypeError, type, "NewCommand", (amp.Command, ),
++            {"response": [(u"foo", None)]})
++        self.assertRegexpMatches(
++            str(error), "^Response names must be byte strings, got: u?'foo'$")
++
++
++    def test_commandErrorsIsConvertedToDict(self):
++        """
++        A L{Command} subclass's C{errors} is coerced into a C{dict}.
++        """
++        class NewCommand(amp.Command):
++            errors = [(ZeroDivisionError, b"ZDE")]
++
++        self.assertEqual(
++            {ZeroDivisionError: b"ZDE"},
++            NewCommand.errors)
++
++
++    def test_commandErrorsMustUseBytesForOnWireRepresentation(self):
++        """
++        A L{Command} subclass's C{errors} must map exceptions to byte strings.
++        """
++        error = self.assertRaises(
++            TypeError, type, "NewCommand", (amp.Command, ),
++            {"errors": [(ZeroDivisionError, u"foo")]})
++        self.assertRegexpMatches(
++            str(error), "^Error names must be byte strings, got: u?'foo'$")
++
++
++    def test_commandFatalErrorsIsConvertedToDict(self):
++        """
++        A L{Command} subclass's C{fatalErrors} is coerced into a C{dict}.
++        """
++        class NewCommand(amp.Command):
++            fatalErrors = [(ZeroDivisionError, b"ZDE")]
++
++        self.assertEqual(
++            {ZeroDivisionError: b"ZDE"},
++            NewCommand.fatalErrors)
++
++
++    def test_commandFatalErrorsMustUseBytesForOnWireRepresentation(self):
++        """
++        A L{Command} subclass's C{fatalErrors} must map exceptions to byte
++        strings.
++        """
++        error = self.assertRaises(
++            TypeError, type, "NewCommand", (amp.Command, ),
++            {"fatalErrors": [(ZeroDivisionError, u"foo")]})
++        self.assertRegexpMatches(
++            str(error), "^Fatal error names must be byte strings, "
++            "got: u?'foo'$")
++
++
++
+ class ListOfTestsMixin:
+     """
+     Base class for testing L{ListOf}, a parameterized zero-or-more argument
+@@ -2636,13 +2723,14 @@ class ListOfTestsMixin:
+         instance.  The tests will make a L{ListOf} using this.
+ 
+     @ivar strings: Subclasses should set this to a dictionary mapping some
+-        number of keys to the correct serialized form for some example
+-        values.  These should agree with what L{elementType}
++        number of keys -- as BYTE strings -- to the correct serialized form
++        for some example values. These should agree with what L{elementType}
+         produces/accepts.
+ 
+     @ivar objects: Subclasses should set this to a dictionary with the same
+-        keys as C{strings} and with values which are the lists which should
+-        serialize to the values in the C{strings} dictionary.
++        keys as C{strings} -- as NATIVE strings -- and with values which are
++        the lists which should serialize to the values in the C{strings}
++        dictionary.
+     """
+     def test_toBox(self):
+         """
+@@ -2656,7 +2744,8 @@ class ListOfTestsMixin:
+         stringList = amp.ListOf(self.elementType)
+         strings = amp.AmpBox()
+         for key in self.objects:
+-            stringList.toBox(key, strings, self.objects.copy(), None)
++            stringList.toBox(
++                key.encode("ascii"), strings, self.objects.copy(), None)
+         self.assertEqual(strings, self.strings)
+ 
+ 
+@@ -2679,14 +2768,14 @@ class ListOfStringsTests(unittest.TestCase, ListOfTestsMixin):
+     elementType = amp.String()
+ 
+     strings = {
+-        "empty": "",
+-        "single": "\x00\x03foo",
+-        "multiple": "\x00\x03bar\x00\x03baz\x00\x04quux"}
++        b"empty": b"",
++        b"single": b"\x00\x03foo",
++        b"multiple": b"\x00\x03bar\x00\x03baz\x00\x04quux"}
+ 
+     objects = {
+         "empty": [],
+-        "single": ["foo"],
+-        "multiple": ["bar", "baz", "quux"]}
++        "single": [b"foo"],
++        "multiple": [b"bar", b"baz", b"quux"]}
+ 
+ 
+ class ListOfIntegersTests(unittest.TestCase, ListOfTestsMixin):
+@@ -2700,11 +2789,11 @@ class ListOfIntegersTests(unittest.TestCase, ListOfTestsMixin):
+         9999999999999999999999999999999999999999999999999999999999)
+ 
+     strings = {
+-        "empty": "",
+-        "single": "\x00\x0210",
+-        "multiple": "\x00\x011\x00\x0220\x00\x03500",
+-        "huge": "\x00\x74%d" % (huge,),
+-        "negative": "\x00\x02-1"}
++        b"empty": b"",
++        b"single": b"\x00\x0210",
++        b"multiple": b"\x00\x011\x00\x0220\x00\x03500",
++        b"huge": b"\x00\x74" + intToBytes(huge),
++        b"negative": b"\x00\x02-1"}
+ 
+     objects = {
+         "empty": [],
+@@ -2722,9 +2811,9 @@ class ListOfUnicodeTests(unittest.TestCase, ListOfTestsMixin):
+     elementType = amp.Unicode()
+ 
+     strings = {
+-        "empty": "",
+-        "single": "\x00\x03foo",
+-        "multiple": "\x00\x03\xe2\x98\x83\x00\x05Hello\x00\x05world"}
++        b"empty": b"",
++        b"single": b"\x00\x03foo",
++        b"multiple": b"\x00\x03\xe2\x98\x83\x00\x05Hello\x00\x05world"}
+ 
+     objects = {
+         "empty": [],
+@@ -2740,14 +2829,16 @@ class ListOfDecimalTests(unittest.TestCase, ListOfTestsMixin):
+     elementType = amp.Decimal()
+ 
+     strings = {
+-        "empty": "",
+-        "single": "\x00\x031.1",
+-        "extreme": "\x00\x08Infinity\x00\x09-Infinity",
+-        "scientist": "\x00\x083.141E+5\x00\x0a0.00003141\x00\x083.141E-7"
+-                     "\x00\x09-3.141E+5\x00\x0b-0.00003141\x00\x09-3.141E-7",
+-        "engineer": "\x00\x04%s\x00\x06%s" % (
+-            decimal.Decimal("0e6").to_eng_string(),
+-            decimal.Decimal("1.5E-9").to_eng_string()),
++        b"empty": b"",
++        b"single": b"\x00\x031.1",
++        b"extreme": b"\x00\x08Infinity\x00\x09-Infinity",
++        b"scientist": b"\x00\x083.141E+5\x00\x0a0.00003141\x00\x083.141E-7"
++                      b"\x00\x09-3.141E+5\x00\x0b-0.00003141\x00\x09-3.141E-7",
++        b"engineer": (
++            b"\x00\x04" +
++            decimal.Decimal("0e6").to_eng_string().encode("ascii") +
++            b"\x00\x06" +
++            decimal.Decimal("1.5E-9").to_eng_string().encode("ascii")),
+     }
+ 
+     objects = {
+@@ -2784,7 +2875,7 @@ class ListOfDecimalNanTests(unittest.TestCase, ListOfTestsMixin):
+     elementType = amp.Decimal()
+ 
+     strings = {
+-        "nan": "\x00\x03NaN\x00\x04-NaN\x00\x04sNaN\x00\x05-sNaN",
++        b"nan": b"\x00\x03NaN\x00\x04-NaN\x00\x04sNaN\x00\x05-sNaN",
+     }
+ 
+     objects = {
+@@ -2849,13 +2940,13 @@ class ListOfDateTimeTests(unittest.TestCase, ListOfTestsMixin):
+     elementType = amp.DateTime()
+ 
+     strings = {
+-        "christmas": "\x00\x202010-12-25T00:00:00.000000-00:00"
+-                     "\x00\x202010-12-25T00:00:00.000000-00:00",
+-        "christmas in eu": "\x00\x202010-12-25T00:00:00.000000+01:00",
+-        "christmas in iran": "\x00\x202010-12-25T00:00:00.000000+03:30",
+-        "christmas in nyc": "\x00\x202010-12-25T00:00:00.000000-05:00",
+-        "previous tests": "\x00\x202010-12-25T00:00:00.000000+03:19"
+-                          "\x00\x202010-12-25T00:00:00.000000-06:59",
++        b"christmas": b"\x00\x202010-12-25T00:00:00.000000-00:00"
++                      b"\x00\x202010-12-25T00:00:00.000000-00:00",
++        b"christmas in eu": b"\x00\x202010-12-25T00:00:00.000000+01:00",
++        b"christmas in iran": b"\x00\x202010-12-25T00:00:00.000000+03:30",
++        b"christmas in nyc": b"\x00\x202010-12-25T00:00:00.000000-05:00",
++        b"previous tests": b"\x00\x202010-12-25T00:00:00.000000+03:19"
++                           b"\x00\x202010-12-25T00:00:00.000000-06:59",
+     }
+ 
+     objects = {
+@@ -2892,7 +2983,7 @@ class ListOfOptionalTests(unittest.TestCase):
+         """
+         stringList = amp.ListOf(amp.Integer())
+         self.assertRaises(
+-            TypeError, stringList.toBox, 'omitted', amp.AmpBox(),
++            TypeError, stringList.toBox, b'omitted', amp.AmpBox(),
+             {'omitted': None}, None)
+ 
+ 
+@@ -2903,7 +2994,7 @@ class ListOfOptionalTests(unittest.TestCase):
+         """
+         stringList = amp.ListOf(amp.Integer(), optional=True)
+         strings = amp.AmpBox()
+-        stringList.toBox('omitted', strings, {'omitted': None}, None)
++        stringList.toBox(b'omitted', strings, {b'omitted': None}, None)
+         self.assertEqual(strings, {})
+ 
+ 
+@@ -2914,7 +3005,7 @@ class ListOfOptionalTests(unittest.TestCase):
+         """
+         stringList = amp.ListOf(amp.Integer())
+         self.assertRaises(
+-            KeyError, stringList.toBox, 'ommited', amp.AmpBox(),
++            KeyError, stringList.toBox, b'ommited', amp.AmpBox(),
+             {'someOtherKey': 0}, None)
+ 
+ 
+@@ -2924,7 +3015,7 @@ class ListOfOptionalTests(unittest.TestCase):
+         as optional whose key is not present in the objects dictionary.
+         """
+         stringList = amp.ListOf(amp.Integer(), optional=True)
+-        stringList.toBox('ommited', amp.AmpBox(), {'someOtherKey': 0}, None)
++        stringList.toBox(b'ommited', amp.AmpBox(), {b'someOtherKey': 0}, None)
+ 
+ 
+     def test_omittedOptionalArgumentDeserializesAsNone(self):
+@@ -2934,11 +3025,12 @@ class ListOfOptionalTests(unittest.TestCase):
+         """
+         stringList = amp.ListOf(amp.Integer(), optional=True)
+         objects = {}
+-        stringList.fromBox('omitted', {}, objects, None)
++        stringList.fromBox(b'omitted', {}, objects, None)
+         self.assertEqual(objects, {'omitted': None})
+ 
+ 
+ 
++@implementer(interfaces.IUNIXTransport)
+ class UNIXStringTransport(object):
+     """
+     An in-memory implementation of L{interfaces.IUNIXTransport} which collects
+@@ -2948,7 +3040,6 @@ class UNIXStringTransport(object):
+         eg via C{write} or C{sendFileDescriptor}.  Elements are two-tuples of a
+         string (identifying the destination of the data) and the data itself.
+     """
+-    implements(interfaces.IUNIXTransport)
+ 
+     def __init__(self, descriptorFuzz):
+         """
+@@ -3038,13 +3129,13 @@ class DescriptorTests(unittest.TestCase):
+         state inspection and mutation.
+         """
+         argument = amp.Descriptor()
+-        self.assertEqual("0", argument.toStringProto(2, self.protocol))
++        self.assertEqual(b"0", argument.toStringProto(2, self.protocol))
+         self.assertEqual(
+             ("fileDescriptorReceived", 2 + self.fuzz), self.transport._queue.pop(0))
+-        self.assertEqual("1", argument.toStringProto(4, self.protocol))
++        self.assertEqual(b"1", argument.toStringProto(4, self.protocol))
+         self.assertEqual(
+             ("fileDescriptorReceived", 4 + self.fuzz), self.transport._queue.pop(0))
+-        self.assertEqual("2", argument.toStringProto(6, self.protocol))
++        self.assertEqual(b"2", argument.toStringProto(6, self.protocol))
+         self.assertEqual(
+             ("fileDescriptorReceived", 6 + self.fuzz), self.transport._queue.pop(0))
+         self.assertEqual({}, self.protocol._descriptors)
+@@ -3056,12 +3147,13 @@ class DescriptorTests(unittest.TestCase):
+         L{amp.Descriptor.toBox} to reconstruct a file descriptor value.
+         """
+         name = "alpha"
++        nameAsBytes = name.encode("ascii")
+         strings = {}
+         descriptor = 17
+         sendObjects = {name: descriptor}
+ 
+         argument = amp.Descriptor()
+-        argument.toBox(name, strings, sendObjects.copy(), self.protocol)
++        argument.toBox(nameAsBytes, strings, sendObjects.copy(), self.protocol)
+ 
+         receiver = amp.BinaryBoxProtocol(
+             amp.BoxDispatcher(amp.CommandLocator()))
+@@ -3069,7 +3161,8 @@ class DescriptorTests(unittest.TestCase):
+             getattr(receiver, event[0])(*event[1:])
+ 
+         receiveObjects = {}
+-        argument.fromBox(name, strings.copy(), receiveObjects, receiver)
++        argument.fromBox(
++            nameAsBytes, strings.copy(), receiveObjects, receiver)
+ 
+         # Make sure we got the descriptor.  Adjust by fuzz to be more convincing
+         # of having gone through L{IUNIXTransport.sendFileDescriptor}, not just
+@@ -3082,7 +3175,7 @@ class DateTimeTests(unittest.TestCase):
+     """
+     Tests for L{amp.DateTime}, L{amp._FixedOffsetTZInfo}, and L{amp.utc}.
+     """
+-    string = '9876-01-23T12:34:56.054321-01:23'
++    string = b'9876-01-23T12:34:56.054321-01:23'
+     tzinfo = tz('-', 1, 23)
+     object = datetime.datetime(9876, 1, 23, 12, 34, 56, 54321, tzinfo)
+ 
+@@ -3162,6 +3255,34 @@ class UTCTests(unittest.TestCase):
+ 
+ 
+ 
++class RemoteAmpErrorTests(unittest.TestCase):
++    """
++    Tests for L{amp.RemoteAmpError}.
++    """
++
++    def test_stringMessage(self):
++        error = amp.RemoteAmpError(b"BROKEN", "Something has broken")
++        self.assertEqual("Code<BROKEN>: Something has broken", str(error))
++
++
++    def test_stringMessageReplacesNonAsciiText(self):
++        error = amp.RemoteAmpError(b"BROKEN-\xff", "Something has broken")
++        self.assertEqual("Code<BROKEN-\\xff>: Something has broken", str(error))
++
++
++    def test_stringMessageWithLocalFailure(self):
++        failure = Failure(Exception("Something came loose"))
++        error = amp.RemoteAmpError(
++            b"BROKEN", "Something has broken", local=failure)
++        self.assertRegexpMatches(
++            str(error), (
++                "^Code<BROKEN> [(]local[)]: Something has broken\n"
++                "Traceback [(]failure with no frames[)]: "
++                "<.+Exception.>: Something came loose\n"
++            ))
++
++
++
+ if not interfaces.IReactorSSL.providedBy(reactor):
+     skipMsg = 'This test case requires SSL support in the reactor'
+     TLSTests.skip = skipMsg
+diff --git a/twisted/topfiles/6833.feature b/twisted/topfiles/6833.feature
+new file mode 100644
+index 0000000..dd2a030
+--- /dev/null
++++ b/twisted/topfiles/6833.feature
+@@ -0,0 +1 @@
++twisted.protocols.amp has been ported to Python 3.

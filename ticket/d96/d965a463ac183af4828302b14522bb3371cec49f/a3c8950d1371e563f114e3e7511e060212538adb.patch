@@ -1,0 +1,622 @@
+Index: twisted/internet/_win32eventsupport.c
+===================================================================
+--- twisted/internet/_win32eventsupport.c	(revision 0)
++++ twisted/internet/_win32eventsupport.c	(revision 0)
+@@ -0,0 +1,238 @@
++/*
++ * Copyright (c) Twisted Matrix Laboratories.
++ * See LICENSE for details.
++ */
++
++#include <winsock2.h>
++#include <Python.h>
++
++/* Imported by module initialization function. */
++static PyObject *pywintypes_error = NULL;
++static PyTypeObject *pywintypes_handletype = NULL;
++
++
++/*
++ * Convert a Python handle or integer to a C handle.
++ *
++ * Return 0 on success, -1 on error (with TypeError exception set).
++ *
++ * This is a reimplementation of PyWinObject_AsHANDLE, because it is easier
++ * than figuring out how to find pywin32 headers and link against pywintypes.
++ */
++static int
++MyObject_AsHandle(PyObject *obj, HANDLE *result)
++{
++    PyObject *intval;
++    long address;
++
++    if (obj == NULL || obj == Py_None) {
++        return 0;
++    }
++
++    if (PyObject_TypeCheck(obj, pywintypes_handletype)) {
++        intval = PyNumber_Int(obj);
++        if (intval == NULL) {
++            return -1;
++        }
++    }
++    else {
++        Py_INCREF(obj);
++        intval = obj;
++    }
++    /*
++     * There is no good way to distinguish integral numbers from other
++     * numbers in Python versions prior to 2.5. There is also no good way
++     * to convert a python integral number to a signed or unsigned size_t
++     * integer. I guess it doesn't matter, even Python 2.7 still assumes
++     * that a file descriptor fits in an int (PyObject_AsFileDescriptor),
++     * even though sizeof(SOCKET) == sizeof(UINT_PTR) on Windows. Microsoft
++     * better make sure that handles always fit in an int, they are the one
++     * who created this mess :(
++     */
++    if (PyInt_Check(intval) || PyLong_Check(intval)) {
++        address = PyLong_AsLong(intval);
++        if (address == -1 &&  PyErr_Occurred()) {
++            /* Clear the overflow error */
++            PyErr_Clear();
++            address = (long)PyLong_AsUnsignedLong(intval);
++            if (address == -1 &&  PyErr_Occurred()) {
++                /* Overwrite the overflow error */
++                PyErr_SetString(PyExc_TypeError,
++                                "Python long too large for C unsigned long");
++            }
++        }
++    }
++    else {
++        PyErr_Format(PyExc_TypeError,
++                     "event must be a handle or an integer, "
++                     "not '%s'", intval->ob_type->tp_name);
++        address = -1;
++    }
++    Py_DECREF(intval);
++    if (address == -1 && PyErr_Occurred()) {
++        return -1;
++    }
++    *result = (HANDLE)address;
++    return 0;
++}
++
++
++/*
++ * Copy an event flag and its asscociated error code from WSANETWORKEVENTS
++ * structure to a Python dictionary.
++ *
++ * Return 0 on success, -1 on error (with Python exception set).
++ */
++static int
++MyCopyEvent(PyObject *dict, WSANETWORKEVENTS *events, long event, int eventbit)
++{
++    int res = 0;
++
++    if (events->lNetworkEvents & event) {
++        PyObject *key, *value;
++
++        key = PyInt_FromLong(event);
++        if (key == NULL) {
++            return -1;
++        }
++        value = PyInt_FromLong(events->iErrorCode[eventbit]);
++        if (value == NULL) {
++            Py_DECREF(key);
++            return -1;
++        }
++        res = PyDict_SetItem(dict, key, value);
++        Py_DECREF(key);
++        Py_DECREF(value);
++    }
++    return res;
++}
++
++
++PyDoc_STRVAR(MyWSAEnumNetworkEvents_doc,
++"WSAEnumNetworkEvents(socket [, event]) -> dictionary of network events.\n\
++\n\
++Return network events that caused the event object associated with the\n\
++socket to become signaled.\n\
++\n\
++@return: a dictionary mapping network events that occured for the specified\n\
++         socket since the last call to this function (e.g. C{FD_READ}) to\n\
++         their associated error code, or 0 if the event occured without an\n\
++         error. The events returned are a subset of events previously\n\
++         registered for this socket with C{WSAEventSelect}.\n\
++\n\
++param socket: socket to check for netork events, previously registered for\n\
++              network event notification with C{WSAEventSelect}.\n\
++type socket: C{int} or an object with a C{fileno()} method that returns\n\
++             the socket handle.\n\
++\n\
++param event: optional handle to the event associated with C{socket} in the\n\
++             last call to C{WSAEventSelect}. If specified, the event will be\n\
++             reset.\n\
++type event: C{int} or C{pywintypes.HANDLEType}.");
++
++
++static PyObject*
++MyWSAEnumNetworkEvents(PyObject *self, PyObject *args)
++{
++    PyObject *socket, *event = NULL;
++    int fd;
++    SOCKET s;
++    HANDLE hEvent = NULL;
++    WSANETWORKEVENTS wsaevents;
++    int rc;
++    PyObject *events;
++
++    if (!PyArg_ParseTuple(args, "O|O:WSAEnumNetworkEvents", &socket, &event)) {
++        return NULL;
++    }
++    fd = PyObject_AsFileDescriptor(socket);
++    if (fd == -1) {
++        return NULL;
++    }
++    s = (SOCKET)fd;
++    if (MyObject_AsHandle(event, &hEvent)) {
++        return NULL;
++    }
++
++    Py_BEGIN_ALLOW_THREADS;
++    rc = WSAEnumNetworkEvents(s, hEvent, &wsaevents);
++    Py_END_ALLOW_THREADS;
++    if (rc == SOCKET_ERROR) {
++        PyErr_SetExcFromWindowsErr(pywintypes_error, WSAGetLastError());
++        return NULL;
++    }
++
++    events = PyDict_New();
++    if (events == NULL) {
++        return NULL;
++    }
++    if (MyCopyEvent(events, &wsaevents, FD_READ, FD_READ_BIT) ||
++        MyCopyEvent(events, &wsaevents, FD_WRITE, FD_WRITE_BIT) ||
++        MyCopyEvent(events, &wsaevents, FD_OOB, FD_OOB_BIT) ||
++        MyCopyEvent(events, &wsaevents, FD_ACCEPT, FD_ACCEPT_BIT) ||
++        MyCopyEvent(events, &wsaevents, FD_CONNECT, FD_CONNECT_BIT) ||
++        MyCopyEvent(events, &wsaevents, FD_CLOSE, FD_CLOSE_BIT) ||
++        MyCopyEvent(events, &wsaevents, FD_QOS, FD_QOS_BIT) ||
++        MyCopyEvent(events, &wsaevents, FD_GROUP_QOS, FD_GROUP_QOS_BIT) ||
++        MyCopyEvent(events, &wsaevents, FD_ROUTING_INTERFACE_CHANGE, FD_ROUTING_INTERFACE_CHANGE_BIT) ||
++        MyCopyEvent(events, &wsaevents, FD_ADDRESS_LIST_CHANGE, FD_ADDRESS_LIST_CHANGE_BIT)) {
++        Py_DECREF(events);
++        return NULL;
++    }
++    return events;
++}
++
++
++static PyMethodDef wi32eventsupport_functions[] = {
++    {"WSAEnumNetworkEvents", MyWSAEnumNetworkEvents, METH_VARARGS,
++     MyWSAEnumNetworkEvents_doc},
++    /* sentinel */
++    {NULL, NULL, 0, NULL},
++};
++
++
++PyMODINIT_FUNC
++init_win32eventsupport(void)
++{
++    WSADATA wsaData;
++    PyObject *pywintypes = NULL;
++    PyObject *handletype = NULL;
++
++    if (pywintypes_error == NULL) {
++        if (WSAStartup(MAKEWORD(2, 2), &wsaData)) {
++            PyErr_SetString(PyExc_ImportError,
++                            "twisted.internet._win32eventsupport: "
++                            "could not initialize winsock");
++            return;
++        }
++        pywintypes = PyImport_ImportModule("pywintypes");
++        if (pywintypes == NULL) {
++            goto error;
++        }
++        handletype = PyObject_GetAttrString(pywintypes, "HANDLEType");
++        if (handletype == NULL) {
++            goto error;
++        }
++        if (!PyType_Check(handletype)) {
++            PyErr_Format(PyExc_TypeError,
++                         "expected pywintypes.HANDLEType to be a type, "
++                         "found '%s' instead", handletype->ob_type->tp_name);
++            goto error;
++        }
++        pywintypes_error = PyObject_GetAttrString(pywintypes, "error");
++        if (pywintypes_error == NULL) {
++            goto error;
++        }
++        pywintypes_handletype = (PyTypeObject *)handletype;
++        Py_DECREF(pywintypes);
++    }
++    Py_InitModule3("twisted.internet._win32eventsupport",
++                   wi32eventsupport_functions,
++                   "Support functions for the win32event reactor.");
++    return;
++
++  error:
++    Py_XDECREF(handletype);
++    Py_XDECREF(pywintypes);
++    WSACleanup();
++}
+Index: twisted/internet/test/test_win32eventsupport.py
+===================================================================
+--- twisted/internet/test/test_win32eventsupport.py	(revision 0)
++++ twisted/internet/test/test_win32eventsupport.py	(revision 0)
+@@ -0,0 +1,358 @@
++# Copyright (c) Twisted Matrix Laboratories.
++# See LICENSE for details.
++
++"""
++Tests for helpers in C{twisted.internet._win32eventsupport}.
++"""
++
++import os
++import errno
++import socket
++
++from twisted.trial.unittest import TestCase
++
++try:
++    import win32file
++    import win32event
++    import pywintypes
++    from twisted.internet._win32eventsupport import WSAEnumNetworkEvents
++except ImportError, e:
++    skipReason = str(e) or "could not import prerequisites"
++else:
++    skipReason = None
++
++
++
++class TestWSAEnumNetworkEvents(TestCase):
++    """
++    Tests for C{_win32eventsupport.WSAEnumNetworkEvents}.
++    """
++
++    if skipReason is not None:
++        skip = skipReason
++
++    # Vista sometimes takes a bit of time for socket events to get signaled,
++    # even when the wait should theoretically finish immediately (i.e. when the
++    # expected network event has already occurred).
++    # It seems that a timeout of one second is good enough as a workaround.
++    WAIT_TIMEOUT = 1000
++
++
++    def createEvent(self, manualReset, initialState):
++        """
++        Shorthand for win32event.CreateEvent, with irrelevant parameters
++        omitted and automatic closing at the end of the test run.
++        """
++        event = win32event.CreateEvent(None, manualReset, initialState, None)
++        self.addCleanup(event.close)
++        return event
++
++
++    def _assertWaitEqual(self, event, timeout, result):
++        """
++        Check that waiting on a synchronization handle for C{timeout}
++        microseconds returns the expected C{result}.
++        """
++        WaitForObjects = win32event.WaitForMultipleObjects
++        self.assertEqual(WaitForObjects([event], False, timeout), result)
++
++
++    def assertSignaled(self, event):
++        """
++        Check that C{event} handle is signaled.
++        """
++        self._assertWaitEqual(event, 0, win32event.WAIT_OBJECT_0)
++
++
++    def assertNotSignaled(self, event):
++        """
++        Check that C{event} handle is not signaled.
++        """
++        self._assertWaitEqual(event, 0, win32event.WAIT_TIMEOUT)
++
++
++    def assertGetsSignaled(self, event):
++        """
++        Check that C{event} gets signaled in a C{self.WAIT_TIMEOUT} amount of
++        time.
++        """
++        self._assertWaitEqual(event, self.WAIT_TIMEOUT, win32event.WAIT_OBJECT_0)
++
++
++    def assertNetworkEvents(self, sock, event, expectedEvents):
++        """
++        Check that C{WSAEnumNetworkEvents} returns a dictionary of network
++        events equal to C{expectedEvents} and resets the C{event} associated
++        with C{socket}.
++        """
++        self.assertEqual(WSAEnumNetworkEvents(sock, event), expectedEvents)
++        self.assertNotSignaled(event)
++
++
++    def socket(self):
++        """
++        Return a non-blocking TCP socket and close it at the end of the test.
++        """
++        sock = socket.socket()
++        self.addCleanup(sock.close)
++        sock.setblocking(False)
++        return sock
++
++
++    def listeningSocket(self):
++        """
++        Return a listening TCP socket bound to an arbitrary local port.
++        """
++        port = self.socket()
++        port.bind(("127.0.0.1", 0))
++        port.listen(1)
++        return port
++
++
++    def connectingSocket(self, port):
++        """
++        Return a socket that is connecting to the listening socket C{port}.
++        """
++        client = self.socket()
++        err = client.connect_ex(("127.0.0.1", port.getsockname()[1]))
++        self.assertEqual(err, errno.WSAEWOULDBLOCK)
++        return client
++
++
++    def socketPair(self):
++        """
++        Return a pair of connected non-blocking TCP sockets.
++        """
++        port = self.listeningSocket()
++        event = self.createEvent(manualReset=False, initialState=False)
++        win32file.WSAEventSelect(port, event, win32file.FD_ACCEPT)
++        client = self.connectingSocket(port)
++
++        # Make sure that accept won't raise WSAEWOULDBLOCK, as seen on Vista.
++        self.assertGetsSignaled(event)
++        server, addr = port.accept()
++        self.addCleanup(server.close)
++        server.setblocking(False)
++
++        return client, server
++
++
++    def test_invalidInputType(self):
++        """
++        C{WSAEnumNetworkEvents} raises C{TypeError} when called with arguments
++        of wrong type.
++        """
++        sock = self.socket()
++
++        self.assertRaises(TypeError, WSAEnumNetworkEvents, "not socket")
++        err = self.assertRaises(TypeError,
++                                WSAEnumNetworkEvents, sock, "not event")
++        self.assertIn("'str'", err.args[0])
++
++        floatFileno = float(sock.fileno())
++        self.assertRaises(TypeError, WSAEnumNetworkEvents, floatFileno)
++        self.assertRaises(TypeError, WSAEnumNetworkEvents, sock, floatFileno)
++
++
++    def test_invalidInputHandle(self):
++        """
++        C{WSAEnumNetworkEvents} raises C{ValueError} when C{socket} is an
++        invalid handle and C{pywintypes.error} when C{event} is an invalid
++        handle.
++        """
++        # The errors raised might look arbitrary, but they are consistent
++        # with win32file's WSAEventSelect and WSAEnumNetworkEvents.
++        sock = self.socket()
++        self.assertRaises(ValueError, WSAEnumNetworkEvents, -1)
++        self.assertRaises(TypeError, WSAEnumNetworkEvents, sock, 2 ** 65)
++        err = self.assertRaises(pywintypes.error,
++                                WSAEnumNetworkEvents, sock, -1)
++        # From the MSDN docs you might expect that this will fail with
++        # WSAEINVAL, but it doesn't.
++        self.assertEqual(err.args[0], errno.WSAENOTSOCK)
++
++
++    def test_invalidInputHandleType(self):
++        """
++        C{WSAEnumNetworkEvents} raises C{pywintypes.error} when called with
++        handles that are not sockets or events.
++        """
++        sock = self.socket()
++        f = open(os.devnull)
++        self.addCleanup(f.close)
++        handle = win32file._get_osfhandle(f.fileno())
++
++        class NotSocket(object):
++
++            def fileno(self):
++                return handle
++
++        notsock = NotSocket()
++
++        err = self.assertRaises(pywintypes.error,
++                                WSAEnumNetworkEvents, notsock)
++        self.assertEqual(err.args[0], errno.WSAENOTSOCK)
++
++        err = self.assertRaises(pywintypes.error, WSAEnumNetworkEvents, handle)
++        self.assertEqual(err.args[0], errno.WSAENOTSOCK)
++
++        err = self.assertRaises(pywintypes.error,
++                                WSAEnumNetworkEvents, sock, handle)
++        self.assertEqual(err.args[0], errno.WSAENOTSOCK)
++
++
++    def test_notSelectedHandleType(self):
++        """
++        Enumerating network events for a socket that has not been registered
++        with WSAEventSelect returns an empty dictionary.
++        """
++        # You might expect that Windows will return an error in this case,
++        # but it doesn't.
++        sock = self.socket()
++        event = self.createEvent(manualReset=True, initialState=True)
++        self.assertEqual(WSAEnumNetworkEvents(sock), {})
++        self.assertEqual(WSAEnumNetworkEvents(sock, event), {})
++
++
++    def test_basicFunctionality(self):
++        """
++        Enumerating network events for a non-connected, non-listening socket
++        returns an empty dictionary and resets the (optional) event parameter.
++        """
++        sock = self.socket()
++        event = self.createEvent(manualReset=True, initialState=True)
++        win32file.WSAEventSelect(sock, event, win32file.FD_CLOSE)
++        events = WSAEnumNetworkEvents(sock)
++        self.assertEqual(events, {})
++        self.assertIdentical(type(events), dict)
++        self.assertSignaled(event)
++        self.assertNetworkEvents(sock, event, {})
++
++
++    def test_accept(self):
++        """
++        C{WSAEnumNetworkEvents} reports a C{FD_ACCEPT} event for the listening
++        socket when a client tries to establish a connection.
++        """
++        port = self.listeningSocket()
++        event = self.createEvent(manualReset=False, initialState=False)
++        win32file.WSAEventSelect(port, event, win32file.FD_ACCEPT)
++        self.assertNetworkEvents(port, event, {})
++
++        client = self.connectingSocket(port)
++        self.assertGetsSignaled(event)
++        self.assertNetworkEvents(port, event, {win32file.FD_ACCEPT: 0})
++
++
++    def test_initialWrite(self):
++        """
++        When a connected socket is associated with an event for the first time,
++        that event gets signaled and a C{FD_WRITE} network event recorded.
++        """
++        for sock in self.socketPair():
++            event = self.createEvent(manualReset=False, initialState=False)
++            win32file.WSAEventSelect(sock, event, win32file.FD_WRITE)
++            self.assertGetsSignaled(event)
++            self.assertNetworkEvents(sock, event, {win32file.FD_WRITE: 0})
++
++
++    def test_connect(self):
++        """
++        C{WSAEnumNetworkEvents} reports a C{FD_CONNECT} event for the
++        connecting client socket once its connection attempt was accepted.
++        """
++        port = self.listeningSocket()
++        client = self.connectingSocket(port)
++        event = self.createEvent(manualReset=False, initialState=False)
++        win32file.WSAEventSelect(client, event, win32file.FD_CONNECT)
++
++        # Make sure that accept won't raise WSAEWOULDBLOCK, as seen on Vista.
++        pevent = self.createEvent(manualReset=False, initialState=False)
++        win32file.WSAEventSelect(port, pevent, win32file.FD_ACCEPT)
++        self.assertGetsSignaled(pevent)
++        server, addr = port.accept()
++
++        self.assertGetsSignaled(event)
++        self.assertNetworkEvents(client, event, {win32file.FD_CONNECT: 0})
++
++
++    def test_readWrite(self):
++        """
++        C{WSAEnumNetworkEvents} reports a C{FD_READ} event when there is
++        data to read in socket's input buffer and C{FD_WRITE} event when
++        a previously full output buffer has been emptied.
++        """
++        reader, writer = self.socketPair()
++        revent = self.createEvent(manualReset=False, initialState=False)
++        wevent = self.createEvent(manualReset=False, initialState=False)
++
++        win32file.WSAEventSelect(reader, revent, win32file.FD_READ)
++        win32file.WSAEventSelect(writer, wevent, win32file.FD_WRITE)
++
++        self.assertGetsSignaled(wevent)
++        self.assertNetworkEvents(writer, wevent, {win32file.FD_WRITE: 0})
++        self.assertNetworkEvents(reader, revent, {})
++
++        # The stupidity of FD_WRITE. It gets posted once at connection
++        # establishment, but then it gets posted only after you've hit
++        # EWOULDBLOCK and after the other side has consumed the queued data.
++        sent = 0
++        data = "x" * 16 * 1024
++        while sent < 16 * 1024 * 1024:
++            try:
++                sent += writer.send(data)
++            except socket.error, e:
++                if e.args[0] == errno.WSAEINTR:
++                    continue
++                elif e.args[0] in (errno.WSAEWOULDBLOCK, errno.WSAENOBUFS):
++                    break
++                else:
++                    raise
++        else:
++            self.fail("could not find socket buffer limit")
++
++        self.assertGetsSignaled(revent)
++        self.assertNetworkEvents(reader, revent, {win32file.FD_READ: 0})
++        self.assertNetworkEvents(writer, wevent, {})
++
++        received = 0
++        while received < sent:
++            try:
++                received += len(reader.recv(16 * 1024))
++            except socket.error, e:
++                # WSAEWOULDBLOCK seen by Mark Hammond
++                if e.args[0] in (errno.WSAEINTR, errno.WSAEWOULDBLOCK):
++                    continue
++                else:
++                    raise
++
++        self.assertEqual(received, sent)
++        self.assertGetsSignaled(wevent)
++        self.assertNetworkEvents(writer, wevent, {win32file.FD_WRITE: 0})
++        self.assertNetworkEvents(reader, revent, {})
++
++
++    def test_close(self):
++        """
++        C{WSAEnumNetworkEvents} reports a C{FD_CLOSE} event when the other
++        side terminates the connection.
++        """
++        client, server = self.socketPair()
++        cevent = self.createEvent(manualReset=False, initialState=False)
++        sevent = self.createEvent(manualReset=False, initialState=False)
++
++        win32file.WSAEventSelect(client, cevent, win32file.FD_CLOSE)
++        win32file.WSAEventSelect(server, sevent, win32file.FD_CLOSE)
++
++        self.assertNetworkEvents(client, cevent, {})
++        self.assertNetworkEvents(server, sevent, {})
++
++        client.shutdown(socket.SHUT_WR)
++        self.assertGetsSignaled(sevent)
++        self.assertNetworkEvents(server, sevent, {win32file.FD_CLOSE: 0})
++        self.assertNetworkEvents(client, cevent, {})
++
++        server.close()
++        self.assertGetsSignaled(cevent)
++        self.assertNetworkEvents(client, cevent, {win32file.FD_CLOSE: 0})
++
+Index: twisted/topfiles/setup.py
+===================================================================
+--- twisted/topfiles/setup.py	(revision 32931)
++++ twisted/topfiles/setup.py	(working copy)
+@@ -36,6 +36,11 @@
+               libraries=["ws2_32"],
+               condition=lambda _: _isCPython and sys.platform == "win32"),
+ 
++    Extension("twisted.internet._win32eventsupport",
++              ["twisted/internet/_win32eventsupport.c"],
++              libraries=["ws2_32"],
++              condition=lambda _: _isCPython and sys.platform == "win32"),
++
+     Extension("twisted.python._initgroups",
+               ["twisted/python/_initgroups.c"]),
+     Extension("twisted.internet._sigchld",

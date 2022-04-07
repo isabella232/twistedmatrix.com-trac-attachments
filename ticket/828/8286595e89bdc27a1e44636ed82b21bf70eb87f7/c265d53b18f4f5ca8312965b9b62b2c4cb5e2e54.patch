@@ -1,0 +1,239 @@
+Index: twisted/web/test/test_xmlrpc.py
+===================================================================
+--- twisted/web/test/test_xmlrpc.py	(revision 35482)
++++ twisted/web/test/test_xmlrpc.py	(working copy)
+@@ -14,7 +14,7 @@
+ from twisted.web import xmlrpc
+ from twisted.web.xmlrpc import (
+     XMLRPC, payloadTemplate, addIntrospection, _QueryFactory, Proxy,
+-    withRequest)
++    withRequest, MultiCall)
+ from twisted.web import server, static, client, error, http
+ from twisted.internet import reactor, defer
+ from twisted.internet.error import ConnectionDone
+@@ -686,7 +686,8 @@
+                  'deferFault', 'dict', 'echo', 'fail', 'fault',
+                  'pair', 'system.listMethods',
+                  'system.methodHelp',
+-                 'system.methodSignature', 'withRequest'])
++                 'system.methodSignature', 'system.multicall', 
++                 'withRequest'])
+ 
+         d = self.proxy().callRemote("system.listMethods")
+         d.addCallback(cbMethods)
+@@ -719,7 +720,41 @@
+             dl.append(d)
+         return defer.DeferredList(dl, fireOnOneErrback=True)
+ 
++    def test_multicall(self):
++        '''
++        test a suscessfull multicall
++        '''
++        inputs = range(5)
++        m = MultiCall(self.proxy())
++        for x in inputs:
++            m.echo(x)
+ 
++        def testResults(iterator):
++            self.assertEqual(inputs, list(iterator))
++
++        return m().addCallback(testResults)
++
++
++    def test_multicall_error(self):
++        ''' test that a multicall which has an error
++        (an invalid (not found) method ) raises an 
++        exception when the multicall results
++        iterator is used
++        '''
++        m = MultiCall(self.proxy())
++        m.echo(1)
++        m.foo() # method not present on server
++        m.echo(2)
++
++        def testResults(iterator):
++            ''' using the iterator should raise a Fault
++            '''
++            self.assertRaises(xmlrpc.Fault, list, iterator) 
++            self.flushLoggedErrors(failure.DefaultException)
++
++        return m().addCallback(testResults)
++
++
+ class XMLRPCClientErrorHandling(unittest.TestCase):
+     """
+     Test error handling on the xmlrpc client.
+Index: twisted/web/xmlrpc.py
+===================================================================
+--- twisted/web/xmlrpc.py	(revision 35482)
++++ twisted/web/xmlrpc.py	(working copy)
+@@ -318,7 +318,169 @@
+     xmlrpc_methodSignature.signature = [['array', 'string'],
+                                         ['string', 'string']]
+ 
++    @withRequest
++    def xmlrpc_multicall(self, request, procedureList):
++        """
++        Execute several RPC methods in a single XMLRPC request using the
++        multicall object.
+ 
++        Example:
++            On the server side, just load the instrospection so your
++            server has system.multicall. Then on the client:
++
++            from twisted.web.xmlrpc import Proxy
++            from twisted.web.xmlrpc import MultiCall
++
++            proxy = Proxy('url of your server')
++
++            multiRPC = Multicall( proxy )
++            # queue a few calls
++            multiRPC.system.listMethods()
++            multiRPC.system.methodHelp('system.listMethods')
++            multiRPC.system.methodSignature('system.listMethods')
++
++            def handleResults(resultsIterator):
++                for result in resultsIterator:
++                    print result
++
++            multiRPC().addCallback(handleResults)
++
++        @param request: the http C{request} object
++        @type request: L{http.Request}
++
++        @param procedureList: A list of dictionaries, each representing an
++            individual rpc call, containing the C{methodName} and the 
++            C{params}
++        @type procedureList: list
++
++        @return: L{defer.DeferredList} of the deferreds for each procedure
++            in procedure list
++        @rtype: L{defer.DeferredList}
++        """
++        def callError(failure):
++            """ 
++            errorback to handle individual call errors
++
++            Individual errors in a multicall are returned as
++            dictionaries. See U{http://www.xmlrpc.com/discuss/msgReader$1208}.
++
++            @param result: C{failure}
++            @type result: L{Failure}
++
++            @rtype: dict
++            @return: a dict with keys C{faultCode} and C{faultString}
++            """ 
++            log.err(failure.value)
++            return {'faultCode':   self.FAILURE,
++                    'faultString': failure.value}
++
++        def prepareCallResponse(result):
++            """
++            callback to convert a call C{response} to a list
++
++            The xmlrpc multicall spec expects a list wrapping 
++            each call response. 
++            See U{http://www.xmlrpc.com/discuss/msgReader$1208}.
++
++            @param result: C{response}
++            @type result: any python type
++
++            @rtype: list
++            @return: a list with response as element 0  
++            """
++            return [result]
++
++        def run(procedurePath, params):
++            """
++            run an individual procedure from the L{procedureList} and
++            returns a C{deferred}
++
++
++            @param procedurePath: string naming a procedure
++            @type procedurePath: str
++            
++            @param params: list of arguments to be passed to the procedure
++            @type params: list
++
++            @return: a C{deferred} object with prepareCallResponse and
++            callError attached.
++            @rtype: L{defer.Deferred}
++            """
++            try:
++                procedure = self._xmlrpc_parent.lookupProcedure(procedurePath)
++            except Exception, e:
++                return defer.fail(str(e)).addErrback(callError)
++            else:
++                if getattr(procedure, 'withRequest', False):
++                    call = defer.maybeDeferred(procedure, request, *params)
++                else:
++                    call = defer.maybeDeferred(procedure, *params)
++                
++                call.addErrback(callError)
++                call.addCallback(prepareCallResponse)
++                return call
++
++        def filterResults(results):
++            return map(lambda x: x[1], results)
++
++        results = [
++            run(procedure['methodName'], procedure['params'])
++            for procedure in procedureList]
++
++        return (defer.DeferredList(results)
++            .addCallback(filterResults))
++
++    xmlrpc_multicall.signature = [['array', 'array']]
++
++
++class MultiCall(xmlrpclib.MultiCall):
++    """
++    server -> a object used to boxcar method calls
++
++    server should be a twisted xmlrpc Proxy object.
++
++    Methods can be added to the MultiCall using normal
++    method call syntax e.g.:
++    
++    proxy = Proxy('http://advogato.org/XMLRPC')
++
++    multicall = MultiCall(proxy)
++    multicall.add(2,3)
++    multicall.add(5,6)
++    
++    To execute the multicall, call the MultiCall object 
++    and attach callbacks, errbacks to the returned
++    deferred e.g.:
++    
++    def printResults(iterator):
++        for result in iterator:
++            print result
++
++    d = multicall()
++    d.addCallback(printResults)
++    """
++    def __call__(self):
++        """
++        execute the multicall
++        """
++        marshalled_list = []
++        for name, args in self.__call_list:
++            marshalled_list.append({
++                'methodName': name,
++                'params': args})
++
++        def getIterator(results):
++            '''
++            callback to return an xmlrpclib
++            MultiCallIterator of the results
++            '''
++            return xmlrpclib.MultiCallIterator(results)
++
++        return self.__server.callRemote(
++            'system.multicall', marshalled_list
++        ).addCallback(getIterator)
++
++
+ def addIntrospection(xmlrpc):
+     """
+     Add Introspection support to an XMLRPC server.

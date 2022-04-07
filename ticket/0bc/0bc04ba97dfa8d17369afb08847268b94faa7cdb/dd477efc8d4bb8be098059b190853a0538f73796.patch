@@ -1,0 +1,151 @@
+Index: twisted/web/test/test_http.py
+===================================================================
+--- twisted/web/test/test_http.py	(revision 38257)
++++ twisted/web/test/test_http.py	(working copy)
+@@ -5,7 +5,9 @@
+ Test HTTP support.
+ """
+ 
++import __builtin__
+ import random, cgi, base64
++import os
+ 
+ try:
+     from urlparse import (
+@@ -14,6 +16,7 @@
+     from urllib.parse import (
+         ParseResultBytes, urlparse, urlunsplit, clear_cache)
+ 
++from twisted.python import log
+ from twisted.python.compat import _PY3, iterbytes, networkString, unicode, intToBytes
+ from twisted.python.failure import Failure
+ from twisted.trial import unittest
+@@ -1923,3 +1926,128 @@
+               b"Version: HTTP/1.1",
+               b"Request: /foo",
+               b"'''\n4\ndefg'''\n")])
++
++
++
++class FakeFile(object):
++    """
++    A fake file-like object that acts enough like a file for L{HTTPFactory}.
++    """
++
++    def __init__(self):
++        self.outchunks = []
++        self.closed = False
++
++
++    def write(self, chunk):
++        """
++        Append the given item to the 'outchunks' list.
++        """
++        if self.closed:
++            raise IOError("the file was closed")
++        self.outchunks.append(chunk)
++
++
++    def close(self):
++        """
++        Set the 'closed' flag to True, explicitly marking that it has been
++        closed.
++        """
++        self.closed = True
++
++
++
++def _fakeOpen(path, mode, buffering):
++    """
++    A fake open method.
++
++    @param path: The path of the file to open.
++    @type path: C{str}.
++
++    @param mode: The mode of the file to be opened.
++    @type mode: C{str}.
++
++    @param buffering: Specifies the file's desired buffer size: 0 means
++        unbuffered, 1 means line buffered, any other positive value means use a
++        buffer of (approximately) that size (in bytes). 
++    @type mode: C{int}.
++
++    @return fakeFile: A L{FakeFile} instance.
++    """
++    fakeFile = FakeFile()
++    fakeFile.path = path
++    fakeFile.mode = mode
++    fakeFile.buffering = buffering
++    return fakeFile
++
++
++
++class HTTPFactoryTests(unittest.TestCase):
++    """
++    Tests for L{twisted.web.http.HTTPFactory}.
++    """
++    def test_buildProtocol(self):
++        """
++        L{HTTPFactory.buildProtocol} returns a L{HTTPChannel} instance and set
++        timeOut as its attribute.
++        """
++        httpFactory = http.HTTPFactory()
++        p = httpFactory.buildProtocol(None)
++        self.assertIsInstance(p, http.HTTPChannel)
++        self.assertIdentical(p.factory, httpFactory)
++        self.assertEqual(p.timeOut, httpFactory.timeOut)
++
++
++    def test_buildProtocolWithTimeOut(self):
++        """
++        L{HTTPFactory.buildProtocol} returns a L{HTTPChannel} instance and set
++        timeOut to the value user supplied when create the L{HTTPFactory}.
++        """
++        timeOut = 10
++        httpFactory = http.HTTPFactory(timeout=timeOut)
++        self.assertEqual(httpFactory.timeOut, timeOut)
++        p = httpFactory.buildProtocol(None)
++        self.assertEqual(p.timeOut, httpFactory.timeOut)
++
++
++    def test_startFactory(self):
++        """
++        L{HTTPFactory.startFactory} sets up request logging.
++        """
++        httpFactory = http.HTTPFactory()
++        httpFactory.startFactory()
++        self.assertIdentical(httpFactory.logFile, log.logfile)
++        httpFactory.stopFactory()
++
++
++    def test_startFactoryWithLogPath(self):
++        """
++        L{HTTPFactory.startFactory} opens file in C{logPath}, which is
++        supplied when the {HTTPFactory} is created, as the log file.
++        """
++        _old_open = __builtin__.open
++        __builtin__.open = _fakeOpen
++        logPath = "path/to/log/file"
++        httpFactory = http.HTTPFactory(logPath=logPath)
++        httpFactory.startFactory()
++        self.assertEqual(httpFactory.logFile.path, os.path.abspath(logPath))
++        self.assertEqual(httpFactory.logFile.mode, "a")
++        self.assertEqual(httpFactory.logFile.buffering, 1)
++        httpFactory.stopFactory()
++        __builtin__.open = _old_open
++
++
++    def test_stopFactoryWithLogFileClosed(self):
++        """
++        L{HTTPFactory.stopFactory} closes the C{logFile} if it is not
++        L{twisted.python.log.logFile}
++        """
++        _old_open = __builtin__.open
++        __builtin__.open = _fakeOpen
++        logPath = "path/to/log/file"
++        httpFactory = http.HTTPFactory(logPath=logPath)
++        httpFactory.startFactory()
++        logFile = httpFactory.logFile
++        httpFactory.stopFactory()
++        self.assertTrue(logFile.closed)
++        __builtin__.open = _old_open

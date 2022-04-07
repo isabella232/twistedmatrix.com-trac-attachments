@@ -1,0 +1,448 @@
+Index: twisted/words/test/test_irc.py
+===================================================================
+--- twisted/words/test/test_irc.py	(revision 26936)
++++ twisted/words/test/test_irc.py	(working copy)
+@@ -15,6 +15,120 @@
+ from twisted.test.proto_helpers import StringTransport, StringIOWithoutClosing
+ 
+ 
++
++class TextAttributesTests(unittest.TestCase):
++    def test_createNoParams(self):
++        """
++        Creating TextAttributes without any parameters produces something that
++        describes unformatted text.
++        """
++        ta = irc.TextAttributes()
++        self.assertEqual(set(), ta.attributes)
++        self.assertEqual([None, None], ta.color)
++        self.assertFalse(ta.hasColor())
++
++
++    def test_createParams(self):
++        """
++        Creating TextAttributes with parameters results in something that
++        correctly describes the desired formatting.
++        """
++        ta = irc.TextAttributes(['bold', 'bold', 'underline'], [1])
++        self.assertEqual(set(['bold', 'underline']),
++                         ta.attributes)
++        self.assertTrue(ta.hasColor())
++        self.assertEqual(ta.color, [1, None])
++
++        self.assertRaises(ValueError, irc.TextAttributes, [], [1, 2, 3])
++
++
++    def test_color(self):
++        """
++        TextAttributes with colors behave correctly and result in
++        well-formatted strings.
++        """
++        ta = irc.TextAttributes([], [1])
++        self.assertEqual(ta.colorString(), '01')
++
++        ta = irc.TextAttributes([], [1, 2])
++        self.assertEqual(ta.colorString(), '01,02')
++
++        ta = irc.TextAttributes()
++        self.assertRaises(ValueError, ta.colorString)
++        self.assertRaises(ValueError, ta.foreground, None)
++        self.assertRaises(ValueError, ta.foreground, -1)
++        self.assertRaises(ValueError, ta.foreground, 100)
++        self.assertRaises(ValueError, ta.background, -1)
++        self.assertRaises(ValueError, ta.background, 100)
++
++        ta.foreground(99)
++        ta.background(None)
++        self.assertEqual(ta.color, [99, None])
++
++        ta.background(0)
++        self.assertEqual(ta.color, [99, 0])
++
++        ta.resetColor()
++        self.assertFalse(ta.hasColor())
++
++
++
++class FormattedTextTests(unittest.TestCase):
++    def attr(self, *attrs, **kw):
++        """
++        Helper function to produce TextAttributes.
++        """
++        color = kw.pop('color', None)
++        return irc.TextAttributes(attrs, color)
++
++
++    def test_assemble(self):
++        """
++        Assembling structured information results in the correct control codes
++        appearing in the resulting string.
++        """
++        self.assertEqual(irc.assembleFormattedText([]), '')
++
++        formatted = [
++            (self.attr('bold', 'underline'), 'foo'),
++            (self.attr(), 'bar'),
++            (self.attr('bold', color=[1,2]), 'baz')]
++
++        self.assertEqual(formatted,
++            irc.parseFormattedText(
++                irc.assembleFormattedText(formatted)))
++
++        # Attempting to apply an attribute to the empty string should still
++        # produce two control codes.
++        formatted = [
++            (self.attr('bold'), '')]
++        self.assertEqual(irc.FormattingState._formatNames['bold'] * 2,
++                         irc.assembleFormattedText(formatted))
++
++
++    def test_parseEmptyString(self):
++        """
++        Parsing an empty string results in an empty list of formatting
++        information.
++        """
++        parsed = irc.parseFormattedText('')
++        self.assertEqual(len(parsed), 0)
++
++
++    def test_parseUnformattedText(self):
++        """
++        Parsing unformatted text results in text with TextAttributes that
++        constitute a no-op.
++        """
++        parsed = irc.parseFormattedText('hello')
++        self.assertEqual(len(parsed), 1)
++
++        attrs, text = parsed[0]
++        self.assertEqual(attrs, irc.TextAttributes())
++        self.assertEqual(text, 'hello')
++
++
++
+ stringSubjects = [
+     "Hello, this is a nice string with no complications.",
+     "xargs%(NUL)smight%(NUL)slike%(NUL)sthis" % {'NUL': irc.NUL },
+Index: twisted/words/protocols/irc.py
+===================================================================
+--- twisted/words/protocols/irc.py	(revision 26936)
++++ twisted/words/protocols/irc.py	(working copy)
+@@ -2146,6 +2146,318 @@
+         return s
+ 
+ 
++
++class TextAttributes(object):
++    """
++    State of text attributes.
++
++    @type attributes: C{set} of C{str}
++    @ivar attributes: Currently set text attributes
++
++    @type _color: C{list} of C{int}
++    @ivar _color: C{[foreground, background]}
++    """
++    def __init__(self, attributes=None, color=None):
++        """
++        """
++        if attributes is None:
++            attributes = set()
++        self.attributes = set(attributes)
++
++        if not color:
++            self.resetColor()
++        else:
++            if len(color) > 2:
++                raise ValueError('"color" must be a 2-tuple of integers less than 99 or None')
++            self.resetColor()
++            self.foreground(color[0])
++            if len(color) > 1:
++                self.background(color[1])
++
++
++    def __eq__(self, other):
++        if isinstance(other, TextAttributes):
++            return (other.attributes == self.attributes and
++                    other.color == self.color)
++        return False
++
++
++    def __repr__(self):
++        attrs = list(self.attributes)
++        if self.hasColor():
++            attrs.append('color=' + repr(self.color))
++        attrs = ' ' + ' '.join(attrs)
++        return '<%s%s>' % (type(self).__name__, attrs.rstrip())
++
++
++    def hasColor(self):
++        """
++        Determine whether the color attribute has been set or not.
++        """
++        return self.color[0] is not None
++
++
++    def colorString(self):
++        """
++        Construct a color string for the current color.
++
++        @raise ValueError: If there is no color set
++
++        @rtype: C{str}
++        @return C{fg,bg}
++        """
++        if self.hasColor():
++            a, b = self.color
++            a = '%02d' % a
++            if b is not None:
++                b = '%02d' % self.color[1]
++            return ','.join(filter(None, (a, b)))
++
++        raise ValueError('Color string is not available for text '
++                         'attributes without color')
++
++
++    def foreground(self, color):
++        """
++        Set the foreground color.
++        """
++        if not 99 >= color >= 0:
++            raise ValueError('Foreground must be in the range [0;100)')
++        self.color[0] = color
++
++
++    def background(self, color):
++        """
++        Set the background color.
++        """
++        if color is not None and not 99 >= color >= 0:
++            raise ValueError('Background must be in the range [0;100) or None')
++        self.color[1] = color
++
++
++    def toggle(self, attr):
++        """
++        Toggle an attribute's state.
++        """
++        if attr in self.attributes:
++            self.attributes.remove(attr)
++        else:
++            self.attributes.add(attr)
++
++
++    def resetColor(self):
++        """
++        Reset the color to the default value.
++        """
++        self.color = [None, None]
++
++
++    def copy(self):
++        """
++        Make a copy of this object.
++        """
++        return copy.deepcopy(self)
++
++
++
++class FormattingState(CommandDispatcherMixin):
++    """
++    A finite-state machine that parses formatted IRC text.
++
++    Currently handled formatting includes: bold, reverse, underline,
++    mIRC color codes and the ability to remove all current formatting.
++
++    @type _formatCodes: C{dict} mapping C{str} to C{str}
++    @cvar _formatCodes: Mapping of format code values to names
++
++    @type _formatNames: C{dict} mapping C{str} to C{str}
++    @cvar _formatNames: Mapping of format code names to values
++
++    @type state: C{str}
++    @ivar state: Current state of the FSM
++
++    @type _buffer: C{str}
++    @ivar _buffer: Accumulation buffer
++
++    @type _attrs: L{TextAttributes}
++    @ivar _attrs: Current state of text attributes
++
++    @type _result: C{list}
++    @ivar _result: Emitted parse results
++    """
++    prefix = 'state'
++
++    _formatCodes = {
++        '\x0f': 'off',
++        '\x02': 'bold',
++        '\x03': 'color',
++        '\x16': 'reverse',
++        '\x1f': 'underline'}
++
++
++    _formatNames = dict(map(reversed, _formatCodes.iteritems()))
++
++
++    def __init__(self):
++        self.state = 'text'
++        self._buffer = ''
++        self._attrs = TextAttributes()
++        self._result = []
++
++
++    def process(self, ch):
++        """
++        Handle input.
++
++        @type ch: C{str}
++        @param ch: A single character of input to process
++        """
++        self.dispatch(self.state, ch)
++
++
++    def complete(self):
++        """
++        Flush the current buffer and return the final parsed result.
++
++        @rtype: C{list} of C{(TextAttributes, str)}
++        """
++        self.emit()
++        return self._result
++
++
++    def emit(self):
++        """
++        Add the currently parsed input to the result.
++        """
++        if self._buffer:
++            self._result.append((self._attrs, self._buffer))
++            self._buffer = ''
++        self._attrs = self._attrs.copy()
++
++
++    def state_text(self, ch):
++        """
++        Handle the "text" state.
++
++        Along with regular text, single token formatting codes are handled
++        in this state too.
++        """
++        formatName = self._formatCodes.get(ch)
++        if formatName == 'color':
++            self.emit()
++            self.state = 'colorForeground'
++        else:
++            if formatName is None:
++                self._buffer += ch
++            else:
++                if self._buffer:
++                    self.emit()
++
++                if formatName == 'off':
++                    self._attrs = TextAttributes()
++                else:
++                    self._attrs.toggle(formatName)
++
++
++    def state_colorForeground(self, ch):
++        """
++        Handle the foreground color state.
++
++        Foreground colors can consist of up to two digits and may optionally
++        end in a C{,}. Any non-digit or non-comma characters are treated as
++        invalid input and result in the state being reset to "text".
++        """
++        # Color codes may only be a maximum of two characters.
++        if ch.isdigit() and len(self._buffer) < 2:
++            self._buffer += ch
++        else:
++            if self._buffer:
++                self._attrs.foreground(int(self._buffer))
++            else:
++                # If there were no digits, then this has been an empty color
++                # code and we can reset the color state.
++                self._attrs.resetColor()
++
++            if ch == ',' and self._buffer:
++                # If there's a comma and it's not the first thing, move on to
++                # the background state.
++                self._buffer = ''
++                self.state = 'colorBackground'
++            else:
++                # Otherwise, this is a bogus color code, fall back to text.
++                self._buffer = ''
++                self.state = 'text'
++                self.emit()
++                self.process(ch)
++
++
++    def state_colorBackground(self, ch):
++        """
++        Handle the background color state.
++
++        Background colors can consist of up to two digits and must occur after
++        a foreground color and must be preceded by a C{,}. Any non-digit
++        character is treated as invalid input and results in the state being
++        set to "text".
++        """
++        # Color codes may only be a maximum of two characters.
++        if ch.isdigit() and len(self._buffer) < 2:
++            self._buffer += ch
++        else:
++            if self._buffer:
++                self._attrs.background(int(self._buffer))
++                self._buffer = ''
++
++            self.emit()
++            self.state = 'text'
++            self.process(ch)
++
++
++
++def parseFormattedText(text):
++    """
++    Parse text containing IRC formatting codes into structured information.
++
++    @type text: C{str}
++
++    @rtype: C{list} of C{(TextAttributes, str)}
++    """
++    state = FormattingState()
++
++    for ch in text:
++        state.process(ch)
++
++    return state.complete()
++
++
++
++def assembleFormattedText(formatted):
++    """
++    Assemble formatted text from structured information.
++
++    @type formatted: C{list} of C{(TextAttributes, str)}
++
++    @rtype: C{str}
++    """
++    def _simpleAttrs(textAttr):
++        for name in textAttr.attributes:
++            yield FormattingState._formatNames[name]
++
++    def _assemble():
++        for textAttrs, text in formatted:
++            if textAttrs.hasColor():
++                yield FormattingState._formatNames['color']
++                yield textAttrs.colorString()
++
++            _sa = ''.join(_simpleAttrs(textAttrs))
++            yield _sa + text + _sa
++            if textAttrs.hasColor():
++                yield FormattingState._formatNames['color']
++
++    return ''.join(_assemble())
++
++
++
+ # CTCP constants and helper functions
+ 
+ X_DELIM = chr(001)

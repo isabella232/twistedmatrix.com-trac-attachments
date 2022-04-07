@@ -1,0 +1,693 @@
+Index: twisted/test/test_endpoints.py
+===================================================================
+--- twisted/test/test_endpoints.py	(revision 18181)
++++ twisted/test/test_endpoints.py	(working copy)
+@@ -1,3 +1,5 @@
++from zope.interface import implements, Interface
++
+ from twisted.trial import unittest
+ from twisted.internet import (defer, error, interfaces, reactor, 
+                               _sslverify as sslverify)
+@@ -2,14 +4,15 @@
+ from twisted.internet.address import IPv4Address, UNIXAddress
+-from twisted.internet.protocol import ClientFactory, Protocol, ServerFactory
+-from twisted.internet.endpoints import (TCPEndpoint, UNIXEndpoint)
++from twisted.internet.protocol import ClientFactory, Protocol
++from twisted.internet.endpoints import (TCPServerEndpoint, TCPClientEndpoint, 
++                                        SSLTCPServerEndpoint, 
++                                        SSLTCPClientEndpoint, 
++                                        UNIXServerEndpoint, UNIXClientEndpoint)
+ from twisted.test.test_sslverify import makeCertificate
+ 
+-class ServerProtocol(Protocol):
+-    def connectionMade(self):
+-        self.factory.onConnectionMade.callback(self)
+ 
+-    def connectionLost(self, *a):
+-        self.factory.onConnectionLost.callback(self)
+-
+-class ClientProtocol(Protocol):
++class TestProtocol(Protocol):
++    """I am a protocol whose only function is to callback deferreds on my 
++    factory when I am connected and when I am disconnected.
++    """
++    
+     def connectionMade(self):
+@@ -20,40 +23,86 @@
+     def connectionLost(self, *a):
+         self.factory.onConnectionLost.callback(self)
+ 
+-class MyServerFactory(ServerFactory):
+-    protocol = ServerProtocol
+-    
+-    def __init__(self):
+-        self.onConnectionMade = defer.Deferred()
+-        self.onConnectionLost = defer.Deferred()
+ 
+-class MyClientFactory(ClientFactory):
+-    protocol = ClientProtocol
++class TestFactory(ClientFactory):
++    """I am a simple factory to be used both when connecting and listening. I 
++    contain two deferreds which are called back when my protocol connects and 
++    disconnects.
++    """
+     
++    protocol = TestProtocol
++    
+     def __init__(self):
+         self.onConnectionMade = defer.Deferred()
+         self.onConnectionLost = defer.Deferred()
+ 
++
+ class PortAndConnectorCleanerUpper(unittest.TestCase):
++    """I am a base class for Endpoint testcases. I clean up all the Ports and 
++    Connectors used in subclass test methods (provided that I know about them). 
++    When a subclass creates a server, the resulting Port should be appended to 
++    my list of listeningPorts. 
++    When my subclasses create a client, the resulting connector should be 
++    appended to my list of clientConnectors. 
++    """
++    
+     def setUp(self):
++        """Setup my fresh lists for listeningPorts and clientConnections"""
+         self.listeningPorts = []
+         self.clientConnections = []
+     
+     def tearDown(self):
++        """Stoplistening on all Ports and disconnect all connectors"""
+         map(lambda p: p.stopListening(), self.listeningPorts)
+         map(lambda c: c.disconnect(), self.clientConnections)
+ 
++
++class IEndpointTestCase(Interface):
++    """I provide methods for creating servers / clients and server / client 
++    endpoints"""
++    
++    def createServer(factory):
++        """Create a server
++        
++        @param factory: A provider of I{IProtocolFactory}
++        """
++
++    def createClient(address, factory):
++        """Create a client
++        
++        @param address: A provider of I{IAddress}
++        @param factory: A provider of I{IProtocolFactory}
++        """
++        
++    def createServerEndpoint(address=None):
++        """Create an ServerEndpoint. 
++        
++        @param address: An optional provider of I{IAddress}. If omitted a 
++        suitable free address will be chosen.
++        """
++
++    def createClientEndpoint(address):
++        """Create an ClientEndpoint.
++        
++        @param address: A provider of I{IAddress} to which the endpoint will be 
++        required to connect.
++        """
++
++
+ class EndpointTestCaseMixin(object):
++    """Generic test methods to be mixed into all EndpointTest classes. Classes
++    that mix me in, should provide IEndpointTestCase"""
++    
+     def test_EndpointConnectSuccess(self):
+-        """Test that Endpoint can connect and returns a deferred who
++        """Test that a client Endpoint can connect and returns a deferred who
+         gets called back with a protocol instance. 
+         """
+-        sf = MyServerFactory()
++        sf = TestFactory()
+         p = self.createServer(sf)
+         addr = p.getHost()
+-        ep = self.createEndpoint(addr)
+-        cf = MyClientFactory()
+-        d = ep.connect(reactor, cf)
++        ep = self.createClientEndpoint(addr)
++        cf = TestFactory()
++        d = ep.connect(cf)
+         self.assertTrue(isinstance(d, defer.Deferred))
+         def onConnectSuccess(proto):
+             self.assertTrue(interfaces.IProtocol.providedBy(proto))
+@@ -65,12 +114,12 @@
+         """Test that if an Endpoint tries to connect to a none 
+         listening port that it gets a ConnectError failure.
+         """
+-        p = self.createServer(MyServerFactory())
++        p = self.createServer(TestFactory())
+         addr = p.getHost()
+         p.loseConnection()
+ 
+-        ep = self.createEndpoint(addr)
+-        d = ep.connect(reactor, MyClientFactory())
++        ep = self.createClientEndpoint(addr)
++        d = ep.connect(TestFactory())
+         self.failUnlessFailure(d, error.ConnectError)
+         return d
+     
+@@ -78,9 +127,9 @@
+         """Test that Endpoint can listen and returns a deferred that
+         gets called back with a port instance. 
+         """
+-        ep = self.createEndpoint()
+-        sf = MyServerFactory()
+-        d = ep.listen(reactor, sf)
++        ep = self.createServerEndpoint()
++        sf = TestFactory()
++        d = ep.listen(sf)
+         self.assertTrue(isinstance(d, defer.Deferred))
+         def onListenSuccess(port):
+             self.assertTrue(interfaces.IListeningPort.providedBy(port))
+@@ -88,7 +137,7 @@
+             return port.getHost()
+         d.addCallback(onListenSuccess)
+         def connectTo(addr):
+-            self.createClient(addr, MyClientFactory())
++            self.createClient(addr, TestFactory())
+         d.addCallback(connectTo)
+         return defer.gatherResults([sf.onConnectionMade, d])
+ 
+@@ -96,14 +145,19 @@
+         """Test that if Endpoint tries to listen on an already listening 
+         port, that a CannotListenError failure is errbacked. 
+         """
+-        p = self.createServer(MyServerFactory())
++        p = self.createServer(TestFactory())
+         addr = p.getHost()
+-        ep = self.createEndpoint(addr)
+-        d = ep.listen(reactor, MyServerFactory())
++        ep = self.createServerEndpoint(addr)
++        d = ep.listen(TestFactory())
+         self.failUnlessFailure(d, error.CannotListenError)
+         return d
+ 
++
+ class TCPEndpointsTestCase(PortAndConnectorCleanerUpper, EndpointTestCaseMixin):
++    """Tests for TCP Endpoints"""
++    
++    implements(IEndpointTestCase)
++    
+     def createServer(self, factory):
+         p = reactor.listenTCP(0, factory)
+         self.listeningPorts.append(p)
+@@ -114,14 +168,22 @@
+         self.clientConnections.append(c)
+         return c
+ 
+-    def createEndpoint(self, address=None):
+-        if not address:
++    def createServerEndpoint(self, address=None):
++        if address is None:
+             address = IPv4Address("TCP", "localhost", 0)
+-        return TCPEndpoint(address.host, address.port)
++        return TCPServerEndpoint(reactor, address.port)
+ 
++    def createClientEndpoint(self, address):
++        return TCPClientEndpoint(reactor, address.host, address.port)
++
++
+ class SSLEndpointsTestCase(PortAndConnectorCleanerUpper, EndpointTestCaseMixin):
++    """Tests for SSL Endpoints"""
+     
++    implements(IEndpointTestCase)
++    
+     def setUpClass(self):
++        """Set up client and server SSL contexts for use later."""
+         self.sKey, self.sCert = makeCertificate(
+             O="Server Test Certificate",
+             CN="server")
+@@ -142,14 +204,22 @@
+         self.clientConnections.append(c)
+         return c
+ 
+-    def createEndpoint(self, address=None):
+-        if not address:
++    def createServerEndpoint(self, address=None):
++        if address is None:
+             address = IPv4Address("TCP", "localhost", 0)
+-        return TCPEndpoint(address.host, address.port, 
+-                           sslContextFactory=self.clientSSLContext)
+-        
++        return SSLTCPServerEndpoint(reactor, address.port, 
++                                    self.clientSSLContext)
+ 
++    def createClientEndpoint(self, address):
++        return SSLTCPClientEndpoint(reactor, address.host, address.port, 
++                                    self.clientSSLContext)
++
++
+ class UNIXEndpointsTestCase(PortAndConnectorCleanerUpper, EndpointTestCaseMixin):
++    """Tests for UnixSocket Endpoints"""
++    
++    implements(IEndpointTestCase)
++    
+     def createServer(self, factory):
+         p = reactor.listenUNIX(self.mktemp(), factory)
+         self.listeningPorts.append(p)
+@@ -160,7 +230,10 @@
+         self.clientConnections.append(c)
+         return c
+ 
+-    def createEndpoint(self, address=None):
+-        if not address:
++    def createServerEndpoint(self, address=None):
++        if address is None:
+             address = UNIXAddress(self.mktemp())
+-        return UNIXEndpoint(address.name)
++        return UNIXServerEndpoint(reactor, address.name)
++
++    def createClientEndpoint(self, address=None):
++        return UNIXClientEndpoint(reactor, address.name)
+Index: twisted/test/test_address.py
+===================================================================
+--- twisted/test/test_address.py	(revision 0)
++++ twisted/test/test_address.py	(revision 0)
+@@ -0,0 +1,61 @@
++import re
++
++from twisted.trial import unittest
++from twisted.internet.address import IPv4Address, UNIXAddress
++
++
++class AddressTestCaseMixin(object):
++    def test_AddressComparison(self):
++        """Test that two different address instances, sharing the same 
++        properties are considered equal."""
++        self.assertEquals(self.buildAddress(), self.buildAddress())
++
++    def test_StringRepresentation(self):
++        """Test that when addresses are converted to strings, they adhere to a 
++        standard pattern. Not sure if it's worth it, but seemed like a bit of 
++        fun and demonstrates an inconsistency with UNIXAddress.__str__
++        """
++        addr = self.buildAddress()
++        pattern = "".join([
++           "^",
++           "([^\(]+Address)", # class name,
++           "\(",       # opening bracket,
++           "([^)]+)",  # arguments,
++           "\)",       # closing bracket,
++           "$"
++        ])
++        m = re.match(pattern, str(addr))
++        self.assertNotEqual(None, m, 
++                            "%s does not match the standard __str__ pattern " 
++                            "ClassName(arg1, arg2, etc)" % str(addr))
++        self.assertEqual(addr.__class__.__name__, m.group(1))
++        
++        args = [x.strip() for x in m.group(2).split(",")]
++        self.assertEqual(len(args), len(self.addressArgSpec))
++        def checkArg(arg, argSpec):
++            self.assertEqual(argSpec[1] % getattr(addr, argSpec[0]), arg)
++        map(checkArg, args, self.addressArgSpec)
++
++
++class IPv4AddressTestCaseMixin(AddressTestCaseMixin):
++    def setUpClass(self):
++        self.addressArgSpec = (("type", "%s"), ("host", "%r"), ("port", "%d"))
++
++
++class IPv4AddressTCPTestCase(unittest.TestCase, IPv4AddressTestCaseMixin):
++    def buildAddress(self):
++        return IPv4Address("TCP", "127.0.0.1", 0)
++
++
++class IPv4AddressUDPTestCase(unittest.TestCase, IPv4AddressTestCaseMixin):
++    def buildAddress(self):
++        return IPv4Address("UDP", "127.0.0.1", 0)
++
++
++class UNIXAddressTestCase(unittest.TestCase, AddressTestCaseMixin):
++    def setUpClass(self):
++        self._socketAddress = self.mktemp()
++        self.addressArgSpec = (("name", "%r"),)
++        
++    def buildAddress(self):
++        return UNIXAddress(self._socketAddress)
+Index: twisted/internet/endpoints.py
+===================================================================
+--- twisted/internet/endpoints.py	(revision 18181)
++++ twisted/internet/endpoints.py	(working copy)
+@@ -1,11 +1,12 @@
+ # -*- test-case-name: twisted.test.test_endpoints -*-
+ 
+-from zope.interface import implements, providedBy, directlyProvides
++from zope.interface import implements
+ 
+ from twisted.internet import interfaces
+-from twisted.internet import defer, protocol
++from twisted.internet import defer
+ from twisted.internet.protocol import ClientFactory, Protocol
+ 
++
+ class _WrappingProtocol(Protocol):
+     """I wrap another protocol in order to notify my user when a connection has 
+     been made.
+@@ -23,7 +24,7 @@
+         """
+         
+         self.wrappedProtocol.makeConnection(self.transport)
+-        self.factory.deferred.callback(self.wrappedProtocol)
++        self.factory.onFirstConnection.callback(self.wrappedProtocol)
+         
+     def dataReceived(self, data):
+         return self.wrappedProtocol.dataReceived(data)
+@@ -32,101 +33,183 @@
+         return self.wrappedProtocol.connectionLost(reason)
+         
+ class _WrappingFactory(ClientFactory):
++    """I wrap a factory in order to wrap the protocols it builds."""
+     protocol = _WrappingProtocol
+ 
+     def __init__(self, wrappedFactory):
++        """
++        @param wrappedFactory: A provider of I{IProtocolFactory} whose 
++        buildProtocol method will be called and whose resulting protocol will be 
++        wrapped.
++        """
+         self.wrappedFactory = wrappedFactory
+-        self.deferred = defer.Deferred()
++        self.onFirstConnection = defer.Deferred()
+ 
+     def buildProtocol(self, addr):
+         try:
+             proto = self.wrappedFactory.buildProtocol(addr)
+         except:
+-            self.deferred.errback()
++            self.onFirstConnection.errback()
+         else:
+             return self.protocol(self, proto)
+ 
+     def clientConnectionFailed(self, connector, reason):
+-        self.deferred.errback(reason)
++        self.onFirstConnection.errback(reason)
+ 
+ 
+-class TCPEndpoint(object):
+-    implements(interfaces.IClientEndpoint, interfaces.IServerEndpoint)
++class TCPServerEndpoint(object):
++    """I am a TCP server endpoint."""
++    
++    implements(interfaces.IServerEndpoint)
+ 
+-    def __init__(self, host, port, connectArgs={}, listenArgs={},
+-                 sslContextFactory=None):
++    def __init__(self, reactor, port, listenArgs={}):
+         """
+-        @param host: A hostname, used only when connecting
+-        @param port: The port number, used both when connecting and listening
+-        @param connectArgs: An optional dict of keyword args that will be passed
+-        to L{twisted.internet.interfaces.IReactorTCP.connectTCP}
++        @param reactor: The reactor
++        @param port: The port number used listening
+         @param listenArgs: An optional dict of keyword args that will be passed 
+         to L{twisted.internet.interfaces.IReactorTCP.listenTCP}
+-        @param sslContextFactory: An optional instance of 
+-        L{twisted.internet._sslverify.OpenSSLCertificateOptions}. If given, it 
+-        makes L{connect} and L{listen} use the corresponding methods from 
+-        L{twisted.internet.interfaces.IReactorSSL}
+         """
++        self.reactor = reactor
++        self.port = port
++        self.listenArgs = dict(backlog=50, interface='')
++        self.listenArgs.update(listenArgs)
++
++    def listen(self, serverFactory):
++        wf = _WrappingFactory(serverFactory)
++        return defer.execute(self.reactor.listenTCP, self.port, wf, 
++                             **self.listenArgs)
++
++
++class TCPClientEndpoint(object):
++    """I am a TCP client endpoint."""
++    
++    implements(interfaces.IClientEndpoint)
++
++    def __init__(self, reactor, host, port, connectArgs={}):
++        """
++        @param reactor: The reactor
++        @param host: A hostname, used when connecting
++        @param port: The port number, used when connecting
++        @param connectArgs: An optional dict of keyword args that will be passed
++        to L{twisted.internet.interfaces.IReactorTCP.connectTCP}
++        """
++        self.reactor = reactor
+         self.host = host
+         self.port = port
+         self.connectArgs = dict(timeout=30, bindAddress=None)
+         self.connectArgs.update(connectArgs)
++        
++    def connect(self, clientFactory):
++        wf = _WrappingFactory(clientFactory)
++        d = defer.execute(self.reactor.connectTCP, self.host, self.port, wf, 
++                          **self.connectArgs)
++        d.addCallback(lambda _: wf.onFirstConnection)
++        return d
++
++
++class SSLTCPServerEndpoint(object):
++    """I am an SSL secured TCP server endpoint."""
++    
++    implements(interfaces.IServerEndpoint)
++
++    def __init__(self, reactor, port, sslContextFactory, listenArgs={}):
++        """
++        @param reactor: The reactor
++        @param port: The port number used listening
++        @param sslContextFactory: An instance of 
++        L{twisted.internet._sslverify.OpenSSLCertificateOptions}.
++        @param listenArgs: An optional dict of keyword args that will be passed 
++        to L{twisted.internet.interfaces.IReactorTCP.listenTCP}
++        """
++        self.reactor = reactor
++        self.port = port
++        self.sslContextFactory = sslContextFactory
+         self.listenArgs = dict(backlog=50, interface='')
+         self.listenArgs.update(listenArgs)
++
++    def listen(self, serverFactory):
++        wf = _WrappingFactory(serverFactory)
++        return defer.execute(self.reactor.listenSSL, self.port, wf, 
++                             contextFactory=self.sslContextFactory, 
++                             **self.listenArgs)
++
++
++class SSLTCPClientEndpoint(object):
++    """I am an SSL secured TCP client endpoint."""
++    
++    implements(interfaces.IClientEndpoint)
++
++    def __init__(self, reactor, host, port, sslContextFactory, connectArgs={}):
++        """
++        @param reactor: The reactor
++        @param host: A hostname, used when connecting
++        @param port: The port number, used when connecting
++        @param sslContextFactory: An instance of 
++        L{twisted.internet._sslverify.OpenSSLCertificateOptions}.
++        @param connectArgs: An optional dict of keyword args that will be passed
++        to L{twisted.internet.interfaces.IReactorTCP.connectTCP}
++        """
++        self.reactor = reactor
++        self.host = host
++        self.port = port
+         self.sslContextFactory = sslContextFactory
++        self.connectArgs = dict(timeout=30, bindAddress=None)
++        self.connectArgs.update(connectArgs)
+         
+-    def connect(self, reactor, clientFactory):
++    def connect(self, clientFactory):
+         wf = _WrappingFactory(clientFactory)
+-        connectArgs = self.connectArgs
+-        connectMethod = reactor.connectTCP
+-        if self.sslContextFactory:
+-            connectMethod = reactor.connectSSL
+-            connectArgs["contextFactory"] = self.sslContextFactory
+-            
+-        d = defer.execute(connectMethod, self.host, self.port, wf, **connectArgs)
++        d = defer.execute(self.reactor.connectSSL, self.host, self.port, wf, 
++                          contextFactory=self.sslContextFactory, 
++                          **self.connectArgs)
++        d.addCallback(lambda _: wf.onFirstConnection)
++        return d
+ 
+-        d.addCallback(lambda _: wf.deferred)
+ 
+-        return d
++class UNIXServerEndpoint(object):
++    """I am a UnixSocket server endpoint"""
++    
++    implements(interfaces.IServerEndpoint)
+ 
+-    def listen(self, reactor, serverFactory):
++    def __init__(self, reactor, address, listenArgs={}):
++        """
++        @param reactor: The reactor
++        @param address: The path to the Unix socket file, used when listening
++        @param listenArgs: A dict of keyword args that will be passed to 
++        L{twisted.internet.interfaces.IReactorUNIX.listenUNIX}
++        """
++        self.reactor = reactor
++        self.address = address
++        self.listenArgs = dict(backlog=50, mode=0666, wantPID=0)
++        self.listenArgs.update(listenArgs)
++
++    def listen(self, serverFactory):
+         wf = _WrappingFactory(serverFactory)
+-        listenArgs = self.listenArgs
+-        listenMethod = reactor.listenTCP
+-        if self.sslContextFactory:
+-            listenMethod = reactor.listenSSL
+-            listenArgs["contextFactory"] = self.sslContextFactory
+-        return defer.execute(listenMethod, self.port, wf, **listenArgs)
++        return defer.execute(self.reactor.listenUNIX, self.address, wf, 
++                             **self.listenArgs)
+ 
+-class UNIXEndpoint(object):
+-    implements(interfaces.IClientEndpoint, interfaces.IServerEndpoint)
+ 
+-    def __init__(self, address, connectArgs={}, listenArgs={}):
++class UNIXClientEndpoint(object):
++    """I am a UnixSocket client endpoint"""
++    
++    implements(interfaces.IClientEndpoint)
++
++    def __init__(self, reactor, address, connectArgs={}):
+         """
+-        @param address: The path to the Unix socket file, used both when 
+-        connecting and listening
++        @param reactor: The reactor
++        @param address: The path to the Unix socket file, used when connecting
+         @param connectArgs: A dict of keyword args that will be passed to 
+         L{twisted.internet.interfaces.IReactorUNIX.connectUNIX}
+-        @param listenArgs: A dict of keyword args that will be passed to 
+-        L{twisted.internet.interfaces.IReactorUNIX.listenUNIX}
+         """
+-
++        self.reactor = reactor
+         self.address = address
+         self.connectArgs = dict(timeout=30, checkPID=0)
+         self.connectArgs.update(connectArgs)
+-        self.listenArgs = dict(backlog=50, mode=0666, wantPID=0)
+-        self.listenArgs.update(listenArgs)
+ 
+-    def connect(self, reactor, clientFactory):
++    def connect(self, clientFactory):
+         wf = _WrappingFactory(clientFactory)
+-        d = defer.execute(reactor.connectUNIX, self.address, wf, 
++        d = defer.execute(self.reactor.connectUNIX, self.address, wf, 
+                           **self.connectArgs)
+ 
+-        d.addCallback(lambda _: wf.deferred)
++        d.addCallback(lambda _: wf.onFirstConnection)
+ 
+         return d
+-
+-    def listen(self, reactor, serverFactory):
+-        wf = _WrappingFactory(serverFactory)
+-        return defer.execute(reactor.listenUNIX, self.address, wf, 
+-                             **self.listenArgs)
+Index: twisted/internet/interfaces.py
+===================================================================
+--- twisted/internet/interfaces.py	(revision 18181)
++++ twisted/internet/interfaces.py	(working copy)
+@@ -18,11 +18,6 @@
+ 
+     Default implementations are in L{twisted.internet.address}.
+     """
+-    
+-    def buildEndpoint():
+-        """
+-        @return: an instance providing both L{IClientEndpoint} and L{IServerEndpoint}
+-        """
+ 
+ 
+ ### Reactor Interfaces
+@@ -1303,9 +1298,8 @@
+ class IClientEndpoint(Interface):
+     """Object that represents a remote endpoint that we wish to connect to.
+     """
+-    def connect(reactor, clientFactory):
++    def connect(clientFactory):
+         """
+-        @param reactor: The reactor
+         @param clientFactory: A provider of L{IProtocolFactory}
+         @return: A L{Deferred} that results in an L{IProtocol} upon successful
+         connection otherwise a L{ConnectError}
+@@ -1315,9 +1309,8 @@
+     """Object representing an endpoint where we will listen for connections.
+     """
+ 
+-    def listen(callable):
++    def listen(serverFactory):
+         """
+-        @param reactor: The reactor
+         @param serverFactory: A provider of L{IProtocolFactory}
+         @return: A L{Deferred} that results in an L{IListeningPort} or an 
+         L{CannotListenError}
+Index: twisted/internet/address.py
+===================================================================
+--- twisted/internet/address.py	(revision 18181)
++++ twisted/internet/address.py	(working copy)
+@@ -9,8 +9,8 @@
+ from zope.interface import implements
+ 
+ from twisted.internet.interfaces import IAddress
+-from twisted.internet.endpoints import TCPEndpoint, UNIXEndpoint
+ 
++
+ class IPv4Address(object):
+     """
+     Object representing an IPv4 socket endpoint.
+@@ -36,12 +36,6 @@
+         self.port = port
+         self._bwHack = _bwHack
+ 
+-    def buildEndpoint(self):
+-        if self.type == "TCP":
+-            return TCPEndpoint(self.host, self.port)
+-        else:
+-            raise NotImplementedError
+-
+     def __getitem__(self, index):
+         warnings.warn("IPv4Address.__getitem__ is deprecated.  Use attributes instead.",
+                       category=DeprecationWarning, stacklevel=2)
+@@ -79,9 +73,6 @@
+         self.name = name
+         self._bwHack = _bwHack
+ 
+-    def buildEndpoint(self):
+-        return UNIXEndpoint(self.name)
+-
+     def __getitem__(self, index):
+         warnings.warn("UNIXAddress.__getitem__ is deprecated.  Use attributes instead.",
+                       category=DeprecationWarning, stacklevel=2)
+@@ -96,14 +87,20 @@
+         if isinstance(other, tuple):
+             return tuple(self) == other
+         elif isinstance(other, UNIXAddress):
+-            try:
+-                return os.path.samefile(self.name, other.name)
+-            except OSError:
+-                pass
++            # First do the simple thing and check to see if the names are the 
++            # same. If not, and the paths exist, check to see if they point to 
++            # the same file.
++            if self.name == other.name:
++                return True
++            else:
++                try:
++                    return os.path.samefile(self.name, other.name)
++                except OSError:
++                    pass
+         return False
+ 
+     def __str__(self):
+-        return 'UNIXSocket(%r)' % (self.name,)
++        return 'UNIXAddress(%r)' % (self.name,)
+ 
+ 
+ # These are for buildFactory backwards compatability due to

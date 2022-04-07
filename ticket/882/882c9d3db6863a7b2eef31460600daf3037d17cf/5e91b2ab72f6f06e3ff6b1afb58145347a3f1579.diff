@@ -1,0 +1,2021 @@
+Index: test/test_session.py
+===================================================================
+--- test/test_session.py	(revision 23186)
++++ test/test_session.py	(revision 23704)
+@@ -3,14 +3,19 @@
+ 
+ """
+ Tests for the 'session' channel implementation in twisted.conch.ssh.session.
++
++See also RFC 4254.
+ """
+ 
++import os, signal, sys, struct
++
++from zope.interface import implements
++
+ from twisted.conch.ssh import common, connection, session
+ from twisted.internet import defer, protocol, error
+ from twisted.python import components, failure
++from twisted.python.versions import Version
+ from twisted.trial import unittest
+-from zope.interface import implements
+-import os, signal, sys
+ 
+ 
+ 
+@@ -24,16 +29,18 @@
+     def lookupSubsystem(self, name, data):
+         """
+         If the other side requests the 'subsystem' subsystem, allow it by
+-        returning a MockProcessProtocol to implement it.  Otherwise, fail.
++        returning a MockProcessProtocol to implement it.  Otherwise, return
++        None which is interpreted by SSHSession as a failure.
+         """
+         if name == 'subsystem':
+             return MockProcessProtocol()
+ 
+ 
+ 
+-class StubOldAvatar(object):
++class StubOldAvatar:
+     """
+-    A stub class representing the avatar representing the authenticated user.
++    A stub class representing the avata representing the authenticated user.
++    It implements the old I{ISession} interface.
+     """
+ 
+ 
+@@ -41,7 +48,8 @@
+         """
+         If the user requests the TestSubsystem subsystem, connect them
+         to our MockProcessProtocol.  If they request the protocol
+-        subsystem, connect them to a MockProtocol.
++        subsystem, connect them to a MockProtocol.  If they request neither,
++        then None is returned which is interpreted by SSHSession as a failure.
+         """
+         if name == 'TestSubsystem':
+             self.subsystem = MockProcessProtocol()
+@@ -56,7 +64,9 @@
+ 
+ class StubSessionForStubOldAvatar(object):
+     """
+-    A stub ISession implementation for our StubOldAvatar.
++    A stub ISession implementation for our StubOldAvatar.  The instance
++    variables generally keep track of method invocations so that we can test
++    that the methods were called.
+ 
+     @ivar avatar: the C{StubOldAvatar} we are adapting.
+     @ivar ptyRequest: if present, the terminal, window size, and modes passed
+@@ -97,7 +107,7 @@
+         if terminal != 'bad':
+             self.ptyRequest = (terminal, window, modes)
+         else:
+-            raise NotImplementedError('not getting a pty')
++            raise RuntimeError('not getting a pty')
+ 
+ 
+     def windowChanged(self, window):
+@@ -106,20 +116,19 @@
+         windowChange variable.
+         """
+         if window == (0, 0, 0, 0):
+-            raise NotImplementedError('not changing the window size')
++            raise RuntimeError('not changing the window size')
+         else:
+             self.windowChange = window
+ 
+ 
+     def openShell(self, pp):
+         """
+-        If we have gotten a shell request before, fail.  Otherwise,
+-        store the process protocol in the shellProtocol variable,
+-        connect it to the EchoTransport and store that as
+-        shellTransport.
++        If we have gotten a shell request before, fail.  Otherwise, store the
++        process protocol in the shellProtocol variable, connect it to the
++        EchoTransport and store that as shellTransport.
+         """
+         if self.shellProtocol is not None:
+-            raise NotImplementedError('not getting a shell this time')
++            raise RuntimeError('not getting a shell this time')
+         else:
+             self.shellProtocol = pp
+             self.shellTransport = EchoTransport(pp)
+@@ -127,19 +136,19 @@
+ 
+     def execCommand(self, pp, command):
+         """
+-        If the command is 'true', store the command, the process protocol,
+-        and the transport we connect to the process protocol
+-        Otherwise, just store the command and raise an error.
++        If the command is 'true', store the command, the process protocol, and
++        the transport we connect to the process protocol.  Otherwise, just
++        store the command and raise an error.
+         """
+         self.execCommandLine = command
+-        if command == 'true':
++        if command == 'success':
+             self.execProtocol = pp
+-        elif command[:4] == 'echo':
++        elif command[:6] == 'repeat':
+             self.execProtocol = pp
+             self.execTransport = EchoTransport(pp)
+-            pp.outReceived(command[5:])
++            pp.outReceived(command[7:])
+         else:
+-            raise NotImplementedError('not getting a command')
++            raise RuntimeError('not getting a command')
+ 
+ 
+     def eofReceived(self):
+@@ -173,6 +182,8 @@
+ class StubApplicationFactoryForStubNewAvatar:
+     """
+     A stub ISessionApplicationFactory implementation for our StubNewAvatar.
++    The instance variables generally keep track of method calls so that the
++    tests can verify that those methods were called.
+ 
+     @ivar avatar: the C{StubOldAvatar} we are adapting.
+     @ivar inConnectionOpen: C{True} if the input side is open.
+@@ -214,7 +225,7 @@
+         """
+         if self.subsystem is not None:
+             raise ValueError('already opened a subsystem')
+-        if subsystem == 'echo':
++        if subsystem == 'repeat':
+             self.subsystem = MockApplication()
+             self.subsystem.packetData = data
+             return self.subsystem
+@@ -222,7 +233,7 @@
+ 
+     def getPTY(self, term, windowSize, modes):
+         """
+-        Request a psuedoterminal.  Store the data passed to us.
++        Request a pseudoterminal.  Store the data passed to us.
+         """
+         self.term = term
+         self.windowSize = windowSize
+@@ -244,7 +255,7 @@
+         """
+ 
+         if self.command is not None:
+-            raise ValueError('already executed a command')
++            raise RuntimeError('already executed a command')
+         self.command = MockApplication()
+         self.command.command = command
+         return self.command
+@@ -258,7 +269,7 @@
+         """
+ 
+         if self.shell is not None:
+-            raise ValueError('already opened a shell')
++            raise RuntimeError('already opened a shell')
+         self.shell = MockApplication()
+         return self.shell
+ 
+@@ -322,6 +333,8 @@
+     def dataReceived(self, data):
+         """
+         We got some data.  Store it, and echo it back with a tilde appended.
++        The tilde is appended so that the tests can verify that this method
++        was called by checking for the extra byte.
+         """
+         self.data.append(data)
+         self.channel.write(data + '~')
+@@ -330,7 +343,8 @@
+     def extendedDataReceived(self, type, data):
+         """
+         We got some extended data.  Store it, and echo it back with an
+-        incremented data type and with a tilde appended to the data.
++        incremented data type and with a tilde appended to the data.  Also see
++        the docstring for dataReceived().
+         """
+         self.extendedData.append((type, data))
+         self.channel.writeExtended(type + 1, data + '~')
+@@ -377,8 +391,10 @@
+ class MockProcessProtocol(protocol.ProcessProtocol):
+     """
+     A mock ProcessProtocol which echoes back data sent to it and
+-    appends a tilde.
++    appends a tilde.  The tilde is appended so the tests can verify that
++    we received and processed the data.
+ 
++    @ivar packetData: C{str} of data to be sent when the connection is made.
+     @ivar data: a C{str} of data received.
+     @ivar err: a C{str} of error data received.
+     @ivar inConnectionOpen: True if the input side is open.
+@@ -429,7 +445,7 @@
+ 
+     def outConnectionLost(self):
+         """
+-        close the output side.
++        Close the output side.
+         """
+         self.outConnectionOpen = False
+ 
+@@ -452,23 +468,23 @@
+ class EchoTransport:
+     """
+     A transport for a ProcessProtocol which echos data that is sent to it with
+-    a Window newline (\\r\\n) appended to it.  If a null byte is in the data,
+-    disconnect.  When we are asked to disconnect, disconnect the C{ProcessProtocol}
+-    with a 0 exit code.
++    a Window newline (CR LF) appended to it.  If a null byte is in the data,
++    disconnect.  When we are asked to disconnect, disconnect the
++    C{ProcessProtocol} with a 0 exit code.
+ 
+     @ivar proto: the C{ProcessProtocol} connected to us.
+     @ivar data: a C{str} of data written to us.
+     """
+ 
+ 
+-    def __init__(self, p):
++    def __init__(self, processProtocol):
+         """
+         Initialize our instance variables.
+ 
+-        @param p: a C{ProcessProtocol} to connect to ourself.
++        @param processProtocol: a C{ProcessProtocol} to connect to ourself.
+         """
+-        self.proto = p
+-        p.makeConnection(self)
++        self.proto = processProtocol
++        processProtocol.makeConnection(self)
+         self.closed = False
+         self.data = ''
+ 
+@@ -490,7 +506,8 @@
+         If we're asked to disconnect (and we haven't already) shut down
+         the C{ProcessProtocol} with a 0 exit code.
+         """
+-        if self.closed: return
++        if self.closed:
++            return
+         self.closed = 1
+         self.proto.inConnectionLost()
+         self.proto.outConnectionLost()
+@@ -502,8 +519,9 @@
+ 
+ class MockProtocol(protocol.Protocol):
+     """
+-    A sample Process which stores the data passed to it.
++    A sample Protocol which stores the data passed to it.
+ 
++    @ivar packetData: a C{str} of data to be sent when the connection is made.
+     @ivar data: a C{str} of the data passed to us.
+     @ivar open: True if the channel is open.
+     @ivar reason: if not None, the reason the protocol was closed.
+@@ -513,7 +531,8 @@
+ 
+     def connectionMade(self):
+         """
+-        Set up the instance variables.
++        Set up the instance variables.  If we have any packetData, send it
++        along.
+         """
+         self.data = ''
+         self.open = True
+@@ -524,7 +543,9 @@
+ 
+     def dataReceived(self, data):
+         """
+-        Store the received data.
++        Store the received data and write it back with a tilde appended.
++        The tilde is appended so that the tests can verify that we processed
++        the data.
+         """
+         self.data += data
+         self.transport.write(data + '~')
+@@ -621,15 +642,11 @@
+     @ivar buf: the data sent to the transport.
+     @type buf: C{str}
+ 
+-    @ivar err: the extended data sent to the transport.
+-    @type err: C{str}
+-
+     @ivar close: flags indicating if the transport has been closed.
+     @type close: C{bool}
+     """
+ 
+     buf = ''
+-    err = ''
+     close = False
+ 
+ 
+@@ -640,21 +657,34 @@
+         self.buf += data
+ 
+ 
+-    def writeErr(self, data):
++    def loseConnection(self):
+         """
+-        Record the extended data in the buffer.
++        Note that the connection was closed.
+         """
+-        self.err += data
++        self.close = True
+ 
+ 
+-    def loseConnection(self):
++class StubTransportWithWriteErr(StubTransport):
++    """
++    A version of StubTransport which records the error data sent to it.
++
++    @ivar err: the extended data sent to the transport.
++    @type err: C{str}
++    """
++
++    err = ''
++
++
++    def writeErr(self, data):
+         """
+-        Note that the connection was closed.
++        Record the extended data in the buffer.  This was an old interface
++        that allowed the Transports from ISession.openShell() or
++        ISession.execCommand() to receive extended data from the client.
+         """
+-        self.close = True
++        self.err += data
+ 
+ 
+-
++    
+ class StubClient(object):
+     """
+     A stub class representing the client to a SSHSession.
+@@ -665,10 +695,9 @@
+ 
+ 
+     def __init__(self):
+-        self.transport = StubTransport()
++        self.transport = StubTransportWithWriteErr()
+ 
+ 
+-
+ class OldSessionInterfaceTestCase(unittest.TestCase):
+     """
+     Tests for the old SSHSession class interface.  This interface is not ideal,
+@@ -678,19 +707,38 @@
+ 
+     def setUp(self):
+         """
+-        Make an SSHSession object to test.  Give the chanel some window
+-        so that it's allowed to send packets.
++        Make an SSHSession object to test.  Give the channel some window
++        so that it's allowed to send packets.  500 and 100 are arbitrary
++        values.
+         """
+         self.session = session.SSHSession(remoteWindow=500,
+                 remoteMaxPacket=100, conn=StubConnection(),
+                 avatar=StubOldAvatar())
+ 
+ 
++    def assertSessionIsStubSession(self):
++        """
++        Asserts that self.session.session is an instance of
++        StubSessionForStubOldAvatar.
++        """
++        self.assertIsInstance(self.session.session,
++                              StubSessionForStubOldAvatar)
++        
++
++    def _wrapWithAssertWarns(self, function, *args):
++        """
++        Some of the methods we test give a warning that using an old avatar
++        (one that implements ISession instead of ISessionApplication) is
++        deprecated.
++        """
++        return self.assertWarns(DeprecationWarning, "Using an avatar that doesn't implement ISessionApplicationFactory is deprecated since Twisted 8.2.",
++                         __file__, function, *args)
++
++                
+     def test_init(self):
+         """
+-        Test that SSHSession initializes its buffer (buf), client, and
+-        ISession adapter.  The avatar should not need to be adaptable to an
+-        ISession immediately.
++        SSHSession initializes its buffer (buf), client, and ISession adapter.
++        The avatar should not need to be adaptable to an ISession immediately.
+         """
+         s = session.SSHSession(avatar=object) # use object because it doesn't
+                                               # have an adapter
+@@ -699,86 +747,71 @@
+         self.assertIdentical(s.session, None)
+ 
+ 
+-    def _testGetsSession(self):
++    def test_client_dataReceived(self):
+         """
+-        Check that a function will cause SSHSession to generate a session.
+-
+-        We return a C{tuple} of a C{SSHSession} and aC{Deferred} which expects
+-        to be called back with a function and arguments to be called.  After
+-        the function is called, the C{SSHSession} should have a session
+-        attribute which provides I{ISession}.
++        SSHSession.dataReceived() passes data along to a client.  If the data
++        comes before there is a client, the data should be discarded.
+         """
+-        s = session.SSHSession()
+-        d = defer.Deferred()
+-        def check(fargs):
+-            f = fargs[0]
+-            args = fargs[1:]
+-            s.avatar = StubOldAvatar()
+-            self.assertIdentical(s.session, None)
+-            f(*args)
+-            self.assertTrue(session.ISession.providedBy(s.session))
+-        d.addCallback(check)
+-        return s, d
++        self.session.dataReceived('1')
++        self.session.client = StubClient()
++        self.session.dataReceived('2')
++        self.assertEquals(self.session.client.transport.buf, '2')
+ 
+-
+-    def test_requestShellGetsSession(self):
++    def test_client_extReceived(self):
+         """
+-        If an ISession adapter isn't already present, request_shell should get
+-        one.
++        SSHSession.extReceived() passed data of type EXTENDED_DATA_STDERR along
++        to the client.  If the data comes before there is a client, or if the
++        data is not of type EXTENDED_DATA_STDERR, it is discared.
+         """
+-        s, d = self._testGetsSession()
+-        return d.callback((s.requestReceived, 'shell', ''))
++        self.session.extReceived(connection.EXTENDED_DATA_STDERR, '1')
++        self.session.extReceived(255, '2') # 255 is arbitrary
++        self.session.client = StubClient()
++        self.session.extReceived(connection.EXTENDED_DATA_STDERR, '3')
++        self.assertEquals(self.session.client.transport.err, '3')
+ 
+-
+-    def test_requestExecGetsSession(self):
++    def test_client_extReceivedWithoutWriteErr(self):
+         """
+-        If an ISession adapter isn't already present, request_exec should get
+-        one.
++        SSHSession.extReceived() should handle the case where the transport
++        on the client doesn't have a writeErr method.
+         """
+-        s, d = self._testGetsSession()
+-        return d.callback((s.requestReceived, 'exec', common.NS('true')))
++        client = StubClient()
++        client.transport = StubTransport() # doesn't have writeErr
++        self.session.client = client
+ 
++        # should not raise an error
++        self.session.extReceived(connection.EXTENDED_DATA_STDERR, 'ignored')
+ 
+-    def test_requestPtyReqGetsSession(self):
++        
++    def test_client_eofReceived(self):
+         """
+-        If an ISession adapter isn't already present, request_pty_req should
+-        get one.
++        SSHSession.eofReceived() should send a close message to the remote
++        side.
+         """
+-        s, d = self._testGetsSession()
+-        return d.callback((s.requestReceived, 'pty_req',
+-            session.packRequest_pty_req(
+-            'term', (0, 0, 0, 0), [])))
++        self.session.client = StubClient()
++        self._wrapWithAssertWarns(self.session.eofReceived)
++        self.assertTrue(self.session.conn.closes[self.session])
+ 
+-
+-    def test_requestWindowChangeGetsSession(self):
++    def test_client_closed(self):
+         """
+-        If an ISession adapter isn't already present, request_window_change
+-        should get one.
++        SSHSession.closed() should tell the transport connected to the client
++        that the connection was lost.
+         """
+-        s, d = self._testGetsSession()
+-        return d.callback((s.requestReceived, 'window_change',
+-            session.packRequest_window_change((1, 1, 1, 1))))
++        self.session.client = StubClient()
++        self._wrapWithAssertWarns(self.session.closed)
++        self.assertTrue(self.session.client.transport.close)
++        self.session.client.transport.close = False
+ 
+ 
+-    def test_client(self):
++    def test_badSubsystemDoesNotCreateClient(self):
+         """
+-        Test that SSHSession passes data and extended data along to a client.
++        When a subsystem request fails, SSHSession.client should not be set.
+         """
+-        self.session.dataReceived('1')
+-        self.session.extReceived(connection.EXTENDED_DATA_STDERR, '3')
+-        # these don't get sent as part of the client interface
+-        self.session.client = StubClient()
+-        self.session.dataReceived('2')
+-        self.session.extReceived(connection.EXTENDED_DATA_STDERR, '4')
+-        self.assertEquals(self.session.client.transport.buf, '2')
+-        self.assertEquals(self.session.client.transport.err, '4')
+-        self.session.eofReceived()
+-        self.assertTrue(self.session.conn.closes[self.session])
+-        self.session.closed()
+-        self.assertTrue(self.session.client.transport.close)
+-        self.session.client.transport.close = False
++        ret = self._wrapWithAssertWarns(self.session.requestReceived,
++                'subsystem', common.NS('BadSubsystem'))
++        self.assertFalse(ret)
++        self.assertIdentical(self.session.client, None)
+ 
+-
++        
+     def test_lookupSubsystem(self):
+         """
+         When a client requests a subsystem, the SSHSession object should get
+@@ -786,37 +819,25 @@
+         the client.
+         """
+         self.session.session = None # old SSHSession didn't have this attribute
+-        self.session.dataReceived('1')
+-        self.session.extReceived(connection.EXTENDED_DATA_STDERR, '2')
+-        self.assertFalse(self.session.requestReceived(
+-                'subsystem', common.NS('BadSubsystem')))
+-        self.assertIdentical(self.session.client, None)
+-        self.assertTrue(self.session.requestReceived(
+-                'subsystem', common.NS('TestSubsystem') + 'data'))
++        ret = self._wrapWithAssertWarns(self.session.requestReceived,
++                'subsystem', common.NS('TestSubsystem') + 'data')
++        self.assertTrue(ret)
+         self.assertIsInstance(self.session.client, protocol.ProcessProtocol)
+         self.assertIdentical(self.session.sessionApplication.processProtocol,
+                              self.session.avatar.subsystem)
+ 
+-        self.assertEquals(self.session.conn.data[self.session],
+-                ['\x00\x00\x00\x0dTestSubsystemdata~'])
+-        self.session.dataReceived('more data')
+-        self.assertEquals(self.session.conn.data[self.session][-1],
+-                'more data~')
+-        self.session.closeReceived()
+-        self.assertTrue(self.session.conn.closes[self.session])
+ 
+-
+     def test_lookupSubsystemProtocol(self):
+         """
+-        Test that lookupSubsystem correctly handles being returned a
+-        Protocol.
++        Test that lookupSubsystem handles being returned a Protocol by wrapping
++        it in a ProcessProtocol.  The ProcessProtocol that wraps the Protocol
++        should pass attributes along to the protocol.
+         """
+         self.session.session = None # old SSHSession didn't have this attribute
+-        self.session.dataReceived('1')
+-        self.session.extReceived(connection.EXTENDED_DATA_STDERR, '2')
+-        self.assertIdentical(self.session.client, None)
+-        self.assertTrue(self.session.requestReceived(
+-                'subsystem', common.NS('protocol') + 'data'))
++        
++        ret = self._wrapWithAssertWarns(self.session.requestReceived,
++                'subsystem', common.NS('protocol') + 'data')
++        self.assertTrue(ret)
+         self.assertIsInstance(self.session.client,
+                               protocol.ProcessProtocol)
+         self.assertIdentical(
+@@ -832,26 +853,18 @@
+             self.session.sessionApplication.processProtocol.transport.proto,
+             self.session.sessionApplication.processProtocol)
+ 
+-        self.assertEquals(self.session.conn.data[self.session],
+-                ['\x00\x00\x00\x08protocoldata~'])
+-        self.session.dataReceived('more data')
+-        self.assertEquals(self.session.conn.data[self.session][-1],
+-                'more data~')
+-        self.session.closeReceived()
+-        self.assertTrue(self.session.conn.closes[self.session])
+-        self.session.closed()
+-        self.assertEquals(self.session.sessionApplication.processProtocol.proto.reason,
+-                          protocol.connectionDone)
+ 
+-
+     def test_lookupSubsystemDoesNotNeedISession(self):
+         """
+-        Previously, if one only wanted to implement a subsystem, an
+-        ISession adapter wasn't needed.
++        Previously, if one only wanted to implement a subsystem, an ISession
++        adapter wasn't needed because subsystems were looked up using the
++        lookupSubsystem method on the avatar.
+         """
+         s = session.SSHSession(avatar=SubsystemOnlyAvatar(),
+                                conn=StubConnection())
+-        self.assertTrue(s.request_subsystem(common.NS('subsystem') + 'data'))
++        ret = self._wrapWithAssertWarns(s.request_subsystem,
++                                        common.NS('subsystem') + 'data')
++        self.assertTrue(ret)
+         self.assertNotIdentical(s.applicationFactory, None)
+         self.assertIdentical(s.conn.closes.get(s), None)
+         s.eofReceived()
+@@ -861,6 +874,55 @@
+         s.closed()
+ 
+ 
++    def test_lookupSubsystem_data(self):
++        """
++        After having looked up a subsystem, data should be passed along to the
++        client.  Additionally, subsystems were passed the entire request packet
++        as data, instead of just the additional data.
++
++        We check for the additional tidle to verify that the data passed
++        through the client.
++        """
++        self.session.session = None # old SSHSession didn't have this attribute
++        self.session.dataReceived('1')
++        # subsystems didn't get extended data
++        self.session.extReceived(connection.EXTENDED_DATA_STDERR, '2')
++
++        self._wrapWithAssertWarns(self.session.requestReceived, 'subsystem',
++                                     common.NS('TestSubsystem') + 'data')
++
++        self.assertEquals(self.session.conn.data[self.session],
++                ['\x00\x00\x00\x0dTestSubsystemdata~'])
++        self.session.dataReceived('more data')
++        self.assertEquals(self.session.conn.data[self.session][-1],
++                'more data~')
++
++
++    def test_lookupSubsystem_closeReceived(self):
++        """
++        SSHSession.closeReceived() should sent a close message to the remote
++        side.
++        """
++        self.session.session = None # old SSHSession didn't have this attribute
++
++        self._wrapWithAssertWarns(self.session.requestReceived, 'subsystem',
++                                     common.NS('TestSubsystem') + 'data')
++
++        self.session.closeReceived()
++        self.assertTrue(self.session.conn.closes[self.session])
++
++
++    def assertRequestRaisedRuntimeError(self):
++        """
++        Assert that the request we just made raised a RuntimeError (and only a
++        RuntimeError).
++        """
++        errors = self.flushLoggedErrors(RuntimeError)
++        self.assertEquals(len(errors), 1, "Multiple RuntimeErrors raised: %s" %
++                          '\n'.join([repr(error) for error in errors]))
++        errors[0].trap(RuntimeError)
++
++
+     def test_requestShell(self):
+         """
+         When a client requests a shell, the SSHSession object should get
+@@ -868,26 +930,28 @@
+         calling openShell() with a ProcessProtocol to attach.
+         """
+         # gets a shell the first time
+-        self.assertTrue(self.session.requestReceived('shell', ''))
+-        self.assertIsInstance(self.session.session,
+-                              StubSessionForStubOldAvatar)
++        ret = self._wrapWithAssertWarns(self.session.requestReceived, 'shell',
++                                        '')
++        self.assertTrue(ret)
++        self.assertSessionIsStubSession()
+         self.assertIsInstance(self.session.client,
+                               session.SSHSessionProcessProtocol)
+         self.assertIdentical(self.session.session.shellProtocol,
+                 self.session.client)
+         # doesn't get a shell the second time
+         self.assertFalse(self.session.requestReceived('shell', ''))
+-        self.flushLoggedErrors()
++        self.assertRequestRaisedRuntimeError()
++        
+ 
+-
+     def test_requestShellWithData(self):
+         """
+-        When a client executes a shell, it should be able to give pass data back
+-        and forth.
++        When a client executes a shell, it should be able to give pass data
++        back and forth between the local and the remote side.
+         """
+-        self.assertTrue(self.session.requestReceived('shell', ''))
+-        self.assertIsInstance(self.session.session,
+-                              StubSessionForStubOldAvatar)
++        ret = self._wrapWithAssertWarns(self.session.requestReceived, 'shell',
++                                        '')
++        self.assertTrue(ret)
++        self.assertSessionIsStubSession()
+         self.session.dataReceived('some data\x00')
+         self.assertEquals(self.session.session.shellTransport.data,
+                           'some data\x00')
+@@ -905,36 +969,36 @@
+         calling execCommand with a ProcessProtocol to attach and the
+         command line.
+         """
+-        self.assertFalse(self.session.requestReceived('exec', common.NS('false')))
+-        self.flushLoggedErrors()
++        ret = self._wrapWithAssertWarns(self.session.requestReceived, 'exec',
++                                                      common.NS('failure'))
++        self.assertFalse(ret)
++        self.assertRequestRaisedRuntimeError()
+         self.assertIdentical(self.session.client, None)
+ 
+-        self.assertTrue(self.session.requestReceived('exec', common.NS('true')))
+-        self.assertIsInstance(self.session.session,
+-                              StubSessionForStubOldAvatar)
++        self.assertTrue(self.session.requestReceived('exec',
++                                                     common.NS('success')))
++        self.assertSessionIsStubSession()
+         self.assertIsInstance(self.session.client,
+                               session.SSHSessionProcessProtocol)
+         self.assertIdentical(self.session.session.execProtocol,
+                 self.session.client)
+         self.assertEquals(self.session.session.execCommandLine,
+-                'true')
++                'success')
+ 
+ 
+     def test_requestExecWithData(self):
+         """
+-        When a client executes a command, it should be able to give pass data back
+-        and forth.  Setting the remoteWindowLeft to 4 tests that the C{SSHChannel}
+-        buf instance variable isn't overriden by SSHSession.
++        When a client executes a command, it should be able to give pass data
++        back and forth.
+         """
+-        self.session.remoteWindowLeft = 4
+-        self.assertTrue(self.session.requestReceived('exec', common.NS('echo hello')))
+-        self.assertIsInstance(self.session.session,
+-                              StubSessionForStubOldAvatar)
++        ret = self._wrapWithAssertWarns(self.session.requestReceived, 'exec',
++                                                     common.NS('repeat hello'))
++        self.assertTrue(ret)
++        self.assertSessionIsStubSession()
+         self.session.dataReceived('some data')
+         self.assertEquals(self.session.session.execTransport.data, 'some data')
+-        self.session.addWindowBytes(20)
+         self.assertEquals(self.session.conn.data[self.session],
+-                          ['hell', 'osome data\r\n'])
++                          ['hello', 'some data', '\r\n'])
+         self.session.eofReceived()
+         self.session.closeReceived()
+         self.session.closed()
+@@ -943,6 +1007,24 @@
+                           [('exit-status', '\x00\x00\x00\x00', False)])
+ 
+ 
++    def test_requestExecBuffering(self):
++        """
++        Channel buffering should not interfere with the buffering that
++        SSHSession does.
++        """
++        self.session.remoteWindowLeft = 4 # arbitrary, to force channel
++                                          # buffering
++        self.session.dataReceived(' world')
++        self._wrapWithAssertWarns(self.session.requestReceived, 'exec',
++                                  common.NS('repeat hello'))
++        self.assertEquals(self.session.conn.data[self.session],
++                          ['hell'])
++        self.session.dataReceived('another line')
++        self.session.addWindowBytes(30)
++        self.assertEquals(''.join(self.session.conn.data[self.session]),
++                          'hello world\r\nanother line\r\n')
++
++
+     def test_requestPty(self):
+         """
+         When a client requests a PTY, the SSHSession object should make
+@@ -950,12 +1032,13 @@
+         calling getPty with the terminal type, the window size, and any modes
+         the client gave us.
+         """
+-        self.assertFalse(
+-                self.session.requestReceived('pty_req',
+-            session.packRequest_pty_req('bad', (1, 2, 3, 4), [])))
+-        self.assertIsInstance(self.session.session,
+-                              StubSessionForStubOldAvatar)
+-        self.flushLoggedErrors()
++        # 'bad' terminal type fails
++        ret = self._wrapWithAssertWarns(self.session.requestReceived, 'pty_req',
++            session.packRequest_pty_req('bad', (1, 2, 3, 4), []))
++        self.assertFalse(ret)
++        self.assertSessionIsStubSession()
++        self.assertRequestRaisedRuntimeError()
++        # 'good' terminal type succeeds
+         self.assertTrue(self.session.requestReceived('pty_req',
+             session.packRequest_pty_req('good', (1, 2, 3, 4), [])))
+         self.assertEquals(self.session.session.ptyRequest,
+@@ -968,11 +1051,12 @@
+         object should make the request by getting an ISession adapter for the
+         avatar, then calling windowChanged with the new window size.
+         """
+-        self.assertFalse(self.session.requestReceived('window_change',
+-            session.packRequest_window_change((0, 0, 0, 0))))
+-        self.flushLoggedErrors()
+-        self.assertIsInstance(self.session.session,
+-                              StubSessionForStubOldAvatar)
++        ret = self._wrapWithAssertWarns(self.session.requestReceived,
++                                        'window_change',
++            session.packRequest_window_change((0, 0, 0, 0)))
++        self.assertFalse(ret)
++        self.assertRequestRaisedRuntimeError()
++        self.assertSessionIsStubSession()
+         self.assertTrue(self.session.requestReceived('window_change',
+             session.packRequest_window_change((1, 2, 3, 4))))
+         self.assertEquals(self.session.session.windowChange,
+@@ -993,7 +1077,8 @@
+         """
+         When a close is received, the session should send a close message.
+         """
+-        self.assertIdentical(self.session.closeReceived(), None)
++        ret = self._wrapWithAssertWarns(self.session.closeReceived)
++        self.assertIdentical(ret, None)
+         self.assertTrue(self.session.conn.closes[self.session])
+ 
+ 
+@@ -1008,6 +1093,82 @@
+ 
+ 
+ 
++class OldSessionWithNoAvatarTestCase(unittest.TestCase):
++    """
++    Test for the old SSHSession interface.  Several of the old methods
++    (request_shell, request_exec, request_pty_req, request_window_change) would
++    create a 'session' instance variable from the avatar if one didn't exist
++    when they were called.
++    """
++
++    
++    def setUp(self):
++        self.session = session.SSHSession()
++        self.session.avatar = StubOldAvatar()
++        self.assertIdentical(self.session.session, None)
++
++
++    def assertSessionProvidesISession(self):
++        """
++        self.session.session should provide I{ISession}.
++        """
++        self.assertTrue(session.ISession.providedBy(self.session.session),
++                        "ISession not provided by %r" % self.session.session)
++
++
++    def _wrapWithAssertWarns(self, function, *args):
++        """
++        All of the methods that we test give a warning that using an old avatar
++        (one that implements ISession instead of ISessionApplication) is
++        deprecated.
++        """
++        self.assertWarns(DeprecationWarning, "Using an avatar that doesn't implement ISessionApplicationFactory is deprecated since Twisted 8.2.",
++                         __file__, function, *args)
++
++        
++    def test_requestShellGetsSession(self):
++        """
++        If an ISession adapter isn't already present, request_shell should get
++        one.
++        """
++        self._wrapWithAssertWarns(self.session.requestReceived, 'shell', '')
++        self.assertSessionProvidesISession()
++
++
++    def test_requestExecGetsSession(self):
++        """
++        If an ISession adapter isn't already present, request_exec should get
++        one.
++        """
++        self._wrapWithAssertWarns(self.session.requestReceived, 'exec',
++                                  common.NS('success'))
++        self.assertSessionProvidesISession()
++
++
++    def test_requestPtyReqGetsSession(self):
++        """
++        If an ISession adapter isn't already present, request_pty_req should
++        get one.
++        """
++        self._wrapWithAssertWarns(self.session.requestReceived, 'pty_req',
++                                  session.packRequest_pty_req(
++                'term', (0, 0, 0, 0), []))
++        self.assertSessionProvidesISession()
++
++
++    def test_requestWindowChangeGetsSession(self):
++        """
++        If an ISession adapter isn't already present, request_window_change
++        should get one.
++        """
++        self._wrapWithAssertWarns(self.session.requestReceived,
++                                  'window_change',
++                                  session.packRequest_window_change(
++                (1, 1, 1, 1)))
++        self.assertSessionProvidesISession()
++                                     
++    
++
+ class TestHelpers(unittest.TestCase):
+     """
+     Tests for the 4 helper functions: parseRequest_* and packRequest_*.
+@@ -1029,21 +1190,38 @@
+             uint32  mode value
+         """
+         self.assertEquals(session.parseRequest_pty_req(common.NS('xterm') +
+-                '\x00\x00\x00\x01\x00\x00\x00\x02\x00\x00\x00\x03\x00\x00\x00'
+-                '\x04\x00\x00\x00\x05\x05\x00\x00\x00\x06'),
+-                ('xterm', (2, 1, 3, 4), [(5, 6)]))
++                                                       struct.pack('>4L',
++                                                                   1, 2, 3, 4)
++                                                       + common.NS(
++                    struct.pack('>BL', 5, 6))),
++                          ('xterm', (2, 1, 3, 4), [(5, 6)]))
+ 
+ 
++    def test_packRequest_pty_req_old(self):
++        """
++        See test_parseRequest_pty_req for the payload format.
++        """
++        def _():
++            return session.packRequest_pty_req('xterm', (2, 1, 3, 4),
++                                               '\x05\x00\x00\x00\x06')
++
++        packed = self.assertWarns(DeprecationWarning,
++                                  "packRequest_pty_req should be packing "
++                                  "the modes.",
++                                  __file__, _)
++        self.assertEquals(packed,
++                          common.NS('xterm') + struct.pack('>4L', 1, 2, 3, 4) +
++                          common.NS(struct.pack('>BL', 5, 6)))
++
++
+     def test_packRequest_pty_req(self):
+         """
+         See test_parseRequest_pty_req for the payload format.
+         """
+-        self.assertEquals(self.assertWarns(DeprecationWarning,
+-            "packRequest_pty_req should be packing the modes.",
+-            unittest.__file__, session.packRequest_pty_req, 'xterm',
+-            (2, 1, 3, 4), '\x05\x00\x00\x00\x06'),
+-            common.NS('xterm') + '\x00\x00\x00\x01\x00\x00\x00\x02\x00\x00'
+-            '\x00\x03\x00\x00\x00\x04\x00\x00\x00\x05\x05\x00\x00\x00\x06')
++        packed = session.packRequest_pty_req('xterm', (2, 1, 3, 4), [(5, 6)])
++        self.assertEquals(packed,
++                          common.NS('xterm') + struct.pack('>4L', 1, 2, 3, 4) +
++                          common.NS(struct.pack('>BL', 5, 6)))
+ 
+ 
+     def test_parseRequest_window_change(self):
+@@ -1053,9 +1231,12 @@
+             uint32  rows
+             uint32  x pixels
+             uint32  y pixels
++
++        parseRequest_window_change() returns (rows, columns, x pixels,
++        y pixels).
+         """
+-        self.assertEquals(session.parseRequest_window_change('\x00\x00\x00\x01'
+-            '\x00\x00\x00\x02\x00\x00\x00\x03\x00\x00\x00\x04'), (2, 1, 3, 4))
++        self.assertEquals(session.parseRequest_window_change(
++                struct.pack('>4L', 1, 2, 3, 4)), (2, 1, 3, 4))
+ 
+ 
+     def test_packRequest_window_change(self):
+@@ -1063,14 +1244,14 @@
+         See test_parseRequest_window_change for the payload format.
+         """
+         self.assertEquals(session.packRequest_window_change((2, 1, 3, 4)),
+-            '\x00\x00\x00\x01\x00\x00\x00\x02\x00\x00\x00\x03\x00\x00\x00\x04')
++                          struct.pack('>4L', 1, 2, 3, 4))
+ 
+ 
+ 
+ class SSHSessionProcessProtocolTestCase(unittest.TestCase):
+     """
+     SSHSessionProcessProtocol is an obsolete class used as a ProcessProtocol
+-    for executed programs.  It has has a couple transport methods, namely
++    for executed programs.  It has has a couple of transport methods, namely
+     write() and loseConnection()
+     """
+ 
+@@ -1094,31 +1275,32 @@
+     def test_getSignalName(self):
+         """
+         _getSignalName should return the name of a signal when given the
+-        signal number.  Also, it should only generate the signal dictionary
+-        once.
++        signal number.
+         """
++        for signalName in session.SUPPORTED_SIGNALS:
++            signalName = 'SIG' + signalName
++            signalValue = getattr(signal, signalName)
++            sshName = self.pp._getSignalName(signalValue)
++            self.assertEquals(sshName, signalName,
++                              "%i: %s != %s" % (signalValue, sshName,
++                                                signalName))
++
++
++    def test_getSignalNameWithLocalSignal(self):
++        """
++        If there are signals in the signal module which aren't in the SSH RFC,
++        we map their name to [signal name]@[platform].
++        """
+         signal.SIGTwistedTest = signal.NSIG + 1 # value can't exist normally
+         # Force reinitialization of signals
+-        self.pp.__class__._signalNames = None
+-        try:
+-            for signame in session.supportedSignals:
+-                signame = 'SIG' + signame
+-                value = getattr(signal, signame)
+-                self.assertEquals(self.pp._getSignalName(value),
+-                        signame, "%i: %s != %s" % (value,
+-                            self.pp._getSignalName(value), signame))
+-            self.assertEquals(self.pp._getSignalName(signal.SIGTwistedTest),
+-                'SIGTwistedTest@' + sys.platform)
+-            newPP = session.SSHSessionProcessProtocol(self.session)
+-            self.assertNotIdentical(newPP._signalNames, None)
+-            self.assertIdentical(newPP._signalNames, self.pp._signalNames)
+-        finally:
+-            del signal.SIGTwistedTest
+-            # Force reinitialization of signals
+-            self.pp.__class__._signalNames = None
++        self.pp._signalNames = None
++        self.assertEquals(self.pp._getSignalName(signal.SIGTwistedTest),
++                          'SIGTwistedTest@' + sys.platform)
+ 
++        
+     if getattr(signal, 'SIGALRM', None) is None:
+-        test_getSignalName.skip = "Not all signals available"
++        test_getSignalName.skip = test_getSignalNameWithLocalSignal = \
++            "Not all signals available"
+ 
+ 
+     def test_outReceived(self):
+@@ -1136,7 +1318,8 @@
+         When data is passed to the write method, it should be sent to the
+         session channel's write method.
+         """
+-        self.pp.write('test data')
++        self.callDeprecated(Version('Twisted', 8, 2, 0), self.pp.write,
++                            'test data')
+         self.assertEquals(self.session.conn.data[self.session],
+                 ['test data'])
+ 
+@@ -1173,7 +1356,7 @@
+         When loseConnection() is called, it should call loseConnection
+         on the session channel.
+         """
+-        self.pp.loseConnection()
++        self.callDeprecated(Version('Twisted', 8, 2, 0),self.pp.loseConnection)
+         self.assertTrue(self.session.conn.closes[self.session])
+ 
+ 
+@@ -1185,7 +1368,7 @@
+         """
+         self.pp.processEnded(failure.Failure(error.ProcessDone(None)))
+         self.assertEquals(self.session.conn.requests[self.session],
+-                [('exit-status', '\x00' * 4, False)])
++                [('exit-status', struct.pack('>I', 0) , False)])
+         self.assertTrue(self.session.conn.closes[self.session])
+ 
+ 
+@@ -1196,10 +1379,14 @@
+         closed.
+         """
+         self.pp.processEnded(failure.Failure(error.ProcessTerminated(None,
+-            signal.SIGTERM, 128)))
++            signal.SIGTERM, 1 << 7))) # 7th bit means core dumped
+         self.assertEqual(self.session.conn.requests[self.session],
+-                [('exit-signal', common.NS('TERM') + '\x01' + common.NS('') +
+-                    common.NS(''), False)])
++                [('exit-signal',
++                  common.NS('TERM') # signal name
++                  + '\x01' # core dumped is true
++                  + common.NS('') # error message
++                  + common.NS(''), # language tag
++                  False)])
+         self.assertTrue(self.session.conn.closes[self.session])
+ 
+ 
+@@ -1211,6 +1398,8 @@
+         """
+         self.pp.processEnded(
+             failure.Failure(error.ProcessTerminated(None, signal.SIGTERM, 0)))
++        # see comments in test_processEndedWithExitSignalCoreDump for the
++        # meaning of the parts in the request
+         self.assertEqual(self.session.conn.requests[self.session],
+                          [('exit-signal', common.NS('TERM') + '\x00' +
+                            common.NS('') + common.NS(''), False)])
+@@ -1246,14 +1435,26 @@
+         received, it should be passed along to SSHSessionProcessProtocol's
+         transport.writeErr.
+         """
+-        transport = StubTransport()
++        transport = StubTransportWithWriteErr()
+         pp = MockProcessProtocol()
+         pp.makeConnection(transport)
+         app = session.SSHSessionProcessProtocolApplication(pp)
++        # 255 is an arbitrary value that's not EXTENDED_DATA_STDERR so the data
++        # should be ignored.
+         app.extendedDataReceived(255, "ignore this")
+         app.extendedDataReceived(connection.EXTENDED_DATA_STDERR, "data")
+         self.assertEquals(transport.err, "data")
+-        # should not raise an error if writeErr doesn't exist
++
++    def test_extendedDataReceivedWithoutWrteErr(self):
++        """
++        If the transport doesn't support extended data by implementing
++        writeErr, then the extended data should silently be dropped on the
++        floor.
++        """
++        transport = StubTransport()
++        pp = MockProcessProtocol()
++        pp.makeConnection(transport)
++        app = session.SSHSessionProcessProtocolApplication(pp)
+         app.extendedDataReceived(connection.EXTENDED_DATA_STDERR, "more")
+ 
+ 
+@@ -1269,7 +1470,13 @@
+         """
+         When data is received, it should be sent to the transport.
+         """
+-        client = session.SSHSessionClient()
++        def _():
++            return session.SSHSessionClient()
++        client = self.assertWarns(DeprecationWarning,
++                                  "twisted.conch.ssh.session.SSHSessionClient "
++                                  "was deprecated in Twisted 8.2.0",
++                                  __file__,
++                                  _)
+         client.transport = StubTransport()
+         client.dataReceived('test data')
+         self.assertEquals(client.transport.buf, 'test data')
+@@ -1289,10 +1496,21 @@
+                 remoteMaxPacket=32768, conn=self.conn,
+                 avatar=self.avatar)
+ 
++        
++    def assertRequestRaisedError(self):
++        """
++        Assert that the request we just made raised an error (and only one
++        error).
++        """
++        errors = self.flushLoggedErrors()
++        self.assertEquals(len(errors), 1, "Multiple errors raised: %s" %
++                          '\n'.join([repr(error) for error in errors]))
+ 
++
+     def test_init(self):
+         """
+-        Test that the session is initialized correctly,
++        After the session is created, self. client should be None, and
++        self..applicationFactory should provide I{ISessionApplicationFactory}.
+         """
+         self.assertEquals(self.session.client, None)
+         self.assertTrue(session.ISessionApplicationFactory.providedBy(
+@@ -1300,29 +1518,44 @@
+                         str(self.session.applicationFactory))
+ 
+ 
+-    def test_client(self):
++    def test_client_data(self):
+         """
+-        Test that the session performs correctly when it has a client
+-        application.
++        SSHSession should pass data and extended data to its client, buffering
++        that data if the client isn't present at the time the data is received.
++        The client should also be able to send data back to the remote side.
+         """
+         client = MockApplication()
+         self.session.dataReceived('1')
+         self.session.extReceived(connection.EXTENDED_DATA_STDERR, '2')
+         self.session.extReceived(2, '3')
+-        self.session.setupSession(client)
++        self.session._setUpSession(client)
+         self.session.dataReceived('out')
++
+         self.assertEquals(client.data, ['1', 'out'])
++        # the tilde means the data was sent by the client
+         self.assertEquals(self.session.conn.data[self.session],
+                           ['1~', 'out~'])
++        
+         self.session.extReceived(connection.EXTENDED_DATA_STDERR, 'err')
++
+         self.assertEquals(client.extendedData,
+                           [(connection.EXTENDED_DATA_STDERR, '2'),
+                            (2, '3'),
+                            (connection.EXTENDED_DATA_STDERR, 'err')])
++        # the tilde and the incrementing of the data type means the extended
++        # data was sent by the client
+         self.assertEquals(self.session.conn.extData[self.session],
+                           [(connection.EXTENDED_DATA_STDERR + 1, '2~'),
+                            (2 + 1, '3~'),
+                            (connection.EXTENDED_DATA_STDERR + 1, 'err~')])
++
++        
++    def test_client_closing(self):
++        """
++        SSHSession should notify the client of EOF and Close messages.
++        """
++        client = MockApplication()
++        self.session._setUpSession(client)
+         self.session.eofReceived()
+         self.assertTrue(client.gotEOF)
+         self.assertFalse(client.hasClosed, 'closed() called during EOF')
+@@ -1336,7 +1569,8 @@
+ 
+     def test_applicationFactory(self):
+         """
+-        Test that SSHSession handles dispatching to applicationFactory correctly.
++        SSHSession should notify the applicationFactory of EOF and close
++        messages.
+         """
+         self.session.eofReceived()
+         self.assertFalse(self.session.applicationFactory.inConnectionOpen)
+@@ -1348,15 +1582,15 @@
+ 
+     def test_subsystem(self):
+         """
+-        Test that SSHSession handles subsystem requests by dispatching to the
+-        application factory's requestSubsytem() method and connecting the
+-        ISessionApplication to itself.
++        SSHSession should handle subsystem requests by dispatching to the
++        application factory's requestSubsytem() method and connecting to the
++        ISessionApplication returned by requestSubsytem().
+         """
+         ret = self.session.requestReceived('subsystem', common.NS('bad'))
+         self.assertFalse(ret)
+         self.assertEquals(self.session.client, None)
+         ret = self.session.requestReceived('subsystem',
+-                common.NS('echo') + 'abc')
++                common.NS('repeat') + 'abc')
+         self.assertTrue(ret)
+         self.assertTrue(session.ISessionApplication.providedBy(
+                 self.session.sessionApplication))
+@@ -1371,8 +1605,8 @@
+     def test_shell(self):
+         """
+         Test that SSHSession handles shell requests by dispatching to the
+-        application factory's openShell() method and connecting the
+-        ISessionApplication to itself.
++        application factory's openShell() method and connecting itself to the
++        ISessionApplication returned by openShell().
+         """
+         self.assertTrue(self.session.requestReceived('shell', ''))
+         self.assertNotEquals(self.session.sessionApplication, None)
+@@ -1381,17 +1615,17 @@
+         self.assertEquals(self.session.sessionApplication.channel,
+                 self.session)
+         self.assertFalse(self.session.sessionApplication.hasClosed)
+-        self.assertFalse(self.session.requestReceived('shell',
+-            '')) # fail if we have
+-        # a shell already
+-        self.flushLoggedErrors()
+ 
++        # fail if we have a shell already
++        self.assertFalse(self.session.requestReceived('shell', ''))
++        self.assertRequestRaisedError()
+ 
++
+     def test_exec(self):
+         """
+-        Test that SSHSession handles command requests by dispatching to the
+-        the application factory's execCommand method and connecting the
+-        ISessionApplication to itself.
++        Test that SSHSession handles command requests by dispatching to the the
++        application factory's execCommand method and connecting itself to the
++        ISessionApplication returned by execCommand().
+         """
+         self.assertTrue(self.session.requestReceived('exec',
+             common.NS('good')))
+@@ -1402,9 +1636,11 @@
+                 self.session)
+         self.assertEquals(self.session.sessionApplication.command, 'good')
+         self.assertFalse(self.session.sessionApplication.hasClosed)
++
++        # fail if we already have a command
+         self.assertFalse(self.session.requestReceived('exec',
+-            common.NS('bad')))
+-        self.flushLoggedErrors()
++            common.NS('good')))
++        self.assertRequestRaisedError()
+ 
+ 
+     def test_ptyRequest(self):
+@@ -1416,16 +1652,21 @@
+         windowSize = (80, 25, 0, 0)
+         modes = [(0, 1), (2, 3)]
+         ret = self.session.requestReceived('pty_req',
+-                common.NS(term) +
+-                '\x00\x00\x00\x19' + '\x00\x00\x00\x50' +
+-                '\x00\x00\x00\x00' * 2 + common.NS('\x00\x00\x00\x00\x01'
+-                    '\x02\x00\x00\x00\x03'))
++                                           session.packRequest_pty_req(
++                term, windowSize, modes))
+         self.assertTrue(ret)
+         self.assertEquals(self.session.applicationFactory.term, term)
+-        self.assertEquals(self.session.applicationFactory.windowSize, windowSize)
++        self.assertEquals(self.session.applicationFactory.windowSize,
++                          windowSize)
+         self.assertEquals(self.session.applicationFactory.modes, modes)
++
++        
++    def test_ptyRequestFailure(self):
++        """
++        If the PTY request can't be parsed, the request should fail.
++        """
+         self.assertFalse(self.session.requestReceived('pty_req', ''))
+-        self.flushLoggedErrors()
++        self.assertRequestRaisedError()
+ 
+ 
+     def test_windowChange(self):
+@@ -1435,14 +1676,20 @@
+         """
+         windowSize = (1, 1, 1, 1)
+         ret = self.session.requestReceived('window_change',
+-                '\x00\x00\x00\x01' * 4)
++                                           session.packRequest_window_change(
++                windowSize))
+         self.assertTrue(ret)
+         self.assertEquals(self.session.applicationFactory.windowSize, windowSize)
++
++    def test_windowChangeFailure(self):
++        """
++        If the window change request can't be parsed, the request should fail.
++        """
+         self.assertFalse(self.session.requestReceived('window_change', ''))
+-        self.flushLoggedErrors()
++        self.assertRequestRaisedError()
+ 
++        
+ 
+-
+ class ClientSessionTestCase(unittest.TestCase):
+     """
+     Test methods that use SSHSession as a client.
+@@ -1457,54 +1704,63 @@
+ 
+     def test_getPty(self):
+         """
+-        Test that getPty sends the correct request.
++        Test that getPty sends a correctly formatted request.  See the
++        TestHelpers class for a description of this packet.
+         """
++        terminalType = 'term'
++        windowSize = (80, 25, 0, 0)
++        modes = [(0, 1), (2, 3)]
+         d = self.session.getPty('term', (80, 25, 0, 0), [(0, 1), (2, 3)],
+                 True)
+         def check(value):
+             self.assertEquals(self.conn.requests[self.session],
+-                    [('pty-req', common.NS('term') + '\x00\x00\x00\x19' +
+-                        '\x00\x00\x00\x50' + '\x00\x00\x00\x00' * 2 +
+-                        common.NS('\x00\x00\x00\x00\x01\x02\x00\x00\x00\x03'),
+-                        True)])
++                              [('pty-req', session.packRequest_pty_req(
++                            terminalType,
++                            windowSize,
++                            modes), True)])
+             self.assertEquals(self.session.getPty('term', (80, 25, 0, 0), []),
+-                    None)
+-        d.addCallback(check)
+-        return d
++                              None)
++            
++        return d.addCallback(check)
+ 
+-
++    
+     def test_changeWindowSize(self):
+         """
+-        Test that windowChange sends the correct request.
++        Test that windowChange sends the correct request.  See the TestHelpers
++        class for a description of this packet.
+         """
+-        d = self.session.changeWindowSize((80, 25, 0, 0), True)
++        size = (80, 25, 0, 0)
++        d = self.session.changeWindowSize(size, True)
+         def check(value):
+             self.assertEquals(self.conn.requests[self.session],
+-                    [('window-change', '\x00\x00\x00\x19\x00\x00\x00\x50' +
+-                        '\x00\x00\x00\x00' * 2, True)])
+-            self.assertEquals(self.session.changeWindowSize((80, 25, 0, 0)),
++                              [('window-change',
++                                session.packRequest_window_change(size),
++                                True)])
++
++            self.assertEquals(self.session.changeWindowSize(size),
+                     None)
+-        d.addCallback(check)
+-        return d
++        return d.addCallback(check)
+ 
+ 
+     def test_openSubsystem(self):
+         """
+-        Test that openSubsystem sends the correct request.
++        Test that openSubsystem sends the correct request.  Format::
++
++            string subsystem type
++            [any other packet data]
+         """
+-        d = self.session.openSubsystem('echo', 'data', True)
++        d = self.session.openSubsystem('repeat', 'data', True)
+         def check(value):
+             self.assertEquals(self.conn.requests[self.session],
+-                    [('subsystem', common.NS('echo') + 'data', True)])
+-            self.assertEquals(self.session.openSubsystem('echo', 'data'),
++                    [('subsystem', common.NS('repeat') + 'data', True)])
++            self.assertEquals(self.session.openSubsystem('repeat', 'data'),
+                     None)
+-        d.addCallback(check)
+-        return d
++        return d.addCallback(check)
+ 
+ 
+     def test_openShell(self):
+         """
+-        Test that openShell sends the correct request.
++        Test that openShell sends the correct request.  No data.
+         """
+         d = self.session.openShell(True)
+         def check(value):
+@@ -1517,7 +1773,9 @@
+ 
+     def test_execCommand(self):
+         """
+-        Test that execCommand sentds the correct request.
++        Test that execCommand sends the correct request.  Format::
++
++            string command line
+         """
+         d = self.session.execCommand('true', True)
+         def check(value):
+Index: scripts/conch.py
+===================================================================
+--- scripts/conch.py	(revision 23186)
++++ scripts/conch.py	(revision 23704)
+@@ -24,8 +24,12 @@
+ """
+ 
+     optParameters = [['escape', 'e', '~'],
+-                      ['localforward', 'L', None, 'listen-port:host:port   Forward local port to remote address'],
+-                      ['remoteforward', 'R', None, 'listen-port:host:port   Forward remote port to local address'],
++                     ['localforward', 'L', None,
++                      'listen-port:host:port   '
++                      'Forward local port to remote address'],
++                     ['remoteforward', 'R', None,
++                      'listen-port:host:port   '
++                      'Forward remote port to local address'],
+                      ]
+ 
+     optFlags = [['null', 'n', 'Redirect input from /dev/null.'],
+Index: ssh/session.py
+===================================================================
+--- ssh/session.py	(revision 23186)
++++ ssh/session.py	(revision 23704)
+@@ -1,11 +1,13 @@
+ # -*- test-case-name: twisted.conch.test.test_session -*-
+-# Copyright (c) 2001-2007 Twisted Matrix Laboratories.
++# Copyright (c) 2001-2008 Twisted Matrix Laboratories.
+ # See LICENSE for details.
+ 
+ """
+ This module contains the implementation of SSHSession, which (by default)
+ allows access to a shell and a python interpreter over SSH.
+ 
++For more information see RFC 4254.
++
+ Maintainer: U{Paul Swartz<mailto:z3p@twistedmatrix.com>}
+ """
+ 
+@@ -15,18 +17,26 @@
+ 
+ from twisted.internet import protocol
+ from twisted.python import components, log
++from twisted.python.deprecate import deprecated
++from twisted.python.versions import Version
+ from twisted.conch.interfaces import ISessionApplication
+ from twisted.conch.interfaces import ISessionApplicationFactory, ISession
+ from twisted.conch.ssh import common, channel, connection
+ 
+ 
+-# supportedSignals is a list of signals that every session channel is supposed
+-# to support.
+-supportedSignals = ["ABRT", "ALRM", "FPE", "HUP", "ILL", "INT", "KILL", "PIPE",
+-                    "QUIT", "SEGV", "TERM", "USR1", "USR2"]
+ 
++__all__ = ['SSHSession', 'packRequest_window_change', 'packRequest_pty_req',
++           'parseRequest_window_change', 'parseRequest_pty_req']
+ 
+ 
++
++# SUPPORTED_SIGNALS is a list of signals that every session channel is supposed
++# to accept.  See RFC 4254
++SUPPORTED_SIGNALS = ["ABRT", "ALRM", "FPE", "HUP", "ILL", "INT", "KILL",
++                     "PIPE", "QUIT", "SEGV", "TERM", "USR1", "USR2"]
++
++
++
+ class SSHSession(channel.SSHChannel):
+     """
+     A channel implementing the server side of the 'session' channel.  This is
+@@ -34,7 +44,7 @@
+     command.
+ 
+     @ivar earlyData: data sent to this channel before a client is present.
+-    @type earlyData: C{str}
++    @type earlyData: C{list} of C{str}
+     @ivar earlyExtended: extended data sent to this channel before a client is
+     present.
+     @type earlyExtended: C{list}
+@@ -65,10 +75,13 @@
+             # buffers (because this would not have previously delivered any
+             # data, only delivered subsequent data) and set the old-style
+             # "client" object up as a new-style processProtocol.
+-            self.earlyData = ''
++
++            # XXX DeprecationWarning
++            self.earlyData = []
+             self.earlyExtended = []
+-            self.setupSession(_TransportToProcessProtocol(v.transport))
++            self._setUpSession(_TransportToProcessProtocol(v.transport))
+         if k == 'session' and v is not None:
++            # XXX DeprecationWarning
+             # Someone is trying to inform us of an old-style session.  Wrap it
+             # in a _DeprecatedSSHSession.
+             self.applicationFactory = _DeprecatedSSHSession(self, v)
+@@ -78,10 +91,19 @@
+     def applicationFactory(self):
+         """
+         Produce an applicationFactory dynamically if one does not yet exist.
++        We set self.appplicationFactory when we have created the application
++        factory because old-style classes don't support getters for
++        properties.
+         """
+         if self.avatar is not None:
+             factoryCandidate = ISessionApplicationFactory(self.avatar, None)
+             if factoryCandidate is None:
++                warnings.warn("Using an avatar that doesn't implement "
++                              "ISessionApplicationFactory is deprecated since "
++                              "Twisted 8.2.",
++                              DeprecationWarning,
++                              stacklevel=5)
++                              
+                 # Maybe it implements the old version.
+                 oldStyle = ISession(self.avatar, None)
+                 if oldStyle is not None:
+@@ -97,6 +119,9 @@
+             else:
+                 self.applicationFactory = factoryCandidate
+             return self.applicationFactory
++        else:
++            raise RuntimeError('Cannot get an application factory without an '
++                               'avatar')
+     applicationFactory = property(applicationFactory)
+ 
+ 
+@@ -107,26 +132,26 @@
+         fake it.
+         """
+         if isinstance(self.sessionApplication,
+-                      _ProcessProtocolToSessionApplication):
++                      (_ProcessProtocolToSessionApplication,
++                        SSHSessionProcessProtocolApplication)):
+             return self.sessionApplication.processProtocol
+-        elif isinstance(self.sessionApplication,
+-                        SSHSessionProcessProtocolApplication):
+-            return self.sessionApplication.processProtocol
+     client = property(client)
+ 
+ 
+     # This used to be set in the older SSHSession implementation.
++    # We set it when we create an application factory (see
++    # applicationFactory() above.
+     session = None
+ 
+ 
+     def __init__(self, *args, **kw):
+         channel.SSHChannel.__init__(self, *args, **kw)
+-        self.earlyData = ''
++        self.earlyData = []
+         self.earlyExtended = []
+         self.sessionApplication = None
+ 
+ 
+-    def setupSession(self, sessionApplication):
++    def _setUpSession(self, sessionApplication):
+         """
+         Connect us to the application.  We set ourselves as it's channel
+         instance variable, and the application becomes our sessionApplication.
+@@ -136,14 +161,13 @@
+         sessionApplication = ISessionApplication(sessionApplication)
+         sessionApplication.channel = self
+         sessionApplication.connectionMade()
+-        # Maybe change this name too...
+         self.sessionApplication = sessionApplication
+         if self.earlyData:
+-            b, self.earlyData = self.earlyData, None
+-            self.dataReceived(b)
++            bytes, self.earlyData = self.earlyData, None
++            self.dataReceived(''.join(bytes))
+         if self.earlyExtended:
+-            b, self.earlyExtended = self.earlyExtended, None
+-            for dataType, data in b:
++            bytes, self.earlyExtended = self.earlyExtended, None
++            for dataType, data in bytes:
+                 self.extReceived(dataType, data)
+ 
+ 
+@@ -153,19 +177,23 @@
+             string  subsystem name
+ 
+         Try to get a subsystem object by calling our adapter's lookupSubsystem
+-        method.  If that method returns a subsystem, then connect to our
+-        client and return True.  Otherwise, return False.
++        method.  If that method returns a subsystem, then connect it to
++        ourself and return True.  Otherwise, return False.
+         """
+         subsystem, rest = common.getNS(data)
+         log.msg('asking for subsystem "%s"' % subsystem)
+-        client = self.applicationFactory.lookupSubsystem(subsystem, rest)
+-        if client:
+-            self.setupSession(client)
+-            return True
+-        else:
+-            return False
++        try:
++            client = self.applicationFactory.lookupSubsystem(subsystem, rest)
++            if client:
++                self._setUpSession(client)
++                return True
++        except KeyboardInterrupt:
++            raise
++        except:
++            log.err()
++        return False
+ 
+-
++    
+     def request_shell(self, data):
+         """
+         The remote side has requested a shell.  No payload.  Call the
+@@ -176,8 +204,10 @@
+         """
+         log.msg('getting shell')
+         try:
+-            self.setupSession(self.applicationFactory.openShell())
+-        except Exception:
++            self._setUpSession(self.applicationFactory.openShell())
++        except KeyboardInterrupt:
++            raise
++        except:
+             log.err()
+             return False
+         else:
+@@ -197,8 +227,10 @@
+         command, data = common.getNS(data)
+         log.msg('executing command "%s"' % command)
+         try:
+-            self.setupSession(self.applicationFactory.execCommand(command))
+-        except Exception:
++            self._setUpSession(self.applicationFactory.execCommand(command))
++        except KeyboardInterrupt:
++            raise
++        except:
+             log.err()
+             return False
+         else:
+@@ -227,7 +259,9 @@
+             term, windowSize, modes = parseRequest_pty_req(data)
+             log.msg('pty request: %s %s' % (term, windowSize))
+             self.applicationFactory.getPTY(term, windowSize, modes)
+-        except Exception:
++        except KeyboardInterrupt:
++            raise
++        except:
+             log.err()
+             return False
+         else:
+@@ -249,7 +283,9 @@
+         try:
+             winSize = parseRequest_window_change(data)
+             self.applicationFactory.windowChanged(winSize)
+-        except Exception:
++        except KeyboardInterrupt:
++            raise
++        except:
+             log.msg('error changing window size')
+             log.err()
+             return False
+@@ -265,7 +301,7 @@
+         @type data: C{str}
+         """
+         if self.sessionApplication is None:
+-            self.earlyData += data
++            self.earlyData.append(data)
+             return
+         self.sessionApplication.dataReceived(data)
+ 
+@@ -301,6 +337,9 @@
+         The channel is closed.  If we have an application factory,
+         notify it.  If we have an application, tell it the connection
+         is lost.
++
++        Note: closing the channel is separate from closing the connection
++        to the client.  To do that, call self.conn.transport.loseConnection().
+         """
+         if self.applicationFactory is not None:
+             self.applicationFactory.closed()
+@@ -321,7 +360,8 @@
+             self.sessionApplication.closeReceived()
+ 
+ 
+-    # client methods
++    # Below are methods that are used by client implementations of the
++    # 'session' channel.
+ 
+ 
+     def getPty(self, term, windowSize, modes, wantReply=False):
+@@ -333,13 +373,13 @@
+         @param windowSize: the size of the window: (rows, cols, xpixels,
+                            ypixels)
+         @type windowSize: C{tuple}
+-        @param modes: termanal modes; a list of (modeNumber, modeValue) pairs.
++        @param modes: terminal modes; a list of (modeNumber, modeValue) pairs.
+         @type modes: C{list}
+-        @param wantReply: True if we want a reply to this request.
++        @param wantReply: True if we want a reply to this request.x
+         @type wantReply: C{bool}
+ 
+-        @returns: if wantReply, a Deferred that will be called back when
+-                  the request has succeeded or failed; else, None.
++        @returns: if wantReply, a Deferred that will be called back when the
++                  request has succeeded or failed; else, None.
+         @rtype: C{Deferred}/C{None}
+         """
+         data = packRequest_pty_req(term, windowSize, modes)
+@@ -417,7 +457,7 @@
+ 
+ 
+ 
+-class _SubsystemOnlyApplicationFactory:
++class _SubsystemOnlyApplicationFactory(object):
+     """
+     An application factory which which is only good for looking up a
+     subsystem.  It is used when there is not an ISession adapter
+@@ -425,7 +465,7 @@
+     """
+     implements(ISessionApplicationFactory)
+ 
+-
++    
+     def __init__(self, sessionChannel):
+         self.sessionChannel = sessionChannel
+ 
+@@ -436,10 +476,11 @@
+         the avatar instead of through the ISession adapter.  To be backwards
+         compatible, try to look up the subsystem through the avatar.
+         """
+-        self.sessionChannel.earlyData = ''
++        self.sessionChannel.earlyData = []
+         self.sessionChannel.earlyExtended = []
+         client = self.sessionChannel.avatar.lookupSubsystem(subsystem,
+-                                              common.NS(subsystem) + data)
++                                                            common.NS(subsystem)
++                                                            + data)
+         return wrapProcessProtocol(client)
+ 
+ 
+@@ -531,6 +572,8 @@
+     """
+     This class wraps a L{Protocol} instance in a L{ProcessProtocol} instance.
+ 
++    XXX: This belongs in twisted.internet, not twisted.conch. - jml 2008-04-06
++
+     @ivar proto: the C{Protocol} we're wrapping.
+     """
+ 
+@@ -590,13 +633,17 @@
+         return _ProtocolToProcessProtocol(inst)
+     else:
+         return inst
++        
+ 
+-
+-
+ class _TransportToProcessProtocol(protocol.ProcessProtocol):
+     """
+     This wraps something implementing I{ITransport} in a
+-    C{ProcessProtocol} because that's how the old interface worked.
++    C{ProcessProtocol}.  Some old implementations directly set
++    SSHSession().client to a transport, and this wrapper supports that
++    obscure use of SSHSession.  We wrap it in a C{ProcessProtocol} instead
++    of directly in an I{ISessionApplication} because C{_DeprecatedSSHSession}
++    expects the client to be a C{ProcessProtocol}.  This class was added in
++    Twisted 8.2.
+ 
+     @ivar applicationTransport: the ITransport we're wrapping.
+     """
+@@ -613,15 +660,15 @@
+         self.applicationTransport.write(data)
+ 
+ 
+-    def errReceived(self, errData):
++    def errReceived(self, data):
+         """
+         When we get extended data, give it to the writeErr method of
+-        our transport.
++        our transport if it exists.
+         """
+-        # XXX need to test when writeErr isn't available
+-        self.applicationTransport.writeErr(errData)
++        if hasattr(self.applicationTransport, 'writeErr'):
++            self.applicationTransport.writeErr(data)
+ 
+-
++    
+     def processEnded(self, reason):
+         """
+         When we're told the process ended, tell the transport to drop
+@@ -633,8 +680,11 @@
+ 
+ class _ProcessProtocolToSessionApplication:
+     """
+-    This adapts a C{ProcessProtocol} to an ISessionApplication.
+-
++    This adapts a C{ProcessProtocol} to an C{ISessionApplication.}  The old
++    I{ISession} interface returned C{ProcessProtocol}s from lookupSubsystem().
++    We wrap those objects with this class in order to provide the new
++    I{ISessionApplication} interface.  This class was added in Twisted 8.2.
++    
+     @ivar processProtocol: the C{ProcessProtocol} we're adapting.
+     """
+ 
+@@ -709,6 +759,8 @@
+     """
+ 
+ 
++    # once initialized, a dictionary mapping signal values to strings
++    # that follow RFC 4254.
+     _signalNames = None
+ 
+ 
+@@ -721,9 +773,9 @@
+         Get a signal name given a signal number.
+         """
+         if self._signalNames is None:
+-            self.__class__._signalNames = {}
++            self._signalNames = {}
+             # make sure that the POSIX ones are the defaults
+-            for signame in supportedSignals:
++            for signame in SUPPORTED_SIGNALS:
+                 signame = 'SIG' + signame
+                 sigvalue = getattr(signal, signame, None)
+                 if sigvalue is not None:
+@@ -777,10 +829,11 @@
+             err = reason.value
+             if err.signal is not None:
+                 signame = self._getSignalName(err.signal)
+-                log.msg('exitSignal: %s' % (signame,))
+                 if hasattr(os, 'WCOREDUMP') and os.WCOREDUMP(err.status):
++                    log.msg('exitSignal: %s (core dumped)' % (signame,))
+                     coreDumped = 1
+                 else:
++                    log.msg('exitSignal: %s' % (signame,))
+                     coreDumped = 0
+                 self.session.conn.sendRequest(self.session, 'exit-signal',
+                         common.NS(signame[3:]) + chr(coreDumped) +
+@@ -792,22 +845,23 @@
+         self.session.loseConnection()
+ 
+ 
+-    # also a transport :(
++    # also a transport :( Some old code used SSHSessionProcessProtocol() like a
++    # transport, so we have to continue to support this interface.
+     def write(self, data):
+         """
+         If we're used like a transport, just send the data to the channel.
+         """
+         self.session.write(data)
++    write = deprecated(Version("Twisted", 8, 2, 0))(write)
+ 
+-
+     def loseConnection(self):
+         """
+-        If we're use like a transport, send the close message.
++        If we're used like a transport, send the close message.
+         """
+         self.session.loseConnection()
++    loseConnection = deprecated(Version("Twisted", 8, 2, 0))(loseConnection)
+ 
+ 
+-
+ class SSHSessionProcessProtocolApplication:
+     """
+     Another layer of wrapping to make the old-style ISession
+@@ -881,6 +935,13 @@
+     A class the conch command-line client uses to connect the channel
+     to standard output.  Deprecated.
+     """
++
++    def __init__(self):
++        warnings.warn(
++            "twisted.conch.ssh.session.SSHSessionClient was deprecated "
++            "in Twisted 8.2.0", DeprecationWarning, stacklevel=2)
++
++
+     def dataReceived(self, data):
+         """
+         Send data to the transport.
+@@ -892,25 +953,25 @@
+ # methods factored out to make live easier on server writers
+ def parseRequest_pty_req(data):
+     """
+-    Parse the data from a pty-req request into usable data.
++    Parse the data from a pty-req request into usable data.  See RFC 4254 6.2
++    and 8.
+ 
+     @returns: a tuple of (terminal type, (rows, cols, xpixel, ypixel), modes)
+     """
+     term, rest = common.getNS(data)
+-    cols, rows, xpixel, ypixel = struct.unpack('>4L', rest[: 16])
++    cols, rows, xpixel, ypixel = struct.unpack('>4L', rest[:16])
+     modes, ignored= common.getNS(rest[16:])
+     winSize = (rows, cols, xpixel, ypixel)
+-    modes = [(ord(modes[i]), struct.unpack('>L', modes[i+1: i+5])[0]) for i in
+-            range(0, len(modes)-1, 5)]
++    modes = [(ord(modes[i]), struct.unpack('>L', modes[i+1:i+5])[0]) for i in
++            range(0, len(modes) - 1, 5)]
+     return term, winSize, modes
+ 
+ 
+ 
+ def packRequest_pty_req(term, (rows, cols, xpixel, ypixel), modes):
+     """
+-    Pack a pty-req request so that it is suitable for sending.
+-
+-    NOTE: modes must be packed before being sent here.
++    Pack a pty-req request so that it is suitable for sending.  See RFC 4254
++    6.2 and 8.
+     """
+     termPacked = common.NS(term)
+     winSizePacked = struct.pack('>4L', cols, rows, xpixel, ypixel)
+@@ -940,8 +1001,3 @@
+     Pack a window-change request so that it is suitable for sending.
+     """
+     return struct.pack('>4L', cols, rows, xpixel, ypixel)
+-
+-
+-
+-__all__ = ['SSHSession', 'packRequest_window_change', 'packRequest_pty_req',
+-           'parseRequest_window_change', 'parseRequest_pty_req']
+Index: avatar.py
+===================================================================
+--- avatar.py	(revision 23186)
++++ avatar.py	(revision 23704)
+@@ -1,5 +1,5 @@
+ # -*- test-case-name: twisted.conch.test.test_conch -*-
+-# Copyright (c) 2007 Twisted Matrix Laboratories.
++# Copyright (c) 2008 Twisted Matrix Laboratories.
+ # See LICENSE for details.
+ 
+ from zope import interface
+Index: interfaces.py
+===================================================================
+--- interfaces.py	(revision 23186)
++++ interfaces.py	(revision 23704)
+@@ -46,14 +46,14 @@
+ class ISession(Interface):
+     """
+     The old, deprecated interface for implementing SSH session applications.
+-    Please don't use this for anything.
++    Please don't use this for anything.  Deprecated in Twisted 8.2.
+     """
+ 
+     def getPty(term, windowSize, modes):
+         """
+-        Get a psuedo-terminal for use by a shell or command.
++        Get a pseudo-terminal for use by a shell or command.
+ 
+-        If a psuedo-terminal is not available, or the request otherwise
++        If a pseudo-terminal is not available, or the request otherwise
+         fails, raise an exception.
+         """
+ 
+@@ -110,6 +110,7 @@
+     def lookupSubsystem(subsystem, data):
+         """
+         The other side requested a subsystem.
++        
+         @param subsystem: the name of the subsystem being requested.
+         @param data: any other packet data (often nothing).
+ 
+@@ -163,6 +164,7 @@
+         """
+ 
+ 
++
+ class ISessionApplication(Interface):
+     """
+     Objects which are returned by an ISessionApplicationFactory implementor

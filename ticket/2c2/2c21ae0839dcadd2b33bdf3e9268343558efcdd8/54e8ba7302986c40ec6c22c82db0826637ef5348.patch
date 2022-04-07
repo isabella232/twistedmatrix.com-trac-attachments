@@ -1,0 +1,180 @@
+diff --git a/dailylog.tac b/dailylog.tac
+new file mode 100644
+index 0000000..074cadd
+--- /dev/null
++++ b/dailylog.tac
+@@ -0,0 +1,8 @@
++#-*- mode: python -*-
++from twisted.application.service import Application
++from twisted.python.log import ILogObserver, FileLogObserver
++from twisted.python.logfile import DailyLogFile
++
++application = Application("myapp")
++logfile = DailyLogFile("my.log", "/tmp")
++application.setComponent(ILogObserver, FileLogObserver(logfile).emit)
+\ No newline at end of file
+diff --git a/twisted/application/app.py b/twisted/application/app.py
+index 11f256b..ddffa1c 100644
+--- a/twisted/application/app.py
++++ b/twisted/application/app.py
+@@ -411,28 +411,46 @@ class ApplicationRunner(object):
+         raise NotImplementedError()
+ 
+ 
++    def _customApplicationSpecified(self):
++        """
++        Checks if the L{ApplicationRunner} config specifies
++        any existing files which define an L{Application}.
++        """
++        s = [(self.config[t], t)
++               for t in ['python', 'source', 'file'] if self.config[t]][0]
++        filename, style = s[0], {'file':'pickle'}.get(s[1],s[1])
++        return os.path.exists(filename)
++
++
+     def createOrGetApplication(self):
+         """
+         Create or load an Application based on the parameters found in the
+         given L{ServerOptions} instance.
+ 
+-        If a subcommand was used, the L{service.IServiceMaker} that it
+-        represents will be used to construct a service to be added to
+-        a newly-created Application.
++        If a subcommand was used the L{service.IServiceMaker} that it
++        represents will be used to construct a service and then either:
++         - This application contained in a specified tac file will be
++           loaded and service will be added to the loaded application.
++         - The subcommand object also implements L{service.IApplicationMaker}
++           at which point we create the a new application using subcommands
++           ServiceMaker.
+ 
+         Otherwise, an application will be loaded based on parameters in
+         the config.
+         """
+         if self.config.subCommand:
+-            # If a subcommand was given, it's our responsibility to create
+-            # the application, instead of load it from a file.
+-
+             # loadedPlugins is set up by the ServerOptions.subCommands
+             # property, which is iterated somewhere in the bowels of
+             # usage.Options.
+             plg = self.config.loadedPlugins[self.config.subCommand]
+             ser = plg.makeService(self.config.subOptions)
+-            application = service.Application(plg.tapname)
++            if self._customApplicationSpecified():
++                passphrase = getPassphrase(self.config['encrypted'])
++                application = getApplication(self.config, passphrase)
++            else:
++                am = service.IApplicationMaker(plg)
++                application = am.makeApplication(self.config)
++            service.IService(application).setName(plg.tapname)
+             ser.setServiceParent(application)
+         else:
+             passphrase = getPassphrase(self.config['encrypted'])
+diff --git a/twisted/application/service.py b/twisted/application/service.py
+index 16cd938..a463434 100644
+--- a/twisted/application/service.py
++++ b/twisted/application/service.py
+@@ -356,6 +356,43 @@ class Process:
+         self.gid = gid
+ 
+ 
++
++class IApplicationMaker(Interface):
++    """
++    An object which can be used to construct Applications.
++
++    This interface should most often be implemented along with
++    L{twisted.plugin.IPlugin}, and will most often be used by the
++    'twistd' command.
++    """
++
++    def makeApplication(options):
++        """
++        Create and return an L{twisted.application.service.Application} object.
++        
++        @param options: A mapping (typically a C{dict} or
++        C{twisted.python.usage.Options} instance) of configuration
++        options to desired configuration values.
++        """
++
++
++
++class DefaultApplicationMakerAdapter(object):
++    implements(IApplicationMaker)
++    
++    def __init__(self, serviceMaker):
++        self.serviceMaker = serviceMaker
++    
++    def makeApplication(self, options):
++        application = Application(self.serviceMaker.tapname)
++        return application
++
++
++
++components.registerAdapter(DefaultApplicationMakerAdapter, IServiceMaker, IApplicationMaker)
++
++
++
+ def Application(name, uid=None, gid=None):
+     """
+     Return a compound class.
+@@ -395,4 +432,4 @@ def loadApplication(filename, kind, passphrase=None):
+ 
+ __all__ = ['IServiceMaker', 'IService', 'Service',
+            'IServiceCollection', 'MultiService',
+-           'IProcess', 'Process', 'Application', 'loadApplication']
++           'IProcess', 'Process', 'IApplicationMaker', 'Application', 'loadApplication']
+diff --git a/twisted/plugins/custom_logging.py b/twisted/plugins/custom_logging.py
+new file mode 100644
+index 0000000..8f7db48
+--- /dev/null
++++ b/twisted/plugins/custom_logging.py
+@@ -0,0 +1,34 @@
++# Copyright (c) 2001-2010 Twisted Matrix Laboratories.
++# See LICENSE for details.
++
++from zope import interface
++
++from twisted.application.service import ServiceMaker, IServiceMaker
++from twisted.application.service import Application, IApplicationMaker
++from twisted.plugin import IPlugin
++from twisted.python.log import ILogObserver, FileLogObserver
++from twisted.python.logfile import DailyLogFile
++
++
++
++class TwistedWebServiceMaker(ServiceMaker):
++    interface.implements(IPlugin, IServiceMaker, IApplicationMaker)
++
++    def makeApplication(self, options):
++        application = Application(self.tapname)
++        #import pdb; pdb.set_trace()
++        logpath = options.get("logfile") or options.subOptions.get("logfile")
++        if not logpath:
++            logpath = "twistd.log"
++        logfile = DailyLogFile(logpath, ".")
++        application.setComponent(ILogObserver, FileLogObserver(logfile).emit)
++        return application
++    
++
++
++TwistedWeb = TwistedWebServiceMaker(
++    "Twisted Web",
++    "twisted.web.tap",
++    ("A example of how to customize the Twisted Web service with"
++     "a custom Application and logging."),
++    "logexample")
+\ No newline at end of file
+diff --git a/twisted/test/test_twistd.py b/twisted/test/test_twistd.py
+index eb00d1b..3d96e0e 100644
+--- a/twisted/test/test_twistd.py
++++ b/twisted/test/test_twistd.py
+@@ -111,6 +111,7 @@ class MockServiceMaker(object):
+     """
+     A non-implementation of L{twisted.application.service.IServiceMaker}.
+     """
++    implements(service.IServiceMaker)
+     tapname = 'ueoa'
+ 
+     def makeService(self, options):

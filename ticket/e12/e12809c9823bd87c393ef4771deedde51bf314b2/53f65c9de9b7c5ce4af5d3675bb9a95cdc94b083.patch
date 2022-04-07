@@ -1,0 +1,201 @@
+commit f1520662de8ef71a6b0d5ca727175da52815c4ff
+Author: Dustin J. Mitchell <dustin@zmanda.com>
+Date:   Tue Jun 28 22:55:29 2011 -0500
+
+    fix and tests for PB refleak
+
+diff --git a/twisted/spread/pb.py b/twisted/spread/pb.py
+index 9ea07cf..06a4d95 100644
+--- a/twisted/spread/pb.py
++++ b/twisted/spread/pb.py
+@@ -1278,17 +1278,19 @@ class _JellyableAvatarMixin:
+ 
+         puid = avatar.processUniqueID()
+ 
+-        def dereferenceLogout():
+-            self.broker.dontNotifyOnDisconnect(logout)
+-            logout()
+-
+-        self.broker._localCleanup[puid] = dereferenceLogout
+-        # No special helper function is necessary for notifyOnDisconnect
+-        # because dereference callbacks won't be invoked if the connection is
+-        # randomly dropped.  I'm not sure those are ideal semantics, but this
+-        # is the only user of the (private) API at the moment and it works just
+-        # fine as things are. -exarkun
+-        self.broker.notifyOnDisconnect(logout)
++        # only call logout once, whether the connection is dropped (disconnect)
++        # or a logout occurs (cleanup), and be careful to drop the reference to
++        # it in either case
++        logout = [ logout ]
++        def maybeLogout():
++            if not logout:
++                return
++            fn = logout[0]
++            del logout[0]
++            fn()
++        self.broker._localCleanup[puid] = maybeLogout
++        self.broker.notifyOnDisconnect(maybeLogout)
++
+         return avatar
+ 
+ 
+diff --git a/twisted/test/test_pb.py b/twisted/test/test_pb.py
+index 0063032..d421313 100644
+--- a/twisted/test/test_pb.py
++++ b/twisted/test/test_pb.py
+@@ -11,7 +11,7 @@ only specific tests for old API.
+ # issue1195 TODOs: replace pump.pump() with something involving Deferreds.
+ # Clean up warning suppression.
+ 
+-import sys, os, time, gc
++import sys, os, time, gc, weakref
+ 
+ from cStringIO import StringIO
+ from zope.interface import implements, Interface
+@@ -23,6 +23,7 @@ from twisted.internet import protocol, main, reactor
+ from twisted.internet.error import ConnectionRefusedError
+ from twisted.internet.defer import Deferred, gatherResults, succeed
+ from twisted.protocols.policies import WrappingFactory
++from twisted.protocols import loopback
+ from twisted.python import failure, log
+ from twisted.cred.error import UnauthorizedLogin, UnhandledCredentials
+ from twisted.cred import portal, checkers, credentials
+@@ -66,17 +67,29 @@ class IOPump:
+         self.clientIO = clientIO
+         self.serverIO = serverIO
+ 
++
+     def flush(self):
+         """
+-        Pump until there is no more input or output. This does not run any
+-        timers, so don't use it with any code that calls reactor.callLater.
++        Pump until there is no more input or output or until L{stop} is called.
++        This does not run any timers, so don't use it with any code that calls
++        reactor.callLater.
+         """
+         # failsafe timeout
++        self._stop = False
+         timeout = time.time() + 5
+-        while self.pump():
++        while not self._stop and self.pump():
+             if time.time() > timeout:
+                 return
+ 
++
++    def stop(self):
++        """
++        Stop a running L{flush} operation, even if data remains to be
++        transferred.
++        """
++        self._stop = True
++
++
+     def pump(self):
+         """
+         Move data back and forth.
+@@ -103,13 +116,19 @@ class IOPump:
+             return 0
+ 
+ 
+-def connectedServerAndClient():
++
++def connectedServerAndClient(realm=None):
+     """
+-    Returns a 3-tuple: (client, server, pump).
++    Connect a client and server L{Broker} together with an L{IOPump}
++
++    @param realm: realm to use, defaulting to a L{DummyRealm}
++
++    @returns: a 3-tuple (client, server, pump).
+     """
++    realm = realm or DummyRealm()
+     clientBroker = pb.Broker()
+     checker = checkers.InMemoryUsernamePasswordDatabaseDontUse(guest='guest')
+-    factory = pb.PBServerFactory(portal.Portal(DummyRealm(), [checker]))
++    factory = pb.PBServerFactory(portal.Portal(realm, [checker]))
+     serverBroker = factory.buildProtocol(('127.0.0.1',))
+ 
+     clientTransport = StringIO()
+@@ -1117,6 +1136,75 @@ class MyView(pb.Viewable):
+ 
+ 
+ 
++class LeakyRealm(TestRealm):
++    """
++    A realm which hangs onto a reference to the mind object in its logout
++    function.
++    """
++    def __init__(self, mindEater):
++        """
++        Create a L{LeakyRealm}.
++
++        @param mindEater: a callable that will be called with the C{mind}
++        object when it is available
++        """
++        self._mindEater = mindEater
++
++
++    def requestAvatar(self, avatarId, mind, interface):
++        self._mindEater(mind)
++        persp = self.perspectiveFactory(avatarId)
++        return (pb.IPerspective, persp, lambda : (mind, persp.logout()))
++
++
++
++class NewCredLeakTests(unittest.TestCase):
++    """
++    Tests to try to trigger memory leaks.
++    """
++    def test_logoutLeak(self):
++        """
++        Test that the server does not leak a reference when the client
++        disconnects suddenly.  This leak occurs because the logout function
++        maintains a reference to the perspective, which maintains a reference
++        to the logout function.
++        """
++        # keep a weak reference to the mind object, which we can verify later
++        # evaluates to None, thereby ensuring the reference leak is fixed.
++        self.mindRef = None
++        def setMindRef(mind):
++            self.mindRef = weakref.ref(mind)
++
++        clientBroker, serverBroker, pump = connectedServerAndClient(
++                LeakyRealm(setMindRef))
++
++        # log in from the client
++        connectionBroken = []
++        root = clientBroker.remoteForName("root")
++        d = root.callRemote("login", 'guest')
++        def cbResponse((challenge, challenger)):
++            mind = SimpleRemote()
++            return challenger.callRemote("respond",
++                    pb.respond(challenge, 'guest'), mind)
++        d.addCallback(cbResponse)
++        def connectionLost(_):
++            pump.stop() # don't try to pump data anymore - it won't work
++            connectionBroken.append(1)
++            serverBroker.connectionLost(failure.Failure(RuntimeError("boom")))
++        d.addCallback(connectionLost)
++
++        # flush out the response and connectionLost
++        pump.flush()
++        self.assertEqual(connectionBroken, [1])
++
++        # and check for lingering references - requestAvatar sets mindRef
++        # to a weakref to the mind; this object should be gc'd, and thus
++        # the ref should return None
++        gc.collect()
++        self.assertEqual(self.mindRef(), None)
++
++
++
+ class NewCredTestCase(unittest.TestCase):
+     """
+     Tests related to the L{twisted.cred} support in PB.
+diff --git a/twisted/topfiles/5079.bugfix b/twisted/topfiles/5079.bugfix
+new file mode 100644
+index 0000000..b11759a
+--- /dev/null
++++ b/twisted/topfiles/5079.bugfix
+@@ -0,0 +1 @@
++twistd.pb.Broker no longer leaks a reference when the logout callback holds a reference to the root object

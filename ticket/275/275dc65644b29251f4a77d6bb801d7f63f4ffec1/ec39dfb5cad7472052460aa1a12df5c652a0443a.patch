@@ -1,0 +1,183 @@
+=== modified file 'doc/core/howto/listings/udp/MulticastClient.py'
+--- doc/core/howto/listings/udp/MulticastClient.py	2011-06-05 16:53:27 +0000
++++ doc/core/howto/listings/udp/MulticastClient.py	2011-11-07 18:55:24 +0000
+@@ -1,12 +1,29 @@
+ from twisted.internet.protocol import DatagramProtocol
+ from twisted.internet import reactor
+-
+-class MulticastClientUDP(DatagramProtocol):
++from twisted.python import log
++import sys
++
++# For a client to send multicast to a multicast server it needs to join
++# the same multicast address
++mcastaddr = '228.0.0.5'
++
++class MulticastPingClient(DatagramProtocol):
++
++    def startProtocol(self):
++        log.msg("TTL: " + repr(self.transport.getTTL()))
++        # Default TTL=1 to send over router hops TTL needs to be increased
++        self.transport.setTTL(3)
++        # send IGMP JOIN for multicast group addr so you can receive
++        self.deferred=self.transport.joinGroup(mcastaddr)
++        # send to 228.0.0.5:8005 - all listeners will receive - i.e multicast!
++        # You could also send unicast to server via write('data',(addr,8005))
++        self.transport.write('Client1: Ping',(mcastaddr, 8005))
+ 
+     def datagramReceived(self, datagram, address):
+-            print "Received:" + repr(datagram)
+-
+-# Send multicast on 224.0.0.1:8005, on our dynamically allocated port
+-port = reactor.listenUDP(0, MulticastClientUDP())
+-port.write('UniqueID', ('224.0.0.1', 8005))
++        log.msg("Received: " + repr(datagram))
++
++# listen on multicast 228.0.0.1:8005, just like the server
++log.startLogging(sys.stdout)
++reactor.listenMulticast(8005, MulticastPingClient())
++
+ reactor.run()
+
+=== modified file 'doc/core/howto/listings/udp/MulticastServer.py'
+--- doc/core/howto/listings/udp/MulticastServer.py	2011-06-05 16:53:27 +0000
++++ doc/core/howto/listings/udp/MulticastServer.py	2011-11-07 19:47:10 +0000
+@@ -1,24 +1,34 @@
+ from twisted.internet.protocol import DatagramProtocol
+ from twisted.internet import reactor
+-
+-class MulticastServerUDP(DatagramProtocol):
++from twisted.python.log import msg, err, startLogging
++import sys
++
++# Multicast address has to be in range 224.0.0.0 - 239.255.255.255
++# Multicast addr in range 224.0.0.0-255 DON'T pass 1st router with ANY TTL(ie > 1)
++# Multicast addr 224.0.0.1 (all hosts) is joined by kernel so NO IGMP sent
++mcastaddr = "228.0.0.5"
++
++class MulticastPingPong(DatagramProtocol):
++
++    def __init__(self, text):
++        self.text = text
++
+     def startProtocol(self):
+-        print 'Started Listening'
++        # Need to set the TTL so multicast will cross router hops
++        self.transport.setTTL(5)
+         # Join a specific multicast group, which is the IP we will respond to
+-        self.transport.joinGroup('224.0.0.1')
++        self.deferred=self.transport.joinGroup(mcastaddr)
+ 
+     def datagramReceived(self, datagram, address):
+-        # The uniqueID check is to ensure we only service requests from
+-        # ourselves
+-        if datagram == 'UniqueID':
+-            print "Server Received:" + repr(datagram)
+-            self.transport.write("data", address)
+-
+-# Note that the join function is picky about having a unique object
+-# on which to call join.  To avoid using startProtocol, the following is
+-# sufficient:
+-#reactor.listenMulticast(8005, MulticastServerUDP()).join('224.0.0.1')
+-
+-# Listen for multicast on 224.0.0.1:8005
+-reactor.listenMulticast(8005, MulticastServerUDP())
++        msg("Datagram %s received from %s" % (repr(datagram), repr(address)))
++        if datagram == 'Client1: Ping':
++            self.transport.write("Srv: " + self.text, (mcastaddr, 8005))
++
++
++startLogging(sys.stdout)
++# start multicast listener on multiple interfaces
++# To avoid using startProtocol, the following is sufficient:
++# reactor.listenMulticast(8005, MulticastPingPong()).joinGroup(mcastaddr)
++
++reactor.listenMulticast(8005, MulticastPingPong("Mcast Pong"), listenMultiple=True)
+ reactor.run()
+
+=== modified file 'doc/core/howto/udp.xhtml'
+--- doc/core/howto/udp.xhtml	2011-03-01 18:51:01 +0000
++++ doc/core/howto/udp.xhtml	2011-11-07 19:31:59 +0000
+@@ -131,51 +131,54 @@
+ 
+     <h2>Multicast UDP</h2>
+ 
+-    <p>A multicast UDP socket can send and receive datagrams from multiple
+-    clients.  The interesting and useful feature of multicast is that a client
++    <p>A multicast UDP socket can send and receive datagrams from/to multiple
++    clients.  An interesting and useful feature of multicast is that a client
+     can contact multiple servers with a single packet, without knowing the
+-    specific IP address of any of the hosts.</p>
++    specific unicast IP address of any of the hosts.</p>
+ 
+     <a href="listings/udp/MulticastServer.py"
+     class="py-listing">MulticastServer.py</a>
+ 
+-    <p>The server protocol is very simple and closely resembles a
+-    normal <code class="API"
++    <p>With Multicast there is no server/client differentiation at the protocol
++    level. You can send multicast without Joining the group address, However you
++    can only receive if you have joined the multicast group address (IPv4 range
++    224.0.0.0-239.255.255.255). Our "server" protocol is very simple
++    and closely resembles a normal <code class="API"
+     base="twisted.internet.interfaces.IReactorUDP">listenUDP</code>
+     implementation.  The main difference is that instead
+     of <code>listenUDP</code>, <code class="API"
+     base="twisted.internet.interfaces.IReactorMulticast">listenMulticast</code>
+-    is called with a specified port number.  The server must also
++    is called with a specified port number. Our server must also
+     call <code class="API"
+     base="twisted.internet.interfaces.IMulticastTransport">joinGroup</code> to
+-    specify on which multicast IP address it will service requests.  Another
+-    item of interest is the contents of the datagram.  Many different
+-    applications use multicast as a way of device discovery, which leads to an
+-    abundance of packets flying around.  Checking the payload can ensure that we
+-    only service requests from our specific clients.
++    specify on which multicast IP address it will receive requests.  Another
++    item of interest is like any connectionless protocol once you listen on a
++    port then ANY client can send you data if they know your (addr, port),
++    however with multicast if you send to that (groupaddr, port) you will also
++    receive that information.
+     </p>
+ 
+     <a href="listings/udp/MulticastClient.py"
+     class="py-listing">MulticastClient.py</a>
+ 
+-    <p>This is a mirror implementation of a standard UDP client.  The only
+-    difference is that the destination IP is the multicast address.  This
+-    datagram will be distributed to every server listening on 
+-    <code>224.0.0.1</code> (a special address for all hosts on the local
+-    network segment, defined by
+-    <a href="http://www.faqs.org/rfcs/rfc1112.html">RFC 1112</a>) and port 
+-    <code>8005</code>.  Note that the client  port is specified as 
+-    <code>0</code>, as we have no need to keep track of what port the client
+-    is listening on.
++    <p>This strikes a very close resemblance to the Multicast "server". Server
++    logic should really be stipulated in Service classes above the protocol.
++    If the client didn't want to receive information from the server it could
++    implement this by NOT joining the multicast group address. The client could
++    also directly send to the "server" via UDP unicast if it so wished.
+     </p>
+ 
+-<h2>Acknowledgments</h2>
+-
+-<p>Thank you to all contributors to this document, including:</p>
+-
+-<ul>
+-<li>Kyle Robertson, author of the explanation and examples of multicast</li>
+-</ul>
++<h3>Note: Multicast "Gotchas"</h3>
++
++<p>A Multicast socket will have a default TTL=1. Therefore datagrams WON'T
++  traverse router Hops.</p>
++<p>The <code>224.0.0.1-255</code> range is for local services. Any multicast
++services in this range wont be forwarded past a router NO matter what their TTL.
++<a href="http://www.faqs.org/rfcs/rfc1112.html">RFC 1112</a>)</p>
++<p>The assigned multicast group <code>224.0.0.1<code> for ALL-HOSTS-ON-SUBNET is
++joined by the kernel. Therefore any process that tries to JOIN this group will
++not send a IGMP JOIN as the group has been already joined by the kernel.
++</p>
+ 
+ </body>
+ </html>
+

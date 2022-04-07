@@ -1,0 +1,224 @@
+--- smtp.py	Thu Oct 21 12:30:56 2004
++++ smtp.new	Thu Oct 21 12:32:54 2004
+@@ -126,9 +126,27 @@
+ class SMTPError(Exception):
+     pass
+ 
++class ErrorTypes:
++    SMTPClientError     = "SMTPClientError"
++    ESMTPClientError    = "ESMTPClientError"
++    EHLORequiredError   = "EHLORequiredError"
++    AUTHRequiredError   = "AUTHRequiredError"
++    TLSRequiredError    = "TLSRequiredError"
++    AUTHDeclinedError   = "AUTHDeclinedError"
++    AuthenticationError = "AuthenticationError"
++    TLSError            = "TLSError"
++    SMTPConnectError    = "SMTPConnectError"
++    SMTPProtocolError   = "SMTPProtocolError"
++    SMTPDeliveryError   = "SMTPDeliveryError"
++
++
+ class SMTPClientError(SMTPError):
+     """Base class for SMTP client errors.
+     """
++
++    #Can use this instead of isinstance for better performance
++    type = ErrorTypes.SMTPClientError
++
+     def __init__(self, code, resp, log=None, addresses=None, isFatal=False, retry=False):
+         """
+         @param code: The SMTP response code associated with this error.
+@@ -162,27 +180,32 @@
+ class ESMTPClientError(SMTPClientError):
+     """Base class for ESMTP client errors.
+     """
++    #Can use this instead of isinstance for better performance
++    type = ErrorTypes.ESMTPClientError
+ 
+ class EHLORequiredError(ESMTPClientError):
+     """The server does not support EHLO.
+-
+     This is considered a non-fatal error (the connection will not be
+     dropped).
+     """
++    #Can use this instead of isinstance for better performance
++    type = ErrorTypes.EHLORequiredError
+ 
+ class AUTHRequiredError(ESMTPClientError):
+     """Authentication was required but the server does not support it.
+-
+     This is considered a non-fatal error (the connection will not be
+     dropped).
+     """
++    #Can use this instead of isinstance for better performance
++    type = ErrorTypes.AUTHRequiredError
+ 
+ class TLSRequiredError(ESMTPClientError):
+     """Transport security was required but the server does not support it.
+-
+     This is considered a non-fatal error (the connection will not be
+     dropped).
+     """
++    #Can use this instead of isinstance for better performance
++    type = ErrorTypes.TLSRequiredError
+ 
+ class AUTHDeclinedError(ESMTPClientError):
+     """The server rejected our credentials.
+@@ -193,6 +216,8 @@
+     This is considered a non-fatal error (the connection will not be
+     dropped).
+     """
++    #Can use this instead of isinstance for better performance
++    type = ErrorTypes.AUTHDeclinedError
+ 
+ class AuthenticationError(ESMTPClientError):
+     """An error ocurred while authenticating.
+@@ -203,6 +228,8 @@
+     This is considered a non-fatal error (the connection will not be
+     dropped).
+     """
++    #Can use this instead of isinstance for better performance
++    type = ErrorTypes.AuthenticationError
+ 
+ class TLSError(ESMTPClientError):
+     """An error occurred while negiotiating for transport security.
+@@ -210,12 +237,17 @@
+     This is considered a non-fatal error (the connection will not be
+     dropped).
+     """
++    #Can use this instead of isinstance for better performance
++    type = ErrorTypes.TLSError
+ 
+ class SMTPConnectError(SMTPClientError):
+     """Failed to connect to the mail exchange host.
+ 
+     This is considered a fatal error.  A retry will be made.
+     """
++    #Can use this instead of isinstance for better performance
++    type = ErrorTypes.SMTPConnectError
++
+     def __init__(self, code, resp, log=None, addresses=None, isFatal=True, retry=True):
+         SMTPClientError.__init__(self, code, resp, log, addresses, isFatal, retry)
+ 
+@@ -224,12 +256,17 @@
+ 
+     This is considered a fatal error.  A retry will not be made.
+     """
++    #Can use this instead of isinstance for better performance
++    type = ErrorTypes.SMTPProtocolError
++
+     def __init__(self, code, resp, log=None, addresses=None, isFatal=True, retry=False):
+         SMTPClientError.__init__(self, code, resp, log, addresses, isFatal, retry)
+ 
+ class SMTPDeliveryError(SMTPClientError):
+     """Indicates that a delivery attempt has had an error.
+     """
++    #Can use this instead of isinstance for better performance
++    type = ErrorTypes.SMTPDeliveryError
+ 
+ class SMTPServerError(SMTPError):
+     def __init__(self, code, resp):
+@@ -921,12 +958,16 @@
+         p.host = self.domain
+         return p
+ 
+-class SMTPClient(basic.LineReceiver):
++class SMTPClient(basic.LineReceiver, policies.TimeoutMixin):
+     """SMTP client for sending emails."""
+ 
+     # If enabled then log SMTP client server communication
+     debug = True
+ 
++    #Number of seconds to wait before timing out a connection.
++    #If the number is <= 0 no timeout checking will be performed.
++    timeout = 0
++
+     def __init__(self, identity, logsize=10):
+         self.identity = identity or ''
+         self.toAddressesResult = []
+@@ -944,11 +985,28 @@
+         basic.LineReceiver.sendLine(self,line)
+ 
+     def connectionMade(self):
++        if self.timeout > 0:
++            self.setTimeout(self.timeout)
++
+         self._expected = [ 220 ]
+         self._okresponse = self.smtpState_helo
+         self._failresponse = self.smtpConnectionFailed
+ 
++    def connectionLost(self, reason=protocol.connectionDone):
++        """We are no longer connected"""
++        if self.timeout > 0:
++            self.setTimeout(None)
++
++        self.mailFile = None
++
++    def timeoutConnection(self):
++        self.sendError(SMTPConnectError(-1, "Connection with SMTP server timed out. Please try again later.",
++                                        self.log))
++
+     def lineReceived(self, line):
++        if self.timeout > 0:
++            self.resetTimeout()
++
+         # Log lineReceived only if you are in debug mode for performance
+         if self.debug:
+             self.log.append('<<< ' + line)
+@@ -1068,10 +1126,6 @@
+         self.sendLine(line)
+     ##
+ 
+-    def connectionLost(self, reason=protocol.connectionDone):
+-        """We are no longer connected"""
+-        self.mailFile = None
+-
+     # these methods should be overriden in subclasses
+     def getMailFrom(self):
+         """Return the email address the mail is from."""
+@@ -1193,6 +1247,9 @@
+         self.authenticators.append(auth)
+ 
+     def connectionMade(self):
++        if self.timeout > 0:
++            self.setTimeout(self.timeout)
++
+         self._expected = [220]
+         self._okresponse = self.esmtpState_ehlo
+         self._failresponse = self.smtpConnectionFailed
+@@ -1460,10 +1517,11 @@
+         #   2. The error is of base type SMTPClientError and retry is false
+         #   3. The error code is not in the 4xx range (Communication Errors)
+ 
+-        if isinstance(exc, SMTPClientError):
+-            if self.factory.retries >= 0 or (not exc.retry and not (exc.code >= 400 and exc.code < 500)):
+-                self.factory.sendFinished = 1
+-                self.factory.result.errback(exc)
++        assert isinstance(exc, SMTPClientError)
++
++        if self.factory.retries >= 0 or (not exc.retry and not (exc.code >= 400 and exc.code < 500)):
++            self.factory.sendFinished = 1
++            self.factory.result.errback(exc)
+ 
+     def sentMail(self, code, resp, numOk, addresses, log):
+         # Do not retry the SMTP Server responsed to the request
+@@ -1498,15 +1556,15 @@
+         """
+         @param fromEmail: The RFC 2821 address from which to send this
+         message.
+-        
++
+         @param toEmail: A sequence of RFC 2821 addresses to which to
+         send this message.
+-        
++
+         @param file: A file-like object containing the message to send.
+-        
++
+         @param deferred: A Deferred to callback or errback when sending
+         of this message completes.
+-        
++
+         @param retries: The number of times to retry delivery of this
+         message.
+         """

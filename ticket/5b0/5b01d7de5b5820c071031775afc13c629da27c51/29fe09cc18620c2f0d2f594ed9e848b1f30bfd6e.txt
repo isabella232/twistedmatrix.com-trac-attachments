@@ -1,0 +1,624 @@
+diff -r dc23153b5916 twisted/internet/abstract.py
+--- a/twisted/internet/abstract.py	Sun Jun 04 04:37:06 2006 +0000
++++ b/twisted/internet/abstract.py	Sun Jun 04 17:54:48 2006 +0200
+@@ -1,5 +1,7 @@
+ # Copyright (c) 2001-2004 Twisted Matrix Laboratories.
+ # See LICENSE for details.
++#
++# Copyright (C) 2006  Andrea Arcangeli <andrea@cpushare.com>
+ 
+ 
+ """Support for generic select()able objects.
+@@ -219,9 +221,27 @@ class FileDescriptor(log.Logger, styles.
+         """Stop waiting for read availability.
+ 
+         Call this to remove this selectable from being notified when it is
+-        ready for reading.
++        ready for reading. This will prevent receiving notification of
++        disconnects and errors too. It is normally called when the
++        selectable is closed.
+         """
+         self.reactor.removeReader(self)
++
++    def pauseReading(self):
++        """Pause waiting for read availability.
++
++        Call this to remove this selectable from being notified when it is
++        ready for reading but while still being notified if the other end
++        disconnects or there are errors (on the reactors that supports
++        this feature by implementing the reactor.pauseReader method).
++        """
++        reactor = self.reactor
++        try:
++            pauseReader = reactor.pauseReader
++        except AttributeError:
++            reactor.removeReader(self)
++        else:
++            pauseReader(self)
+ 
+     def stopWriting(self):
+         """Stop waiting for write availability.
+@@ -233,6 +253,10 @@ class FileDescriptor(log.Logger, styles.
+ 
+     def startReading(self):
+         """Start waiting for read availability.
++
++        This cannot be nested with pauseReading as it will destroy the
++        pauseReading state: after a startReading, the selectable
++        will be not paused anymore.
+         """
+         self.reactor.addReader(self)
+ 
+@@ -264,6 +288,7 @@ class FileDescriptor(log.Logger, styles.
+         """
+         if self.producer is not None:
+             raise RuntimeError("Cannot register producer %s, because producer %s was never unregistered." % (producer, self.producer))
++        assert not self.producerPaused
+         if self.disconnected:
+             producer.stopProducing()
+         else:
+@@ -275,7 +300,14 @@ class FileDescriptor(log.Logger, styles.
+     def unregisterProducer(self):
+         """Stop consuming data from a producer, without disconnecting.
+         """
++        producer = self.producer
+         self.producer = None
++        if producer:
++            if self.producerPaused:
++                self.producerPaused = 0
++                # if it's a streaming producer resume it before letting
++                # it go by itself without the consumer throttling control
++                producer.resumeProducing()
+ 
+     def stopConsuming(self):
+         """Stop consuming data.
+@@ -290,11 +322,11 @@ class FileDescriptor(log.Logger, styles.
+     # producer interface implementation
+ 
+     def resumeProducing(self):
+-        assert self.connected and not self.disconnecting
+-        self.startReading()
++        if self.connected and not self.disconnecting:
++            self.startReading()
+ 
+     def pauseProducing(self):
+-        self.stopReading()
++        self.pauseReading()
+ 
+     def stopProducing(self):
+         self.loseConnection()
+diff -r dc23153b5916 twisted/internet/interfaces.py
+--- a/twisted/internet/interfaces.py	Sun Jun 04 04:37:06 2006 +0000
++++ b/twisted/internet/interfaces.py	Sun Jun 04 17:54:48 2006 +0200
+@@ -1,5 +1,7 @@
+ # Copyright (c) 2001-2004 Twisted Matrix Laboratories.
+ # See LICENSE for details.
++#
++# Copyright (C) 2006  Andrea Arcangeli <andrea@cpushare.com>
+ 
+ 
+ """Interface documentation.
+@@ -657,6 +659,16 @@ class IReactorFDSet(Interface):
+         @returns: C{None}.
+         """
+ 
++    def pauseReader(self, reader):
++        """I stop getting read events but the reader remains polled for errors.
++        If no errors are received this automatically fallbacks to removeReader
++        after calling selectable.pausedConnectionLost().
++
++        @param reader: An L{IReadDescriptor} that will be checked only for error
++            events until it is resumed from the reactor with L{resumeReader}.
++        @returns: C{None}.
++        """
++
+     def removeAll(self):
+         """Remove all readers and writers, and return the list of
+         L{IReadDescriptor}s and L{IWriteDescriptor}s removed.
+@@ -719,7 +731,20 @@ class IFileDescriptor(Interface):
+          L{twisted.internet.error.ConnectionDone} are of special note, but
+          the failure may be of other classes as well.
+         """
+-    
++
++    def pausedConnectionLost(self, reason):
++        """Notify about the connection being lost while in read-throtting.
++
++        We'll just notify the application that if it doesn't want to risk
++        to get stuck it may want to drop the connection by hand (risking
++        data loss) because the connection was hangup from the other side
++        while we were paused. We're not allowed to read so we can't make
++        progress, only the application can decide if we can risk to lose
++        the incoming data that may still be in the kernel receive queues.
++
++        @param reason: Same as connectionLost(reason).
++        """
++
+ class IReadDescriptor(IFileDescriptor):
+ 
+     def doRead(self):
+@@ -875,6 +900,9 @@ class IProtocol(Interface):
+ 
+         @type reason: L{twisted.python.failure.Failure}
+         """
++
++    def pausedConnectionLost(self, reason):
++        "See IFileDescriptor.pausedConnectionLost()"
+ 
+     def makeConnection(self, transport):
+         """Make a connection to a transport and a server.
+diff -r dc23153b5916 twisted/internet/pollreactor.py
+--- a/twisted/internet/pollreactor.py	Sun Jun 04 04:37:06 2006 +0000
++++ b/twisted/internet/pollreactor.py	Sun Jun 04 17:54:48 2006 +0200
+@@ -1,5 +1,7 @@
+ # Copyright (c) 2001-2004 Twisted Matrix Laboratories.
+ # See LICENSE for details.
++#
++# Copyright (C) 2006  Andrea Arcangeli <andrea@cpushare.com>
+ 
+ 
+ """A poll() based implementation of the twisted main loop.
+@@ -27,6 +29,7 @@ from twisted.internet.interfaces import 
+ 
+ # globals
+ reads = {}
++paused_reads = {}
+ writes = {}
+ selectables = {}
+ poller = select.poll()
+@@ -46,9 +49,20 @@ class PollReactor(posixbase.PosixReactor
+             pass
+ 
+         mask = 0
+-        if reads.has_key(fd): mask = mask | select.POLLIN
+-        if writes.has_key(fd): mask = mask | select.POLLOUT
+-        if mask != 0:
++        tracked = 0
++        if reads.has_key(fd):
++            if fd not in paused_reads:
++                mask = mask | select.POLLIN
++            tracked = 1
++        else:
++            try:
++                del paused_reads[fd]
++            except KeyError:
++                pass
++        if writes.has_key(fd):
++            mask = mask | select.POLLOUT
++            tracked = 1
++        if tracked:
+             poller.register(fd, mask)
+         else:
+             if selectables.has_key(fd): del selectables[fd]
+@@ -60,15 +74,14 @@ class PollReactor(posixbase.PosixReactor
+             # make sure the fd is actually real.  In some situations we can get
+             # -1 here.
+             mdict[fd]
+-        except:
++        except KeyError:
+             # the hard way: necessary because fileno() may disappear at any
+             # moment, thanks to python's underlying sockets impl
+             for fd, fdes in selectables.items():
+                 if selectable is fdes:
+                     break
+             else:
+-                # Hmm, maybe not the right course of action?  This method can't
+-                # fail, because it happens inside error detection...
++                # permissive behaviour: allow multiple calls
+                 return
+         if mdict.has_key(fd):
+             del mdict[fd]
+@@ -78,15 +91,23 @@ class PollReactor(posixbase.PosixReactor
+         """Add a FileDescriptor for notification of data available to read.
+         """
+         fd = reader.fileno()
++        assert fd >= 0
+         if not reads.has_key(fd):
+             selectables[fd] = reader
+             reads[fd] =  1
+             self._updateRegistration(fd)
++        else:
++            # invalidate any paused reader
++            try:
++                del paused_reads[fd]
++            except KeyError:
++                pass
+ 
+     def addWriter(self, writer, writes=writes, selectables=selectables):
+         """Add a FileDescriptor for notification of data available to write.
+         """
+         fd = writer.fileno()
++        assert fd >= 0
+         if not writes.has_key(fd):
+             selectables[fd] = writer
+             writes[fd] =  1
+@@ -95,20 +116,30 @@ class PollReactor(posixbase.PosixReactor
+     def removeReader(self, reader, reads=reads):
+         """Remove a Selectable for notification of data available to read.
+         """
+-        return self._dictRemove(reader, reads)
++        self._dictRemove(reader, reads)
++
++    def pauseReader(self, reader, paused_reads=paused_reads):
++        """Only notify about DISCONNECT events.
++        """
++        fd = reader.fileno()
++        assert fd >= 0
++        if not paused_reads.has_key(fd):
++            paused_reads[fd] = 1
++            self._updateRegistration(fd)
+ 
+     def removeWriter(self, writer, writes=writes):
+         """Remove a Selectable for notification of data available to write.
+         """
+-        return self._dictRemove(writer, writes)
+-
+-    def removeAll(self, reads=reads, writes=writes, selectables=selectables):
++        self._dictRemove(writer, writes)
++
++    def removeAll(self, reads=reads, paused_reads=paused_reads, writes=writes, selectables=selectables):
+         """Remove all selectables, and return a list of them."""
+         if self.waker is not None:
+             self.removeReader(self.waker)
+         result = selectables.values()
+         fds = selectables.keys()
+         reads.clear()
++        paused_reads.clear()
+         writes.clear()
+         selectables.clear()
+         for fd in fds:
+@@ -157,7 +188,10 @@ class PollReactor(posixbase.PosixReactor
+         why = None
+         inRead = False
+         if event & POLL_DISCONNECTED and not (event & POLLIN):
+-            why = main.CONNECTION_LOST
++            if fd in paused_reads:
++                self.pausedConnectionLost(selectable)
++            else:
++                why = main.CONNECTION_LOST
+         else:
+             try:
+                 if event & POLLIN:
+@@ -165,10 +199,8 @@ class PollReactor(posixbase.PosixReactor
+                     inRead = True
+                 if not why and event & POLLOUT:
+                     why = selectable.doWrite()
+-                    inRead = False
+                 if not selectable.fileno() == fd:
+                     why = error.ConnectionFdescWentAway('Filedescriptor went away')
+-                    inRead = False
+             except:
+                 log.deferr()
+                 why = sys.exc_info()[1]
+diff -r dc23153b5916 twisted/internet/posixbase.py
+--- a/twisted/internet/posixbase.py	Sun Jun 04 04:37:06 2006 +0000
++++ b/twisted/internet/posixbase.py	Sun Jun 04 17:54:48 2006 +0200
+@@ -254,6 +254,20 @@ class PosixReactorBase(ReactorBase):
+         else:
+             self.removeWriter(selectable)
+             selectable.connectionLost(failure.Failure(why))
++
++    def pausedConnectionLost(self, selectable):
++        """Drop the paused selectable.
++
++        Go back to the old way of waiting forever but only after
++        notifying the application about it.
++        """
++        self.removeReader(selectable)
++        try:
++            pausedConnectionLost = selectable.pausedConnectionLost
++        except AttributeError:
++            pass
++        else:
++            pausedConnectionLost(failure.Failure(error.ConnectionLost()))
+ 
+     def installWaker(self):
+         """Install a `waker' to allow threads and signals to wake up the IO thread.
+diff -r dc23153b5916 twisted/internet/tcp.py
+--- a/twisted/internet/tcp.py	Sun Jun 04 04:37:06 2006 +0000
++++ b/twisted/internet/tcp.py	Sun Jun 04 17:54:48 2006 +0200
+@@ -1,6 +1,8 @@
+ # -*- test-case-name: twisted.test.test_tcp -*-
+ # Copyright (c) 2001-2004 Twisted Matrix Laboratories.
+ # See LICENSE for details.
++#
++# Copyright (C) 2006  Andrea Arcangeli <andrea@cpushare.com>
+ 
+ 
+ 
+@@ -85,7 +87,7 @@ class _SocketCloser:
+         # filedescriptor.
+         skt = self.socket
+         try:
+-            getattr(skt, self._socketShutdownMethod)(2)
++            getattr(skt, self._socketShutdownMethod)(socket.SHUT_RDWR)
+         except socket.error:
+             pass
+         try:
+@@ -98,34 +100,49 @@ class _TLSMixin:
+ 
+     writeBlockedOnRead = 0
+     readBlockedOnWrite = 0
+-    _userWantRead = _userWantWrite = True
++    _userWantWrite = True
++    _False = 0
++    _True = 1
++    _Paused = 2
++    _userWantRead = _True
+     
+     def getPeerCertificate(self):
+         return self.socket.get_peer_certificate()
+ 
+     def doRead(self):
+-        if self.writeBlockedOnRead:
+-            self.writeBlockedOnRead = 0
+-            self._resetReadWrite()
+-        try:
+-            return Connection.doRead(self)
++        wantMoreRead = False
++        wantWrite = False
++
++        try:
++            ret = Connection.doRead(self)
+         except SSL.ZeroReturnError:
+-            return main.CONNECTION_DONE
++            ret = main.CONNECTION_DONE
+         except SSL.WantReadError:
+-            return
++            wantMoreRead = True
++            ret = None
+         except SSL.WantWriteError:
+-            self.readBlockedOnWrite = 1
+-            Connection.startWriting(self)
+-            Connection.stopReading(self)
+-            return
++            wantWrite = True
++            ret = None
+         except SSL.SysCallError, (retval, desc):
+-            if ((retval == -1 and desc == 'Unexpected EOF')
+-                or retval > 0):
+-                return main.CONNECTION_LOST
+-            log.err()
+-            return main.CONNECTION_LOST
++            if not ((retval == -1 and desc == 'Unexpected EOF')
++                    or retval > 0):
++                log.err()
++            ret = main.CONNECTION_LOST
+         except SSL.Error, e:
+-            return e
++            ret = e
++
++        if not wantMoreRead:
++            if self.writeBlockedOnRead:
++                self.writeBlockedOnRead = 0
++                if self._userWantRead == self._False:
++                    Connection.stopReading(self)
++                elif self._userWantRead == self._Paused:
++                    Connection.pauseReading(self)
++            if wantWrite:
++                self.readBlockedOnWrite = 1
++                Connection.startWriting(self)
++
++        return ret
+ 
+     def doWrite(self):
+         # Retry disconnecting
+@@ -134,32 +151,42 @@ class _TLSMixin:
+         if self._writeDisconnected:
+             return self._closeWriteConnection()
+         
+-        if self.readBlockedOnWrite:
+-            self.readBlockedOnWrite = 0
+-            self._resetReadWrite()
+         return Connection.doWrite(self)
+ 
+     def writeSomeData(self, data):
+-        try:
+-            return Connection.writeSomeData(self, data)
++        wantMoreWrite = False
++        wantRead = False
++
++        try:
++            ret = Connection.writeSomeData(self, data)
+         except SSL.WantWriteError:
+-            return 0
++            wantMoreWrite = True
++            ret = 0
+         except SSL.WantReadError:
+-            self.writeBlockedOnRead = 1
+-            Connection.stopWriting(self)
+-            Connection.startReading(self)
+-            return 0
++            wantRead = True
++            ret = 0
+         except SSL.ZeroReturnError:
+-            return main.CONNECTION_LOST
++            ret = main.CONNECTION_LOST
+         except SSL.SysCallError, e:
+             if e[0] == -1 and data == "":
+                 # errors when writing empty strings are expected
+                 # and can be ignored
+-                return 0
++                ret = 0
+             else:
+-                return main.CONNECTION_LOST
++                ret = main.CONNECTION_LOST
+         except SSL.Error, e:
+-            return e
++            ret = e
++
++        if not wantMoreWrite:
++            if self.readBlockedOnWrite:
++                self.readBlockedOnWrite = 0
++                if not self._userWantWrite:
++                    Connection.stopWriting(self)
++            if wantRead:
++                self.writeBlockedOnRead = 1
++                Connection.startReading(self)
++
++        return ret
+ 
+     def _postLoseConnection(self):
+         """Gets called after loseConnection(), after buffered data is sent.
+@@ -234,14 +261,21 @@ class _TLSMixin:
+         return result
+ 
+     def startReading(self):
+-        self._userWantRead = True
++        self._userWantRead = self._True
+         if not self.readBlockedOnWrite:
+             return Connection.startReading(self)
+ 
+     def stopReading(self):
+-        self._userWantRead = False
++        self._userWantRead = self._False
+         if not self.writeBlockedOnRead:
+             return Connection.stopReading(self)
++
++    def pauseReading(self):
++        if self._userWantRead == self._True:
++            # pauseReading won't override a stopReading from the user
++            self._userWantRead = self._Paused
++        if not self.writeBlockedOnRead:
++            return Connection.pauseReading(self)
+ 
+     def startWriting(self):
+         self._userWantWrite = True
+@@ -252,19 +286,6 @@ class _TLSMixin:
+         self._userWantWrite = False
+         if not self.readBlockedOnWrite:
+             return Connection.stopWriting(self)
+-
+-    def _resetReadWrite(self):
+-        # After changing readBlockedOnWrite or writeBlockedOnRead,
+-        # call this to reset the state to what the user requested.
+-        if self._userWantWrite:
+-            self.startWriting()
+-        else:
+-            self.stopWriting()
+-        
+-        if self._userWantRead:
+-            self.startReading()
+-        else:
+-            self.stopReading()
+ 
+ def _getTLSClass(klass, _existing={}):
+     if klass not in _existing:
+@@ -367,7 +388,7 @@ class Connection(abstract.FileDescriptor
+ 
+     def _closeWriteConnection(self):
+         try:
+-            getattr(self.socket, self._socketShutdownMethod)(1)
++            getattr(self.socket, self._socketShutdownMethod)(socket.SHUT_WR)
+         except socket.error:
+             pass
+         p = interfaces.IHalfCloseableProtocol(self.protocol, None)
+@@ -400,6 +421,17 @@ class Connection(abstract.FileDescriptor
+         del self.socket
+         del self.fileno
+         protocol.connectionLost(reason)
++
++    def pausedConnectionLost(self, reason):
++        """See interfaces.().
++        """
++        protocol = self.protocol
++        try:
++            pausedConnectionLost = protocol.pausedConnectionLost
++        except AttributeError:
++            pass
++        else:
++            pausedConnectionLost(reason)
+ 
+     logstr = "Uninitialized"
+ 
+diff -r dc23153b5916 twisted/test/test_throttle.py
+--- /dev/null	Thu Jan 01 00:00:00 1970 +0000
++++ b/twisted/test/test_throttle.py	Sun Jun 04 17:54:48 2006 +0200
+@@ -0,0 +1,87 @@
++# Copyright (C) 2006  Andrea Arcangeli <andrea@cpushare.com>
++
++from twisted.internet import protocol, reactor, defer
++from twisted.trial import unittest
++
++class SingleProtocolFactory(object):
++	def buildProtocol(self, addr):
++		p = super(SingleProtocolFactory, self).buildProtocol(addr)
++		self.p = p
++		return p
++
++class ThrottleServerProtocol(protocol.Protocol):
++	pass
++
++class ThrottleServerFactory(SingleProtocolFactory, protocol.ServerFactory):
++	protocol = ThrottleServerProtocol
++
++class ThrottleClientProtocol(protocol.Protocol):
++	worked = False
++	def pausedConnectionLost(self, reason):
++		self.worked = True
++		self.transport.loseConnection()
++		self.factory.d.callback(None)
++	def connectionMade(self):
++		def later():
++			self.transport.pauseProducing()
++
++			self.factory.server.p.transport.write('x')
++			self.factory.server.p.transport.pauseProducing()
++			self.transport.write('x')
++			self.factory.server.p.transport.loseConnection()
++
++		# twisted isn't smart enough to understand
++		# we paused the selectable in connectionMade
++		# so we've to do it after this runtime context is complete
++		reactor.callLater(0, later)
++
++	# Even if you remove the _ it still won't work without the
++	# pausedConnectionLost support in the reactor.
++	# Keep the _ in the name to make sure pauseConnectionLost is called.
++	def _connectionLost(self, reason):
++		if not self.worked:
++			print 'no luck sorry'
++			self.factory.d.callback(None)
++
++class ThrottleClientFactory(SingleProtocolFactory, protocol.ClientFactory):
++	protocol = ThrottleClientProtocol
++
++	def __init__(self):
++		self.d = defer.Deferred()
++
++class ThrottlingTestCase(unittest.TestCase):
++	def tearDown(self):
++		self.client.p.transport.loseConnection()
++		self.server.p.transport.loseConnection()
++		self.port.stopListening()
++	def testThrottle(self):
++		self.server = ThrottleServerFactory()
++		self.client = ThrottleClientFactory()
++		self.client.server = self.server
++		self.server.client = self.client
++		self.port = reactor.listenTCP(0, self.server, interface='127.0.0.1')
++		reactor.connectTCP('127.0.0.1', self.port.getHost().port, self.client)
++		return self.client.d
++
++class ThrottlingTestCaseSSL(unittest.TestCase):
++	def tearDown(self):
++		self.client.p.transport.loseConnection()
++		self.server.p.transport.loseConnection()
++		self.port.stopListening()
++	def testThrottle(self):
++		self.server = ThrottleServerFactory()
++		self.client = ThrottleClientFactory()
++		self.client.server = self.server
++		self.server.client = self.client
++
++		from twisted.internet import ssl
++		from OpenSSL import SSL
++		import os
++		cert = os.path.join(os.path.dirname(__file__), 'server.pem')
++		ssl_context = ssl.DefaultOpenSSLContextFactory(cert, cert,
++							       SSL.SSLv3_METHOD,)
++		self.port = reactor.listenSSL(0, self.server,
++					      ssl_context, interface='127.0.0.1')
++		reactor.connectSSL('127.0.0.1', self.port.getHost().port, self.client,
++				   ssl.ClientContextFactory())
++		return self.client.d

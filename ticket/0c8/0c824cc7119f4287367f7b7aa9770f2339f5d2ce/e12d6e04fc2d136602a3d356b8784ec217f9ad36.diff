@@ -1,0 +1,330 @@
+diff -ru Twisted-10.1.0.orig/twisted/web/_newclient.py Twisted-10.1.0/twisted/web/_newclient.py
+--- Twisted-10.1.0.orig/twisted/web/_newclient.py	2010-02-25 12:48:17.000000000 +0900
++++ Twisted-10.1.0/twisted/web/_newclient.py	2010-10-27 15:42:29.000000000 +0900
+@@ -524,11 +524,12 @@
+     @ivar bodyProducer: C{None} or an L{IBodyProducer} provider which
+         produces the content body to send to the remote HTTP server.
+     """
+-    def __init__(self, method, uri, headers, bodyProducer):
++    def __init__(self, method, uri, headers, bodyProducer, persistent=False):
+         self.method = method
+         self.uri = uri
+         self.headers = headers
+         self.bodyProducer = bodyProducer
++        self.persistent = persistent
+ 
+ 
+     def _writeHeaders(self, transport, TEorCL):
+@@ -542,7 +543,8 @@
+         requestLines = []
+         requestLines.append(
+             '%s %s HTTP/1.1\r\n' % (self.method, self.uri))
+-        requestLines.append('Connection: close\r\n')
++        if not self.persistent:
++            requestLines.append('Connection: close\r\n')
+         if TEorCL is not None:
+             requestLines.append(TEorCL)
+         for name, values in self.headers.getAllRawHeaders():
+@@ -1239,6 +1241,11 @@
+     """
+     _state = 'QUIESCENT'
+     _parser = None
++    persistent = False
++
++    @property
++    def state(self):
++        return self._state
+ 
+     def request(self, request):
+         """
+@@ -1259,6 +1266,7 @@
+             may errback with L{RequestNotSent} if it is not possible to send
+             any more requests using this L{HTTP11ClientProtocol}.
+         """
++        self.persistent = request.persistent
+         if self._state != 'QUIESCENT':
+             return fail(RequestNotSent())
+ 
+@@ -1278,10 +1286,6 @@
+         def cbRequestWrotten(ignored):
+             if self._state == 'TRANSMITTING':
+                 self._state = 'WAITING'
+-                # XXX We're stuck in WAITING until we lose the connection now.
+-                # This will be wrong when persistent connections are supported.
+-                # See #3420 for persistent connections.
+-
+                 self._responseDeferred.chainDeferred(self._finishedRequest)
+ 
+         def ebRequestWriting(err):
+@@ -1307,18 +1311,11 @@
+             the L{HTTPClientParser} which were not part of the response it
+             was parsing.
+         """
+-        # XXX this is because Connection: close is hard-coded above, probably
+-        # will want to change that at some point.  Either the client or the
+-        # server can control this.
+-
+-        # XXX If the connection isn't being closed at this point, it's
+-        # important to make sure the transport isn't paused (after _giveUp,
+-        # or inside it, or something - after the parser can no longer touch
+-        # the transport)
++        assert self._state in ('WAITING', 'TRANSMITTING')
+ 
+-        # For both of the above, see #3420 for persistent connections.
+-
+-        if self._state == 'TRANSMITTING':
++        if self._state == 'WAITING':
++            self._state = 'QUIESCENT'
++        else:
+             # The server sent the entire response before we could send the
+             # whole request.  That sucks.  Oh well.  Fire the request()
+             # Deferred with the response.  But first, make sure that if the
+@@ -1327,7 +1324,8 @@
+             self._state = 'TRANSMITTING_AFTER_RECEIVING_RESPONSE'
+             self._responseDeferred.chainDeferred(self._finishedRequest)
+ 
+-        self._giveUp(Failure(ConnectionDone("synthetic!")))
++        reason = ConnectionDone("synthetic!")
++        self._giveUp(Failure(reason))
+ 
+ 
+     def _disconnectParser(self, reason):
+diff -ru Twisted-10.1.0.orig/twisted/web/client.py Twisted-10.1.0/twisted/web/client.py
+--- Twisted-10.1.0.orig/twisted/web/client.py	2010-04-22 23:37:13.000000000 +0900
++++ Twisted-10.1.0/twisted/web/client.py	2010-10-27 21:55:10.875844212 +0900
+@@ -628,10 +628,17 @@
+     @since: 9.0
+     """
+     _protocol = HTTP11ClientProtocol
++    maxConnections = 2 # RFC 2616: A single-user client SHOULD NOT
++                       # maintain more than 2 connections with any
++                       # server or proxy.
+ 
+-    def __init__(self, reactor, contextFactory=WebClientContextFactory()):
++    def __init__(self, reactor, contextFactory=WebClientContextFactory(),
++                 persistent=False):
+         self._reactor = reactor
+         self._contextFactory = contextFactory
++        self.persistent = persistent
++        self._semaphores = {}
++        self._protocolCache = {}
+ 
+ 
+     def _wrapContextFactory(self, host, port):
+@@ -704,7 +711,6 @@
+         @rtype: L{Deferred}
+         """
+         scheme, host, port, path = _parse(uri)
+-        d = self._connect(scheme, host, port)
+         if headers is None:
+             headers = Headers()
+         if not headers.hasHeader('host'):
+@@ -713,8 +719,63 @@
+             headers = Headers(dict(headers.getAllRawHeaders()))
+             headers.addRawHeader(
+                 'host', self._computeHostValue(scheme, host, port))
++        if self.persistent:
++            sem = self._semaphores.get((scheme, host, port))
++            if sem is None:
++                sem = defer.DeferredSemaphore(self.maxConnections)
++                self._semaphores[scheme, host, port] = sem
++            return sem.run(self._request, method, scheme, host, port, path,
++                           headers, bodyProducer)
++        else:
++            return self._request(
++                method, scheme, host, port, path, headers, bodyProducer)
++
++
++    def _request(self, method, scheme, host, port, path, headers, bodyProducer):
++        """
++        Issue a new request.
++
++        @param method: The request method to send.
++        @type method: C{str}
++
++        @param uri: The request URI send.
++        @type uri: C{str}
++
++        @param headers: The request headers to send.  If no I{Host} header is
++            included, one will be added based on the request URI.
++        @type headers: L{Headers}
++
++        @param bodyProducer: An object which will produce the request body or,
++            if the request body is to be empty, L{None}.
++        @type bodyProducer: L{IBodyProducer} provider
++
++        @return: A L{Deferred} which fires with the result of the request (a
++            L{Response} instance), or fails if there is a problem setting up a
++            connection over which to issue the request.  It may also fail with
++            L{SchemeNotSupported} if the scheme of the given URI is not
++            supported.
++        @rtype: L{Deferred}
++        """
++        protos = self._protocolCache.setdefault((scheme, host, port), [])
++        while protos:
++            # connection exists
++            p = protos.pop(0)
++            if p.state == 'QUIESCENT':
++                d = defer.succeed(p)
++                break
++        else:
++            # new connection
++            d = self._connect(scheme, host, port)
+         def cbConnected(proto):
+-            return proto.request(Request(method, path, headers, bodyProducer))
++            def cbRequest(response):
++                if self.persistent:
++                    protos.append(proto)
++                return response
++            req = Request(method, path, headers, bodyProducer,
++                          persistent=self.persistent)
++            rd = proto.request(req)
++            rd.addCallback(cbRequest)
++            return rd
+         d.addCallback(cbConnected)
+         return d
+ 
+diff -ru Twisted-10.1.0.orig/twisted/web/test/test_newclient.py Twisted-10.1.0/twisted/web/test/test_newclient.py
+--- Twisted-10.1.0.orig/twisted/web/test/test_newclient.py	2010-02-25 12:48:17.000000000 +0900
++++ Twisted-10.1.0/twisted/web/test/test_newclient.py	2010-10-26 20:57:47.143065000 +0900
+@@ -775,6 +775,7 @@
+     """
+     method = 'GET'
+     stopped = False
++    persistent = False
+ 
+     def writeTo(self, transport):
+         self.finished = Deferred()
+@@ -793,6 +794,8 @@
+     returns a succeeded L{Deferred}.  This vaguely emulates the behavior of a
+     L{Request} with no body producer.
+     """
++    persistent = False
++
+     def writeTo(self, transport):
+         transport.write('SOME BYTES')
+         return succeed(None)
+@@ -861,6 +864,7 @@
+         L{RequestGenerationFailed} wrapping the underlying failure.
+         """
+         class BrokenRequest:
++            persistent = False
+             def writeTo(self, transport):
+                 return fail(ArbitraryException())
+ 
+@@ -883,6 +887,7 @@
+         a L{Failure} of L{RequestGenerationFailed} wrapping that exception.
+         """
+         class BrokenRequest:
++            persistent = False
+             def writeTo(self, transport):
+                 raise ArbitraryException()
+ 
+@@ -952,6 +957,7 @@
+             self.assertEqual(response.code, 200)
+             self.assertEqual(response.headers, Headers())
+             self.assertTrue(self.transport.disconnecting)
++            self.assertEqual(self.protocol.state, 'QUIESCENT')
+         d.addCallback(cbRequest)
+         self.protocol.dataReceived(
+             "HTTP/1.1 200 OK\r\n"
+@@ -997,6 +1003,8 @@
+             p = AccumulatingProtocol()
+             whenFinished = p.closedDeferred = Deferred()
+             response.deliverBody(p)
++            self.assertEqual(
++                self.protocol.state, 'TRANSMITTING_AFTER_RECEIVING_RESPONSE')
+             return whenFinished.addCallback(
+                 lambda ign: (response, p.data))
+         d.addCallback(cbResponse)
+@@ -1293,6 +1301,19 @@
+             "\r\n")
+ 
+ 
++    def test_sendSimplestPersistentRequest(self):
++        """
++        A pesistent request does not send 'Connection: close' header.
++        """
++        req = Request('GET', '/', _boringHeaders, None, persistent=True)
++        req.writeTo(self.transport)
++        self.assertEqual(
++            self.transport.value(),
++            "GET / HTTP/1.1\r\n"
++            "Host: example.com\r\n"
++            "\r\n")
++
++
+     def test_sendRequestHeaders(self):
+         """
+         L{Request.writeTo} formats header data and writes it to the given
+diff -ru Twisted-10.1.0.orig/twisted/web/test/test_webclient.py Twisted-10.1.0/twisted/web/test/test_webclient.py
+--- Twisted-10.1.0.orig/twisted/web/test/test_webclient.py	2010-04-22 23:37:13.000000000 +0900
++++ Twisted-10.1.0/twisted/web/test/test_webclient.py	2010-10-26 21:50:48.119063000 +0900
+@@ -857,6 +857,7 @@
+     """
+     def __init__(self):
+         self.requests = []
++        self.state = 'QUIESCENT'
+ 
+ 
+     def request(self, request):
+@@ -916,12 +917,10 @@
+         the TCP connection attempt fails.
+         """
+         result = self.agent.request('GET', 'http://foo/')
+-
+         # Cause the connection to be refused
+         host, port, factory = self.reactor.tcpClients.pop()[:3]
+         factory.clientConnectionFailed(None, Failure(ConnectionRefusedError()))
+         self.completeConnection()
+-
+         return self.assertFailure(result, ConnectionRefusedError)
+ 
+ 
+@@ -1051,6 +1050,46 @@
+         self.assertIdentical(req.bodyProducer, body)
+ 
+ 
++    def test_persistentRequest(self):
++        """
++        Test L{Agent.request} with persistent=True option.
++        """
++        self.agent.persistent = True
++        self.agent._connect = self._dummyConnect
++
++        # first request
++        d1 = self.agent.request(
++            'GET', 'http://example.com:1234/foo', None, None)
++        p1 = self.protocol
++        self.assertEquals(len(p1.requests), 1)
++        req, res = p1.requests.pop()
++        self.assertEquals(req.uri, '/foo')
++        # second request
++        d2 = self.agent.request(
++            'GET', 'http://example.com:1234/bar', None, None)
++        self.assertTrue(self.protocol is not p1)
++        p2 = self.protocol
++        self.assertEquals(len(p2.requests), 1)
++        req, res = p2.requests.pop()
++        self.assertEquals(req.uri, '/bar')
++        # third request
++        d3 = self.agent.request(
++            'GET', 'http://example.com:1234/baz', None, None)
++        # third request does not make a new protocol instance
++        self.assertTrue(self.protocol is p2)
++        sem = self.agent._semaphores['http', 'example.com', 1234]
++        self.assertIsInstance(sem, defer.DeferredSemaphore)
++        # third request is in waiting
++        self.assertEquals(len(sem.waiting), 1)
++        d1.result.result.callback('First request done')
++        # third request starts
++        self.assertEquals(len(sem.waiting), 0)
++        cache = self.agent._protocolCache['http', 'example.com', 1234]
++        self.assertEquals(len(cache), 0)
++        d2.result.result.callback('Second request done')
++        self.assertEquals(len(cache), 1)
++
++
+     def test_hostProvided(self):
+         """
+         If C{None} is passed to L{Agent.request} for the C{headers}

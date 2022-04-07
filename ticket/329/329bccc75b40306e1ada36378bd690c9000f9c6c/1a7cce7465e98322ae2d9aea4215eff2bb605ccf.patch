@@ -1,0 +1,126 @@
+Index: twisted/web/http.py
+===================================================================
+--- twisted/web/http.py	(revision 27323)
++++ twisted/web/http.py	(working copy)
+@@ -378,16 +378,30 @@
+ 
+ 
+ class HTTPClient(basic.LineReceiver):
+-    """A client for HTTP 1.0
++    """
++    A client for HTTP 1.0
+ 
+     Notes:
+     You probably want to send a 'Host' header with the name of
+     the site you're connecting to, in order to not break name
+     based virtual hosting.
++
++    @ivar length: The length of the request body in bytes.
++    @type length: C{int}
++
++    @ivar firstLine: Are we waiting for the first header line?
++    @type firstLine: C{int}
++
++    @ivar __buffer: The buffer that stores the response to the HTTP request.
++    @type __buffer: A C{StringIO} object.
++
++    @ivar _header: Part or all of an HTTP request header.
++    @type _header: C{str}
+     """
+     length = None
+     firstLine = 1
+     __buffer = None
++    _header = ""
+ 
+     def sendCommand(self, command, path):
+         self.transport.write('%s %s HTTP/1.0\r\n' % (command, path))
+@@ -399,6 +413,28 @@
+         self.transport.write('\r\n')
+ 
+     def lineReceived(self, line):
++        """
++        Parse the headers for an HTTP request.
++
++        @param line: Part of an HTTP request header. Multiline headers are
++            possible.
++        @type line: C{str}
++        """
++        def flushHeader(header):
++            """
++            Given a complete header, extract the field name and value and
++            process the header.
++
++            @param header: a complete HTTP request header of the form
++                'field-name: value'.
++            @type header: C{str}
++            """
++            key, val = self._header.split(':', 1)
++            val = val.lstrip()
++            self.handleHeader(key, val)
++            if key.lower() == 'content-length':
++                self.length = int(val)
++
+         if self.firstLine:
+             self.firstLine = 0
+             l = line.split(None, 2)
+@@ -412,12 +448,17 @@
+             self.handleStatus(version, status, message)
+             return
+         if line:
+-            key, val = line.split(':', 1)
+-            val = val.lstrip()
+-            self.handleHeader(key, val)
+-            if key.lower() == 'content-length':
+-                self.length = int(val)
++            if line.startswith('\t') or line.startswith(' '):
++                # This line is part of a multiline header
++                self._header = self._header + line
++            elif self._header:
++                # This line starts a new header, so flush the previous one.
++                flushHeader(self._header)
++                self._header = line
++            else: # First header
++                self._header = line
+         else:
++            flushHeader(self._header)
+             self.__buffer = StringIO()
+             self.handleEndHeaders()
+             self.setRawMode()
+Index: twisted/web/test/test_http.py
+===================================================================
+--- twisted/web/test/test_http.py	(revision 27323)
++++ twisted/web/test/test_http.py	(working copy)
+@@ -1379,3 +1379,33 @@
+         producer = DummyProducer()
+         req.registerProducer(producer, False)
+         self.assertEquals([(producer, False)], req.transport.producers)
++
++
++
++class MultilineHeaders(unittest.TestCase):
++    """
++    RFCs 1945 (HTTP 1.0) and 2616 (HTTP 1.1) state that HTTP message header
++    fields can span multiple lines if each extra line is preceded by at least
++    one space or horizontal tab.
++    """
++    expectedHeaders = {'X-Multiline' : 'line-0\r\n\tline-1\r\n',
++                       'X-Multiline2' : 'line-2\r\n line-3\r\n'}
++
++    def ourHandleHeader(self, key, val):
++        self.assertEquals(val, self.expectedHeaders[key])
++
++
++    def test_MultilineHeader(self):
++        c = ClientDriver()
++        c.handleHeader = self.ourHandleHeader
++        c.lineReceived('HTTP/1.0 201')
++
++        c.lineReceived('X-Multiline: line-0\r\n')
++        # Start continuing line with a tab.
++        c.lineReceived('\tline-1\r\n')
++
++        c.lineReceived('X-Multiline2: line-2\r\n')
++        # Start continuing line with a space.
++        c.lineReceived(' line-3\r\n')
++        # Signal end of headers.
++        c.lineReceived('')

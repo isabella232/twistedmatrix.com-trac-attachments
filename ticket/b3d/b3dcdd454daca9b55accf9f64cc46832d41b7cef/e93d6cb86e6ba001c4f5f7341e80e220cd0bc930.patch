@@ -1,0 +1,1974 @@
+diff --git twisted/python/dist3.py twisted/python/dist3.py
+index 8068cdc..abf6457 100644
+--- twisted/python/dist3.py
++++ twisted/python/dist3.py
+@@ -126,6 +126,7 @@ modules = [
+     "twisted._version",
+     "twisted.web",
+     "twisted.web.http_headers",
++    "twisted.web._newclient",
+     "twisted.web.resource",
+     "twisted.web._responses",
+     "twisted.web.test",
+@@ -220,6 +221,7 @@ testModules = [
+     "twisted.web.test.test_webclient",
+     "twisted.web.test.test_http",
+     "twisted.web.test.test_http_headers",
++    "twisted.web.test.test_newclient",
+     "twisted.web.test.test_resource",
+     "twisted.web.test.test_web",
+ ]
+diff --git twisted/web/_newclient.py twisted/web/_newclient.py
+index 3e2ba06..92ec166 100644
+--- twisted/web/_newclient.py
++++ twisted/web/_newclient.py
+@@ -26,11 +26,13 @@ Various other classes in this module support this usage:
+     response.
+ """
+ 
++from __future__ import absolute_import
+ __metaclass__ = type
+ 
+-from zope.interface import implements
++from zope.interface import implementer
+ 
+ from twisted.python import log
++from twisted.python.compat import networkString
+ from twisted.python.components import proxyForInterface
+ from twisted.python.reflect import fullyQualifiedName
+ from twisted.python.failure import Failure
+@@ -233,11 +235,12 @@ class HTTPParser(LineReceiver):
+ 
+     # Some servers (like http://news.ycombinator.com/) return status lines and
+     # HTTP headers delimited by \n instead of \r\n.
+-    delimiter = '\n'
++    delimiter = b'\n'
+ 
+     CONNECTION_CONTROL_HEADERS = set([
+-            'content-length', 'connection', 'keep-alive', 'te', 'trailers',
+-            'transfer-encoding', 'upgrade', 'proxy-connection'])
++            b'content-length', b'connection', b'keep-alive', b'te',
++            b'trailers', b'transfer-encoding', b'upgrade',
++            b'proxy-connection'])
+ 
+     def connectionMade(self):
+         self.headers = Headers()
+@@ -264,17 +267,17 @@ class HTTPParser(LineReceiver):
+         Handle one line from a response.
+         """
+         # Handle the normal CR LF case.
+-        if line[-1:] == '\r':
++        if line[-1:] == b'\r':
+             line = line[:-1]
+ 
+         if self.state == STATUS:
+             self.statusReceived(line)
+             self.state = HEADER
+         elif self.state == HEADER:
+-            if not line or line[0] not in ' \t':
++            if not line or line[0] not in b' \t':
+                 if self._partialHeader is not None:
+-                    header = ''.join(self._partialHeader)
+-                    name, value = header.split(':', 1)
++                    header = b''.join(self._partialHeader)
++                    name, value = header.split(b':', 1)
+                     value = value.strip()
+                     self.headerReceived(name, value)
+                 if not line:
+@@ -316,7 +319,7 @@ class HTTPParser(LineReceiver):
+ 
+         @param status: The first line of an HTTP request or response message
+             without trailing I{CR LF}.
+-        @type status: C{str}
++        @type status: C{bytes}
+         """
+ 
+ 
+@@ -362,7 +365,7 @@ class HTTPClientParser(HTTPParser):
+     NO_BODY_CODES = set([NO_CONTENT, NOT_MODIFIED])
+ 
+     _transferDecoders = {
+-        'chunked': _ChunkedTransferDecoder,
++        b'chunked': _ChunkedTransferDecoder,
+         }
+ 
+     bodyDecoder = None
+@@ -389,10 +392,10 @@ class HTTPClientParser(HTTPParser):
+         on bad syntax.
+         """
+         try:
+-            proto, strnumber = strversion.split('/')
+-            major, minor = strnumber.split('.')
++            proto, strnumber = strversion.split(b'/')
++            major, minor = strnumber.split(b'.')
+             major, minor = int(major), int(minor)
+-        except ValueError, e:
++        except ValueError as e:
+             raise BadResponseVersion(str(e), strversion)
+         if major < 0 or minor < 0:
+             raise BadResponseVersion("version may not be negative", strversion)
+@@ -404,7 +407,7 @@ class HTTPClientParser(HTTPParser):
+         Parse the status line into its components and create a response object
+         to keep track of this response's state.
+         """
+-        parts = status.split(' ', 2)
++        parts = status.split(b' ', 2)
+         if len(parts) != 3:
+             raise ParseError("wrong number of parts", status)
+ 
+@@ -428,7 +431,7 @@ class HTTPClientParser(HTTPParser):
+         bytes will be interpreted by this L{HTTPClientParser}.  Extra bytes are
+         passed up and the state of this L{HTTPClientParser} is set to I{DONE}.
+ 
+-        @param rest: A C{str} giving any extra bytes delivered to this
++        @param rest: A C{bytes} giving any extra bytes delivered to this
+             L{HTTPClientParser} which are not part of the response being
+             parsed.
+         """
+@@ -441,7 +444,7 @@ class HTTPClientParser(HTTPParser):
+         Content-Length in the response to a HEAD request is an entity header,
+         not a connection control header.
+         """
+-        if self.request.method == 'HEAD' and name == 'content-length':
++        if self.request.method == b'HEAD' and name == b'content-length':
+             return False
+         return HTTPParser.isConnectionControlHeader(self, name)
+ 
+@@ -452,7 +455,7 @@ class HTTPClientParser(HTTPParser):
+         headers and stuff.
+         """
+         if (self.response.code in self.NO_BODY_CODES
+-            or self.request.method == 'HEAD'):
++            or self.request.method == b'HEAD'):
+             self.response.length = 0
+             # The order of the next two lines might be of interest when adding
+             # support for pipelining.
+@@ -460,7 +463,7 @@ class HTTPClientParser(HTTPParser):
+             self.response._bodyDataFinished()
+         else:
+             transferEncodingHeaders = self.connHeaders.getRawHeaders(
+-                'transfer-encoding')
++                b'transfer-encoding')
+             if transferEncodingHeaders:
+ 
+                 # This could be a KeyError.  However, that would mean we do not
+@@ -468,7 +471,8 @@ class HTTPClientParser(HTTPParser):
+                 # is as good a behavior as any.  Perhaps someday we will want
+                 # to normalize/document/test this specifically, but failing
+                 # seems fine to me for now.
+-                transferDecoder = self._transferDecoders[transferEncodingHeaders[0].lower()]
++                transferDecoder = self._transferDecoders[
++                    transferEncodingHeaders[0].lower()]
+ 
+                 # If anyone ever invents a transfer encoding other than
+                 # chunked (yea right), and that transfer encoding can predict
+@@ -476,7 +480,8 @@ class HTTPClientParser(HTTPParser):
+                 # allow the transfer decoder to set the response object's
+                 # length attribute.
+             else:
+-                contentLengthHeaders = self.connHeaders.getRawHeaders('content-length')
++                contentLengthHeaders = self.connHeaders.getRawHeaders(
++                    b'content-length')
+                 if contentLengthHeaders is None:
+                     contentLength = None
+                 elif len(contentLengthHeaders) == 1:
+@@ -546,6 +551,7 @@ class HTTPClientParser(HTTPParser):
+ 
+ 
+ 
++@implementer(IClientRequest)
+ class Request:
+     """
+     A L{Request} instance describes an HTTP request to be sent to an HTTP
+@@ -560,18 +566,16 @@ class Request:
+     @ivar _parsedURI: Parsed I{URI} for the request, or C{None}.
+     @type _parsedURI: L{twisted.web.client.URI} or L{None}
+     """
+-    implements(IClientRequest)
+-
+ 
+     def __init__(self, method, uri, headers, bodyProducer, persistent=False):
+         """
+         @param method: The HTTP method to for this request, ex: 'GET', 'HEAD',
+             'POST', etc.
+-        @type method: L{str}
++        @type method: L{bytes}
+ 
+         @param uri: The relative URI of the resource to request.  For example,
+             C{'/foo/bar?baz=quux'}.
+-        @type uri: L{str}
++        @type uri: L{bytes}
+ 
+         @param headers: Headers to be sent to the server.  It is important to
+             note that this object does not create any implicit headers.  So it
+@@ -623,7 +627,7 @@ class Request:
+ 
+ 
+     def _writeHeaders(self, transport, TEorCL):
+-        hosts = self.headers.getRawHeaders('host', ())
++        hosts = self.headers.getRawHeaders(b'host', ())
+         if len(hosts) != 1:
+             raise BadHeaders("Exactly one Host header required")
+ 
+@@ -631,15 +635,15 @@ class Request:
+         # method would probably be good.  It would be nice if this method
+         # weren't limited to issueing HTTP/1.1 requests.
+         requestLines = []
+-        requestLines.append(
+-            '%s %s HTTP/1.1\r\n' % (self.method, self.uri))
++        requestLines.append(b' '.join([self.method, self.uri,
++            b'HTTP/1.1\r\n']))
+         if not self.persistent:
+-            requestLines.append('Connection: close\r\n')
++            requestLines.append(b'Connection: close\r\n')
+         if TEorCL is not None:
+             requestLines.append(TEorCL)
+         for name, values in self.headers.getAllRawHeaders():
+-            requestLines.extend(['%s: %s\r\n' % (name, v) for v in values])
+-        requestLines.append('\r\n')
++            requestLines.extend([name + b': ' + v + b'\r\n' for v in values])
++        requestLines.append(b'\r\n')
+         transport.writeSequence(requestLines)
+ 
+ 
+@@ -648,7 +652,7 @@ class Request:
+         Write this request to the given transport using chunked
+         transfer-encoding to frame the body.
+         """
+-        self._writeHeaders(transport, 'Transfer-Encoding: chunked\r\n')
++        self._writeHeaders(transport, b'Transfer-Encoding: chunked\r\n')
+         encoder = ChunkedEncoder(transport)
+         encoder.registerProducer(self.bodyProducer, True)
+         d = self.bodyProducer.startProducing(encoder)
+@@ -674,7 +678,8 @@ class Request:
+         """
+         self._writeHeaders(
+             transport,
+-            'Content-Length: %d\r\n' % (self.bodyProducer.length,))
++            networkString(
++                'Content-Length: %d\r\n' % (self.bodyProducer.length,)))
+ 
+         # This Deferred is used to signal an error in the data written to the
+         # encoder below.  It can only errback and it will only do so before too
+@@ -914,6 +919,7 @@ def makeStatefulDispatcher(name, template):
+ 
+ 
+ 
++@implementer(IResponse)
+ class Response:
+     """
+     A L{Response} instance describes an HTTP response received from an HTTP
+@@ -932,7 +938,7 @@ class Response:
+ 
+     @ivar _state: Indicates what state this L{Response} instance is in,
+         particularly with respect to delivering bytes from the response body
+-        to an application-suppled protocol object.  This may be one of
++        to an application-supplied protocol object.  This may be one of
+         C{'INITIAL'}, C{'CONNECTED'}, C{'DEFERRED_CLOSE'}, or C{'FINISHED'},
+         with the following meanings:
+ 
+@@ -957,7 +963,6 @@ class Response:
+             more data, the L{Response} moves to this state.  Nothing else
+             can happen once the L{Response} is in this state.
+     """
+-    implements(IResponse)
+ 
+     length = UNKNOWN_LENGTH
+ 
+@@ -1173,12 +1178,12 @@ class Response:
+ 
+ 
+ 
++@implementer(IConsumer)
+ class ChunkedEncoder:
+     """
+     Helper object which exposes L{IConsumer} on top of L{HTTP11ClientProtocol}
+     for streaming request bodies to the server.
+     """
+-    implements(IConsumer)
+ 
+     def __init__(self, transport):
+         self.transport = transport
+@@ -1204,23 +1209,25 @@ class ChunkedEncoder:
+         Write the given request body bytes to the transport using chunked
+         encoding.
+ 
+-        @type data: C{str}
++        @type data: C{bytes}
+         """
+         if self.transport is None:
+             raise ExcessWrite()
+-        self.transport.writeSequence(("%x\r\n" % len(data), data, "\r\n"))
++        self.transport.writeSequence((networkString("%x\r\n" % len(data)),
++            data, b"\r\n"))
+ 
+ 
+     def unregisterProducer(self):
+         """
+         Indicate that the request body is complete and finish the request.
+         """
+-        self.write('')
++        self.write(b'')
+         self.transport.unregisterProducer()
+         self._allowNoMoreWrites()
+ 
+ 
+ 
++@implementer(IPushProducer)
+ class TransportProxyProducer:
+     """
+     An L{IPushProducer} implementation which wraps another such thing and
+@@ -1229,7 +1236,6 @@ class TransportProxyProducer:
+     @ivar _producer: The wrapped L{IPushProducer} provider or C{None} after
+         this proxy has been stopped.
+     """
+-    implements(IPushProducer)
+ 
+     # LineReceiver uses this undocumented attribute of transports to decide
+     # when to stop calling lineReceived or rawDataReceived (if it finds it to
+@@ -1402,7 +1408,7 @@ class HTTP11ClientProtocol(Protocol):
+         self._parser.makeConnection(self._transportProxy)
+         self._responseDeferred = self._parser._responseDeferred
+ 
+-        def cbRequestWrotten(ignored):
++        def cbRequestWritten(ignored):
+             if self._state == 'TRANSMITTING':
+                 self._state = 'WAITING'
+                 self._responseDeferred.chainDeferred(self._finishedRequest)
+@@ -1417,7 +1423,7 @@ class HTTP11ClientProtocol(Protocol):
+                 log.err(err, 'Error writing request, but not in valid state '
+                              'to finalize request: %s' % self._state)
+ 
+-        _requestDeferred.addCallbacks(cbRequestWrotten, ebRequestWriting)
++        _requestDeferred.addCallbacks(cbRequestWritten, ebRequestWriting)
+ 
+         return self._finishedRequest
+ 
+@@ -1427,7 +1433,7 @@ class HTTP11ClientProtocol(Protocol):
+         Called by an L{HTTPClientParser} to indicate that it has parsed a
+         complete response.
+ 
+-        @param rest: A C{str} giving any trailing bytes which were given to
++        @param rest: A C{bytes} giving any trailing bytes which were given to
+             the L{HTTPClientParser} which were not part of the response it
+             was parsing.
+         """
+@@ -1456,8 +1462,8 @@ class HTTP11ClientProtocol(Protocol):
+             return
+ 
+         reason = ConnectionDone("synthetic!")
+-        connHeaders = self._parser.connHeaders.getRawHeaders('connection', ())
+-        if (('close' in connHeaders) or self._state != "QUIESCENT" or
++        connHeaders = self._parser.connHeaders.getRawHeaders(b'connection', ())
++        if ((b'close' in connHeaders) or self._state != "QUIESCENT" or
+             not self._currentRequest.persistent):
+             self._giveUp(Failure(reason))
+         else:
+diff --git twisted/web/test/test_newclient.py twisted/web/test/test_newclient.py
+index 50b6846..396b6e4 100644
+--- twisted/web/test/test_newclient.py
++++ twisted/web/test/test_newclient.py
+@@ -5,9 +5,10 @@
+ Tests for L{twisted.web._newclient}.
+ """
+ 
++from __future__ import absolute_import
+ __metaclass__ = type
+ 
+-from zope.interface import implements
++from zope.interface import implementer
+ from zope.interface.verify import verifyObject
+ 
+ from twisted.python import log
+@@ -67,7 +68,7 @@ class AnotherArbitraryException(Exception):
+ 
+ # A re-usable Headers instance for tests which don't really care what headers
+ # they're sending.
+-_boringHeaders = Headers({'host': ['example.com']})
++_boringHeaders = Headers({b'host': [b'example.com']})
+ 
+ 
+ def assertWrapperExceptionTypes(self, deferred, mainType, reasonTypes):
+@@ -143,6 +144,7 @@ def justTransportResponse(transport):
+     return Response(('HTTP', 1, 1), 200, 'OK', _boringHeaders, transport)
+ 
+ 
++
+ class MakeStatefulDispatcherTests(TestCase):
+     """
+     Tests for L{makeStatefulDispatcher}.
+@@ -191,8 +193,8 @@ class _HTTPParserTests(object):
+         protocol.statusReceived = status.append
+         protocol.makeConnection(StringTransport())
+         self.assertEqual(protocol.state, STATUS)
+-        protocol.dataReceived('HTTP/1.1 200 OK' + self.sep)
+-        self.assertEqual(status, ['HTTP/1.1 200 OK'])
++        protocol.dataReceived(b'HTTP/1.1 200 OK' + self.sep)
++        self.assertEqual(status, [b'HTTP/1.1 200 OK'])
+         self.assertEqual(protocol.state, HEADER)
+ 
+ 
+@@ -201,7 +203,7 @@ class _HTTPParserTests(object):
+         protocol = HTTPParser()
+         protocol.headerReceived = header.__setitem__
+         protocol.makeConnection(StringTransport())
+-        protocol.dataReceived('HTTP/1.1 200 OK' + self.sep)
++        protocol.dataReceived(b'HTTP/1.1 200 OK' + self.sep)
+         return header, protocol
+ 
+ 
+@@ -211,11 +213,11 @@ class _HTTPParserTests(object):
+         header.
+         """
+         header, protocol = self._headerTestSetup()
+-        protocol.dataReceived('X-Foo:bar' + self.sep)
++        protocol.dataReceived(b'X-Foo:bar' + self.sep)
+         # Cannot tell it's not a continue header until the next line arrives
+         # and is not a continuation
+         protocol.dataReceived(self.sep)
+-        self.assertEqual(header, {'X-Foo': 'bar'})
++        self.assertEqual(header, {b'X-Foo': b'bar'})
+         self.assertEqual(protocol.state, BODY)
+ 
+ 
+@@ -225,11 +227,11 @@ class _HTTPParserTests(object):
+         C{headerReceived} with the entire value once it is received.
+         """
+         header, protocol = self._headerTestSetup()
+-        protocol.dataReceived('X-Foo: bar' + self.sep)
+-        protocol.dataReceived(' baz' + self.sep)
+-        protocol.dataReceived('\tquux' + self.sep)
++        protocol.dataReceived(b'X-Foo: bar' + self.sep)
++        protocol.dataReceived(b' baz' + self.sep)
++        protocol.dataReceived(b'\tquux' + self.sep)
+         protocol.dataReceived(self.sep)
+-        self.assertEqual(header, {'X-Foo': 'bar baz\tquux'})
++        self.assertEqual(header, {b'X-Foo': b'bar baz\tquux'})
+         self.assertEqual(protocol.state, BODY)
+ 
+ 
+@@ -239,12 +241,12 @@ class _HTTPParserTests(object):
+         value passed to the C{headerReceived} callback.
+         """
+         header, protocol = self._headerTestSetup()
+-        value = ' \t %(sep)s bar \t%(sep)s \t%(sep)s' % dict(sep=self.sep)
+-        protocol.dataReceived('X-Bar:' + value)
+-        protocol.dataReceived('X-Foo:' + value)
++        value = self.sep.join([b' \t ', b' bar \t', b' \t', b''])
++        protocol.dataReceived(b'X-Bar:' + value)
++        protocol.dataReceived(b'X-Foo:' + value)
+         protocol.dataReceived(self.sep)
+-        self.assertEqual(header, {'X-Foo': 'bar',
+-                                  'X-Bar': 'bar'})
++        self.assertEqual(header, {b'X-Foo': b'bar',
++                                  b'X-Bar': b'bar'})
+ 
+ 
+     def test_allHeadersCallback(self):
+@@ -281,11 +283,11 @@ class _HTTPParserTests(object):
+         """
+         protocol = HTTPParser()
+         protocol.makeConnection(StringTransport())
+-        protocol.dataReceived('HTTP/1.1 200 OK' + self.sep)
+-        protocol.dataReceived('X-Foo: bar' + self.sep)
+-        protocol.dataReceived('X-Foo: baz' + self.sep)
++        protocol.dataReceived(b'HTTP/1.1 200 OK' + self.sep)
++        protocol.dataReceived(b'X-Foo: bar' + self.sep)
++        protocol.dataReceived(b'X-Foo: baz' + self.sep)
+         protocol.dataReceived(self.sep)
+-        expected = [('X-Foo', ['bar', 'baz'])]
++        expected = [(b'X-Foo', [b'bar', b'baz'])]
+         self.assertEqual(expected, list(protocol.headers.getAllRawHeaders()))
+ 
+ 
+@@ -297,8 +299,8 @@ class _HTTPParserTests(object):
+         """
+         protocol = HTTPParser()
+         connHeaderNames = [
+-            'content-length', 'connection', 'keep-alive', 'te', 'trailers',
+-            'transfer-encoding', 'upgrade', 'proxy-connection']
++            b'content-length', b'connection', b'keep-alive', b'te', b'trailers',
++            b'transfer-encoding', b'upgrade', b'proxy-connection']
+ 
+         for header in connHeaderNames:
+             self.assertTrue(
+@@ -327,7 +329,7 @@ class HTTPParserTestsRFCComplaintDelimeter(_HTTPParserTests, TestCase):
+     """
+     L{_HTTPParserTests} using standard CR LF newlines.
+     """
+-    sep = '\r\n'
++    sep = b'\r\n'
+ 
+ 
+ 
+@@ -335,7 +337,7 @@ class HTTPParserTestsNonRFCComplaintDelimeter(_HTTPParserTests, TestCase):
+     """
+     L{_HTTPParserTests} using bare LF newlines.
+     """
+-    sep = '\n'
++    sep = b'\n'
+ 
+ 
+ 
+@@ -351,8 +353,8 @@ class HTTPClientParserTests(TestCase):
+         """
+         protocol = HTTPClientParser(None, None)
+         self.assertEqual(
+-            protocol.parseVersion('CANDY/7.2'),
+-            ('CANDY', 7, 2))
++            protocol.parseVersion(b'CANDY/7.2'),
++            (b'CANDY', 7, 2))
+ 
+ 
+     def test_parseBadVersion(self):
+@@ -368,14 +370,14 @@ class HTTPClientParserTests(TestCase):
+             exc = self.assertRaises(e, f, s)
+             self.assertEqual(exc.data, s)
+ 
+-        checkParsing('foo')
+-        checkParsing('foo/bar/baz')
++        checkParsing(b'foo')
++        checkParsing(b'foo/bar/baz')
+ 
+-        checkParsing('foo/')
+-        checkParsing('foo/..')
++        checkParsing(b'foo/')
++        checkParsing(b'foo/..')
+ 
+-        checkParsing('foo/a.b')
+-        checkParsing('foo/-1.-1')
++        checkParsing(b'foo/a.b')
++        checkParsing(b'foo/-1.-1')
+ 
+ 
+     def test_responseStatusParsing(self):
+@@ -383,13 +385,13 @@ class HTTPClientParserTests(TestCase):
+         L{HTTPClientParser.statusReceived} parses the version, code, and phrase
+         from the status line and stores them on the response object.
+         """
+-        request = Request('GET', '/', _boringHeaders, None)
++        request = Request(b'GET', b'/', _boringHeaders, None)
+         protocol = HTTPClientParser(request, None)
+         protocol.makeConnection(StringTransport())
+-        protocol.dataReceived('HTTP/1.1 200 OK\r\n')
+-        self.assertEqual(protocol.response.version, ('HTTP', 1, 1))
++        protocol.dataReceived(b'HTTP/1.1 200 OK\r\n')
++        self.assertEqual(protocol.response.version, (b'HTTP', 1, 1))
+         self.assertEqual(protocol.response.code, 200)
+-        self.assertEqual(protocol.response.phrase, 'OK')
++        self.assertEqual(protocol.response.phrase, b'OK')
+ 
+ 
+     def test_badResponseStatus(self):
+@@ -405,12 +407,12 @@ class HTTPClientParserTests(TestCase):
+ 
+         # If there are fewer than three whitespace-delimited parts to the
+         # status line, it is not valid and cannot be parsed.
+-        checkParsing('foo')
+-        checkParsing('HTTP/1.1 200')
++        checkParsing(b'foo')
++        checkParsing(b'HTTP/1.1 200')
+ 
+         # If the response code is not an integer, the status line is not valid
+         # and cannot be parsed.
+-        checkParsing('HTTP/1.1 bar OK')
++        checkParsing(b'HTTP/1.1 bar OK')
+ 
+ 
+     def _noBodyTest(self, request, status, response):
+@@ -445,7 +447,7 @@ class HTTPClientParserTests(TestCase):
+         self.assertEqual(transport.producerState, 'producing')
+         self.assertEqual(protocol.state, DONE)
+         self.assertEqual(body, [])
+-        self.assertEqual(finished, [''])
++        self.assertEqual(finished, [b''])
+         self.assertEqual(bodyDataFinished, [True])
+         self.assertEqual(protocol.response.length, 0)
+         return header
+@@ -457,13 +459,13 @@ class HTTPClientParserTests(TestCase):
+         callback is not invoked, and the I{Content-Length} header is passed to
+         the header callback.
+         """
+-        request = Request('HEAD', '/', _boringHeaders, None)
+-        status = 'HTTP/1.1 200 OK\r\n'
++        request = Request(b'HEAD', b'/', _boringHeaders, None)
++        status = b'HTTP/1.1 200 OK\r\n'
+         response = (
+-            'Content-Length: 10\r\n'
+-            '\r\n')
++            b'Content-Length: 10\r\n'
++            b'\r\n')
+         header = self._noBodyTest(request, status, response)
+-        self.assertEqual(header, {'Content-Length': '10'})
++        self.assertEqual(header, {b'Content-Length': b'10'})
+ 
+ 
+     def test_noContentResponse(self):
+@@ -471,9 +473,9 @@ class HTTPClientParserTests(TestCase):
+         If the response code is I{NO CONTENT} (204), no body is expected and
+         the body callback is not invoked.
+         """
+-        request = Request('GET', '/', _boringHeaders, None)
+-        status = 'HTTP/1.1 204 NO CONTENT\r\n'
+-        response = '\r\n'
++        request = Request(b'GET', b'/', _boringHeaders, None)
++        status = b'HTTP/1.1 204 NO CONTENT\r\n'
++        response = b'\r\n'
+         self._noBodyTest(request, status, response)
+ 
+ 
+@@ -482,9 +484,9 @@ class HTTPClientParserTests(TestCase):
+         If the response code is I{NOT MODIFIED} (304), no body is expected and
+         the body callback is not invoked.
+         """
+-        request = Request('GET', '/', _boringHeaders, None)
+-        status = 'HTTP/1.1 304 NOT MODIFIED\r\n'
+-        response = '\r\n'
++        request = Request(b'GET', b'/', _boringHeaders, None)
++        status = b'HTTP/1.1 304 NOT MODIFIED\r\n'
++        response = b'\r\n'
+         self._noBodyTest(request, status, response)
+ 
+ 
+@@ -494,18 +496,18 @@ class HTTPClientParserTests(TestCase):
+         L{Headers} instance.
+         """
+         protocol = HTTPClientParser(
+-            Request('GET', '/', _boringHeaders, None),
++            Request(b'GET', b'/', _boringHeaders, None),
+             lambda rest: None)
+         protocol.makeConnection(StringTransport())
+-        protocol.dataReceived('HTTP/1.1 200 OK\r\n')
+-        protocol.dataReceived('X-Foo: bar\r\n')
+-        protocol.dataReceived('\r\n')
++        protocol.dataReceived(b'HTTP/1.1 200 OK\r\n')
++        protocol.dataReceived(b'X-Foo: bar\r\n')
++        protocol.dataReceived(b'\r\n')
+         self.assertEqual(
+             protocol.connHeaders,
+             Headers({}))
+         self.assertEqual(
+             protocol.response.headers,
+-            Headers({'x-foo': ['bar']}))
++            Headers({b'x-foo': [b'bar']}))
+         self.assertIdentical(protocol.response.length, UNKNOWN_LENGTH)
+ 
+ 
+@@ -515,20 +517,20 @@ class HTTPClientParserTests(TestCase):
+         L{Headers} instance.
+         """
+         protocol = HTTPClientParser(
+-            Request('GET', '/', _boringHeaders, None),
++            Request(b'GET', b'/', _boringHeaders, None),
+             lambda rest: None)
+         protocol.makeConnection(StringTransport())
+-        protocol.dataReceived('HTTP/1.1 200 OK\r\n')
+-        protocol.dataReceived('Content-Length: 123\r\n')
+-        protocol.dataReceived('Connection: close\r\n')
+-        protocol.dataReceived('\r\n')
++        protocol.dataReceived(b'HTTP/1.1 200 OK\r\n')
++        protocol.dataReceived(b'Content-Length: 123\r\n')
++        protocol.dataReceived(b'Connection: close\r\n')
++        protocol.dataReceived(b'\r\n')
+         self.assertEqual(
+             protocol.response.headers,
+             Headers({}))
+         self.assertEqual(
+             protocol.connHeaders,
+-            Headers({'content-length': ['123'],
+-                     'connection': ['close']}))
++            Headers({b'content-length': [b'123'],
++                     b'connection': [b'close']}))
+         self.assertEqual(protocol.response.length, 123)
+ 
+ 
+@@ -538,15 +540,15 @@ class HTTPClientParserTests(TestCase):
+         is added to the response headers, not the connection control headers.
+         """
+         protocol = HTTPClientParser(
+-            Request('HEAD', '/', _boringHeaders, None),
++            Request(b'HEAD', b'/', _boringHeaders, None),
+             lambda rest: None)
+         protocol.makeConnection(StringTransport())
+-        protocol.dataReceived('HTTP/1.1 200 OK\r\n')
+-        protocol.dataReceived('Content-Length: 123\r\n')
+-        protocol.dataReceived('\r\n')
++        protocol.dataReceived(b'HTTP/1.1 200 OK\r\n')
++        protocol.dataReceived(b'Content-Length: 123\r\n')
++        protocol.dataReceived(b'\r\n')
+         self.assertEqual(
+             protocol.response.headers,
+-            Headers({'content-length': ['123']}))
++            Headers({b'content-length': [b'123']}))
+         self.assertEqual(
+             protocol.connHeaders,
+             Headers({}))
+@@ -561,28 +563,28 @@ class HTTPClientParserTests(TestCase):
+         """
+         finished = []
+         protocol = HTTPClientParser(
+-            Request('GET', '/', _boringHeaders, None),
++            Request(b'GET', b'/', _boringHeaders, None),
+             finished.append)
+         transport = StringTransport()
+         protocol.makeConnection(transport)
+-        protocol.dataReceived('HTTP/1.1 200 OK\r\n')
++        protocol.dataReceived(b'HTTP/1.1 200 OK\r\n')
+         body = []
+         protocol.response._bodyDataReceived = body.append
+-        protocol.dataReceived('Content-Length: 10\r\n')
+-        protocol.dataReceived('\r\n')
++        protocol.dataReceived(b'Content-Length: 10\r\n')
++        protocol.dataReceived(b'\r\n')
+ 
+         # Incidentally, the transport should be paused now.  It is the response
+         # object's responsibility to resume this when it is ready for bytes.
+         self.assertEqual(transport.producerState, 'paused')
+ 
+         self.assertEqual(protocol.state, BODY)
+-        protocol.dataReceived('x' * 6)
+-        self.assertEqual(body, ['x' * 6])
++        protocol.dataReceived(b'x' * 6)
++        self.assertEqual(body, [b'x' * 6])
+         self.assertEqual(protocol.state, BODY)
+-        protocol.dataReceived('y' * 4)
+-        self.assertEqual(body, ['x' * 6, 'y' * 4])
++        protocol.dataReceived(b'y' * 4)
++        self.assertEqual(body, [b'x' * 6, b'y' * 4])
+         self.assertEqual(protocol.state, DONE)
+-        self.assertTrue(finished, [''])
++        self.assertEqual(finished, [b''])
+ 
+ 
+     def test_zeroContentLength(self):
+@@ -593,25 +595,24 @@ class HTTPClientParserTests(TestCase):
+         """
+         finished = []
+         protocol = HTTPClientParser(
+-            Request('GET', '/', _boringHeaders, None),
++            Request(b'GET', b'/', _boringHeaders, None),
+             finished.append)
+ 
+         protocol.makeConnection(StringTransport())
+-        protocol.dataReceived('HTTP/1.1 200 OK\r\n')
++        protocol.dataReceived(b'HTTP/1.1 200 OK\r\n')
+ 
+         body = []
+         protocol.response._bodyDataReceived = body.append
+ 
+-        protocol.dataReceived('Content-Length: 0\r\n')
+-        protocol.dataReceived('\r\n')
++        protocol.dataReceived(b'Content-Length: 0\r\n')
++        protocol.dataReceived(b'\r\n')
+ 
+         self.assertEqual(protocol.state, DONE)
+         self.assertEqual(body, [])
+-        self.assertTrue(finished, [''])
++        self.assertEqual(finished, [b''])
+         self.assertEqual(protocol.response.length, 0)
+ 
+ 
+-
+     def test_multipleContentLengthHeaders(self):
+         """
+         If a response includes multiple I{Content-Length} headers,
+@@ -619,17 +620,17 @@ class HTTPClientParserTests(TestCase):
+         the response is invalid and the transport is now unusable.
+         """
+         protocol = HTTPClientParser(
+-            Request('GET', '/', _boringHeaders, None),
++            Request(b'GET', b'/', _boringHeaders, None),
+             None)
+ 
+         protocol.makeConnection(StringTransport())
+         self.assertRaises(
+             ValueError,
+             protocol.dataReceived,
+-            'HTTP/1.1 200 OK\r\n'
+-            'Content-Length: 1\r\n'
+-            'Content-Length: 2\r\n'
+-            '\r\n')
++            b'HTTP/1.1 200 OK\r\n'
++            b'Content-Length: 1\r\n'
++            b'Content-Length: 2\r\n'
++            b'\r\n')
+ 
+ 
+     def test_extraBytesPassedBack(self):
+@@ -639,15 +640,15 @@ class HTTPClientParserTests(TestCase):
+         """
+         finished = []
+         protocol = HTTPClientParser(
+-            Request('GET', '/', _boringHeaders, None),
++            Request(b'GET', b'/', _boringHeaders, None),
+             finished.append)
+ 
+         protocol.makeConnection(StringTransport())
+-        protocol.dataReceived('HTTP/1.1 200 OK\r\n')
+-        protocol.dataReceived('Content-Length: 0\r\n')
+-        protocol.dataReceived('\r\nHere is another thing!')
++        protocol.dataReceived(b'HTTP/1.1 200 OK\r\n')
++        protocol.dataReceived(b'Content-Length: 0\r\n')
++        protocol.dataReceived(b'\r\nHere is another thing!')
+         self.assertEqual(protocol.state, DONE)
+-        self.assertEqual(finished, ['Here is another thing!'])
++        self.assertEqual(finished, [b'Here is another thing!'])
+ 
+ 
+     def test_extraBytesPassedBackHEAD(self):
+@@ -657,15 +658,15 @@ class HTTPClientParserTests(TestCase):
+         """
+         finished = []
+         protocol = HTTPClientParser(
+-            Request('HEAD', '/', _boringHeaders, None),
++            Request(b'HEAD', b'/', _boringHeaders, None),
+             finished.append)
+ 
+         protocol.makeConnection(StringTransport())
+-        protocol.dataReceived('HTTP/1.1 200 OK\r\n')
+-        protocol.dataReceived('Content-Length: 12\r\n')
+-        protocol.dataReceived('\r\nHere is another thing!')
++        protocol.dataReceived(b'HTTP/1.1 200 OK\r\n')
++        protocol.dataReceived(b'Content-Length: 12\r\n')
++        protocol.dataReceived(b'\r\nHere is another thing!')
+         self.assertEqual(protocol.state, DONE)
+-        self.assertEqual(finished, ['Here is another thing!'])
++        self.assertEqual(finished, [b'Here is another thing!'])
+ 
+ 
+     def test_chunkedResponseBody(self):
+@@ -676,16 +677,16 @@ class HTTPClientParserTests(TestCase):
+         """
+         finished = []
+         protocol = HTTPClientParser(
+-            Request('GET', '/', _boringHeaders, None),
++            Request(b'GET', b'/', _boringHeaders, None),
+             finished.append)
+         protocol.makeConnection(StringTransport())
+-        protocol.dataReceived('HTTP/1.1 200 OK\r\n')
++        protocol.dataReceived(b'HTTP/1.1 200 OK\r\n')
+ 
+         body = []
+         protocol.response._bodyDataReceived = body.append
+ 
+-        protocol.dataReceived('Transfer-Encoding: chunked\r\n')
+-        protocol.dataReceived('\r\n')
++        protocol.dataReceived(b'Transfer-Encoding: chunked\r\n')
++        protocol.dataReceived(b'\r\n')
+ 
+         # No data delivered yet
+         self.assertEqual(body, [])
+@@ -694,16 +695,16 @@ class HTTPClientParserTests(TestCase):
+         self.assertIdentical(protocol.response.length, UNKNOWN_LENGTH)
+ 
+         # Deliver some chunks and make sure the data arrives
+-        protocol.dataReceived('3\r\na')
+-        self.assertEqual(body, ['a'])
+-        protocol.dataReceived('bc\r\n')
+-        self.assertEqual(body, ['a', 'bc'])
++        protocol.dataReceived(b'3\r\na')
++        self.assertEqual(body, [b'a'])
++        protocol.dataReceived(b'bc\r\n')
++        self.assertEqual(body, [b'a', b'bc'])
+ 
+         # The response's _bodyDataFinished method should be called when the last
+         # chunk is received.  Extra data should be passed to the finished
+         # callback.
+-        protocol.dataReceived('0\r\n\r\nextra')
+-        self.assertEqual(finished, ['extra'])
++        protocol.dataReceived(b'0\r\n\r\nextra')
++        self.assertEqual(finished, [b'extra'])
+ 
+ 
+     def test_unknownContentLength(self):
+@@ -714,20 +715,20 @@ class HTTPClientParserTests(TestCase):
+         """
+         finished = []
+         protocol = HTTPClientParser(
+-            Request('GET', '/', _boringHeaders, None), finished.append)
++            Request(b'GET', b'/', _boringHeaders, None), finished.append)
+         transport = StringTransport()
+         protocol.makeConnection(transport)
+-        protocol.dataReceived('HTTP/1.1 200 OK\r\n')
++        protocol.dataReceived(b'HTTP/1.1 200 OK\r\n')
+ 
+         body = []
+         protocol.response._bodyDataReceived = body.append
+ 
+-        protocol.dataReceived('\r\n')
+-        protocol.dataReceived('foo')
+-        protocol.dataReceived('bar')
+-        self.assertEqual(body, ['foo', 'bar'])
++        protocol.dataReceived(b'\r\n')
++        protocol.dataReceived(b'foo')
++        protocol.dataReceived(b'bar')
++        self.assertEqual(body, [b'foo', b'bar'])
+         protocol.connectionLost(ConnectionDone("simulated end of connection"))
+-        self.assertEqual(finished, [''])
++        self.assertEqual(finished, [b''])
+ 
+ 
+     def test_contentLengthAndTransferEncoding(self):
+@@ -738,25 +739,25 @@ class HTTPClientParserTests(TestCase):
+         """
+         finished = []
+         protocol = HTTPClientParser(
+-            Request('GET', '/', _boringHeaders, None), finished.append)
++            Request(b'GET', b'/', _boringHeaders, None), finished.append)
+         transport = StringTransport()
+         protocol.makeConnection(transport)
+-        protocol.dataReceived('HTTP/1.1 200 OK\r\n')
++        protocol.dataReceived(b'HTTP/1.1 200 OK\r\n')
+ 
+         body = []
+         protocol.response._bodyDataReceived = body.append
+ 
+         protocol.dataReceived(
+-            'Content-Length: 102\r\n'
+-            'Transfer-Encoding: chunked\r\n'
+-            '\r\n'
+-            '3\r\n'
+-            'abc\r\n'
+-            '0\r\n'
+-            '\r\n')
++            b'Content-Length: 102\r\n'
++            b'Transfer-Encoding: chunked\r\n'
++            b'\r\n'
++            b'3\r\n'
++            b'abc\r\n'
++            b'0\r\n'
++            b'\r\n')
+ 
+-        self.assertEqual(body, ['abc'])
+-        self.assertEqual(finished, [''])
++        self.assertEqual(body, [b'abc'])
++        self.assertEqual(finished, [b''])
+ 
+ 
+     def test_connectionLostBeforeBody(self):
+@@ -766,7 +767,7 @@ class HTTPClientParserTests(TestCase):
+         to C{connectionLost}.
+         """
+         transport = StringTransport()
+-        protocol = HTTPClientParser(Request('GET', '/', _boringHeaders, None), None)
++        protocol = HTTPClientParser(Request(b'GET', b'/', _boringHeaders, None), None)
+         protocol.makeConnection(transport)
+         # Grab this here because connectionLost gets rid of the attribute
+         responseDeferred = protocol._responseDeferred
+@@ -783,16 +784,16 @@ class HTTPClientParserTests(TestCase):
+         is logged and not re-raised.
+         """
+         transport = StringTransport()
+-        protocol = HTTPClientParser(Request('GET', '/', _boringHeaders, None),
++        protocol = HTTPClientParser(Request(b'GET', b'/', _boringHeaders, None),
+                                     None)
+         protocol.makeConnection(transport)
+ 
+         response = []
+         protocol._responseDeferred.addCallback(response.append)
+         protocol.dataReceived(
+-            'HTTP/1.1 200 OK\r\n'
+-            'Content-Length: 1\r\n'
+-            '\r\n')
++            b'HTTP/1.1 200 OK\r\n'
++            b'Content-Length: 1\r\n'
++            b'\r\n')
+         response = response[0]
+ 
+         # Arrange for an exception
+@@ -811,7 +812,7 @@ class HTTPClientParserTests(TestCase):
+         resulting error is L{ResponseNeverReceived}.
+         """
+         protocol = HTTPClientParser(
+-            Request('HEAD', '/', _boringHeaders, None),
++            Request(b'HEAD', b'/', _boringHeaders, None),
+             lambda ign: None)
+         d = protocol._responseDeferred
+ 
+@@ -827,12 +828,12 @@ class HTTPClientParserTests(TestCase):
+         L{ResponseNeverReceived}.
+         """
+         protocol = HTTPClientParser(
+-            Request('HEAD', '/', _boringHeaders, None),
++            Request(b'HEAD', b'/', _boringHeaders, None),
+             lambda ign: None)
+         d = protocol._responseDeferred
+ 
+         protocol.makeConnection(StringTransport())
+-        protocol.dataReceived('2')
++        protocol.dataReceived(b'2')
+         protocol.connectionLost(ConnectionLost())
+         return self.assertFailure(d, ResponseFailed).addCallback(
+             self.assertIsInstance, ResponseFailed)
+@@ -850,7 +851,7 @@ class SlowRequest:
+         returned by that method.  L{SlowRequest} will never fire this
+         L{Deferred}.
+     """
+-    method = 'GET'
++    method = b'GET'
+     stopped = False
+     persistent = False
+ 
+@@ -874,7 +875,7 @@ class SimpleRequest:
+     persistent = False
+ 
+     def writeTo(self, transport):
+-        transport.write('SOME BYTES')
++        transport.write(b'SOME BYTES')
+         return succeed(None)
+ 
+ 
+@@ -899,7 +900,7 @@ class HTTP11ClientProtocolTests(TestCase):
+         C{writeTo} method with its own transport.
+         """
+         self.protocol.request(SimpleRequest())
+-        self.assertEqual(self.transport.value(), 'SOME BYTES')
++        self.assertEqual(self.transport.value(), b'SOME BYTES')
+ 
+ 
+     def test_secondRequest(self):
+@@ -910,7 +911,7 @@ class HTTP11ClientProtocolTests(TestCase):
+         """
+         self.protocol.request(SlowRequest())
+         def cbNotSent(ignored):
+-            self.assertEqual(self.transport.value(), '')
++            self.assertEqual(self.transport.value(), b'')
+         d = self.assertFailure(
+             self.protocol.request(SimpleRequest()), RequestNotSent)
+         d.addCallback(cbNotSent)
+@@ -926,7 +927,7 @@ class HTTP11ClientProtocolTests(TestCase):
+         self.protocol.connectionLost(
+             Failure(ConnectionDone("sad transport")))
+         def cbNotSent(ignored):
+-            self.assertEqual(self.transport.value(), '')
++            self.assertEqual(self.transport.value(), b'')
+         d = self.assertFailure(
+             self.protocol.request(SimpleRequest()), RequestNotSent)
+         d.addCallback(cbNotSent)
+@@ -1050,7 +1051,7 @@ class HTTP11ClientProtocolTests(TestCase):
+         L{Deferred} previously returned by the C{request} method is called back
+         with a L{Response} instance and the connection is closed.
+         """
+-        d = self.protocol.request(Request('GET', '/', _boringHeaders, None))
++        d = self.protocol.request(Request(b'GET', b'/', _boringHeaders, None))
+         def cbRequest(response):
+             self.assertEqual(response.code, 200)
+             self.assertEqual(response.headers, Headers())
+@@ -1058,10 +1059,10 @@ class HTTP11ClientProtocolTests(TestCase):
+             self.assertEqual(self.protocol.state, 'QUIESCENT')
+         d.addCallback(cbRequest)
+         self.protocol.dataReceived(
+-            "HTTP/1.1 200 OK\r\n"
+-            "Content-Length: 0\r\n"
+-            "Connection: close\r\n"
+-            "\r\n")
++            b"HTTP/1.1 200 OK\r\n"
++            b"Content-Length: 0\r\n"
++            b"Connection: close\r\n"
++            b"\r\n")
+         return d
+ 
+ 
+@@ -1071,16 +1072,16 @@ class HTTP11ClientProtocolTests(TestCase):
+         are included on the L{Response} instance passed to the callback
+         returned by the C{request} method.
+         """
+-        d = self.protocol.request(Request('GET', '/', _boringHeaders, None))
++        d = self.protocol.request(Request(b'GET', b'/', _boringHeaders, None))
+         def cbRequest(response):
+-            expected = Headers({'x-foo': ['bar', 'baz']})
++            expected = Headers({b'x-foo': [b'bar', b'baz']})
+             self.assertEqual(response.headers, expected)
+         d.addCallback(cbRequest)
+         self.protocol.dataReceived(
+-            "HTTP/1.1 200 OK\r\n"
+-            "X-Foo: bar\r\n"
+-            "X-Foo: baz\r\n"
+-            "\r\n")
++            b"HTTP/1.1 200 OK\r\n"
++            b"X-Foo: bar\r\n"
++            b"X-Foo: baz\r\n"
++            b"\r\n")
+         return d
+ 
+ 
+@@ -1101,11 +1102,11 @@ class HTTP11ClientProtocolTests(TestCase):
+         request = SlowRequest()
+         d = protocol.request(request)
+         protocol.dataReceived(
+-            "HTTP/1.1 200 OK\r\n"
+-            "X-Foo: bar\r\n"
+-            "Content-Length: 6\r\n"
+-            "\r\n"
+-            "foobar")
++            b"HTTP/1.1 200 OK\r\n"
++            b"X-Foo: bar\r\n"
++            b"Content-Length: 6\r\n"
++            b"\r\n"
++            b"foobar")
+         def cbResponse(response):
+             p = AccumulatingProtocol()
+             whenFinished = p.closedDeferred = Deferred()
+@@ -1117,12 +1118,13 @@ class HTTP11ClientProtocolTests(TestCase):
+             return whenFinished.addCallback(
+                 lambda ign: (response, p.data))
+         d.addCallback(cbResponse)
+-        def cbAllResponse((response, body)):
+-            self.assertEqual(response.version, ('HTTP', 1, 1))
++        def cbAllResponse(result):
++            response, body = result
++            self.assertEqual(response.version, (b'HTTP', 1, 1))
+             self.assertEqual(response.code, 200)
+-            self.assertEqual(response.phrase, 'OK')
+-            self.assertEqual(response.headers, Headers({'x-foo': ['bar']}))
+-            self.assertEqual(body, "foobar")
++            self.assertEqual(response.phrase, b'OK')
++            self.assertEqual(response.headers, Headers({b'x-foo': [b'bar']}))
++            self.assertEqual(body, b"foobar")
+ 
+             # Also nothing bad should happen if the request does finally
+             # finish, even though it is completely irrelevant.
+@@ -1141,10 +1143,10 @@ class HTTP11ClientProtocolTests(TestCase):
+         request = SlowRequest()
+         d = self.protocol.request(request)
+         self.protocol.dataReceived(
+-            "HTTP/1.1 400 BAD REQUEST\r\n"
+-            "Content-Length: 9\r\n"
+-            "\r\n"
+-            "tisk tisk")
++            b"HTTP/1.1 400 BAD REQUEST\r\n"
++            b"Content-Length: 9\r\n"
++            b"\r\n"
++            b"tisk tisk")
+         def cbResponse(response):
+             p = AccumulatingProtocol()
+             whenFinished = p.closedDeferred = Deferred()
+@@ -1169,12 +1171,12 @@ class HTTP11ClientProtocolTests(TestCase):
+         """
+         protocol = AccumulatingProtocol()
+         whenFinished = protocol.closedDeferred = Deferred()
+-        requestDeferred = self.protocol.request(Request('GET', '/', _boringHeaders, None))
++        requestDeferred = self.protocol.request(Request(b'GET', b'/', _boringHeaders, None))
+ 
+         self.protocol.dataReceived(
+-            "HTTP/1.1 200 OK\r\n"
+-            "Content-Length: 6\r\n"
+-            "\r")
++            b"HTTP/1.1 200 OK\r\n"
++            b"Content-Length: 6\r\n"
++            b"\r")
+ 
+         # Here's what's going on: all the response headers have been delivered
+         # by this point, so the request Deferred can fire with a Response
+@@ -1186,16 +1188,16 @@ class HTTP11ClientProtocolTests(TestCase):
+         self.assertEqual(result, [])
+         # Deliver the very last byte of the response.  It is exactly at this
+         # point which the Deferred returned by request should fire.
+-        self.protocol.dataReceived("\n")
++        self.protocol.dataReceived(b"\n")
+         response = result[0]
+ 
+         response.deliverBody(protocol)
+ 
+-        self.protocol.dataReceived("foo")
+-        self.protocol.dataReceived("bar")
++        self.protocol.dataReceived(b"foo")
++        self.protocol.dataReceived(b"bar")
+ 
+         def cbAllResponse(ignored):
+-            self.assertEqual(protocol.data, "foobar")
++            self.assertEqual(protocol.data, b"foobar")
+             protocol.closedReason.trap(ResponseDone)
+         whenFinished.addCallback(cbAllResponse)
+         return whenFinished
+@@ -1209,10 +1211,11 @@ class HTTP11ClientProtocolTests(TestCase):
+         method called with a L{Failure} wrapping a L{PotentialDataLoss}
+         exception.
+         """
+-        requestDeferred = self.protocol.request(Request('GET', '/', _boringHeaders, None))
++        requestDeferred = self.protocol.request(Request(b'GET', b'/',
++            _boringHeaders, None))
+         self.protocol.dataReceived(
+-            "HTTP/1.1 200 OK\r\n"
+-            "\r\n")
++            b"HTTP/1.1 200 OK\r\n"
++            b"\r\n")
+ 
+         result = []
+         requestDeferred.addCallback(result.append)
+@@ -1221,10 +1224,10 @@ class HTTP11ClientProtocolTests(TestCase):
+         protocol = AccumulatingProtocol()
+         response.deliverBody(protocol)
+ 
+-        self.protocol.dataReceived("foo")
+-        self.protocol.dataReceived("bar")
++        self.protocol.dataReceived(b"foo")
++        self.protocol.dataReceived(b"bar")
+ 
+-        self.assertEqual(protocol.data, "foobar")
++        self.assertEqual(protocol.data, b"foobar")
+         self.protocol.connectionLost(
+             Failure(ConnectionDone("low-level transport disconnected")))
+ 
+@@ -1238,11 +1241,12 @@ class HTTP11ClientProtocolTests(TestCase):
+         C{connectionLost} method called with a L{Failure} wrapping the
+         exception for that reason.
+         """
+-        requestDeferred = self.protocol.request(Request('GET', '/', _boringHeaders, None))
++        requestDeferred = self.protocol.request(Request(b'GET', b'/',
++            _boringHeaders, None))
+         self.protocol.dataReceived(
+-            "HTTP/1.1 200 OK\r\n"
+-            "Transfer-Encoding: chunked\r\n"
+-            "\r\n")
++            b"HTTP/1.1 200 OK\r\n"
++            b"Transfer-Encoding: chunked\r\n"
++            b"\r\n")
+ 
+         result = []
+         requestDeferred.addCallback(result.append)
+@@ -1251,10 +1255,10 @@ class HTTP11ClientProtocolTests(TestCase):
+         protocol = AccumulatingProtocol()
+         response.deliverBody(protocol)
+ 
+-        self.protocol.dataReceived("3\r\nfoo\r\n")
+-        self.protocol.dataReceived("3\r\nbar\r\n")
++        self.protocol.dataReceived(b"3\r\nfoo\r\n")
++        self.protocol.dataReceived(b"3\r\nbar\r\n")
+ 
+-        self.assertEqual(protocol.data, "foobar")
++        self.assertEqual(protocol.data, b"foobar")
+ 
+         self.protocol.connectionLost(Failure(ArbitraryException()))
+ 
+@@ -1269,13 +1273,14 @@ class HTTP11ClientProtocolTests(TestCase):
+         L{Failure} and passed to the parser's C{connectionLost} and then the
+         L{HTTP11ClientProtocol}'s transport is disconnected.
+         """
+-        requestDeferred = self.protocol.request(Request('GET', '/', _boringHeaders, None))
+-        self.protocol.dataReceived('unparseable garbage goes here\r\n')
++        requestDeferred = self.protocol.request(Request(b'GET', b'/',
++            _boringHeaders, None))
++        self.protocol.dataReceived(b'unparseable garbage goes here\r\n')
+         d = assertResponseFailed(self, requestDeferred, [ParseError])
+         def cbFailed(exc):
+             self.assertTrue(self.transport.disconnecting)
+             self.assertEqual(
+-                exc.reasons[0].value.data, 'unparseable garbage goes here')
++                exc.reasons[0].value.data, b'unparseable garbage goes here')
+ 
+             # Now do what StringTransport doesn't do but a real transport would
+             # have, call connectionLost on the HTTP11ClientProtocol.  Nothing
+@@ -1293,7 +1298,8 @@ class HTTP11ClientProtocolTests(TestCase):
+         L{TransportProxyProducer} which was connected to it as a transport is
+         stopped.
+         """
+-        requestDeferred = self.protocol.request(Request('GET', '/', _boringHeaders, None))
++        requestDeferred = self.protocol.request(Request(b'GET', b'/',
++            _boringHeaders, None))
+         transport = self.protocol._parser.transport
+         self.assertIdentical(transport._producer, self.transport)
+         self.protocol._disconnectParser(Failure(ConnectionDone("connection done")))
+@@ -1349,7 +1355,7 @@ class HTTP11ClientProtocolTests(TestCase):
+         transport = StringTransport()
+         protocol = HTTP11ClientProtocol()
+         protocol.makeConnection(transport)
+-        result = protocol.request(Request('GET', '/', _boringHeaders, None))
++        result = protocol.request(Request(b'GET', b'/', _boringHeaders, None))
+         protocol.abort()
+         self.assertTrue(transport.disconnecting)
+         protocol.connectionLost(Failure(ConnectionDone()))
+@@ -1367,12 +1373,12 @@ class HTTP11ClientProtocolTests(TestCase):
+         transport = StringTransport()
+         protocol = HTTP11ClientProtocol()
+         protocol.makeConnection(transport)
+-        result = protocol.request(Request('GET', '/', _boringHeaders, None))
++        result = protocol.request(Request(b'GET', b'/', _boringHeaders, None))
+ 
+         protocol.dataReceived(
+-            "HTTP/1.1 200 OK\r\n"
+-            "Content-Length: 1\r\n"
+-            "\r\n"
++            b"HTTP/1.1 200 OK\r\n"
++            b"Content-Length: 1\r\n"
++            b"\r\n"
+             )
+ 
+         testResult = Deferred()
+@@ -1440,11 +1446,11 @@ class HTTP11ClientProtocolTests(TestCase):
+         protocol.makeConnection(transport)
+ 
+         requestDeferred = protocol.request(
+-            Request('GET', '/', _boringHeaders, None, persistent=True))
++            Request(b'GET', b'/', _boringHeaders, None, persistent=True))
+         protocol.dataReceived(
+-            "HTTP/1.1 200 OK\r\n"
+-            "Content-length: 3\r\n"
+-            "\r\n")
++            b"HTTP/1.1 200 OK\r\n"
++            b"Content-length: 3\r\n"
++            b"\r\n")
+ 
+         # Headers done, but still no quiescent callback:
+         self.assertEqual(quiescentResult, [])
+@@ -1461,7 +1467,7 @@ class HTTP11ClientProtocolTests(TestCase):
+             lambda ign: quiescentResult.append("response done"))
+ 
+         response.deliverBody(bodyProtocol)
+-        protocol.dataReceived("abc")
++        protocol.dataReceived(b"abc")
+         bodyProtocol.closedReason.trap(ResponseDone)
+         # Quiescent callback called *before* protocol handling the response
+         # body gets its connectionLost called:
+@@ -1496,12 +1502,12 @@ class HTTP11ClientProtocolTests(TestCase):
+         protocol = HTTP11ClientProtocol(callback)
+         protocol.makeConnection(transport)
+         requestDeferred = protocol.request(
+-            Request('GET', '/', _boringHeaders, None, persistent=True))
++            Request(b'GET', b'/', _boringHeaders, None, persistent=True))
+         protocol.dataReceived(
+-            "HTTP/1.1 200 OK\r\n"
+-            "Content-length: 3\r\n"
+-            "\r\n"
+-            "BBB" # _full_ content of the response.
++            b"HTTP/1.1 200 OK\r\n"
++            b"Content-length: 3\r\n"
++            b"\r\n"
++            b"BBB" # _full_ content of the response.
+         )
+ 
+         response = self.successResultOf(requestDeferred)
+@@ -1536,12 +1542,12 @@ class HTTP11ClientProtocolTests(TestCase):
+         protocol.makeConnection(transport)
+ 
+         requestDeferred = protocol.request(
+-            Request('GET', '/', _boringHeaders, None, persistent=True))
++            Request(b'GET', b'/', _boringHeaders, None, persistent=True))
+         requestDeferred.addCallback(quiescentResult.append)
+         protocol.dataReceived(
+-            "HTTP/1.1 200 OK\r\n"
+-            "Content-length: 0\r\n"
+-            "\r\n")
++            b"HTTP/1.1 200 OK\r\n"
++            b"Content-length: 0\r\n"
++            b"\r\n")
+ 
+         self.assertEqual(len(quiescentResult), 2)
+         self.assertIdentical(quiescentResult[0], protocol)
+@@ -1560,12 +1566,12 @@ class HTTP11ClientProtocolTests(TestCase):
+         protocol.makeConnection(transport)
+ 
+         requestDeferred = protocol.request(
+-            Request('GET', '/', _boringHeaders, None, persistent=True))
++            Request(b'GET', b'/', _boringHeaders, None, persistent=True))
+         protocol.dataReceived(
+-            "HTTP/1.1 200 OK\r\n"
+-            "Content-length: 0\r\n"
+-            "Connection: close\r\n"
+-            "\r\n")
++            b"HTTP/1.1 200 OK\r\n"
++            b"Content-length: 0\r\n"
++            b"Connection: close\r\n"
++            b"\r\n")
+ 
+         result = []
+         requestDeferred.addCallback(result.append)
+@@ -1589,11 +1595,11 @@ class HTTP11ClientProtocolTests(TestCase):
+         protocol.makeConnection(transport)
+ 
+         requestDeferred = protocol.request(
+-            Request('GET', '/', _boringHeaders, None, persistent=False))
++            Request(b'GET', b'/', _boringHeaders, None, persistent=False))
+         protocol.dataReceived(
+-            "HTTP/1.1 200 OK\r\n"
+-            "Content-length: 0\r\n"
+-            "\r\n")
++            b"HTTP/1.1 200 OK\r\n"
++            b"Content-length: 0\r\n"
++            b"\r\n")
+ 
+         result = []
+         requestDeferred.addCallback(result.append)
+@@ -1619,11 +1625,11 @@ class HTTP11ClientProtocolTests(TestCase):
+         protocol.makeConnection(transport)
+ 
+         requestDeferred = protocol.request(
+-            Request('GET', '/', _boringHeaders, None, persistent=True))
++            Request(b'GET', b'/', _boringHeaders, None, persistent=True))
+         protocol.dataReceived(
+-            "HTTP/1.1 200 OK\r\n"
+-            "Content-length: 0\r\n"
+-            "\r\n")
++            b"HTTP/1.1 200 OK\r\n"
++            b"Content-length: 0\r\n"
++            b"\r\n")
+ 
+         result = []
+         requestDeferred.addCallback(result.append)
+@@ -1647,7 +1653,7 @@ class HTTP11ClientProtocolTests(TestCase):
+         transport = StringTransport()
+         protocol = HTTP11ClientProtocol()
+         protocol.makeConnection(transport)
+-        result = protocol.request(Request('GET', '/', _boringHeaders, None))
++        result = protocol.request(Request(b'GET', b'/', _boringHeaders, None))
+         result.cancel()
+         self.assertTrue(transport.aborting)
+         return assertWrapperExceptionTypes(
+@@ -1664,8 +1670,8 @@ class HTTP11ClientProtocolTests(TestCase):
+         transport = StringTransport()
+         protocol = HTTP11ClientProtocol()
+         protocol.makeConnection(transport)
+-        result = protocol.request(Request('GET', '/', _boringHeaders, None))
+-        protocol.dataReceived("HTTP/1.1 200 OK\r\n")
++        result = protocol.request(Request(b'GET', b'/', _boringHeaders, None))
++        protocol.dataReceived(b"HTTP/1.1 200 OK\r\n")
+         result.cancel()
+         self.assertTrue(transport.aborting)
+         return assertResponseFailed(self, result, [CancelledError])
+@@ -1683,20 +1689,20 @@ class HTTP11ClientProtocolTests(TestCase):
+         protocol.makeConnection(transport)
+         producer = StringProducer(producerLength)
+ 
+-        nonlocal = {'cancelled': False}
++        nonlocal_ = {'cancelled': False}
+         def cancel(ign):
+-            nonlocal['cancelled'] = True
++            nonlocal_['cancelled'] = True
+         def startProducing(consumer):
+             producer.consumer = consumer
+             producer.finished = Deferred(cancel)
+             return producer.finished
+         producer.startProducing = startProducing
+ 
+-        result = protocol.request(Request('POST', '/bar', _boringHeaders, producer))
+-        producer.consumer.write('x' * 5)
++        result = protocol.request(Request(b'POST', b'/bar', _boringHeaders, producer))
++        producer.consumer.write(b'x' * 5)
+         result.cancel()
+         self.assertTrue(transport.aborting)
+-        self.assertTrue(nonlocal['cancelled'])
++        self.assertTrue(nonlocal_['cancelled'])
+         return assertRequestGenerationFailed(self, result, [CancelledError])
+ 
+ 
+@@ -1721,6 +1727,7 @@ class HTTP11ClientProtocolTests(TestCase):
+ 
+ 
+ 
++@implementer(IBodyProducer)
+ class StringProducer:
+     """
+     L{StringProducer} is a dummy body producer.
+@@ -1733,7 +1740,6 @@ class StringProducer:
+         returned by that method.  L{StringProducer} will never fire this
+         L{Deferred}.
+     """
+-    implements(IBodyProducer)
+ 
+     stopped = False
+ 
+@@ -1765,26 +1771,26 @@ class RequestTests(TestCase):
+         L{Request.writeTo} formats the request data and writes it to the given
+         transport.
+         """
+-        Request('GET', '/', _boringHeaders, None).writeTo(self.transport)
++        Request(b'GET', b'/', _boringHeaders, None).writeTo(self.transport)
+         self.assertEqual(
+             self.transport.value(),
+-            "GET / HTTP/1.1\r\n"
+-            "Connection: close\r\n"
+-            "Host: example.com\r\n"
+-            "\r\n")
++            b"GET / HTTP/1.1\r\n"
++            b"Connection: close\r\n"
++            b"Host: example.com\r\n"
++            b"\r\n")
+ 
+ 
+     def test_sendSimplestPersistentRequest(self):
+         """
+         A pesistent request does not send 'Connection: close' header.
+         """
+-        req = Request('GET', '/', _boringHeaders, None, persistent=True)
++        req = Request(b'GET', b'/', _boringHeaders, None, persistent=True)
+         req.writeTo(self.transport)
+         self.assertEqual(
+             self.transport.value(),
+-            "GET / HTTP/1.1\r\n"
+-            "Host: example.com\r\n"
+-            "\r\n")
++            b"GET / HTTP/1.1\r\n"
++            b"Host: example.com\r\n"
++            b"\r\n")
+ 
+ 
+     def test_sendRequestHeaders(self):
+@@ -1792,19 +1798,20 @@ class RequestTests(TestCase):
+         L{Request.writeTo} formats header data and writes it to the given
+         transport.
+         """
+-        headers = Headers({'x-foo': ['bar', 'baz'], 'host': ['example.com']})
+-        Request('GET', '/foo', headers, None).writeTo(self.transport)
+-        lines = self.transport.value().split('\r\n')
+-        self.assertEqual(lines[0], "GET /foo HTTP/1.1")
+-        self.assertEqual(lines[-2:], ["", ""])
++        headers = Headers({b'x-foo': [b'bar', b'baz'],
++                           b'host': [b'example.com']})
++        Request(b'GET', b'/foo', headers, None).writeTo(self.transport)
++        lines = self.transport.value().split(b'\r\n')
++        self.assertEqual(lines[0], b"GET /foo HTTP/1.1")
++        self.assertEqual(lines[-2:], [b"", b""])
+         del lines[0], lines[-2:]
+         lines.sort()
+         self.assertEqual(
+             lines,
+-            ["Connection: close",
+-             "Host: example.com",
+-             "X-Foo: bar",
+-             "X-Foo: baz"])
++            [b"Connection: close",
++             b"Host: example.com",
++             b"X-Foo: bar",
++             b"X-Foo: baz"])
+ 
+ 
+     def test_sendChunkedRequestBody(self):
+@@ -1814,7 +1821,7 @@ class RequestTests(TestCase):
+         producer with the transport.
+         """
+         producer = StringProducer(UNKNOWN_LENGTH)
+-        request = Request('POST', '/bar', _boringHeaders, producer)
++        request = Request(b'POST', b'/bar', _boringHeaders, producer)
+         request.writeTo(self.transport)
+ 
+         self.assertNotIdentical(producer.consumer, None)
+@@ -1823,25 +1830,25 @@ class RequestTests(TestCase):
+ 
+         self.assertEqual(
+             self.transport.value(),
+-            "POST /bar HTTP/1.1\r\n"
+-            "Connection: close\r\n"
+-            "Transfer-Encoding: chunked\r\n"
+-            "Host: example.com\r\n"
+-            "\r\n")
++            b"POST /bar HTTP/1.1\r\n"
++            b"Connection: close\r\n"
++            b"Transfer-Encoding: chunked\r\n"
++            b"Host: example.com\r\n"
++            b"\r\n")
+         self.transport.clear()
+ 
+-        producer.consumer.write('x' * 3)
+-        producer.consumer.write('y' * 15)
++        producer.consumer.write(b'x' * 3)
++        producer.consumer.write(b'y' * 15)
+         producer.finished.callback(None)
+         self.assertIdentical(self.transport.producer, None)
+         self.assertEqual(
+             self.transport.value(),
+-            "3\r\n"
+-            "xxx\r\n"
+-            "f\r\n"
+-            "yyyyyyyyyyyyyyy\r\n"
+-            "0\r\n"
+-            "\r\n")
++            b"3\r\n"
++            b"xxx\r\n"
++            b"f\r\n"
++            b"yyyyyyyyyyyyyyy\r\n"
++            b"0\r\n"
++            b"\r\n")
+ 
+ 
+     def test_sendChunkedRequestBodyWithError(self):
+@@ -1854,12 +1861,12 @@ class RequestTests(TestCase):
+         transport.
+         """
+         producer = StringProducer(UNKNOWN_LENGTH)
+-        request = Request('POST', '/bar', _boringHeaders, producer)
++        request = Request(b'POST', b'/bar', _boringHeaders, producer)
+         writeDeferred = request.writeTo(self.transport)
+         self.transport.clear()
+         producer.finished.errback(ArbitraryException())
+         def cbFailed(ignored):
+-            self.assertEqual(self.transport.value(), "")
++            self.assertEqual(self.transport.value(), b"")
+             self.assertIdentical(self.transport.producer, None)
+         d = self.assertFailure(writeDeferred, ArbitraryException)
+         d.addCallback(cbFailed)
+@@ -1873,7 +1880,7 @@ class RequestTests(TestCase):
+         chunked encoding is not used.
+         """
+         producer = StringProducer(3)
+-        request = Request('POST', '/bar', _boringHeaders, producer)
++        request = Request(b'POST', b'/bar', _boringHeaders, producer)
+         request.writeTo(self.transport)
+ 
+         self.assertNotIdentical(producer.consumer, None)
+@@ -1882,17 +1889,17 @@ class RequestTests(TestCase):
+ 
+         self.assertEqual(
+             self.transport.value(),
+-            "POST /bar HTTP/1.1\r\n"
+-            "Connection: close\r\n"
+-            "Content-Length: 3\r\n"
+-            "Host: example.com\r\n"
+-            "\r\n")
++            b"POST /bar HTTP/1.1\r\n"
++            b"Connection: close\r\n"
++            b"Content-Length: 3\r\n"
++            b"Host: example.com\r\n"
++            b"\r\n")
+         self.transport.clear()
+ 
+-        producer.consumer.write('abc')
++        producer.consumer.write(b'abc')
+         producer.finished.callback(None)
+         self.assertIdentical(self.transport.producer, None)
+-        self.assertEqual(self.transport.value(), "abc")
++        self.assertEqual(self.transport.value(), b"abc")
+ 
+ 
+     def test_sendRequestBodyWithTooFewBytes(self):
+@@ -1903,9 +1910,9 @@ class RequestTests(TestCase):
+         L{WrongBodyLength} exception.
+         """
+         producer = StringProducer(3)
+-        request = Request('POST', '/bar', _boringHeaders, producer)
++        request = Request(b'POST', b'/bar', _boringHeaders, producer)
+         writeDeferred = request.writeTo(self.transport)
+-        producer.consumer.write('ab')
++        producer.consumer.write(b'ab')
+         producer.finished.callback(None)
+         self.assertIdentical(self.transport.producer, None)
+         return self.assertFailure(writeDeferred, WrongBodyLength)
+@@ -1924,16 +1931,16 @@ class RequestTests(TestCase):
+             It should fire the startProducing Deferred somehow.
+         """
+         producer = StringProducer(3)
+-        request = Request('POST', '/bar', _boringHeaders, producer)
++        request = Request(b'POST', b'/bar', _boringHeaders, producer)
+         writeDeferred = request.writeTo(self.transport)
+ 
+-        producer.consumer.write('ab')
++        producer.consumer.write(b'ab')
+ 
+         # The producer hasn't misbehaved yet, so it shouldn't have been
+         # stopped.
+         self.assertFalse(producer.stopped)
+ 
+-        producer.consumer.write('cd')
++        producer.consumer.write(b'cd')
+ 
+         # Now the producer *has* misbehaved, so we should have tried to
+         # make it stop.
+@@ -1951,17 +1958,17 @@ class RequestTests(TestCase):
+             # going to indicate failure locally.
+             self.assertEqual(
+                 self.transport.value(),
+-                "POST /bar HTTP/1.1\r\n"
+-                "Connection: close\r\n"
+-                "Content-Length: 3\r\n"
+-                "Host: example.com\r\n"
+-                "\r\n"
+-                "ab")
++                b"POST /bar HTTP/1.1\r\n"
++                b"Connection: close\r\n"
++                b"Content-Length: 3\r\n"
++                b"Host: example.com\r\n"
++                b"\r\n"
++                b"ab")
+             self.transport.clear()
+ 
+             # Subsequent writes should be ignored, as should firing the
+             # Deferred returned from startProducing.
+-            self.assertRaises(ExcessWrite, producer.consumer.write, 'ef')
++            self.assertRaises(ExcessWrite, producer.consumer.write, b'ef')
+ 
+             # Likewise, if the Deferred returned from startProducing fires,
+             # this should more or less be ignored (aside from possibly logging
+@@ -1969,7 +1976,7 @@ class RequestTests(TestCase):
+             finisher(producer)
+ 
+             # There should have been nothing further written to the transport.
+-            self.assertEqual(self.transport.value(), "")
++            self.assertEqual(self.transport.value(), b"")
+ 
+         d = self.assertFailure(writeDeferred, WrongBodyLength)
+         d.addCallback(cbFailed)
+@@ -2013,12 +2020,12 @@ class RequestTests(TestCase):
+         This is a whitebox test.
+         """
+         producer = StringProducer(3)
+-        request = Request('POST', '/bar', _boringHeaders, producer)
++        request = Request(b'POST', b'/bar', _boringHeaders, producer)
+         request.writeTo(self.transport)
+ 
+         finishedConsuming = producer.consumer._finished
+ 
+-        producer.consumer.write('abc')
++        producer.consumer.write(b'abc')
+         producer.finished.callback(None)
+ 
+         finishedConsuming.errback(ArbitraryException())
+@@ -2033,15 +2040,15 @@ class RequestTests(TestCase):
+         wrapping the most appropriate exception type.
+         """
+         producer = StringProducer(3)
+-        request = Request('POST', '/bar', _boringHeaders, producer)
++        request = Request(b'POST', b'/bar', _boringHeaders, producer)
+         writeDeferred = request.writeTo(self.transport)
+ 
+-        producer.consumer.write('ab')
++        producer.consumer.write(b'ab')
+         finisher(producer)
+         self.assertIdentical(self.transport.producer, None)
+         self.transport.clear()
+-        self.assertRaises(ExcessWrite, producer.consumer.write, 'cd')
+-        self.assertEqual(self.transport.value(), "")
++        self.assertRaises(ExcessWrite, producer.consumer.write, b'cd')
++        self.assertEqual(self.transport.value(), b"")
+         return writeDeferred
+ 
+ 
+@@ -2081,13 +2088,13 @@ class RequestTests(TestCase):
+         the underlying transport.
+         """
+         producer = StringProducer(UNKNOWN_LENGTH)
+-        request = Request('POST', '/bar', _boringHeaders, producer)
++        request = Request(b'POST', b'/bar', _boringHeaders, producer)
+         writeDeferred = request.writeTo(self.transport)
+         producer.finished.callback(_with)
+         self.transport.clear()
+ 
+-        self.assertRaises(ExcessWrite, producer.consumer.write, 'foo')
+-        self.assertEqual(self.transport.value(), "")
++        self.assertRaises(ExcessWrite, producer.consumer.write, b'foo')
++        self.assertEqual(self.transport.value(), b"")
+         return writeDeferred
+ 
+ 
+@@ -2111,7 +2118,7 @@ class RequestTests(TestCase):
+         L{Failure}.
+         """
+         producer = StringProducer(5)
+-        request = Request('POST', '/bar', _boringHeaders, producer)
++        request = Request(b'POST', b'/bar', _boringHeaders, producer)
+         writeDeferred = request.writeTo(self.transport)
+ 
+         # Sanity check - the producer should be registered with the underlying
+@@ -2119,15 +2126,15 @@ class RequestTests(TestCase):
+         self.assertIdentical(self.transport.producer, producer)
+         self.assertTrue(self.transport.streaming)
+ 
+-        producer.consumer.write('ab')
++        producer.consumer.write(b'ab')
+         self.assertEqual(
+             self.transport.value(),
+-            "POST /bar HTTP/1.1\r\n"
+-            "Connection: close\r\n"
+-            "Content-Length: 5\r\n"
+-            "Host: example.com\r\n"
+-            "\r\n"
+-            "ab")
++            b"POST /bar HTTP/1.1\r\n"
++            b"Connection: close\r\n"
++            b"Content-Length: 5\r\n"
++            b"Host: example.com\r\n"
++            b"\r\n"
++            b"ab")
+ 
+         self.assertFalse(self.transport.disconnecting)
+         producer.finished.errback(Failure(ArbitraryException()))
+@@ -2147,13 +2154,14 @@ class RequestTests(TestCase):
+         L{Request.writeTo} raises L{BadHeaders} if there is not exactly one
+         I{Host} header and writes nothing to the given transport.
+         """
+-        request = Request('GET', '/', Headers({}), None)
++        request = Request(b'GET', b'/', Headers({}), None)
+         self.assertRaises(BadHeaders, request.writeTo, self.transport)
+-        self.assertEqual(self.transport.value(), '')
++        self.assertEqual(self.transport.value(), b'')
+ 
+-        request = Request('GET', '/', Headers({'Host': ['example.com', 'example.org']}), None)
++        request = Request(b'GET', b'/',
++            Headers({b'Host': [b'example.com', b'example.org']}), None)
+         self.assertRaises(BadHeaders, request.writeTo, self.transport)
+-        self.assertEqual(self.transport.value(), '')
++        self.assertEqual(self.transport.value(), b'')
+ 
+ 
+     def test_stopWriting(self):
+@@ -2162,7 +2170,7 @@ class RequestTests(TestCase):
+         method.
+         """
+         producer = StringProducer(3)
+-        request = Request('GET', '/', _boringHeaders, producer)
++        request = Request(b'GET', b'/', _boringHeaders, producer)
+         request.writeTo(self.transport)
+         self.assertFalse(producer.stopped)
+         request.stopWriting()
+@@ -2179,7 +2187,7 @@ class RequestTests(TestCase):
+             raise ArbitraryException("stopProducing is busted")
+         producer.stopProducing = brokenStopProducing
+ 
+-        request = Request('GET', '/', _boringHeaders, producer)
++        request = Request(b'GET', b'/', _boringHeaders, producer)
+         request.writeTo(self.transport)
+         request.stopWriting()
+         self.assertEqual(
+@@ -2205,11 +2213,11 @@ class LengthEnforcingConsumerTests(TestCase):
+         method with the bytes it is passed as long as there are fewer of them
+         than the C{length} attribute indicates remain to be received.
+         """
+-        self.enforcer.write('abc')
+-        self.assertEqual(self.transport.value(), 'abc')
++        self.enforcer.write(b'abc')
++        self.assertEqual(self.transport.value(), b'abc')
+         self.transport.clear()
+-        self.enforcer.write('def')
+-        self.assertEqual(self.transport.value(), 'def')
++        self.enforcer.write(b'def')
++        self.assertEqual(self.transport.value(), b'def')
+ 
+ 
+     def test_finishedEarly(self):
+@@ -2218,7 +2226,7 @@ class LengthEnforcingConsumerTests(TestCase):
+         L{WrongBodyLength} if it is called before the indicated number of bytes
+         have been written.
+         """
+-        self.enforcer.write('x' * 9)
++        self.enforcer.write(b'x' * 9)
+         self.assertRaises(WrongBodyLength, self.enforcer._noMoreWritesExpected)
+ 
+ 
+@@ -2230,9 +2238,9 @@ class LengthEnforcingConsumerTests(TestCase):
+         L{Failure} wrapping a L{WrongBodyLength} and also calls the
+         C{stopProducing} method of the producer.
+         """
+-        self.enforcer.write('x' * 10)
++        self.enforcer.write(b'x' * 10)
+         self.assertFalse(self.producer.stopped)
+-        self.enforcer.write('x')
++        self.enforcer.write(b'x')
+         self.assertTrue(self.producer.stopped)
+         if _unregisterAfter:
+             self.enforcer._noMoreWritesExpected()
+@@ -2245,10 +2253,10 @@ class LengthEnforcingConsumerTests(TestCase):
+         L{LengthEnforcingConsumer._noMoreWritesExpected}, it calls the
+         producer's C{stopProducing} method and raises L{ExcessWrite}.
+         """
+-        self.enforcer.write('x' * 10)
++        self.enforcer.write(b'x' * 10)
+         self.enforcer._noMoreWritesExpected()
+         self.assertFalse(self.producer.stopped)
+-        self.assertRaises(ExcessWrite, self.enforcer.write, 'x')
++        self.assertRaises(ExcessWrite, self.enforcer.write, b'x')
+         self.assertTrue(self.producer.stopped)
+ 
+ 
+@@ -2266,7 +2274,7 @@ class LengthEnforcingConsumerTests(TestCase):
+         If L{LengthEnforcingConsumer._noMoreWritesExpected} is called after
+         the correct number of bytes have been written it returns C{None}.
+         """
+-        self.enforcer.write('x' * 10)
++        self.enforcer.write(b'x' * 10)
+         self.assertIdentical(self.enforcer._noMoreWritesExpected(), None)
+ 
+ 
+@@ -2313,11 +2321,11 @@ class RequestBodyConsumerTests(TestCase):
+         """
+         transport = StringTransport()
+         encoder = ChunkedEncoder(transport)
+-        encoder.write('foo')
+-        self.assertEqual(transport.value(), '3\r\nfoo\r\n')
++        encoder.write(b'foo')
++        self.assertEqual(transport.value(), b'3\r\nfoo\r\n')
+         transport.clear()
+-        encoder.write('x' * 16)
+-        self.assertEqual(transport.value(), '10\r\n' + 'x' * 16 + '\r\n')
++        encoder.write(b'x' * 16)
++        self.assertEqual(transport.value(), b'10\r\n' + b'x' * 16 + b'\r\n')
+ 
+ 
+     def test_producerRegistration(self):
+@@ -2335,7 +2343,7 @@ class RequestBodyConsumerTests(TestCase):
+         self.assertTrue(transport.streaming)
+         encoder.unregisterProducer()
+         self.assertIdentical(transport.producer, None)
+-        self.assertEqual(transport.value(), '0\r\n\r\n')
++        self.assertEqual(transport.value(), b'0\r\n\r\n')
+ 
+ 
+ 
+@@ -2482,8 +2490,8 @@ class ResponseTests(TestCase):
+         response = justTransportResponse(StringTransport())
+         response.deliverBody(consumer)
+ 
+-        response._bodyDataReceived('foo')
+-        self.assertEqual(bytes, ['foo'])
++        response._bodyDataReceived(b'foo')
++        self.assertEqual(bytes, [b'foo'])
+ 
+ 
+     def test_connectionLost(self):
+@@ -2524,11 +2532,11 @@ class ResponseTests(TestCase):
+ 
+         protocol = ListConsumer()
+         response = justTransportResponse(StringTransport())
+-        response._bodyDataReceived('foo')
+-        response._bodyDataReceived('bar')
++        response._bodyDataReceived(b'foo')
++        response._bodyDataReceived(b'bar')
+         response.deliverBody(protocol)
+-        response._bodyDataReceived('baz')
+-        self.assertEqual(bytes, ['foo', 'bar', 'baz'])
++        response._bodyDataReceived(b'baz')
++        self.assertEqual(bytes, [b'foo', b'bar', b'baz'])
+         # Make sure the implementation-detail-byte-buffer is cleared because
+         # not clearing it wastes memory.
+         self.assertIdentical(response._bodyBuffer, None)
+@@ -2562,7 +2570,7 @@ class ResponseTests(TestCase):
+         """
+         response = justTransportResponse(StringTransport())
+         response._bodyDataFinished()
+-        self.assertRaises(RuntimeError, response._bodyDataReceived, 'foo')
++        self.assertRaises(RuntimeError, response._bodyDataReceived, b'foo')
+ 
+ 
+     def test_bodyDataReceivedAfterDeliveryFails(self):
+@@ -2573,7 +2581,7 @@ class ResponseTests(TestCase):
+         response = justTransportResponse(StringTransport())
+         response._bodyDataFinished()
+         response.deliverBody(Protocol())
+-        self.assertRaises(RuntimeError, response._bodyDataReceived, 'foo')
++        self.assertRaises(RuntimeError, response._bodyDataReceived, b'foo')
+ 
+ 
+     def test_bodyDataFinishedAfterFinishedFails(self):
+@@ -2600,7 +2608,7 @@ class ResponseTests(TestCase):
+     def test_transportResumed(self):
+         """
+         L{Response.deliverBody} resumes the HTTP connection's transport
+-        before passing it to the transport's C{makeConnection} method.
++        before passing it to the consumer's C{makeConnection} method.
+         """
+         transportState = []
+         class ListConsumer(Protocol):
+@@ -2625,13 +2633,13 @@ class ResponseTests(TestCase):
+         """
+         transport = StringTransport()
+         response = justTransportResponse(transport)
+-        response._bodyDataReceived('foo')
+-        response._bodyDataReceived('bar')
++        response._bodyDataReceived(b'foo')
++        response._bodyDataReceived(b'bar')
+         response._bodyDataFinished()
+ 
+         protocol = AccumulatingProtocol()
+         response.deliverBody(protocol)
+-        self.assertEqual(protocol.data, 'foobar')
++        self.assertEqual(protocol.data, b'foobar')
+         protocol.closedReason.trap(ResponseDone)
+ 
+ 

@@ -1,0 +1,2168 @@
+Index: twisted/test/test_sip.py
+===================================================================
+--- twisted/test/test_sip.py	(revision 33739)
++++ twisted/test/test_sip.py	(working copy)
+@@ -1,942 +0,0 @@
+-# -*- test-case-name: twisted.test.test_sip -*-
+-# Copyright (c) Twisted Matrix Laboratories.
+-# See LICENSE for details.
+-
+-
+-"""Session Initialization Protocol tests."""
+-
+-from twisted.trial import unittest, util
+-from twisted.protocols import sip
+-from twisted.internet import defer, reactor, utils
+-from twisted.python.versions import Version
+-
+-from twisted.test import proto_helpers
+-
+-from twisted import cred
+-import twisted.cred.portal
+-import twisted.cred.checkers
+-
+-from zope.interface import implements
+-
+-
+-# request, prefixed by random CRLFs
+-request1 = "\n\r\n\n\r" + """\
+-INVITE sip:foo SIP/2.0
+-From: mo
+-To: joe
+-Content-Length: 4
+-
+-abcd""".replace("\n", "\r\n")
+-
+-# request, no content-length
+-request2 = """INVITE sip:foo SIP/2.0
+-From: mo
+-To: joe
+-
+-1234""".replace("\n", "\r\n")
+-
+-# request, with garbage after
+-request3 = """INVITE sip:foo SIP/2.0
+-From: mo
+-To: joe
+-Content-Length: 4
+-
+-1234
+-
+-lalalal""".replace("\n", "\r\n")
+-
+-# three requests
+-request4 = """INVITE sip:foo SIP/2.0
+-From: mo
+-To: joe
+-Content-Length: 0
+-
+-INVITE sip:loop SIP/2.0
+-From: foo
+-To: bar
+-Content-Length: 4
+-
+-abcdINVITE sip:loop SIP/2.0
+-From: foo
+-To: bar
+-Content-Length: 4
+-
+-1234""".replace("\n", "\r\n")
+-
+-# response, no content
+-response1 = """SIP/2.0 200 OK
+-From:  foo
+-To:bar
+-Content-Length: 0
+-
+-""".replace("\n", "\r\n")
+-
+-# short header version
+-request_short = """\
+-INVITE sip:foo SIP/2.0
+-f: mo
+-t: joe
+-l: 4
+-
+-abcd""".replace("\n", "\r\n")
+-
+-request_natted = """\
+-INVITE sip:foo SIP/2.0
+-Via: SIP/2.0/UDP 10.0.0.1:5060;rport
+-
+-""".replace("\n", "\r\n")
+-
+-class TestRealm:
+-    def requestAvatar(self, avatarId, mind, *interfaces):
+-        return sip.IContact, None, lambda: None
+-
+-class MessageParsingTestCase(unittest.TestCase):
+-    def setUp(self):
+-        self.l = []
+-        self.parser = sip.MessagesParser(self.l.append)
+-
+-    def feedMessage(self, message):
+-        self.parser.dataReceived(message)
+-        self.parser.dataDone()
+-
+-    def validateMessage(self, m, method, uri, headers, body):
+-        """Validate Requests."""
+-        self.assertEqual(m.method, method)
+-        self.assertEqual(m.uri.toString(), uri)
+-        self.assertEqual(m.headers, headers)
+-        self.assertEqual(m.body, body)
+-        self.assertEqual(m.finished, 1)
+-
+-    def testSimple(self):
+-        l = self.l
+-        self.feedMessage(request1)
+-        self.assertEqual(len(l), 1)
+-        self.validateMessage(
+-            l[0], "INVITE", "sip:foo",
+-            {"from": ["mo"], "to": ["joe"], "content-length": ["4"]},
+-            "abcd")
+-
+-    def testTwoMessages(self):
+-        l = self.l
+-        self.feedMessage(request1)
+-        self.feedMessage(request2)
+-        self.assertEqual(len(l), 2)
+-        self.validateMessage(
+-            l[0], "INVITE", "sip:foo",
+-            {"from": ["mo"], "to": ["joe"], "content-length": ["4"]},
+-            "abcd")
+-        self.validateMessage(l[1], "INVITE", "sip:foo",
+-                             {"from": ["mo"], "to": ["joe"]},
+-                             "1234")
+-
+-    def testGarbage(self):
+-        l = self.l
+-        self.feedMessage(request3)
+-        self.assertEqual(len(l), 1)
+-        self.validateMessage(
+-            l[0], "INVITE", "sip:foo",
+-            {"from": ["mo"], "to": ["joe"], "content-length": ["4"]},
+-            "1234")
+-
+-    def testThreeInOne(self):
+-        l = self.l
+-        self.feedMessage(request4)
+-        self.assertEqual(len(l), 3)
+-        self.validateMessage(
+-            l[0], "INVITE", "sip:foo",
+-            {"from": ["mo"], "to": ["joe"], "content-length": ["0"]},
+-            "")
+-        self.validateMessage(
+-            l[1], "INVITE", "sip:loop",
+-            {"from": ["foo"], "to": ["bar"], "content-length": ["4"]},
+-            "abcd")
+-        self.validateMessage(
+-            l[2], "INVITE", "sip:loop",
+-            {"from": ["foo"], "to": ["bar"], "content-length": ["4"]},
+-            "1234")
+-
+-    def testShort(self):
+-        l = self.l
+-        self.feedMessage(request_short)
+-        self.assertEqual(len(l), 1)
+-        self.validateMessage(
+-            l[0], "INVITE", "sip:foo",
+-            {"from": ["mo"], "to": ["joe"], "content-length": ["4"]},
+-            "abcd")
+-
+-    def testSimpleResponse(self):
+-        l = self.l
+-        self.feedMessage(response1)
+-        self.assertEqual(len(l), 1)
+-        m = l[0]
+-        self.assertEqual(m.code, 200)
+-        self.assertEqual(m.phrase, "OK")
+-        self.assertEqual(
+-            m.headers,
+-            {"from": ["foo"], "to": ["bar"], "content-length": ["0"]})
+-        self.assertEqual(m.body, "")
+-        self.assertEqual(m.finished, 1)
+-
+-
+-class MessageParsingTestCase2(MessageParsingTestCase):
+-    """Same as base class, but feed data char by char."""
+-
+-    def feedMessage(self, message):
+-        for c in message:
+-            self.parser.dataReceived(c)
+-        self.parser.dataDone()
+-
+-
+-class MakeMessageTestCase(unittest.TestCase):
+-
+-    def testRequest(self):
+-        r = sip.Request("INVITE", "sip:foo")
+-        r.addHeader("foo", "bar")
+-        self.assertEqual(
+-            r.toString(),
+-            "INVITE sip:foo SIP/2.0\r\nFoo: bar\r\n\r\n")
+-
+-    def testResponse(self):
+-        r = sip.Response(200, "OK")
+-        r.addHeader("foo", "bar")
+-        r.addHeader("Content-Length", "4")
+-        r.bodyDataReceived("1234")
+-        self.assertEqual(
+-            r.toString(),
+-            "SIP/2.0 200 OK\r\nFoo: bar\r\nContent-Length: 4\r\n\r\n1234")
+-
+-    def testStatusCode(self):
+-        r = sip.Response(200)
+-        self.assertEqual(r.toString(), "SIP/2.0 200 OK\r\n\r\n")
+-
+-
+-class ViaTestCase(unittest.TestCase):
+-
+-    def checkRoundtrip(self, v):
+-        s = v.toString()
+-        self.assertEqual(s, sip.parseViaHeader(s).toString())
+-
+-    def testExtraWhitespace(self):
+-        v1 = sip.parseViaHeader('SIP/2.0/UDP 192.168.1.1:5060')
+-        v2 = sip.parseViaHeader('SIP/2.0/UDP     192.168.1.1:5060')
+-        self.assertEqual(v1.transport, v2.transport)
+-        self.assertEqual(v1.host, v2.host)
+-        self.assertEqual(v1.port, v2.port)
+-
+-    def test_complex(self):
+-        """
+-        Test parsing a Via header with one of everything.
+-        """
+-        s = ("SIP/2.0/UDP first.example.com:4000;ttl=16;maddr=224.2.0.1"
+-             " ;branch=a7c6a8dlze (Example)")
+-        v = sip.parseViaHeader(s)
+-        self.assertEqual(v.transport, "UDP")
+-        self.assertEqual(v.host, "first.example.com")
+-        self.assertEqual(v.port, 4000)
+-        self.assertEqual(v.rport, None)
+-        self.assertEqual(v.rportValue, None)
+-        self.assertEqual(v.rportRequested, False)
+-        self.assertEqual(v.ttl, 16)
+-        self.assertEqual(v.maddr, "224.2.0.1")
+-        self.assertEqual(v.branch, "a7c6a8dlze")
+-        self.assertEqual(v.hidden, 0)
+-        self.assertEqual(v.toString(),
+-                          "SIP/2.0/UDP first.example.com:4000"
+-                          ";ttl=16;branch=a7c6a8dlze;maddr=224.2.0.1")
+-        self.checkRoundtrip(v)
+-
+-    def test_simple(self):
+-        """
+-        Test parsing a simple Via header.
+-        """
+-        s = "SIP/2.0/UDP example.com;hidden"
+-        v = sip.parseViaHeader(s)
+-        self.assertEqual(v.transport, "UDP")
+-        self.assertEqual(v.host, "example.com")
+-        self.assertEqual(v.port, 5060)
+-        self.assertEqual(v.rport, None)
+-        self.assertEqual(v.rportValue, None)
+-        self.assertEqual(v.rportRequested, False)
+-        self.assertEqual(v.ttl, None)
+-        self.assertEqual(v.maddr, None)
+-        self.assertEqual(v.branch, None)
+-        self.assertEqual(v.hidden, True)
+-        self.assertEqual(v.toString(),
+-                          "SIP/2.0/UDP example.com:5060;hidden")
+-        self.checkRoundtrip(v)
+-
+-    def testSimpler(self):
+-        v = sip.Via("example.com")
+-        self.checkRoundtrip(v)
+-
+-
+-    def test_deprecatedRPort(self):
+-        """
+-        Setting rport to True is deprecated, but still produces a Via header
+-        with the expected properties.
+-        """
+-        v = sip.Via("foo.bar", rport=True)
+-
+-        warnings = self.flushWarnings(
+-            offendingFunctions=[self.test_deprecatedRPort])
+-        self.assertEqual(len(warnings), 1)
+-        self.assertEqual(
+-            warnings[0]['message'],
+-            'rport=True is deprecated since Twisted 9.0.')
+-        self.assertEqual(
+-            warnings[0]['category'],
+-            DeprecationWarning)
+-
+-        self.assertEqual(v.toString(), "SIP/2.0/UDP foo.bar:5060;rport")
+-        self.assertEqual(v.rport, True)
+-        self.assertEqual(v.rportRequested, True)
+-        self.assertEqual(v.rportValue, None)
+-
+-
+-    def test_rport(self):
+-        """
+-        An rport setting of None should insert the parameter with no value.
+-        """
+-        v = sip.Via("foo.bar", rport=None)
+-        self.assertEqual(v.toString(), "SIP/2.0/UDP foo.bar:5060;rport")
+-        self.assertEqual(v.rportRequested, True)
+-        self.assertEqual(v.rportValue, None)
+-
+-
+-    def test_rportValue(self):
+-        """
+-        An rport numeric setting should insert the parameter with the number
+-        value given.
+-        """
+-        v = sip.Via("foo.bar", rport=1)
+-        self.assertEqual(v.toString(), "SIP/2.0/UDP foo.bar:5060;rport=1")
+-        self.assertEqual(v.rportRequested, False)
+-        self.assertEqual(v.rportValue, 1)
+-        self.assertEqual(v.rport, 1)
+-
+-
+-    def testNAT(self):
+-        s = "SIP/2.0/UDP 10.0.0.1:5060;received=22.13.1.5;rport=12345"
+-        v = sip.parseViaHeader(s)
+-        self.assertEqual(v.transport, "UDP")
+-        self.assertEqual(v.host, "10.0.0.1")
+-        self.assertEqual(v.port, 5060)
+-        self.assertEqual(v.received, "22.13.1.5")
+-        self.assertEqual(v.rport, 12345)
+-
+-        self.assertNotEquals(v.toString().find("rport=12345"), -1)
+-
+-
+-    def test_unknownParams(self):
+-       """
+-       Parsing and serializing Via headers with unknown parameters should work.
+-       """
+-       s = "SIP/2.0/UDP example.com:5060;branch=a12345b;bogus;pie=delicious"
+-       v = sip.parseViaHeader(s)
+-       self.assertEqual(v.toString(), s)
+-
+-
+-
+-class URLTestCase(unittest.TestCase):
+-
+-    def testRoundtrip(self):
+-        for url in [
+-            "sip:j.doe@big.com",
+-            "sip:j.doe:secret@big.com;transport=tcp",
+-            "sip:j.doe@big.com?subject=project",
+-            "sip:example.com",
+-            ]:
+-            self.assertEqual(sip.parseURL(url).toString(), url)
+-
+-    def testComplex(self):
+-        s = ("sip:user:pass@hosta:123;transport=udp;user=phone;method=foo;"
+-             "ttl=12;maddr=1.2.3.4;blah;goo=bar?a=b&c=d")
+-        url = sip.parseURL(s)
+-        for k, v in [("username", "user"), ("password", "pass"),
+-                     ("host", "hosta"), ("port", 123),
+-                     ("transport", "udp"), ("usertype", "phone"),
+-                     ("method", "foo"), ("ttl", 12),
+-                     ("maddr", "1.2.3.4"), ("other", ["blah", "goo=bar"]),
+-                     ("headers", {"a": "b", "c": "d"})]:
+-            self.assertEqual(getattr(url, k), v)
+-
+-
+-class ParseTestCase(unittest.TestCase):
+-
+-    def testParseAddress(self):
+-        for address, name, urls, params in [
+-            ('"A. G. Bell" <sip:foo@example.com>',
+-             "A. G. Bell", "sip:foo@example.com", {}),
+-            ("Anon <sip:foo@example.com>", "Anon", "sip:foo@example.com", {}),
+-            ("sip:foo@example.com", "", "sip:foo@example.com", {}),
+-            ("<sip:foo@example.com>", "", "sip:foo@example.com", {}),
+-            ("foo <sip:foo@example.com>;tag=bar;foo=baz", "foo",
+-             "sip:foo@example.com", {"tag": "bar", "foo": "baz"}),
+-            ]:
+-            gname, gurl, gparams = sip.parseAddress(address)
+-            self.assertEqual(name, gname)
+-            self.assertEqual(gurl.toString(), urls)
+-            self.assertEqual(gparams, params)
+-
+-
+-class DummyLocator:
+-    implements(sip.ILocator)
+-    def getAddress(self, logicalURL):
+-        return defer.succeed(sip.URL("server.com", port=5060))
+-
+-class FailingLocator:
+-    implements(sip.ILocator)
+-    def getAddress(self, logicalURL):
+-        return defer.fail(LookupError())
+-
+-
+-class ProxyTestCase(unittest.TestCase):
+-
+-    def setUp(self):
+-        self.proxy = sip.Proxy("127.0.0.1")
+-        self.proxy.locator = DummyLocator()
+-        self.sent = []
+-        self.proxy.sendMessage = lambda dest, msg: self.sent.append((dest, msg))
+-
+-    def testRequestForward(self):
+-        r = sip.Request("INVITE", "sip:foo")
+-        r.addHeader("via", sip.Via("1.2.3.4").toString())
+-        r.addHeader("via", sip.Via("1.2.3.5").toString())
+-        r.addHeader("foo", "bar")
+-        r.addHeader("to", "<sip:joe@server.com>")
+-        r.addHeader("contact", "<sip:joe@1.2.3.5>")
+-        self.proxy.datagramReceived(r.toString(), ("1.2.3.4", 5060))
+-        self.assertEqual(len(self.sent), 1)
+-        dest, m = self.sent[0]
+-        self.assertEqual(dest.port, 5060)
+-        self.assertEqual(dest.host, "server.com")
+-        self.assertEqual(m.uri.toString(), "sip:foo")
+-        self.assertEqual(m.method, "INVITE")
+-        self.assertEqual(m.headers["via"],
+-                          ["SIP/2.0/UDP 127.0.0.1:5060",
+-                           "SIP/2.0/UDP 1.2.3.4:5060",
+-                           "SIP/2.0/UDP 1.2.3.5:5060"])
+-
+-
+-    def testReceivedRequestForward(self):
+-        r = sip.Request("INVITE", "sip:foo")
+-        r.addHeader("via", sip.Via("1.2.3.4").toString())
+-        r.addHeader("foo", "bar")
+-        r.addHeader("to", "<sip:joe@server.com>")
+-        r.addHeader("contact", "<sip:joe@1.2.3.4>")
+-        self.proxy.datagramReceived(r.toString(), ("1.1.1.1", 5060))
+-        dest, m = self.sent[0]
+-        self.assertEqual(m.headers["via"],
+-                          ["SIP/2.0/UDP 127.0.0.1:5060",
+-                           "SIP/2.0/UDP 1.2.3.4:5060;received=1.1.1.1"])
+-
+-
+-    def testResponseWrongVia(self):
+-        # first via must match proxy's address
+-        r = sip.Response(200)
+-        r.addHeader("via", sip.Via("foo.com").toString())
+-        self.proxy.datagramReceived(r.toString(), ("1.1.1.1", 5060))
+-        self.assertEqual(len(self.sent), 0)
+-
+-    def testResponseForward(self):
+-        r = sip.Response(200)
+-        r.addHeader("via", sip.Via("127.0.0.1").toString())
+-        r.addHeader("via", sip.Via("client.com", port=1234).toString())
+-        self.proxy.datagramReceived(r.toString(), ("1.1.1.1", 5060))
+-        self.assertEqual(len(self.sent), 1)
+-        dest, m = self.sent[0]
+-        self.assertEqual((dest.host, dest.port), ("client.com", 1234))
+-        self.assertEqual(m.code, 200)
+-        self.assertEqual(m.headers["via"], ["SIP/2.0/UDP client.com:1234"])
+-
+-    def testReceivedResponseForward(self):
+-        r = sip.Response(200)
+-        r.addHeader("via", sip.Via("127.0.0.1").toString())
+-        r.addHeader(
+-            "via",
+-            sip.Via("10.0.0.1", received="client.com").toString())
+-        self.proxy.datagramReceived(r.toString(), ("1.1.1.1", 5060))
+-        self.assertEqual(len(self.sent), 1)
+-        dest, m = self.sent[0]
+-        self.assertEqual((dest.host, dest.port), ("client.com", 5060))
+-
+-    def testResponseToUs(self):
+-        r = sip.Response(200)
+-        r.addHeader("via", sip.Via("127.0.0.1").toString())
+-        l = []
+-        self.proxy.gotResponse = lambda *a: l.append(a)
+-        self.proxy.datagramReceived(r.toString(), ("1.1.1.1", 5060))
+-        self.assertEqual(len(l), 1)
+-        m, addr = l[0]
+-        self.assertEqual(len(m.headers.get("via", [])), 0)
+-        self.assertEqual(m.code, 200)
+-
+-    def testLoop(self):
+-        r = sip.Request("INVITE", "sip:foo")
+-        r.addHeader("via", sip.Via("1.2.3.4").toString())
+-        r.addHeader("via", sip.Via("127.0.0.1").toString())
+-        self.proxy.datagramReceived(r.toString(), ("client.com", 5060))
+-        self.assertEqual(self.sent, [])
+-
+-    def testCantForwardRequest(self):
+-        r = sip.Request("INVITE", "sip:foo")
+-        r.addHeader("via", sip.Via("1.2.3.4").toString())
+-        r.addHeader("to", "<sip:joe@server.com>")
+-        self.proxy.locator = FailingLocator()
+-        self.proxy.datagramReceived(r.toString(), ("1.2.3.4", 5060))
+-        self.assertEqual(len(self.sent), 1)
+-        dest, m = self.sent[0]
+-        self.assertEqual((dest.host, dest.port), ("1.2.3.4", 5060))
+-        self.assertEqual(m.code, 404)
+-        self.assertEqual(m.headers["via"], ["SIP/2.0/UDP 1.2.3.4:5060"])
+-
+-    def testCantForwardResponse(self):
+-        pass
+-
+-    #testCantForwardResponse.skip = "not implemented yet"
+-
+-
+-class RegistrationTestCase(unittest.TestCase):
+-
+-    def setUp(self):
+-        self.proxy = sip.RegisterProxy(host="127.0.0.1")
+-        self.registry = sip.InMemoryRegistry("bell.example.com")
+-        self.proxy.registry = self.proxy.locator = self.registry
+-        self.sent = []
+-        self.proxy.sendMessage = lambda dest, msg: self.sent.append((dest, msg))
+-    setUp = utils.suppressWarnings(setUp,
+-        util.suppress(category=DeprecationWarning,
+-            message=r'twisted.protocols.sip.DigestAuthorizer was deprecated'))
+-
+-    def tearDown(self):
+-        for d, uri in self.registry.users.values():
+-            d.cancel()
+-        del self.proxy
+-
+-    def register(self):
+-        r = sip.Request("REGISTER", "sip:bell.example.com")
+-        r.addHeader("to", "sip:joe@bell.example.com")
+-        r.addHeader("contact", "sip:joe@client.com:1234")
+-        r.addHeader("via", sip.Via("client.com").toString())
+-        self.proxy.datagramReceived(r.toString(), ("client.com", 5060))
+-
+-    def unregister(self):
+-        r = sip.Request("REGISTER", "sip:bell.example.com")
+-        r.addHeader("to", "sip:joe@bell.example.com")
+-        r.addHeader("contact", "*")
+-        r.addHeader("via", sip.Via("client.com").toString())
+-        r.addHeader("expires", "0")
+-        self.proxy.datagramReceived(r.toString(), ("client.com", 5060))
+-
+-    def testRegister(self):
+-        self.register()
+-        dest, m = self.sent[0]
+-        self.assertEqual((dest.host, dest.port), ("client.com", 5060))
+-        self.assertEqual(m.code, 200)
+-        self.assertEqual(m.headers["via"], ["SIP/2.0/UDP client.com:5060"])
+-        self.assertEqual(m.headers["to"], ["sip:joe@bell.example.com"])
+-        self.assertEqual(m.headers["contact"], ["sip:joe@client.com:5060"])
+-        self.failUnless(
+-            int(m.headers["expires"][0]) in (3600, 3601, 3599, 3598))
+-        self.assertEqual(len(self.registry.users), 1)
+-        dc, uri = self.registry.users["joe"]
+-        self.assertEqual(uri.toString(), "sip:joe@client.com:5060")
+-        d = self.proxy.locator.getAddress(sip.URL(username="joe",
+-                                                  host="bell.example.com"))
+-        d.addCallback(lambda desturl : (desturl.host, desturl.port))
+-        d.addCallback(self.assertEqual, ('client.com', 5060))
+-        return d
+-
+-    def testUnregister(self):
+-        self.register()
+-        self.unregister()
+-        dest, m = self.sent[1]
+-        self.assertEqual((dest.host, dest.port), ("client.com", 5060))
+-        self.assertEqual(m.code, 200)
+-        self.assertEqual(m.headers["via"], ["SIP/2.0/UDP client.com:5060"])
+-        self.assertEqual(m.headers["to"], ["sip:joe@bell.example.com"])
+-        self.assertEqual(m.headers["contact"], ["sip:joe@client.com:5060"])
+-        self.assertEqual(m.headers["expires"], ["0"])
+-        self.assertEqual(self.registry.users, {})
+-
+-
+-    def addPortal(self):
+-        r = TestRealm()
+-        p = cred.portal.Portal(r)
+-        c = cred.checkers.InMemoryUsernamePasswordDatabaseDontUse()
+-        c.addUser('userXname@127.0.0.1', 'passXword')
+-        p.registerChecker(c)
+-        self.proxy.portal = p
+-
+-    def testFailedAuthentication(self):
+-        self.addPortal()
+-        self.register()
+-
+-        self.assertEqual(len(self.registry.users), 0)
+-        self.assertEqual(len(self.sent), 1)
+-        dest, m = self.sent[0]
+-        self.assertEqual(m.code, 401)
+-
+-
+-    def test_basicAuthentication(self):
+-        """
+-        Test that registration with basic authentication suceeds.
+-        """
+-        self.addPortal()
+-        self.proxy.authorizers = self.proxy.authorizers.copy()
+-        self.proxy.authorizers['basic'] = sip.BasicAuthorizer()
+-        warnings = self.flushWarnings(
+-            offendingFunctions=[self.test_basicAuthentication])
+-        self.assertEqual(len(warnings), 1)
+-        self.assertEqual(
+-            warnings[0]['message'],
+-            "twisted.protocols.sip.BasicAuthorizer was deprecated in "
+-            "Twisted 9.0.0")
+-        self.assertEqual(
+-            warnings[0]['category'],
+-            DeprecationWarning)
+-        r = sip.Request("REGISTER", "sip:bell.example.com")
+-        r.addHeader("to", "sip:joe@bell.example.com")
+-        r.addHeader("contact", "sip:joe@client.com:1234")
+-        r.addHeader("via", sip.Via("client.com").toString())
+-        r.addHeader("authorization",
+-                    "Basic " + "userXname:passXword".encode('base64'))
+-        self.proxy.datagramReceived(r.toString(), ("client.com", 5060))
+-
+-        self.assertEqual(len(self.registry.users), 1)
+-        self.assertEqual(len(self.sent), 1)
+-        dest, m = self.sent[0]
+-        self.assertEqual(m.code, 200)
+-
+-
+-    def test_failedBasicAuthentication(self):
+-        """
+-        Failed registration with basic authentication results in an
+-        unauthorized error response.
+-        """
+-        self.addPortal()
+-        self.proxy.authorizers = self.proxy.authorizers.copy()
+-        self.proxy.authorizers['basic'] = sip.BasicAuthorizer()
+-        warnings = self.flushWarnings(
+-            offendingFunctions=[self.test_failedBasicAuthentication])
+-        self.assertEqual(len(warnings), 1)
+-        self.assertEqual(
+-            warnings[0]['message'],
+-            "twisted.protocols.sip.BasicAuthorizer was deprecated in "
+-            "Twisted 9.0.0")
+-        self.assertEqual(
+-            warnings[0]['category'],
+-            DeprecationWarning)
+-        r = sip.Request("REGISTER", "sip:bell.example.com")
+-        r.addHeader("to", "sip:joe@bell.example.com")
+-        r.addHeader("contact", "sip:joe@client.com:1234")
+-        r.addHeader("via", sip.Via("client.com").toString())
+-        r.addHeader(
+-            "authorization", "Basic " + "userXname:password".encode('base64'))
+-        self.proxy.datagramReceived(r.toString(), ("client.com", 5060))
+-
+-        self.assertEqual(len(self.registry.users), 0)
+-        self.assertEqual(len(self.sent), 1)
+-        dest, m = self.sent[0]
+-        self.assertEqual(m.code, 401)
+-
+-
+-    def testWrongDomainRegister(self):
+-        r = sip.Request("REGISTER", "sip:wrong.com")
+-        r.addHeader("to", "sip:joe@bell.example.com")
+-        r.addHeader("contact", "sip:joe@client.com:1234")
+-        r.addHeader("via", sip.Via("client.com").toString())
+-        self.proxy.datagramReceived(r.toString(), ("client.com", 5060))
+-        self.assertEqual(len(self.sent), 0)
+-
+-    def testWrongToDomainRegister(self):
+-        r = sip.Request("REGISTER", "sip:bell.example.com")
+-        r.addHeader("to", "sip:joe@foo.com")
+-        r.addHeader("contact", "sip:joe@client.com:1234")
+-        r.addHeader("via", sip.Via("client.com").toString())
+-        self.proxy.datagramReceived(r.toString(), ("client.com", 5060))
+-        self.assertEqual(len(self.sent), 0)
+-
+-    def testWrongDomainLookup(self):
+-        self.register()
+-        url = sip.URL(username="joe", host="foo.com")
+-        d = self.proxy.locator.getAddress(url)
+-        self.assertFailure(d, LookupError)
+-        return d
+-
+-    def testNoContactLookup(self):
+-        self.register()
+-        url = sip.URL(username="jane", host="bell.example.com")
+-        d = self.proxy.locator.getAddress(url)
+-        self.assertFailure(d, LookupError)
+-        return d
+-
+-
+-class Client(sip.Base):
+-
+-    def __init__(self):
+-        sip.Base.__init__(self)
+-        self.received = []
+-        self.deferred = defer.Deferred()
+-
+-    def handle_response(self, response, addr):
+-        self.received.append(response)
+-        self.deferred.callback(self.received)
+-
+-
+-class LiveTest(unittest.TestCase):
+-
+-    def setUp(self):
+-        self.proxy = sip.RegisterProxy(host="127.0.0.1")
+-        self.registry = sip.InMemoryRegistry("bell.example.com")
+-        self.proxy.registry = self.proxy.locator = self.registry
+-        self.serverPort = reactor.listenUDP(
+-            0, self.proxy, interface="127.0.0.1")
+-        self.client = Client()
+-        self.clientPort = reactor.listenUDP(
+-            0, self.client, interface="127.0.0.1")
+-        self.serverAddress = (self.serverPort.getHost().host,
+-                              self.serverPort.getHost().port)
+-    setUp = utils.suppressWarnings(setUp,
+-        util.suppress(category=DeprecationWarning,
+-            message=r'twisted.protocols.sip.DigestAuthorizer was deprecated'))
+-
+-    def tearDown(self):
+-        for d, uri in self.registry.users.values():
+-            d.cancel()
+-        d1 = defer.maybeDeferred(self.clientPort.stopListening)
+-        d2 = defer.maybeDeferred(self.serverPort.stopListening)
+-        return defer.gatherResults([d1, d2])
+-
+-    def testRegister(self):
+-        p = self.clientPort.getHost().port
+-        r = sip.Request("REGISTER", "sip:bell.example.com")
+-        r.addHeader("to", "sip:joe@bell.example.com")
+-        r.addHeader("contact", "sip:joe@127.0.0.1:%d" % p)
+-        r.addHeader("via", sip.Via("127.0.0.1", port=p).toString())
+-        self.client.sendMessage(
+-            sip.URL(host="127.0.0.1", port=self.serverAddress[1]), r)
+-        d = self.client.deferred
+-        def check(received):
+-            self.assertEqual(len(received), 1)
+-            r = received[0]
+-            self.assertEqual(r.code, 200)
+-        d.addCallback(check)
+-        return d
+-
+-    def test_amoralRPort(self):
+-        """
+-        rport is allowed without a value, apparently because server
+-        implementors might be too stupid to check the received port
+-        against 5060 and see if they're equal, and because client
+-        implementors might be too stupid to bind to port 5060, or set a
+-        value on the rport parameter they send if they bind to another
+-        port.
+-        """
+-        p = self.clientPort.getHost().port
+-        r = sip.Request("REGISTER", "sip:bell.example.com")
+-        r.addHeader("to", "sip:joe@bell.example.com")
+-        r.addHeader("contact", "sip:joe@127.0.0.1:%d" % p)
+-        r.addHeader("via", sip.Via("127.0.0.1", port=p, rport=True).toString())
+-        warnings = self.flushWarnings(
+-            offendingFunctions=[self.test_amoralRPort])
+-        self.assertEqual(len(warnings), 1)
+-        self.assertEqual(
+-            warnings[0]['message'],
+-            'rport=True is deprecated since Twisted 9.0.')
+-        self.assertEqual(
+-            warnings[0]['category'],
+-            DeprecationWarning)
+-        self.client.sendMessage(sip.URL(host="127.0.0.1",
+-                                        port=self.serverAddress[1]),
+-                                r)
+-        d = self.client.deferred
+-        def check(received):
+-            self.assertEqual(len(received), 1)
+-            r = received[0]
+-            self.assertEqual(r.code, 200)
+-        d.addCallback(check)
+-        return d
+-
+-
+-
+-registerRequest = """
+-REGISTER sip:intarweb.us SIP/2.0\r
+-Via: SIP/2.0/UDP 192.168.1.100:50609\r
+-From: <sip:exarkun@intarweb.us:50609>\r
+-To: <sip:exarkun@intarweb.us:50609>\r
+-Contact: "exarkun" <sip:exarkun@192.168.1.100:50609>\r
+-Call-ID: 94E7E5DAF39111D791C6000393764646@intarweb.us\r
+-CSeq: 9898 REGISTER\r
+-Expires: 500\r
+-User-Agent: X-Lite build 1061\r
+-Content-Length: 0\r
+-\r
+-"""
+-
+-challengeResponse = """\
+-SIP/2.0 401 Unauthorized\r
+-Via: SIP/2.0/UDP 192.168.1.100:50609;received=127.0.0.1;rport=5632\r
+-To: <sip:exarkun@intarweb.us:50609>\r
+-From: <sip:exarkun@intarweb.us:50609>\r
+-Call-ID: 94E7E5DAF39111D791C6000393764646@intarweb.us\r
+-CSeq: 9898 REGISTER\r
+-WWW-Authenticate: Digest nonce="92956076410767313901322208775",opaque="1674186428",qop-options="auth",algorithm="MD5",realm="intarweb.us"\r
+-\r
+-"""
+-
+-authRequest = """\
+-REGISTER sip:intarweb.us SIP/2.0\r
+-Via: SIP/2.0/UDP 192.168.1.100:50609\r
+-From: <sip:exarkun@intarweb.us:50609>\r
+-To: <sip:exarkun@intarweb.us:50609>\r
+-Contact: "exarkun" <sip:exarkun@192.168.1.100:50609>\r
+-Call-ID: 94E7E5DAF39111D791C6000393764646@intarweb.us\r
+-CSeq: 9899 REGISTER\r
+-Expires: 500\r
+-Authorization: Digest username="exarkun",realm="intarweb.us",nonce="92956076410767313901322208775",response="4a47980eea31694f997369214292374b",uri="sip:intarweb.us",algorithm=MD5,opaque="1674186428"\r
+-User-Agent: X-Lite build 1061\r
+-Content-Length: 0\r
+-\r
+-"""
+-
+-okResponse = """\
+-SIP/2.0 200 OK\r
+-Via: SIP/2.0/UDP 192.168.1.100:50609;received=127.0.0.1;rport=5632\r
+-To: <sip:exarkun@intarweb.us:50609>\r
+-From: <sip:exarkun@intarweb.us:50609>\r
+-Call-ID: 94E7E5DAF39111D791C6000393764646@intarweb.us\r
+-CSeq: 9899 REGISTER\r
+-Contact: sip:exarkun@127.0.0.1:5632\r
+-Expires: 3600\r
+-Content-Length: 0\r
+-\r
+-"""
+-
+-class FakeDigestAuthorizer(sip.DigestAuthorizer):
+-    def generateNonce(self):
+-        return '92956076410767313901322208775'
+-    def generateOpaque(self):
+-        return '1674186428'
+-
+-
+-class FakeRegistry(sip.InMemoryRegistry):
+-    """Make sure expiration is always seen to be 3600.
+-
+-    Otherwise slow reactors fail tests incorrectly.
+-    """
+-
+-    def _cbReg(self, reg):
+-        if 3600 < reg.secondsToExpiry or reg.secondsToExpiry < 3598:
+-            raise RuntimeError(
+-                "bad seconds to expire: %s" % reg.secondsToExpiry)
+-        reg.secondsToExpiry = 3600
+-        return reg
+-
+-    def getRegistrationInfo(self, uri):
+-        d = sip.InMemoryRegistry.getRegistrationInfo(self, uri)
+-        return d.addCallback(self._cbReg)
+-
+-    def registerAddress(self, domainURL, logicalURL, physicalURL):
+-        d = sip.InMemoryRegistry.registerAddress(
+-            self, domainURL, logicalURL, physicalURL)
+-        return d.addCallback(self._cbReg)
+-
+-class AuthorizationTestCase(unittest.TestCase):
+-    def setUp(self):
+-        self.proxy = sip.RegisterProxy(host="intarweb.us")
+-        self.proxy.authorizers = self.proxy.authorizers.copy()
+-        self.proxy.authorizers['digest'] = FakeDigestAuthorizer()
+-
+-        self.registry = FakeRegistry("intarweb.us")
+-        self.proxy.registry = self.proxy.locator = self.registry
+-        self.transport = proto_helpers.FakeDatagramTransport()
+-        self.proxy.transport = self.transport
+-
+-        r = TestRealm()
+-        p = cred.portal.Portal(r)
+-        c = cred.checkers.InMemoryUsernamePasswordDatabaseDontUse()
+-        c.addUser('exarkun@intarweb.us', 'password')
+-        p.registerChecker(c)
+-        self.proxy.portal = p
+-    setUp = utils.suppressWarnings(setUp,
+-        util.suppress(category=DeprecationWarning,
+-            message=r'twisted.protocols.sip.DigestAuthorizer was deprecated'))
+-
+-    def tearDown(self):
+-        for d, uri in self.registry.users.values():
+-            d.cancel()
+-        del self.proxy
+-
+-    def testChallenge(self):
+-        self.proxy.datagramReceived(registerRequest, ("127.0.0.1", 5632))
+-
+-        self.assertEqual(
+-            self.transport.written[-1],
+-            ((challengeResponse, ("127.0.0.1", 5632)))
+-        )
+-        self.transport.written = []
+-
+-        self.proxy.datagramReceived(authRequest, ("127.0.0.1", 5632))
+-
+-        self.assertEqual(
+-            self.transport.written[-1],
+-            ((okResponse, ("127.0.0.1", 5632)))
+-        )
+-    testChallenge.suppress = [
+-        util.suppress(
+-            category=DeprecationWarning,
+-            message=r'twisted.protocols.sip.DigestAuthorizer was deprecated'),
+-        util.suppress(
+-            category=DeprecationWarning,
+-            message=r'twisted.protocols.sip.DigestedCredentials was deprecated'),
+-        util.suppress(
+-            category=DeprecationWarning,
+-            message=r'twisted.protocols.sip.DigestCalcHA1 was deprecated'),
+-        util.suppress(
+-            category=DeprecationWarning,
+-            message=r'twisted.protocols.sip.DigestCalcResponse was deprecated')]
+-
+-
+-
+-class DeprecationTests(unittest.TestCase):
+-    """
+-    Tests for deprecation of obsolete components of L{twisted.protocols.sip}.
+-    """
+-
+-    def test_deprecatedDigestCalcHA1(self):
+-        """
+-        L{sip.DigestCalcHA1} is deprecated.
+-        """
+-        self.callDeprecated(Version("Twisted", 9, 0, 0),
+-                            sip.DigestCalcHA1, '', '', '', '', '', '')
+-
+-
+-    def test_deprecatedDigestCalcResponse(self):
+-        """
+-        L{sip.DigestCalcResponse} is deprecated.
+-        """
+-        self.callDeprecated(Version("Twisted", 9, 0, 0),
+-                            sip.DigestCalcResponse, '', '', '', '', '', '', '',
+-                            '')
+-
+-    def test_deprecatedBasicAuthorizer(self):
+-        """
+-        L{sip.BasicAuthorizer} is deprecated.
+-        """
+-        self.callDeprecated(Version("Twisted", 9, 0, 0), sip.BasicAuthorizer)
+-
+-
+-    def test_deprecatedDigestAuthorizer(self):
+-        """
+-        L{sip.DigestAuthorizer} is deprecated.
+-        """
+-        self.callDeprecated(Version("Twisted", 9, 0, 0), sip.DigestAuthorizer)
+-
+-
+-    def test_deprecatedDigestedCredentials(self):
+-        """
+-        L{sip.DigestedCredentials} is deprecated.
+-        """
+-        self.callDeprecated(Version("Twisted", 9, 0, 0),
+-                            sip.DigestedCredentials, '', {}, {})
+Index: twisted/protocols/test/test_sip.py
+===================================================================
+--- twisted/protocols/test/test_sip.py	(revision 33739)
++++ twisted/protocols/test/test_sip.py	(working copy)
+@@ -28,6 +28,7 @@
+ 
+ abcd""".replace("\n", "\r\n")
+ 
++
+ # request, no content-length
+ request2 = """INVITE sip:foo SIP/2.0
+ From: mo
+@@ -35,6 +36,7 @@
+ 
+ 1234""".replace("\n", "\r\n")
+ 
++
+ # request, with garbage after
+ request3 = """INVITE sip:foo SIP/2.0
+ From: mo
+@@ -45,6 +47,7 @@
+ 
+ lalalal""".replace("\n", "\r\n")
+ 
++
+ # three requests
+ request4 = """INVITE sip:foo SIP/2.0
+ From: mo
+@@ -63,6 +66,7 @@
+ 
+ 1234""".replace("\n", "\r\n")
+ 
++
+ # response, no content
+ response1 = """SIP/2.0 200 OK
+ From:  foo
+@@ -71,6 +75,7 @@
+ 
+ """.replace("\n", "\r\n")
+ 
++
+ # short header version
+ request_short = """\
+ INVITE sip:foo SIP/2.0
+@@ -80,16 +85,49 @@
+ 
+ abcd""".replace("\n", "\r\n")
+ 
++
+ request_natted = """\
+ INVITE sip:foo SIP/2.0
+ Via: SIP/2.0/UDP 10.0.0.1:5060;rport
+ 
+ """.replace("\n", "\r\n")
+ 
++
++
+ class TestRealm:
+     def requestAvatar(self, avatarId, mind, *interfaces):
+         return sip.IContact, None, lambda: None
+ 
++
++
++class TestHeaderCapitalize(unittest.TestCase):
++
++    def test_simpleHeaderCapitalized(self):
++        r = sip.Request("INVITE", "sip:foo")
++        r.addHeader("foo", "bar")
++        self.assertEqual(
++            r.toString(),
++            "INVITE sip:foo SIP/2.0\r\nFoo: bar\r\n\r\n")
++
++
++    def test_complexHeaderCapitalized(self):
++        r = sip.Request("INVITE", "sip:foo")
++        r.addHeader("foo-bar-baz", "quux")
++        self.assertEqual(
++            r.toString(),
++            "INVITE sip:foo SIP/2.0\r\nFoo-Bar-Baz: quux\r\n\r\n")
++
++
++    def test_specialCaseHeaderCapitalized(self):
++        r = sip.Request("INVITE", "sip:foo")
++        r.addHeader("www-authenticate", "foo")
++        self.assertEqual(
++            r.toString(),
++            "INVITE sip:foo SIP/2.0\r\nWWW-Authenticate: foo\r\n\r\n")
++
++
++
++
+ class MessageParsingTestCase(unittest.TestCase):
+     def setUp(self):
+         self.l = []
+@@ -337,41 +375,210 @@
+ 
+ 
+ 
+-class URLTestCase(unittest.TestCase):
++class URITestCase(unittest.TestCase):
++    """
++    Tests for L{sip.URI} and {sip.parseURL}.
++    """
+ 
+     def testRoundtrip(self):
+         for url in [
+             "sip:j.doe@big.com",
+             "sip:j.doe:secret@big.com;transport=tcp",
+-            "sip:j.doe@big.com?subject=project",
++            "sip:j.doe@big.com?Subject=project",
+             "sip:example.com",
+             ]:
+             self.assertEqual(sip.parseURL(url).toString(), url)
+ 
+-    def testComplex(self):
++
++    def test_complex(self):
++        """
++        Test parsing and printing a URI with one of everything.
++        """
+         s = ("sip:user:pass@hosta:123;transport=udp;user=phone;method=foo;"
+-             "ttl=12;maddr=1.2.3.4;blah;goo=bar?a=b&c=d")
++             "ttl=12;maddr=1.2.3.4;blah;goo=bar?foo-baz=b&c=d")
+         url = sip.parseURL(s)
+         for k, v in [("username", "user"), ("password", "pass"),
+                      ("host", "hosta"), ("port", 123),
+                      ("transport", "udp"), ("usertype", "phone"),
+                      ("method", "foo"), ("ttl", 12),
+-                     ("maddr", "1.2.3.4"), ("other", ["blah", "goo=bar"]),
+-                     ("headers", {"a": "b", "c": "d"})]:
++                     ("maddr", "1.2.3.4"), ("other", {"blah": "",
++                                                      "goo": "bar"}),
++                     ("headers", {"foo-baz": "b", "c": "d"})]:
+             self.assertEqual(getattr(url, k), v)
++        self.assertEquals(
++            str(url),
++            'sip:user:pass@hosta:123;user=phone;transport=udp;'
++            'ttl=12;maddr=1.2.3.4;method=foo;blah;goo=bar?C=d&Foo-Baz=b')
+ 
+ 
++    def test_headers(self):
++        """
++        SIP headers included in the URI are parsed correctly.
++        """
++
++        uris = ["sip:foo@bar.com?header=value",
++                "sip:foo@bar.com:5060?header=value",
++                "sip:foo@bar.com;method=invite?header=value"]
++        for uri in uris:
++            self.assertEquals(sip.parseURL(uri).headers,
++                              {"header": "value"})
++
++
++    def test_invalidScheme(self):
++        """
++        Attempts to parse unsupported URI schemes are rejected.
++        """
++        self.assertRaises(sip.SIPError, sip.parseURL, "http://example.com/")
++        self.assertRaises(sip.SIPError, sip.parseURL, "sips:bob@example.com")
++
++
++    def test_hash(self):
++        """
++        URIs are hashable.
++        """
++        s1 = ("sip:user:pass@hosta:123;transport=udp;user=phone;method=foo;"
++             "ttl=12;maddr=1.2.3.4;blah;goo=bar?foo-baz=b&c=d")
++        s2 = ("sip:user:pass@hostb:123;transport=udp;user=phone;method=foo;"
++             "ttl=12;maddr=1.2.3.4;blah;goo=bar?foo-baz=b&c=d")
++        s3 = ("sip:user:pass@hosta:123;transport=udp;user=voip;method=foo;"
++             "ttl=12;maddr=1.2.3.4;blah;goo=bar?foo-baz=b&c=d")
++        s4 = ("sip:user:pass@hosta:123;transport=udp;user=phone;method=foo;"
++             "ttl=16;maddr=1.2.3.4;blah;goo=bar?foo-baz=b&c=d")
++        s5 = ("sip:user:pass@hosta:123;transport=udp;user=phone;method=foo;"
++             "ttl=12;maddr=1.2.3.5;blah;goo=bar?foo-baz=b&c=d")
++        s6 = ("sip:user:pass@hosta:123;transport=udp;user=phone;method=foo;"
++             "ttl=12;maddr=1.2.3.4;blah;foo=bar?foo-baz=b&c=d")
++        s7 = ("sip:user:pass@hosta:123;transport=udp;user=phone;method=foo;"
++             "ttl=12;maddr=1.2.3.4;blah;goo=bar?foo-baz=b&c=e")
++        d = {
++            sip.URI("example.com"): -2,
++            sip.URI("example.com", "bob"): -1,
++            }
++        for i, s in enumerate([s1, s2, s3, s4, s5, s6, s7]):
++            d[sip.parseURL(s)] = i
++        self.assertEqual(d[sip.URI("example.com")], -2)
++        self.assertEqual(d[sip.URI("example.com", "bob")], -1)
++        for i, s in enumerate([s1, s2, s3, s4, s5, s6, s7]):
++            self.assertEqual(d[sip.parseURL(s)], i)
++
++
++    def test_escaping(self):
++        """
++        Percent-encoded characters are decoded and encoded correctly.
++        """
++        uriString = ("sip:sips%3Auser%40example.com:x%20x@example.net"
++                           ";m%65thod=foo%00baz?a%62c-foo=de%66")
++        uri = sip.parseURL(uriString)
++        self.assertEqual(uri.username, "sips:user@example.com")
++        self.assertEqual(uri.password, "x x")
++        self.assertEqual(uri.method, "foo\x00baz")
++        self.assertEqual(uri.headers, {"abc-foo": "def"})
++        self.assertEqual(uri.toString(),
++                         ("sip:sips%3Auser%40example.com:x%20x@example.net"
++                           ";method=foo%00baz?Abc-Foo=def"))
++
++
++    def test_equivalence(self):
++        """
++        All the URIs the RFC says are equivalent should compare equal.
++        """
++        def assertEquivalentURIs(l, r):
++            self.assertEqual(sip.parseURL(l), sip.parseURL(r))
++
++        assertEquivalentURIs("sip:%61lice@atlanta.com;transport=TCP",
++                             "sip:alice@AtLanTa.CoM;Transport=tcp")
++        assertEquivalentURIs("sip:carol@chicago.com",
++                             "sip:carol@chicago.com;newparam=5")
++        assertEquivalentURIs("sip:carol@chicago.com",
++                             "sip:carol@chicago.com;security=on")
++        assertEquivalentURIs("sip:carol@chicago.com;security=on",
++                             "sip:carol@chicago.com;newparam=5")
++        assertEquivalentURIs("sip:biloxi.com;transport=tcp;method=REGISTER?"
++                             "to=sip:bob%40biloxi.com",
++                             "sip:biloxi.com;method=REGISTER;transport=tcp?"
++                             "to=sip:bob%40biloxi.com")
++        assertEquivalentURIs("sip:alice@atlanta.com?subject=project%20x"
++                             "&priority=urgent",
++                             "sip:alice@atlanta.com?priority=urgent&"
++                             "subject=project%20x")
++
++
++    def test_nonequivalence(self):
++        """
++        Ensure that certain difference between similar URIs prevent them from
++        comparing equal.
++        """
++        def assertNonequivalent(l, r):
++            self.assertNotEqual(sip.parseURL(l), sip.parseURL(r))
++
++        assertNonequivalent("sip:carol@chicago.com;security=off",
++                            "sip:carol@chicago.com;security=on")
++        assertNonequivalent("SIP:ALICE@AtLanTa.CoM;Transport=udp",
++                            "sip:alice@AtLanTa.CoM;Transport=UDP")
++        assertNonequivalent("sip:bob@biloxi.com", "sip:bob@biloxi.com:5060")
++        assertNonequivalent("sip:bob@biloxi.com",
++                            "sip:bob@biloxi.com;transport=udp")
++        assertNonequivalent("sip:bob@biloxi.com",
++                            "sip:bob@biloxi.com:5060;transport=udp")
++        assertNonequivalent("sip:bob@biloxi.com",
++                            "sip:bob@biloxi.com:5060;transport=tcp")
++        assertNonequivalent("sip:carol@chicago.com",
++                            "sip:carol@chicago.com?Subject=next%20meeting")
++        assertNonequivalent("sip:bob@localhost", "sip:bob@127.0.0.1")
++
++    
++    def test_capitalization(self):
++        """
++        Ensure that parameters and headers are correctly treated as case-
++        insensitive (i.e. lowercase)
++        """
++        s1 = ("sip:user:pass@hosta:123;transport=udp;user=phone;method=foo;"
++             "ttl=12;maddr=1.2.3.4;blah;goo=bar?foo-baz=b&c=e")
++        s2 = ("sip:user:pass@hosta:123;transport=udp;user=phone;method=foo;"
++             "ttl=12;maddr=1.2.3.4;blah;Goo=bar?foo-baz=b&c=e")        
++        s3 = ("SIP:user:pass@hosta:123;transport=udp;user=phone;method=foo;"
++             "ttl=12;maddr=1.2.3.4;blah;goo=bar?fOo-baz=b&c=e")
++        self.assertEqual(sip.parseURL(s1), sip.parseURL(s2))
++        self.assertEqual(sip.parseURL(s2), sip.parseURL(s3))
++
++
++
+ class ParseTestCase(unittest.TestCase):
+ 
+     def testParseAddress(self):
++        """
++        Confirm that various names and addresses are parsed correctly.
++        """
+         for address, name, urls, params in [
+             ('"A. G. Bell" <sip:foo@example.com>',
+              "A. G. Bell", "sip:foo@example.com", {}),
+             ("Anon <sip:foo@example.com>", "Anon", "sip:foo@example.com", {}),
++            ('"A. G. Bell" <sip:foo@example.com>',
++             "A. G. Bell", "sip:foo@example.com", {}),
++            (' "A. G. Bell" <sip:foo@example.com>',
++             "A. G. Bell", "sip:foo@example.com", {}),
++            ('"Bell, A. G." <sip:bell@example.com>',
++             "Bell, A. G.", "sip:bell@example.com", {}),
++            ('" \\\\A. G. \\"Bell" <sip:foo@example.com>',
++             " \\A. G. \"Bell", "sip:foo@example.com", {}),
++            ('"\\x21A. G. Bell" <sip:foo@example.com>',
++             "x21A. G. Bell", "sip:foo@example.com", {}),
++            ("abcd1234-.!%*_+`'~ <sip:foo@example.com>",
++             "abcd1234-.!%*_+`'~", "sip:foo@example.com", {}),
++            ('"C\xc3\xa9sar" <sip:C%C3%A9sar@example.com>',
++             u'C\xe9sar', 'sip:C%C3%A9sar@example.com', {}),
++            ("Anon <sip:foo@example.com>",
++             "Anon", "sip:foo@example.com", {}),
+             ("sip:foo@example.com", "", "sip:foo@example.com", {}),
+             ("<sip:foo@example.com>", "", "sip:foo@example.com", {}),
+-            ("foo <sip:foo@example.com>;tag=bar;foo=baz", "foo",
+-             "sip:foo@example.com", {"tag": "bar", "foo": "baz"}),
++            ("foo <sip:foo@example.com>;tag=bar;foo=baz;boz",
++             "foo", "sip:foo@example.com", {"tag": "bar", "foo": "baz",
++                                            "boz": ""}),
++            ("sip:foo@example.com;tag=bar;foo=baz",
++             "", "sip:foo@example.com", {"tag": "bar", "foo": "baz"}),
++            # test the use of name.decode('utf8', 'replace')
++            ('"Invalid \xc3\x28" <sip:foo@example.com>',
++             u"Invalid \ufffd(", "sip:foo@example.com", {}),
+             ]:
+             gname, gurl, gparams = sip.parseAddress(address)
+             self.assertEqual(name, gname)
+@@ -379,17 +586,21 @@
+             self.assertEqual(gparams, params)
+ 
+ 
++
+ class DummyLocator:
+     implements(sip.ILocator)
+     def getAddress(self, logicalURL):
+         return defer.succeed(sip.URL("server.com", port=5060))
+ 
++
++
+ class FailingLocator:
+     implements(sip.ILocator)
+     def getAddress(self, logicalURL):
+         return defer.fail(LookupError())
+ 
+ 
++
+ class ProxyTestCase(unittest.TestCase):
+ 
+     def setUp(self):
+Index: twisted/protocols/sip.py
+===================================================================
+--- twisted/protocols/sip.py	(revision 33739)
++++ twisted/protocols/sip.py	(working copy)
+@@ -9,19 +9,25 @@
+ Documented in RFC 2543.
+ [Superceded by 3261]
+ 
+-
+ This module contains a deprecated implementation of HTTP Digest authentication.
+ See L{twisted.cred.credentials} and L{twisted.cred._digest} for its new home.
++
++Features required by RFC3261 missing from this module:
++ * SIPS support
++
+ """
+ 
+ # system imports
+ import socket, time, sys, random, warnings
++import urllib
++import re
+ from zope.interface import implements, Interface
+ 
+ # twisted imports
+ from twisted.python import log, util
+-from twisted.python.deprecate import deprecated
++from twisted.python.deprecate import deprecated, getDeprecationWarningString
+ from twisted.python.versions import Version
++from twisted.python.compat import set
+ from twisted.python.hashlib import md5
+ from twisted.internet import protocol, defer, reactor
+ 
+@@ -113,6 +119,8 @@
+     606: "Not Acceptable",
+ }
+ 
++
++
+ specialCases = {
+     'cseq': 'CSeq',
+     'call-id': 'Call-ID',
+@@ -120,15 +128,37 @@
+ }
+ 
+ 
++
++def headerCapitalize(h):
++    """
++    Return a version of the given header name that's capitalized in the
++    traditional fashion.
++
++    @param h: A SIP header name.
++    """
++    h = h.lower()
++    if h in specialCases:
++        return specialCases[h]
++    if '-' in h:
++        return '-'.join([bit.capitalize() for bit in h.split('-')])
++    return h.capitalize()
++
++
++
++@deprecated(Version("Twisted", 8, 2, 0))
+ def dashCapitalize(s):
+     ''' Capitalize a string, making sure to treat - as a word seperator '''
+     return '-'.join([ x.capitalize() for x in s.split('-')])
+ 
++
++
+ def unq(s):
+     if s[0] == s[-1] == '"':
+         return s[1:-1]
+     return s
+ 
++
++
+ def DigestCalcHA1(
+     pszAlg,
+     pszUserName,
+@@ -205,27 +235,35 @@
+     See RFC 3261, sections 8.1.1.7, 18.2.2, and 20.42.
+ 
+     @ivar transport: Network protocol used for this leg. (Probably either "TCP"
+-    or "UDP".)
++        or "UDP".)
+     @type transport: C{str}
++
+     @ivar branch: Unique identifier for this request.
+     @type branch: C{str}
++
+     @ivar host: Hostname or IP for this leg.
+     @type host: C{str}
++
+     @ivar port: Port used for this leg.
+     @type port C{int}, or None.
++
+     @ivar rportRequested: Whether to request RFC 3581 client processing or not.
+     @type rportRequested: C{bool}
++
+     @ivar rportValue: Servers wishing to honor requests for RFC 3581 processing
+-    should set this parameter to the source port the request was received
+-    from.
++        should set this parameter to the source port the request was received
++        from.
+     @type rportValue: C{int}, or None.
+ 
+     @ivar ttl: Time-to-live for requests on multicast paths.
+     @type ttl: C{int}, or None.
++
+     @ivar maddr: The destination multicast address, if any.
+     @type maddr: C{str}, or None.
++
+     @ivar hidden: Obsolete in SIP 2.0.
+     @type hidden: C{bool}
++
+     @ivar otherParams: Any other parameters in the header.
+     @type otherParams: C{dict}
+     """
+@@ -237,11 +275,11 @@
+         Set parameters of this Via header. All arguments correspond to
+         attributes of the same name.
+ 
+-        To maintain compatibility with old SIP
+-        code, the 'rport' argument is used to determine the values of
+-        C{rportRequested} and C{rportValue}. If None, C{rportRequested} is set
+-        to True. (The deprecated method for doing this is to pass True.) If an
+-        integer, C{rportValue} is set to the given value.
++        To maintain compatibility with old SIP code, the 'rport' argument is 
++        used to determine the values of C{rportRequested} and C{rportValue}. If
++        None, C{rportRequested} is set to True. (The deprecated method for 
++        doing this is to pass True.) If an integer, C{rportValue} is set to the
++        given value.
+ 
+         Any arguments not explicitly named here are collected into the
+         C{otherParams} dict.
+@@ -369,12 +407,57 @@
+     return Via(**result)
+ 
+ 
+-class URL:
+-    """A SIP URL."""
++class URI:
++    """
++    A SIP URI, as defined in RFC 3261, section 19.1.
+ 
++    @ivar host: A hostname or IP address.
++    @type host: C{str}
++
++    @ivar username: The identifier of a particular resource at the host being
++        addressed.
++    @type username: C{str}, or None.
++
++    @ivar password: A password associated with the username.
++    @type password: C{str}, or None.
++
++    @ivar port: The port number where the request is to be sent.
++    @type port: C{int}, or None.
++
++    @ivar transport: The transport mechanism to be used for sending SIP
++        messages.
++    @type transport: C{str}, or None.
++
++    @ivar usertype: The 'user' URI parameter. May be 'phone' or 'dialstring' -
++        see RFC 3261, 19.1.6., and RFC 4967.
++    @type usertype: C{str}, or None.
++
++    @ivar method: The SIP method to use when forming a request from this
++        URI. (INVITE, REGISTER, etc.)
++    @type method: C{str}, or None.
++    
++    @ivar ttl: Time-to-live for multicast requests. Used with C{maddr}.
++    @type ttl: C{int}, or None.
++
++    @ivar maddr: Server address to be contacted for this user. For use with
++        multicast requests.
++    @type maddr: C{str}, or None.
++
++    @ivar other: Any other URI parameters not specifically mentioned
++        here.
++    @type other: C{dict}, or None.
++
++    @ivar headers: Key-value pairs to be used as headers when forming
++        a request from this URI.
++    @type headers: C{dict}, or None.
++    """
++
+     def __init__(self, host, username=None, password=None, port=None,
+                  transport=None, usertype=None, method=None,
+-                 ttl=None, maddr=None, tag=None, other=None, headers=None):
++                 ttl=None, maddr=None, other=None, headers=None):
++        """
++        Set parameters of this URI.
++        """
+         self.username = username
+         self.host = host
+         self.password = password
+@@ -382,11 +465,10 @@
+         self.transport = transport
+         self.usertype = usertype
+         self.method = method
+-        self.tag = tag
+         self.ttl = ttl
+         self.maddr = maddr
+         if other == None:
+-            self.other = []
++            self.other = {}
+         else:
+             self.other = other
+         if headers == None:
+@@ -394,45 +476,157 @@
+         else:
+             self.headers = headers
+ 
++
+     def toString(self):
++        """
++        Format this object's contents as a SIP URI.
++        """
+         l = []; w = l.append
+         w("sip:")
+         if self.username != None:
+-            w(self.username)
++            w(urllib.quote(self.username))
+             if self.password != None:
+-                w(":%s" % self.password)
++                w(":%s" % (urllib.quote(self.password)))
+             w("@")
+         w(self.host)
+         if self.port != None:
+             w(":%d" % self.port)
+         if self.usertype != None:
+             w(";user=%s" % self.usertype)
+-        for n in ("transport", "ttl", "maddr", "method", "tag"):
++        for n in ("transport", "ttl", "maddr", "method"):
+             v = getattr(self, n)
+             if v != None:
+-                w(";%s=%s" % (n, v))
+-        for v in self.other:
+-            w(";%s" % v)
++                w(";%s=%s" % (urllib.quote(n), urllib.quote(str(v))))
++        for k, v in self.other.iteritems():
++            if v:
++                w(";%s=%s" % (urllib.quote(k), urllib.quote(v)))
++            else:
++                w(";%s" % k)
+         if self.headers:
+             w("?")
+-            w("&".join([("%s=%s" % (specialCases.get(h) or dashCapitalize(h), v)) for (h, v) in self.headers.items()]))
++            w("&".join([("%s=%s" % (headerCapitalize(h), urllib.quote(v)))
++                        for (h, v) in self.headers.items()]))
+         return "".join(l)
+ 
++
+     def __str__(self):
++        """
++        Format this object's contents as a SIP URI.
++        """
+         return self.toString()
+ 
++
+     def __repr__(self):
+-        return '<URL %s:%s@%s:%r/%s>' % (self.username, self.password, self.host, self.port, self.transport)
++        """
++        Provide a debugging representation of this object.
++        """
++        return '<sip.URI %s>' % self.toString()
+ 
+ 
++    def __eq__(self, other):
++        """
++        Comparison for URI equivalence, as described in RFC 3261, section
++        19.1.4.
++        """
++        if not isinstance(other, URI):
++            return False
++
++        if self.username != other.username or self.password != other.password:
++            return False
++
++        if self.host.lower() != other.host.lower() or self.port != other.port:
++            return False
++
++        selfParams = set([p.lower() for p in self.other])
++        otherParams = set([p.lower() for p in other.other])
++        comparisonAttributes = ['usertype', 'method', 'ttl', 'maddr',
++                                'transport']
++        comparisonParams = [(name, self.other[name], other.other[name])
++                            for name in selfParams.intersection(otherParams)]
++        comparisonParams.extend([(name, getattr(self, name),
++                                  getattr(other, name))
++                                 for name in comparisonAttributes])
++        for param, left, right in comparisonParams:
++            if  left == right:
++                continue
++            # Check for case-insensitively equal strings
++            elif (hasattr(left, 'lower') and hasattr(right, 'lower') and
++                  left.lower() == right.lower()):
++                continue
++            else:
++                return False
++            
++        if self.headers != other.headers:
++            return False
++
++        return True
++
++
++    def __ne__(self, other):
++        """
++        Deal with Python's confusing equality model.
++        """
++        return not self.__eq__(other)
++
++
++    def __hash__(self):
++        """
++        Provide a hash value for this URI based on the most common contents.
++        """
++        # __eq__ compares on:
++        #  username
++        #  password
++        #  host (case-insensitive)
++        #  port
++        #  other params (case-insensitive)
++        #  usertype
++        #  method
++        #  ttl
++        #  maddr
++        #  transport
++        #  headers (case-insensitive)
++        cmp_params = [(x[0].lower(), x[1].lower()) for x in self.other.items()]
++        for attr in ['usertype', 'method', 'ttl', 'maddr', 'transport']:
++            value = getattr(self, attr, None)
++            if hasattr(value, 'lower'):
++                value = value.lower()
++            cmp_params.append((attr, value))
++        # headers are already lowercased
++        cmp_params.extend(self.headers.items())
++        fields = (self.username, self.password, self.host.lower(), self.port,
++                  tuple(cmp_params))
++        return hash(fields)
++
++
++
++#"URL" is the deprecated spelling of this class.
++URL = URI
++
++
++
+ def parseURL(url, host=None, port=None):
+-    """Return string into URL object.
++    """
++    Parse string into URI object.
++    URIs are of of form 'sip:user@example.com'.
+ 
+-    URIs are of of form 'sip:user@example.com'.
++    @param url: A string representation of a SIP URI.
++
++    @param host: The host to use for the URI object returned, overriding the
++        value specified in the input.
++
++    @param port: The port to use for the URI object returned, overriding the
++        value specified in the input.
+     """
+     d = {}
+-    if not url.startswith("sip:"):
+-        raise ValueError("unsupported scheme: " + url[:4])
++
++    def parseHeaders(headers):
++        d["headers"] = h = {}
++        for header in headers.split("&"):
++            k, v = header.split("=")
++            h[urllib.unquote(k.lower())] = urllib.unquote(v)
++
++    if not url[:4].lower() == "sip:":
++        raise SIPError(416, "Unsupported URI scheme: " + url[:4])
+     parts = url[4:].split(";")
+     userdomain, params = parts[0], parts[1:]
+     udparts = userdomain.split("@", 1)
+@@ -440,45 +634,54 @@
+         userpass, hostport = udparts
+         upparts = userpass.split(":", 1)
+         if len(upparts) == 1:
+-            d["username"] = upparts[0]
++            d["username"] = urllib.unquote(upparts[0])
+         else:
+-            d["username"] = upparts[0]
+-            d["password"] = upparts[1]
++            d["username"] = urllib.unquote(upparts[0])
++            d["password"] = urllib.unquote(upparts[1])
+     else:
+         hostport = udparts[0]
+     hpparts = hostport.split(":", 1)
++
+     if len(hpparts) == 1:
+-        d["host"] = hpparts[0]
++        if "?" in hpparts[0]:
++            _host, headers = hpparts[0].split("?", 1)
++            parseHeaders(headers)
++        else:
++            _host = hpparts[0]
++        d["host"] = _host
+     else:
++        if "?" in hpparts[1]:
++            _port, headers = hpparts[1].split("?", 1)
++            parseHeaders(headers)
++        else:
++            _port = hpparts[1]
+         d["host"] = hpparts[0]
+-        d["port"] = int(hpparts[1])
++        d["port"] = int(_port)
+     if host != None:
+         d["host"] = host
+     if port != None:
+         d["port"] = port
+     for p in params:
+         if p == params[-1] and "?" in p:
+-            d["headers"] = h = {}
+             p, headers = p.split("?", 1)
+-            for header in headers.split("&"):
+-                k, v = header.split("=")
+-                h[k] = v
++            parseHeaders(headers)
+         nv = p.split("=", 1)
+         if len(nv) == 1:
+-            d.setdefault("other", []).append(p)
++            d.setdefault("other", {})[urllib.unquote(p.lower())] = ''
+             continue
+-        name, value = nv
++        name, value = [urllib.unquote(x.lower()) for x in nv]
+         if name == "user":
+             d["usertype"] = value
+-        elif name in ("transport", "ttl", "maddr", "method", "tag"):
++        elif name in ("transport", "ttl", "maddr", "method"):
+             if name == "ttl":
+                 value = int(value)
+             d[name] = value
+         else:
+-            d.setdefault("other", []).append(p)
+-    return URL(**d)
++            d.setdefault("other", {})[name] = value
++    return URI(**d)
+ 
+ 
++
+ def cleanRequestURL(url):
+     """Clean a URL from a Request line."""
+     url.transport = None
+@@ -490,12 +693,44 @@
+ def parseAddress(address, host=None, port=None, clean=0):
+     """Return (name, uri, params) for From/To/Contact header.
+ 
++    @param address: A string representation of a SIP address (A 'name-addr', as
++        defined in RFC 3261, section 25.1, plus parameters.)
++
++    @param host: The host to use for the URI object returned, overriding the
++        value specified in the input.
++    
++    @param port: The port to use for the URI object returned, overriding the
++        value specified in the input.
++
+     @param clean: remove unnecessary info, usually for From and To headers.
++
++    Although many headers such as From can contain any valid URI, even those
++    with schemes other than 'sip', this function raises SIPError if the scheme
++    is not 'sip' because the upper layers do not support it.
+     """
++    def splitParams(paramstring):
++        params = {}
++        paramstring = paramstring.strip()
++        if paramstring:
++            for l in paramstring.split(";"):
++                if not l:
++                    continue
++                x = l.split("=")
++                if len(x) > 1:
++                    params[x[0]] = x[1]
++                else:
++                    params [x[0]] = ''
++        return params
+     address = address.strip()
+     # simple 'sip:foo' case
+-    if address.startswith("sip:"):
+-        return "", parseURL(address, host=host, port=port), {}
++    if not '<' in address:
++        i = address.rfind(";tag=")
++        if i > -1:
++            params = splitParams(address[i:])
++            address = address[:i]
++        else:
++            params = {}
++        return u"", parseURL(address, host=host, port=port), params
+     params = {}
+     name, url = address.split("<", 1)
+     name = name.strip()
+@@ -503,24 +738,20 @@
+         name = name[1:]
+     if name.endswith('"'):
+         name = name[:-1]
++    name = re.sub(r'\\(.)', r'\1', name)
+     url, paramstring = url.split(">", 1)
+     url = parseURL(url, host=host, port=port)
+-    paramstring = paramstring.strip()
+-    if paramstring:
+-        for l in paramstring.split(";"):
+-            if not l:
+-                continue
+-            k, v = l.split("=")
+-            params[k] = v
++    params = splitParams(paramstring)
+     if clean:
+         # rfc 2543 6.21
+         url.ttl = None
+         url.headers = {}
+         url.transport = None
+         url.maddr = None
+-    return name, url, params
++    return name.decode('utf8', 'replace'), url, params
+ 
+ 
++
+ class SIPError(Exception):
+     def __init__(self, code, phrase=None):
+         if phrase is None:
+@@ -530,10 +761,12 @@
+         self.phrase = phrase
+ 
+ 
++
+ class RegistrationError(SIPError):
+     """Registration was not possible."""
+ 
+ 
++
+ class Message:
+     """A SIP message."""
+ 
+@@ -563,7 +796,7 @@
+         s = "%s\r\n" % self._getHeaderLine()
+         for n, vs in self.headers.items():
+             for v in vs:
+-                s += "%s: %s\r\n" % (specialCases.get(n) or dashCapitalize(n), v)
++                s += "%s: %s\r\n" % (headerCapitalize(n), v)
+         s += "\r\n"
+         s += self.body
+         return s
+@@ -612,8 +845,8 @@
+ class MessagesParser(basic.LineReceiver):
+     """A SIP messages parser.
+ 
+-    Expects dataReceived, dataDone repeatedly,
+-    in that order. Shouldn't be connected to actual transport.
++    Expects dataReceived, dataDone repeatedly, in that order.
++    Shouldn't be connected to actual transport.
+     """
+ 
+     version = "SIP/2.0"
+@@ -835,15 +1068,19 @@
+         raise NotImplementedError
+ 
+ 
++
+ class IContact(Interface):
+     """A user of a registrar or proxy"""
+ 
+ 
++
+ class Registration:
+     def __init__(self, secondsToExpiry, contactURL):
+         self.secondsToExpiry = secondsToExpiry
+         self.contactURL = contactURL
+ 
++
++
+ class IRegistry(Interface):
+     """Allows registration of logical->physical URL mapping."""
+ 
+@@ -853,12 +1090,14 @@
+         @return: Deferred of C{Registration} or failure with RegistrationError.
+         """
+ 
++
+     def unregisterAddress(domainURL, logicalURL, physicalURL):
+         """Unregister the physical address of a logical URL.
+ 
+         @return: Deferred of C{Registration} or failure with RegistrationError.
+         """
+ 
++
+     def getRegistrationInfo(logicalURL):
+         """Get registration info for logical URL.
+ 
+@@ -866,6 +1105,7 @@
+         """
+ 
+ 
++
+ class ILocator(Interface):
+     """Allow looking up physical address for logical URL."""
+ 
+@@ -877,6 +1117,7 @@
+         """
+ 
+ 
++
+ class Proxy(Base):
+     """SIP proxy."""
+ 
+@@ -894,10 +1135,12 @@
+         self.port = port
+         Base.__init__(self)
+ 
++
+     def getVia(self):
+         """Return value of Via header for this proxy."""
+         return Via(host=self.host, port=self.port)
+ 
++
+     def handle_request(self, message, addr):
+         # send immediate 100/trying message before processing
+         #self.deliverResponse(self.responseFromRequest(100, message))
+@@ -917,6 +1160,7 @@
+                     self.deliverResponse(self.responseFromRequest(e.code, message))
+                 )
+ 
++
+     def handle_request_default(self, message, (srcHost, srcPort)):
+         """Default request handler.
+ 
+@@ -944,11 +1188,13 @@
+         d.addCallback(self.sendMessage, message)
+         d.addErrback(self._cantForwardRequest, message)
+ 
++
+     def _cantForwardRequest(self, error, message):
+         error.trap(LookupError)
+         del message.headers["via"][0] # this'll be us
+         self.deliverResponse(self.responseFromRequest(404, message))
+ 
++
+     def deliverResponse(self, responseMessage):
+         """Deliver response.
+ 
+@@ -961,6 +1207,7 @@
+         destAddr = URL(host=host, port=port)
+         self.sendMessage(destAddr, responseMessage)
+ 
++
+     def responseFromRequest(self, code, request):
+         """Create a response to a request message."""
+         response = Response(code)
+@@ -968,6 +1215,7 @@
+             response.headers[name] = request.headers.get(name, [])[:]
+         return response
+ 
++
+     def handle_response(self, message, addr):
+         """Default response handler."""
+         v = parseViaHeader(message.headers["via"][0])
+@@ -984,10 +1232,13 @@
+             return
+         self.deliverResponse(message)
+ 
++
+     def gotResponse(self, message, addr):
+         """Called with responses that are addressed at this server."""
+         pass
+ 
++
++
+ class IAuthorizer(Interface):
+     def getChallenge(peer):
+         """Generate a challenge the client may respond to.
+@@ -999,12 +1250,15 @@
+         @return: The challenge string
+         """
+ 
++
+     def decode(response):
+         """Create a credentials object from the given response.
+ 
+         @type response: C{str}
+         """
+ 
++
++
+ class BasicAuthorizer:
+     """Authorizer for insecure Basic (base64-encoded plaintext) authentication.
+ 
+@@ -1027,6 +1281,7 @@
+     def getChallenge(self, peer):
+         return None
+ 
++
+     def decode(self, response):
+         # At least one SIP client improperly pads its Base64 encoded messages
+         for i in range(3):
+@@ -1050,15 +1305,14 @@
+     """Yet Another Simple Digest-MD5 authentication scheme"""
+ 
+     def __init__(self, username, fields, challenges):
+-        warnings.warn(
+-            "twisted.protocols.sip.DigestedCredentials was deprecated "
+-            "in Twisted 9.0.0",
+-            category=DeprecationWarning,
+-            stacklevel=2)
++        msg = getDeprecationWarningString(DigestedCredentials, 
++                                          Version("Twisted", 9, 0, 0))
++        warnings.warn(msg, category=DeprecationWarning, stacklevel=2)
+         self.username = username
+         self.fields = fields
+         self.challenges = challenges
+ 
++
+     def checkPassword(self, password):
+         method = 'REGISTER'
+         response = self.fields.get('response')
+@@ -1091,24 +1345,22 @@
+     implements(IAuthorizer)
+ 
+     def __init__(self):
+-        warnings.warn(
+-            "twisted.protocols.sip.DigestAuthorizer was deprecated "
+-            "in Twisted 9.0.0",
+-            category=DeprecationWarning,
+-            stacklevel=2)
+-
++        msg = getDeprecationWarningString(DigestAuthorizer,
++                                          Version("Twisted", 9, 0, 0))
++        warnings.warn(msg, category=DeprecationWarning, stacklevel=2)
+         self.outstanding = {}
+ 
+ 
+-
+     def generateNonce(self):
+         c = tuple([random.randrange(sys.maxint) for _ in range(3)])
+         c = '%d%d%d' % c
+         return c
+ 
++
+     def generateOpaque(self):
+         return str(random.randrange(sys.maxint))
+ 
++
+     def getChallenge(self, peer):
+         c = self.generateNonce()
+         o = self.generateOpaque()
+@@ -1120,6 +1372,7 @@
+             'algorithm="MD5"',
+         ))
+ 
++
+     def decode(self, response):
+         response = ' '.join(response.splitlines())
+         parts = response.split(',')
+@@ -1134,6 +1387,7 @@
+             raise SIPError(400)
+ 
+ 
++
+ class RegisterProxy(Proxy):
+     """A proxy that allows registration for a specific domain.
+ 
+@@ -1152,6 +1406,7 @@
+         if "digest" not in self.authorizers:
+             self.authorizers["digest"] = DigestAuthorizer()
+ 
++
+     def handle_ACK_request(self, message, (host, port)):
+         # XXX
+         # ACKs are a client's way of indicating they got the last message
+@@ -1160,6 +1415,7 @@
+         # if no ACK is received.
+         pass
+ 
++
+     def handle_REGISTER_request(self, message, (host, port)):
+         """Handle a registration request.
+ 
+@@ -1175,6 +1431,7 @@
+             else:
+                 return self.login(message, host, port)
+ 
++
+     def unauthorized(self, message, host, port):
+         m = self.responseFromRequest(401, message)
+         for (scheme, auth) in self.authorizers.iteritems():
+@@ -1208,14 +1465,17 @@
+         else:
+             self.deliverResponse(self.responseFromRequest(501, message))
+ 
++
+     def _cbLogin(self, (i, a, l), message, host, port):
+         # It's stateless, matey.  What a joke.
+         self.register(message, host, port)
+ 
++
+     def _ebLogin(self, failure, message, host, port):
+         failure.trap(cred.error.UnauthorizedLogin)
+         self.unauthorized(message, host, port)
+ 
++
+     def register(self, message, host, port):
+         """Allow all users to register"""
+         name, toURL, params = parseAddress(message.headers["to"][0], clean=1)
+@@ -1238,6 +1498,7 @@
+                 errbackArgs=(message,)
+             )
+ 
++
+     def _cbRegister(self, registration, message):
+         response = self.responseFromRequest(200, message)
+         if registration.contactURL != None:
+@@ -1246,11 +1507,13 @@
+         response.addHeader("content-length", "0")
+         self.deliverResponse(response)
+ 
++
+     def _ebRegister(self, error, message):
+         error.trap(RegistrationError, LookupError)
+         # XXX return error message, and alter tests to deal with
+         # this, currently tests assume no message sent on failure
+ 
++
+     def unregister(self, message, toURL, contact):
+         try:
+             expires = int(message.headers["expires"][0])
+@@ -1267,16 +1530,19 @@
+                     ).addErrback(self._ebUnregister, message
+                     )
+ 
++
+     def _cbUnregister(self, registration, message):
+         msg = self.responseFromRequest(200, message)
+         msg.headers.setdefault('contact', []).append(registration.contactURL.toString())
+         msg.addHeader("expires", "0")
+         self.deliverResponse(msg)
+ 
++
+     def _ebUnregister(self, registration, message):
+         pass
+ 
+ 
++
+ class InMemoryRegistry:
+     """A simplistic registry for a specific domain."""
+ 
+@@ -1286,6 +1552,7 @@
+         self.domain = domain # the domain we handle registration for
+         self.users = {} # map username to (IDelayedCall for expiry, address URI)
+ 
++
+     def getAddress(self, userURI):
+         if userURI.host != self.domain:
+             return defer.fail(LookupError("unknown domain"))
+@@ -1295,6 +1562,7 @@
+         else:
+             return defer.fail(LookupError("no such user"))
+ 
++
+     def getRegistrationInfo(self, userURI):
+         if userURI.host != self.domain:
+             return defer.fail(LookupError("unknown domain"))
+@@ -1304,6 +1572,7 @@
+         else:
+             return defer.fail(LookupError("no such user"))
+ 
++
+     def _expireRegistration(self, username):
+         try:
+             dc, url = self.users[username]
+@@ -1314,6 +1583,7 @@
+             del self.users[username]
+         return defer.succeed(Registration(0, url))
+ 
++
+     def registerAddress(self, domainURL, logicalURL, physicalURL):
+         if domainURL.host != self.domain:
+             log.msg("Registration for domain we don't handle.")
+@@ -1330,5 +1600,6 @@
+         self.users[logicalURL.username] = (dc, physicalURL)
+         return defer.succeed(Registration(int(dc.getTime() - time.time()), physicalURL))
+ 
++
+     def unregisterAddress(self, domainURL, logicalURL, physicalURL):
+         return self._expireRegistration(logicalURL.username)

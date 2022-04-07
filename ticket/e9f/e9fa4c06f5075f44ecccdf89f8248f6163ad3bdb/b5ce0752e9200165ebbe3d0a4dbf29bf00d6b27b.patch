@@ -1,0 +1,101 @@
+diff --git twisted/spread/pb.py twisted/spread/pb.py
+index 99b5316..4823ecb 100644
+--- twisted/spread/pb.py
++++ twisted/spread/pb.py
+@@ -363,10 +363,17 @@ class RemoteReference(Serializable, styles.Ephemeral):
+         return self.luid
+ 
+     def __del__(self):
+-        """Do distributed reference counting on finalization.
++        self.decref()
++
++    def decref(self):
++        """Finalize and do distributed reference counting.
+         """
+         if self.doRefCount:
++            self.doRefCount = False
+             self.broker.sendDecRef(self.luid)
++            self.broker = None
++            self.perspective = None
++            self.luid = None
+ 
+ setUnjellyableForClass("remote", RemoteReference)
+ 
+diff --git twisted/test/test_pb.py twisted/test/test_pb.py
+index 4616708..f0eab04 100644
+--- twisted/test/test_pb.py
++++ twisted/test/test_pb.py
+@@ -519,7 +519,6 @@ class NewStyleCachedTestCase(unittest.TestCase):
+         return d
+ 
+ 
+-
+ class BrokerTestCase(unittest.TestCase):
+     thunkResult = None
+ 
+@@ -542,6 +541,15 @@ class BrokerTestCase(unittest.TestCase):
+     def thunkResultBad(self, result):
+         self.fail("This should cause an error, not %s" % (result,))
+ 
++    def test_decref(self):
++        c, s, pump = connectedServerAndClient()
++        ref = pb.RemoteReference("perspective", c, 42, True)
++        ref.decref()
++        self.assertEquals(ref.broker, None)
++        self.assertEquals(ref.perspective, None)
++        self.assertEquals(ref.luid, None)
++        ref.decref()  # Calling it again should be a no-op
++
+     def test_reference(self):
+         c, s, pump = connectedServerAndClient()
+ 
+@@ -665,18 +673,10 @@ class BrokerTestCase(unittest.TestCase):
+         pump.pump()
+         # send response
+         pump.pump()
+-
+-        # delving into internal structures here, because GC is sort of
+-        # inherently internal.
+         rluid = self.nestedRemote.luid
+         self.assertIn(rluid, s.localObjects)
+-        del self.nestedRemote
+-        # nudge the gc
+-        if sys.hexversion >= 0x2000000:
+-            gc.collect()
+-        # try to nudge the GC even if we can't really
+-        pump.pump()
+-        pump.pump()
++        # send decref message
++        self.nestedRemote.decref()
+         pump.pump()
+         self.assertNotIn(rluid, s.localObjects)
+ 
+@@ -750,6 +750,28 @@ class BrokerTestCase(unittest.TestCase):
+                          "Client still had complex after GC")
+         self.assertIdentical(vcc.observer, None, "observer was not removed")
+ 
++    def test_cache_refcounting(self):
++        c, s, pump = connectedServerAndClient()
++        obj = NestedCache()
++        s.setNameForLocal("obj", obj)
++        o2 = c.remoteForName("obj")
++        coll = []
++        o2.callRemote("getCache"
++            ).addCallback(coll.append).addErrback(coll.append)
++        pump.flush()
++        cp = coll[0][0]
++        luid = cp.luid
++        self.assertIn(luid, s.remotelyCachedObjects,
++                      "remote cache doesn't have it")
++        # simulate deleting cp
++        # (__del__ will be called again, but we don't care)
++        cp.__del__()
++        pump.flush()
++        self.assertNotIn(luid, s.remotelyCachedObjects,
++                         "Server still had it after GC")
++        self.assertNotIn(luid, c.locallyCachedObjects,
++                         "Client still had it after GC")
++
+     def test_publishable(self):
+         try:
+             os.unlink('None-None-TESTING.pub') # from RemotePublished.getFileName

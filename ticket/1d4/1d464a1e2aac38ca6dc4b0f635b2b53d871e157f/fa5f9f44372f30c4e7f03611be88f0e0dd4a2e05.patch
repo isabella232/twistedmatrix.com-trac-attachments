@@ -1,0 +1,370 @@
+Index: twisted/web/test/test_newclient.py
+===================================================================
+--- twisted/web/test/test_newclient.py	(revision 32442)
++++ twisted/web/test/test_newclient.py	(working copy)
+@@ -793,6 +793,7 @@
+     """
+     method = 'GET'
+     stopped = False
++    headers = Headers()
+ 
+     def writeTo(self, transport):
+         self.finished = Deferred()
+@@ -811,12 +812,32 @@
+     returns a succeeded L{Deferred}.  This vaguely emulates the behavior of a
+     L{Request} with no body producer.
+     """
++    headers = Headers()
+     def writeTo(self, transport):
+         transport.write('SOME BYTES')
+         return succeed(None)
+ 
+ 
++class BufferProducer(object):
++    """
++    A body producer that outputs a string with a known length.
++    """
++    implements(IBodyProducer)
+ 
++    def __init__(self, data):
++        self.data = data
++        self.length = len(data)
++
++    def startProducing(self, consumer):
++        consumer.write(self.data)
++        return succeed(None)
++
++    def pauseProducing(self):
++        pass
++
++    def stopProducing(self):
++        pass
++
+ class HTTP11ClientProtocolTests(TestCase):
+     """
+     Tests for the HTTP 1.1 client protocol implementation,
+@@ -879,6 +900,7 @@
+         L{RequestGenerationFailed} wrapping the underlying failure.
+         """
+         class BrokenRequest:
++            headers = Headers()
+             def writeTo(self, transport):
+                 return fail(ArbitraryException())
+ 
+@@ -901,6 +923,7 @@
+         a L{Failure} of L{RequestGenerationFailed} wrapping that exception.
+         """
+         class BrokenRequest:
++            headers = Headers()
+             def writeTo(self, transport):
+                 raise ArbitraryException()
+ 
+@@ -1306,8 +1329,76 @@
+         return assertResponseFailed(self, testResult,
+                                     [ConnectionAborted, _DataLoss])
+ 
++    def test_expect100ContinueGot100Continue(self):
++        """
++        When we expect 100-Continue and we receive an 100-Continue L{Response}
++        the user writes the L{Request} body and receives back the second(final)
++        L{Response}.
++        """
++        producer = BufferProducer('X' * 10)
+ 
++        headers = Headers({'host': ['example.com'],
++            'expect': ['100-Continue']})
+ 
++        d = self.protocol.request(Request('POST', '/foo', headers, producer))
++
++        self.transport.clear()
++
++        def cb100Continue(response):
++            self.assertEqual(response.code, 200)
++
++        d.addCallback(cb100Continue)
++
++        self.protocol.dataReceived(
++                "HTTP/1.1 100 Continue\r\n"
++                "Content-Length: 3\r\n"
++                "\r\n"
++                '123'
++                )
++
++        self.protocol.dataReceived(
++                "HTTP/1.1 200 OK\r\n"
++                "Content-Length: 0\r\n"
++                "\r\n"
++                )
++
++        self.assertEqual(self.transport.value(), 'X' * 10)
++
++        return d
++
++
++    def test_expect100ContinueGotFinalStatus(self):
++        """
++        When we expect 100-Continue and we receive a final status L{Response}
++        we don't write the L{Request} body anymore and the user receives the
++        first L{Response}.
++        """
++        producer = BufferProducer('X' * 10)
++
++        headers = Headers({'host': ['example.com'], 'expect': ['100-Continue']})
++
++        d = self.protocol.request(Request('POST', '/foo', headers, producer))
++
++        self.transport.clear()
++
++        def cb100Continue(response):
++            self.assertEqual(response.code, 200)
++
++        d.addCallback(cb100Continue)
++
++
++        self.protocol.dataReceived(
++                "HTTP/1.1 200 OK\r\n"
++                "Content-Length: 0\r\n"
++                "\r\n"
++                )
++
++        self.assertEqual(self.transport.value(), '')
++
++        return d
++
++
++
+ class StringProducer:
+     """
+     L{StringProducer} is a dummy body producer.
+Index: twisted/web/_newclient.py
+===================================================================
+--- twisted/web/_newclient.py	(revision 32442)
++++ twisted/web/_newclient.py	(working copy)
+@@ -39,6 +39,7 @@
+ from twisted.internet.defer import Deferred, succeed, fail, maybeDeferred
+ from twisted.internet.protocol import Protocol
+ from twisted.protocols.basic import LineReceiver
++from twisted.protocols.wire import Discard
+ from twisted.web.iweb import UNKNOWN_LENGTH, IResponse
+ from twisted.web.http_headers import Headers
+ from twisted.web.http import NO_CONTENT, NOT_MODIFIED
+@@ -559,12 +560,11 @@
+         transport.writeSequence(requestLines)
+ 
+ 
+-    def _writeToChunked(self, transport):
++    def _writeBodyToChunked(self, transport):
+         """
+-        Write this request to the given transport using chunked
++        Write this request's body to the given transport using chunked
+         transfer-encoding to frame the body.
+         """
+-        self._writeHeaders(transport, 'Transfer-Encoding: chunked\r\n')
+         encoder = ChunkedEncoder(transport)
+         encoder.registerProducer(self.bodyProducer, True)
+         d = self.bodyProducer.startProducing(encoder)
+@@ -583,14 +583,11 @@
+         return d
+ 
+ 
+-    def _writeToContentLength(self, transport):
++    def _writeBodyToContentLength(self, transport):
+         """
+-        Write this request to the given transport using content-length to frame
+-        the body.
++        Write this request's body to the given transport using content-length
++        to frame the body.
+         """
+-        self._writeHeaders(
+-            transport,
+-            'Content-Length: %d\r\n' % (self.bodyProducer.length,))
+ 
+         # This Deferred is used to signal an error in the data written to the
+         # encoder below.  It can only errback and it will only do so before too
+@@ -702,16 +699,43 @@
+             been completely written to the transport or with a L{Failure} if
+             there is any problem generating the request bytes.
+         """
++
++        self.writeHeadersTo(transport)
++        return self.writeBodyTo(transport)
++
++    def writeHeadersTo(self, transport):
++        """
++        Format this L{Request}'s headers as HTTP/1.1 and write them
++        synchronously to the given transport 
++        """
++        TEorCL = None
+         if self.bodyProducer is not None:
+             if self.bodyProducer.length is UNKNOWN_LENGTH:
+-                return self._writeToChunked(transport)
++                TEorCL = "Transfer-Encoding: chunked\r\n"
+             else:
+-                return self._writeToContentLength(transport)
++                TEorCL = 'Content-Length: %d\r\n' % (self.bodyProducer.length,)
++
++        self._writeHeaders(transport, TEorCL)
++
++    def writeBodyTo(self, transport):
++        """
++        Write this L{Request}'s body to the given transport, framing it
++        according to the given headers('Transport-Encoding' or
++        'Content-Length').
++
++        @return: A L{Deferred} which fires with C{None} when the request has
++            been completely written the transport or with a L{Failure} if there
++            is any problem generating the request body bytes. If bodyProducer
++            is None the returned L{Deferred} is already fired.
++        """
++        if self.bodyProducer is not None:
++            if self.bodyProducer.length is UNKNOWN_LENGTH:
++                return self._writeBodyToChunked(transport)
++            else:
++                return self._writeBodyToContentLength(transport)
+         else:
+-            self._writeHeaders(transport, None)
+             return succeed(None)
+ 
+-
+     def stopWriting(self):
+         """
+         Stop writing this request to the transport.  This can only be called
+@@ -1151,7 +1175,29 @@
+             self._producer.pauseProducing()
+ 
+ 
++class DiscardWithDeferred(Protocol):
++    """
++    A L{Protocol} that discards all received data and that fires a L{Deferred}
++    when all data has been received.
+ 
++    @ivar finishedDeferred: L{Deferred} which fires with C{None} when all data
++        has been received and with L{Failure} on error.
++
++    """
++
++    def __init__(self):
++        self.finishedDeferred = Deferred()
++
++    def dataReceived(self, data):
++        pass
++
++    def connectionLost(self, reason):
++        if reason.type == ResponseDone:
++            self.finishedDeferred.callback(None)
++        else:
++            self.finishedDeferred.errback(reason)
++
++
+ class HTTP11ClientProtocol(Protocol):
+     """
+     L{HTTP11ClientProtocol} is an implementation of the HTTP 1.1 client
+@@ -1236,18 +1282,82 @@
+             return fail(RequestNotSent())
+ 
+         self._state = 'TRANSMITTING'
+-        _requestDeferred = maybeDeferred(request.writeTo, self.transport)
+-        self._finishedRequest = Deferred()
+ 
+         # Keep track of the Request object in case we need to call stopWriting
+         # on it.
+         self._currentRequest = request
+ 
+-        self._transportProxy = TransportProxyProducer(self.transport)
+-        self._parser = HTTPClientParser(request, self._finishResponse)
+-        self._parser.makeConnection(self._transportProxy)
+-        self._responseDeferred = self._parser._responseDeferred
++        self._finishedRequest = Deferred()
+ 
++        if request.headers.hasHeader('expect'):
++            expectations = request.headers.getRawHeaders('expect')
++            _expects100Continue = '100-continue' in [x.lower() for x in expectations]
++        else:
++            _expects100Continue = False
++
++        if _expects100Continue:
++            # This is synchronous, so jump right into WAITING
++            request.writeHeadersTo(self.transport)
++
++            self._state = 'WAITING'
++
++            self._setupParser(request)
++
++            _100ContinueResponseDeferred = self._parser._responseDeferred
++
++            self._responseDeferred = Deferred()
++
++            _requestDeferred = Deferred()
++
++            def ebFirstResponse(err):
++                # Tell the producer we don't need its body and forward the
++                # error
++                request.stopWriting()
++                self._finishedRequest.errback(err)
++
++            def cbFirstResponse(response):
++                if response.code == 100:
++                    # Read and discard the response body
++
++                    discarder = DiscardWithDeferred()
++
++                    response.deliverBody(discarder)
++
++
++                    def cb100ContinueBody(ignored):
++                        # Start sending the request body
++
++                        self._state = 'TRANSMITTING'
++
++                        self._disconnectParser(None)
++
++                        self._setupParser(request)
++
++                        _requestBodyDeferred = maybeDeferred(
++                                request.writeBodyTo, self.transport)
++
++                        _requestBodyDeferred.chainDeferred(_requestDeferred)
++
++                        self._parser._responseDeferred.chainDeferred(
++                                self._responseDeferred)
++
++                    discarder.finishedDeferred.addCallbacks(cb100ContinueBody,
++                            ebFirstResponse)
++
++                else:
++                    request.stopWriting()
++                    self._finishedRequest.callback(response)
++
++            _100ContinueResponseDeferred.addCallbacks(
++                    cbFirstResponse, ebFirstResponse)
++
++        else:
++            _requestDeferred = maybeDeferred(request.writeTo, self.transport)
++
++            self._setupParser(request)
++
++            self._responseDeferred = self._parser._responseDeferred
++
+         def cbRequestWrotten(ignored):
+             if self._state == 'TRANSMITTING':
+                 self._state = 'WAITING'
+@@ -1272,6 +1382,19 @@
+         return self._finishedRequest
+ 
+ 
++    def _setupParser(self, request):
++        """
++        Setup a L{HTTPClientParser} for a L{Response} to a L{Request}. If this
++        is not the first parser associated with this protocol, call
++        L{HTTP11ClientProtocol._disconnectParser} first.
++
++        @param request: L{Request} waiting for a L{Response}
++        """
++        self._transportProxy = TransportProxyProducer(self.transport)
++        self._parser = HTTPClientParser(request, self._finishResponse)
++        self._parser.makeConnection(self._transportProxy)
++
++
+     def _finishResponse(self, rest):
+         """
+         Called by an L{HTTPClientParser} to indicate that it has parsed a

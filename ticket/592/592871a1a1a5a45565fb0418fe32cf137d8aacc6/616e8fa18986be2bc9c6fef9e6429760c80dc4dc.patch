@@ -1,0 +1,334 @@
+diff --git a/twisted/scripts/tap2rpm.py b/twisted/scripts/tap2rpm.py
+index f3d2e0d..e531257 100755
+--- a/twisted/scripts/tap2rpm.py
++++ b/twisted/scripts/tap2rpm.py
+@@ -10,7 +10,6 @@ import tarfile
+ from StringIO import StringIO
+ 
+ from twisted.python import usage, log
+-from twisted.scripts import tap2deb
+ 
+ 
+ #################################
+@@ -95,7 +94,7 @@ Release:    1
+ License:    Unknown
+ Group:      Networking/Daemons
+ Source:     %(tarfile_basename)s
+-BuildRoot:  /var/tmp/%%{name}-%%{version}-root
++BuildRoot:  %%{_tmppath}/%%{name}-%%{version}-root
+ Requires:   /usr/bin/twistd
+ BuildArch:  noarch
+ 
+@@ -143,10 +142,11 @@ class MyOptions(usage.Options):
+     optFlags = [["unsigned", "u"], ['quiet', 'q']]
+     optParameters = [
+                      ["tapfile", "t", "twistd.tap"],
+-                     ["maintainer", "m", ""],
+-                     ["protocol", "p", ""],
+-                     ["description", "e", ""],
+-                     ["long_description", "l", ""],
++                     ["maintainer", "m", "tap2rpm"],
++                     ["protocol", "p", None],
++                     ["description", "e", None],
++                     ["long_description", "l",
++                         "Automatically created by tap2rpm"],
+                      ["set-version", "V", "1.0"],
+                      ["rpmfile", "r", None],
+                      ["type", "y", "tap", "type of configuration: 'tap', 'xml, "
+@@ -160,6 +160,25 @@ class MyOptions(usage.Options):
+                    "rpmfile":'_files -g "*.rpm"'}
+     #zsh_actionDescr = {"logfile":"log file name", "random":"random seed"}
+ 
++    def postOptions(self):
++        """
++        Calculate the default values for certain command-line options.
++        """
++        # Options whose defaults depend on other parameters.
++        if self['protocol'] is None:
++            base_tapfile = os.path.basename(self['tapfile'])
++            self['protocol'] = os.path.splitext(base_tapfile)[0]
++        if self['description'] is None:
++            self['description'] = "A TCP server for %s" % (self['protocol'],)
++        if self['rpmfile'] is None:
++            self['rpmfile'] = 'twisted-%s' % (self['protocol'],)
++
++        # Values that aren't options, but are calculated from options and are
++        # handy to have around.
++        self['twistd_option'] = type_dict[self['type']]
++        self['release-name'] = '%s-%s' % (self['rpmfile'], self['set-version'])
++
++
+ 
+ type_dict = {
+     'tap': 'file',
+@@ -169,8 +188,9 @@ type_dict = {
+ }
+ 
+ 
++
+ ##########################
+-def makeBuildDir(baseDir):
++def makeBuildDir():
+     '''
+     Set up the temporary directory for building RPMs.
+ 
+@@ -186,105 +206,107 @@ def makeBuildDir(baseDir):
+     os.makedirs(os.path.join(tmpDir, 'SOURCES'))
+     os.makedirs(os.path.join(tmpDir, 'SRPMS'))
+ 
++    log.msg(format="Created RPM build structure in %(path)r",
++            path=tmpDir)
+     return tmpDir
+ 
+ 
+-##########
+-def run(options=None):
+-    #  parse options
+-    try:
+-        config = MyOptions()
+-        config.parseOptions(options)
+-    except usage.error, ue:
+-         sys.exit("%s: %s" % (sys.argv[0], ue))
+ 
+-    #  set up some useful local variables
+-    tap_file = config['tapfile']
+-    base_tap_file = os.path.basename(config['tapfile'])
+-    protocol = (config['protocol'] or os.path.splitext(base_tap_file)[0])
+-    rpm_file = config['rpmfile'] or 'twisted-'+protocol
+-    version = config['set-version']
+-    maintainer = config['maintainer']
+-    description = config['description'] or ('A TCP server for %(protocol)s' %
+-                                            vars())
+-    long_description = (config['long_description']
+-                        or "Automatically created by tap2rpm")
+-    twistd_option = type_dict[config['type']]
+-    date = time.strftime('%a %b %d %Y', time.localtime(time.time()))
+-    directory = rpm_file + '-' + version
+-    python_version = '%s.%s' % sys.version_info[:2]
+-
+-    #  set up a blank maintainer if not present
+-    if not maintainer:
+-        maintainer = 'tap2rpm'
+-
+-    #  create source archive directory
+-    tmp_dir = makeBuildDir('/var/tmp')
+-    source_dir = os.path.join(tmp_dir, directory)
+-    os.makedirs(source_dir)
+-
+-    #  create source tar
+-    tarfile_name = source_dir + '.tar.gz'
+-    tarfile_basename = os.path.basename(tarfile_name)
+-    tarHandle = tarfile.open(tarfile_name, "w:gz")
+-
+-    sourceDirInfo = tarfile.TarInfo(directory)
++def setupBuildFiles(buildDir, config):
++    """
++    Create files required to build an RPM in the build directory.
++    """
++    # Create the source tarball in the SOURCES directory.
++    tarballName = "%s.tar" % (config['release-name'],)
++    tarballPath = os.path.join(buildDir, "SOURCES", tarballName)
++    tarballHandle = tarfile.open(tarballPath, "w")
++
++    sourceDirInfo = tarfile.TarInfo(config['release-name'])
+     sourceDirInfo.type = tarfile.DIRTYPE
+     sourceDirInfo.mode = 0755
+-    tarHandle.addfile(sourceDirInfo)
++    tarballHandle.addfile(sourceDirInfo)
+ 
+-    specFileInfo = tarfile.TarInfo(
+-            os.path.join(directory, '%s.spec' % rpm_file))
+-    specFileInfo.type = tarfile.REGTYPE
+-    specFileInfo.mode = 0644
+-    specFileRealData = specFileData % vars()
+-    specFileInfo.size = len(specFileRealData)
+-    tarHandle.addfile(specFileInfo, StringIO(specFileRealData))
++    tapFileBase = os.path.basename(config['tapfile'])
+ 
+     initFileInfo = tarfile.TarInfo(
+-            os.path.join(directory, '%s.init' % rpm_file))
++            os.path.join(
++                config['release-name'],
++                '%s.init' % config['rpmfile'],
++            )
++        )
+     initFileInfo.type = tarfile.REGTYPE
+     initFileInfo.mode = 0755
+-    initFileRealData = initFileData % vars()
++    initFileRealData = initFileData % {
++            'tap_file': tapFileBase,
++            'rpm_file': config['release-name'],
++            'twistd_option': config['twistd_option'],
++        }
+     initFileInfo.size = len(initFileRealData)
+-    tarHandle.addfile(initFileInfo, StringIO(initFileRealData))
++    tarballHandle.addfile(initFileInfo, StringIO(initFileRealData))
+ 
+-    tapFileHandle = open(tap_file, 'rb')
+-    tapFileInfo = tarHandle.gettarinfo(
+-            arcname=os.path.join(directory, os.path.basename(tap_file)),
++    tapFileHandle = open(config['tapfile'], 'rb')
++    tapFileInfo = tarballHandle.gettarinfo(
++            arcname=os.path.join(config['release-name'], tapFileBase),
+             fileobj=tapFileHandle,
+         )
+     tapFileInfo.mode = 0644
+-    tarHandle.addfile(tapFileInfo, tapFileHandle)
++    tarballHandle.addfile(tapFileInfo, tapFileHandle)
++
++    tarballHandle.close()
+ 
+-    tarHandle.close()
++    log.msg(format="Created dummy source tarball %(tarballPath)r",
++            tarballPath=tarballPath)
++
++    # Create the spec file in the SPECS directory.
++    specName = "%s.spec" % (config['release-name'],)
++    specPath = os.path.join(buildDir, "SPECS", specName)
++    specHandle = open(specPath, "w")
++    specFileRealData = specFileData % {
++            'description': config['description'],
++            'rpm_file': config['rpmfile'],
++            'version': config['set-version'],
++            'tarfile_basename': tarballName,
++            'tap_file': tapFileBase,
++            'date': time.strftime('%a %b %d %Y', time.localtime(time.time())),
++            'maintainer': config['maintainer'],
++            'long_description': config['long_description'],
++        }
++    specHandle.write(specFileRealData)
++    specHandle.close()
++
++    log.msg(format="Created RPM spec file %(specPath)r",
++            specPath=specPath)
++
++    return specPath
++
++
++
++def run(options=None):
++    #  parse options
++    try:
++        config = MyOptions()
++        config.parseOptions(options)
++    except usage.error, ue:
++         sys.exit("%s: %s" % (sys.argv[0], ue))
+ 
+-    print "Checking content of tarball %r before we hand it to rpmbuild..." % (
+-            tarfile_name)
+-    os.system('tar tzvf "%(tarfile_name)s"' % vars())
+-    print "done."
++    #  create RPM build environment
++    tmp_dir = makeBuildDir()
++    specPath = setupBuildFiles(tmp_dir, config)
+ 
+     #  build rpm
+     job = subprocess.Popen([
+-            "strace",
+-            "-s", "1000",
+             "rpmbuild",
+             "-vv",
+             "--define", "_topdir %s" % (tmp_dir,),
+-            "-ta", tarfile_name,
++            "-ba", specPath,
+         ], stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+     stdout, _ = job.communicate()
+ 
+     # If there was a problem, show people what it was.
+-    #if job.returncode != 0:
+-    #    print stdout
+-    print stdout
++    if job.returncode != 0:
++        print stdout
+     
+     #  copy the RPMs to the local directory
+-    log.msg(os.listdir(tmp_dir))
+-    log.msg(os.listdir(os.path.join(tmp_dir, "RPMS")))
+-    log.msg(os.listdir(os.path.join(tmp_dir, "SRPMS")))
+-    log.msg(os.listdir(os.path.join(tmp_dir, "RPMS", "noarch")))
+     rpm_path = glob.glob(os.path.join(tmp_dir, 'RPMS', 'noarch', '*'))[0]
+     srpm_path = glob.glob(os.path.join(tmp_dir, 'SRPMS', '*'))[0]
+     if not config['quiet']:
+diff --git a/twisted/scripts/test/test_tap2rpm.py b/twisted/scripts/test/test_tap2rpm.py
+index edabe32..c4b4df2 100644
+--- a/twisted/scripts/test/test_tap2rpm.py
++++ b/twisted/scripts/test/test_tap2rpm.py
+@@ -153,6 +153,78 @@ class TestTap2RPM(TestCase):
+         return d
+ 
+ 
++    def test_optionDefaults(self):
++        """
++        Commandline options should default to sensible values.
++
++        "sensible" here is defined as "the same values that previous versions
++        defaulted to".
++        """
++        config = tap2rpm.MyOptions()
++        config.parseOptions([])
++
++        self.assertEquals(config['tapfile'], 'twistd.tap')
++        self.assertEquals(config['maintainer'], 'tap2rpm')
++        self.assertEquals(config['protocol'], 'twistd')
++        self.assertEquals(config['description'], 'A TCP server for twistd')
++        self.assertEquals(config['long_description'],
++                'Automatically created by tap2rpm')
++        self.assertEquals(config['set-version'], '1.0')
++        self.assertEquals(config['rpmfile'], 'twisted-twistd')
++        self.assertEquals(config['type'], 'tap')
++        self.assertEquals(config['quiet'], False)
++        self.assertEquals(config['twistd_option'], 'file')
++        self.assertEquals(config['release-name'], 'twisted-twistd-1.0')
++
++
++    def test_protocolCalculatedFromTapFile(self):
++        """
++        The protocol name defaults to a value based on the tapfile value.
++        """
++        config = tap2rpm.MyOptions()
++        config.parseOptions(['--tapfile', 'pancakes.tap'])
++
++        self.assertEquals(config['tapfile'], 'pancakes.tap')
++        self.assertEquals(config['protocol'], 'pancakes')
++
++
++    def test_optionsDefaultToProtocolValue(self):
++        """
++        Many options default to a value calculated from the protocol name.
++        """
++        config = tap2rpm.MyOptions()
++        config.parseOptions([
++                '--tapfile', 'sausages.tap',
++                '--protocol', 'eggs',
++            ])
++
++        self.assertEquals(config['tapfile'], 'sausages.tap')
++        self.assertEquals(config['maintainer'], 'tap2rpm')
++        self.assertEquals(config['protocol'], 'eggs')
++        self.assertEquals(config['description'], 'A TCP server for eggs')
++        self.assertEquals(config['long_description'],
++                'Automatically created by tap2rpm')
++        self.assertEquals(config['set-version'], '1.0')
++        self.assertEquals(config['rpmfile'], 'twisted-eggs')
++        self.assertEquals(config['type'], 'tap')
++        self.assertEquals(config['quiet'], False)
++        self.assertEquals(config['twistd_option'], 'file')
++        self.assertEquals(config['release-name'], 'twisted-eggs-1.0')
++
++
++    def test_releaseNameDefaultsToRpmfileValue(self):
++        """
++        The release-name option is calculated from rpmfile and set-version.
++        """
++        config = tap2rpm.MyOptions()
++        config.parseOptions([
++                "--rpmfile", "beans",
++                "--set-version", "1.2.3",
++            ])
++
++        self.assertEquals(config['release-name'], 'beans-1.2.3')
++
++
+     def test_basicOperation(self):
+         """
+         Calling tap2rpm should produce an RPM and SRPM with default metadata.

@@ -1,0 +1,293 @@
+=== modified file 'twisted/python/filepath.py'
+--- twisted/python/filepath.py	2011-04-12 03:28:17 +0000
++++ twisted/python/filepath.py	2011-09-28 06:46:14 +0000
+@@ -863,12 +863,39 @@
+         self.changed()
+ 
+ 
+-    def makedirs(self):
++    def makedirs(self, mode=None):
+         """
+         Create all directories not yet existing in C{path} segments, using
+         C{os.makedirs}.
+         """
+-        return os.makedirs(self.path)
++        if mode is not None:
++            return os.makedirs(self.path, mode)
++        else:
++            return os.makedirs(self.path)
++
++    def makedirsIdempotent(self, mode=None):
++        """
++        Create all directories not yet existing in C{path} segments, using
++        C{os.makedirs}. If makedirs() would raise an exception due to the
++        directory already existing, makedirsIdempotent() does not raise that
++        exception and instead returns.
++
++        @see: L{makedirs}
++        @see: L{createDirectoryIdempotent}
++
++        @raise OSError: If the directory cannot be created (due to some
++        reason other than the directory already existing)
++        """
++        try:
++            return self.makedirs(mode=mode)
++        except OSError, e:
++            if e.errno != errno.EEXIST:
++                raise
++            if not self.isdir():
++                # The OSError is that something already exists there, but
++                # that thing is not a directory.
++                raise
++
+ 
+ 
+     def globChildren(self, pattern):
+@@ -974,15 +1001,43 @@
+         return cmp(self.path, other.path)
+ 
+ 
+-    def createDirectory(self):
++    def createDirectory(self, mode=None):
+         """
+         Create the directory the L{FilePath} refers to.
+ 
+         @see: L{makedirs}
++        @see: L{createDirectoryIdempotent}
+ 
+         @raise OSError: If the directory cannot be created.
+         """
+-        os.mkdir(self.path)
++        if mode is not None:
++            os.mkdir(self.path, mode=mode)
++        else:
++            os.mkdir(self.path)
++
++
++    def createDirectoryIdempotent(self, mode=None):
++        """
++        Create the directory the L{FilePath} refers to. If createDirectory()
++        would raise an exception due to the directory already existing,
++        createDirectoryIdempotent() does not raise that exception and instead
++        returns.
++
++        @see: L{makedirsIdempotent}
++        @see: L{createDirectory}
++
++        @raise OSError: If the directory cannot be created (due to some
++        reason other than the directory already existing)
++        """
++        try:
++            return self.createDirectory(mode=mode)
++        except OSError, e:
++            if e.errno != errno.EEXIST:
++                raise
++            if not self.isdir():
++                # The OSError is that something already exists there, but
++                # that thing is not a directory.
++                raise
+ 
+ 
+     def requireCreate(self, val=1):
+
+=== modified file 'twisted/test/test_paths.py'
+--- twisted/test/test_paths.py	2011-04-11 18:55:50 +0000
++++ twisted/test/test_paths.py	2011-09-28 06:46:53 +0000
+@@ -491,7 +491,12 @@
+ 
+ 
+ 
+-class FilePathTestCase(AbstractFilePathTestCase):
++class ReallyEqualMixin:
++    def failUnlessReallyEqual(self, a, b, msg=None):
++        self.failUnlessEqual(a, b, msg=msg)
++        self.failUnlessEqual(type(a), type(b), msg="a :: %r, b :: %r, %r" % (a, b, msg))
++
++class FilePathTestCase(AbstractFilePathTestCase, ReallyEqualMixin):
+     """
+     Test various L{FilePath} path manipulations.
+     """
+@@ -842,6 +847,182 @@
+         ts.createDirectory()
+         self.assertIn(ts, self.path.parent().children())
+ 
++    def _test_createDirectory(self, method_under_test):
++        class Sentinel(object):
++            pass
++        s = Sentinel()
++        def mock_mkdir1(path, mode=s):
++            self.failUnlessReallyEqual(path, os.path.join(os.getcwd(), 'test_dir1'))
++            self.failUnless((mode is s) or (mode == 0777))
++        self.patch(os, 'mkdir', mock_mkdir1)
++
++        fp1 = filepath.FilePath("test_dir1")
++        method_under_test(fp1)
++
++        def mock_mkdir2(path, mode=s):
++            self.failUnlessReallyEqual(path, os.path.join(os.getcwd(), 'test_dir2'))
++            self.failUnlessReallyEqual(mode, 0700)
++        self.patch(os, 'mkdir', mock_mkdir2)
++
++        fp2 = filepath.FilePath("test_dir2")
++        method_under_test(fp2, mode=0700)
++
++        calls_to_mkdir = []
++        def mock_mkdir3(path, mode=s):
++            calls_to_mkdir.append((path, mode))
++        self.patch(os, 'mkdir', mock_mkdir3)
++
++        fp3 = filepath.FilePath("test_dir3/test_dir4")
++        fp3.makedirs()
++
++        d3path = os.path.join(os.getcwd(), "test_dir3")
++        d4path = os.path.join(d3path, "test_dir4")
++
++        self.failUnlessEqual(calls_to_mkdir, [(d3path, 0777), (d4path, 0777)])
++        del calls_to_mkdir[:]
++
++        fp6 = filepath.FilePath("test_dir5/test_dir6")
++        fp6.makedirs(mode=0644)
++
++        d5path = os.path.join(os.getcwd(), "test_dir5")
++        d6path = os.path.join(d5path, "test_dir6")
++
++        self.failUnlessEqual(calls_to_mkdir, [(d5path, 0644), (d6path, 0644)])
++        del calls_to_mkdir[:]
++
++        fp7 = filepath.FilePath("test_dir5/test_dir7")
++        fp7.makedirs(mode=0640)
++
++        d7path = os.path.join(d5path, "test_dir7")
++
++        # We don't care what calls were made to mkdir(d5path, ...), but we do
++        # require that the was finally a call to mkdir(d7path, 0640):
++        self.failUnlessEqual(calls_to_mkdir[-1], (d7path, 0640))
++
++    def test_createDirectory(self):
++        return self._test_createDirectory(filepath.FilePath.createDirectory)
++
++    def test_createDirectoryIdempotent(self):
++        return self._test_createDirectory(filepath.FilePath.createDirectoryIdempotent)
++
++    def test_makedirs(self):
++        return self._test_createDirectory(filepath.FilePath.makedirs)
++
++    def test_makedirsIdempotent(self):
++        return self._test_createDirectory(filepath.FilePath.makedirsIdempotent)
++
++    def _test_createDirectoryIdempotent(self, method_under_test):
++        class Sentinel(object):
++            pass
++        s = Sentinel()
++
++        fp = filepath.FilePath("test_dir8")
++        method_under_test(fp)
++        self.failUnless(os.path.isdir(os.path.join(os.getcwd(), "test_dir8")))
++        # This is how createDirectoryIdempotent() differs from
++        # createDirectory() -- we can call it again without getting an
++        # exception:
++        method_under_test(fp)
++        self.failUnless(os.path.isdir(os.path.join(os.getcwd(), "test_dir8")))
++
++        # However, it will raise an exception if there is a thing there that
++        # isn't a directory:
++        fo = open("test_dir9", "w")
++        fo.write("hello out there\n")
++        fo.close()
++        
++        fp = filepath.FilePath("test_dir9")
++        self.failUnlessRaises(OSError, method_under_test, fp)
++       
++        # And it will raise an exception if it fails to create the directory
++        # for some other reason:
++        def mock_mkdir(path, mode=s):
++            raise OSError(errno.EACCES, "Permission denied: %r" % (path,))
++        self.patch(os, 'mkdir', mock_mkdir)
++       
++        fp = filepath.FilePath("test_dir10")
++        self.failUnlessRaises(OSError, method_under_test, fp)
++
++    def test_createDirectoryIdempotent_is_idempotent(self):
++        return self._test_createDirectoryIdempotent(filepath.FilePath.createDirectoryIdempotent)
++
++    def test_makedirsIdempotent_is_idempotent(self):
++        return self._test_createDirectoryIdempotent(filepath.FilePath.makedirsIdempotent)
++
++    def _test_createDirectoryIdempotent_race_condition(self, method_under_test):
++        """
++        If you try to implement createDirectoryIdempotent by looking to see
++        if it is already there before attempting to create it, then you could
++        run afoul of a race condition where it wasn't there when you looked
++        but was there when you tried to create it. When such race conditions
++        lead to security problems, they are called "Time Of Check To Time Of
++        Use" (TOCTTOU) bugs. This test makes sure that
++        createDirectoryIdempotent can't cause that problem.
++        """
++        class Sentinel(object):
++            pass
++        s = Sentinel()
++
++        class MockStat:
++            def __init__(self):
++                self.st_mode = None
++
++        it_is_there = [False]
++        def mock_stat(path):
++            if path != os.path.join(os.getcwd(), "test_dir11"):
++                return os.stat(path)
++
++            if it_is_there[0]:
++                mstat = MockStat()
++                mstat.st_mode = 16893 # a directory
++                return mstat
++            else:
++                raise OSError(errno.ENOENT, "No such file or directory: %r" % (path,))
++        self.patch(filepath, 'stat', mock_stat)
++
++        def mock_mkdir(path, mode=s):
++            it_is_there[0] = True
++            raise OSError(errno.EEXIST, "File exists: %r" % (path,))
++        self.patch(os, 'mkdir', mock_mkdir)
++
++        fp = filepath.FilePath("test_dir11")
++
++        # Now it will appear to the method under test that there is nothing
++        # at that path, when it checks, but then when it tries to create a
++        # directory at that path it will get the OSError meaning that
++        # something already exists there. Also if it then inspects with
++        # os.stat() it will be told that the thing that is there is a
++        # directory.
++        method_under_test(fp)
++
++    def test_naiveCreateDirectoryIdempotent_race_condition(self):
++        """
++        This is not actually a test of code from twisted.python.filepath;
++        this is actually a test of the test code
++        (_test_createDirectoryIdempotent_race_condition), and an
++        demonstration of how the obvious implementation of
++        createDirectoryIdempotent isn't sufficient to pass this test.
++        """
++
++        def naive_createDirectoryIdempotent(self, mode=None):
++            """ This is a nice simple way to implement
++            createDirectoryIdempotent! """
++            if not self.isdir():
++                return self.createDirectory(mode=mode)
++
++        try:
++            self._test_createDirectoryIdempotent_race_condition(naive_createDirectoryIdempotent)
++        except OSError:
++            # Aha. Yep, the naive approach can fail in the presence of this race condition.
++            pass
++        else:
++            raise Error, "This test should have detected that naive_createDirectoryIdempotent was vulnerable to a race condition."
++
++    def test_createDirectoryIdempotent_race_condition(self):
++        return self._test_createDirectoryIdempotent_race_condition(filepath.FilePath.createDirectoryIdempotent)
++
++    def test_makedirsIdempotent_race_condition(self):
++        return self._test_createDirectoryIdempotent_race_condition(filepath.FilePath.makedirsIdempotent)
+ 
+     def test_temporarySiblingExtension(self):
+         """
+

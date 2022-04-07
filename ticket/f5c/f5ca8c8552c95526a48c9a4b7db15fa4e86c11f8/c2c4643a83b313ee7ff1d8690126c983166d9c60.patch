@@ -1,0 +1,186 @@
+diff --git twisted/mail/imap4.py twisted/mail/imap4.py
+index bb92df5..c7ef4b7 100644
+--- twisted/mail/imap4.py
++++ twisted/mail/imap4.py
+@@ -1417,18 +1417,18 @@ class IMAP4Server(basic.LineReceiver, policies.TimeoutMixin):
+     def do_SEARCH(self, tag, charset, query, uid=0):
+         sm = ISearchableMailbox(self.mbox, None)
+         if sm is not None:
+-            maybeDeferred(sm.search, query, uid=uid).addCallbacks(
+-                self.__cbSearch, self.__ebSearch,
+-                (tag, self.mbox, uid), None, (tag,), None
+-            )
++            maybeDeferred(sm.search, query, uid=uid
++                          ).addCallback(self.__cbSearch, tag, self.mbox, uid
++                          ).addErrback(self.__ebSearch, tag)
+         else:
+             # that's not the ideal way to get all messages, there should be a
+             # method on mailboxes that gives you all of them
+             s = parseIdList('1:*')
+-            maybeDeferred(self.mbox.fetch, s, uid=uid).addCallbacks(
+-                self.__cbManualSearch, self.__ebSearch,
+-                (tag, self.mbox, query, uid), None, (tag,), None
+-            )
++            maybeDeferred(self.mbox.fetch, s, uid=uid
++                          ).addCallback(self.__cbManualSearch,
++                                        tag, self.mbox, query, uid
++                          ).addErrback(self.__ebSearch, tag)
++
+ 
+     select_SEARCH = (do_SEARCH, opt_charset, arg_searchkeys)
+ 
+@@ -1559,15 +1559,18 @@ class IMAP4Server(basic.LineReceiver, policies.TimeoutMixin):
+                 messageSet = parseIdList(c, lastSequenceId)
+                 return id in messageSet
+             else:
+-                f = getattr(self, 'search_' + c)
+-                if f is not None:
+-                    if c in self._requiresLastMessageInfo:
+-                        result = f(query, id, msg, (lastSequenceId,
+-                                                    lastMessageId))
+-                    else:
+-                        result = f(query, id, msg)
+-                    if not result:
+-                        return False
++                f = getattr(self, 'search_' + c, None)
++                if f is None:
++                    raise IllegalQueryError("Invalid search command %s" % c)
++
++                if c in self._requiresLastMessageInfo:
++                    result = f(query, id, msg, (lastSequenceId,
++                                                lastMessageId))
++                else:
++                    result = f(query, id, msg)
++
++                if not result:
++                    return False
+         return True
+ 
+     def search_ALL(self, query, id, msg):
+@@ -5007,6 +5010,8 @@ class ISearchableMailbox(Interface):
+         @return: A list of message sequence numbers or message UIDs which
+         match the search criteria or a C{Deferred} whose callback will be
+         invoked with such a list.
++
++        @raise IllegalQueryError: Raised when query is not valid.
+         """
+ 
+ class IMessageCopier(Interface):
+diff --git twisted/mail/test/test_imap.py twisted/mail/test/test_imap.py
+index 55c47e9..0c5ae79 100644
+--- twisted/mail/test/test_imap.py
++++ twisted/mail/test/test_imap.py
+@@ -3951,6 +3951,46 @@ class DefaultSearchTestCase(IMAP4HelperMixin, unittest.TestCase):
+         """
+         return self._messageSetSearchTest('2:* 3', [3])
+ 
++    def test_searchInvalidCriteria(self):
++        """
++        If the search criteria is not a valid key, a NO result is returned to
++        the client (resulting in an error callback), and an IllegalQueryError is
++        logged on the server side.
++        """
++        queryTerms = 'FOO'
++        def search():
++            return self.client.search(queryTerms)
++
++        d = self.connected.addCallback(strip(search))
++
++        def searchSucceeded(results):
++            raise Exception("Should not receive results for invalid search criteria")
++
++        d.addCallback(searchSucceeded)
++        d.addCallback(self._cbStopClient)
++
++        def errorReceived(results):
++            """
++            Verify that the server logs an IllegalQueryError and the
++            client raises an IMAP4Exception with 'Search failed:...'
++            """
++            self.client.transport.loseConnection()
++            self.server.transport.loseConnection()
++
++            # Check what the server logs
++            errors = self.flushLoggedErrors(imap4.IllegalQueryError)
++            self.assertEqual(len(errors), 1)
++
++            # Verify client gets an exception of the proper type and message
++            results.trap(imap4.IMAP4Exception)
++            self.assertTrue(str(results.value).startswith("SEARCH failed:"))
++
++
++        d.addErrback(errorReceived)
++        d.addErrback(self._ebGeneral)
++        self.loopback()
++        return d
++
+ 
+ 
+ class FetchSearchStoreTestCase(unittest.TestCase, IMAP4HelperMixin):
+@@ -3970,6 +4010,10 @@ class FetchSearchStoreTestCase(unittest.TestCase, IMAP4HelperMixin):
+         self.client = SimpleClient(self.connected)
+ 
+     def search(self, query, uid):
++        # Look for a specific bad query, so we can verify we handle it properly
++        if query == ['FOO']:
++            raise imap4.IllegalQueryError("FOO is not a valid search criteria")
++
+         self.server_received_query = query
+         self.server_received_uid = uid
+         return self.expected
+@@ -4065,6 +4109,48 @@ class FetchSearchStoreTestCase(unittest.TestCase, IMAP4HelperMixin):
+         return d
+ 
+ 
++    def testInvalidTerm(self):
++        """
++        If, as part of a search, an ISearchableMailbox raises an
++        IllegalQueryError (e.g. due to invalid search criteria), client sees a
++        failure response, and an IllegalQueryError is logged on the server.
++        """
++
++        query = 'FOO'
++
++        def search():
++            return self.client.search(query)
++
++        d = self.connected.addCallback(strip(search))
++
++        def searchSucceeded(results):
++            raise Exception("Should not receive results for invalid search criteria")
++
++        d.addCallback(searchSucceeded)
++        d.addCallback(self._cbStopClient)
++
++        def errorReceived(results):
++            """
++            Verify that the server logs an IllegalQueryError and the
++            client raises an IMAP4Exception with 'Search failed:...'
++            """
++            self.client.transport.loseConnection()
++            self.server.transport.loseConnection()
++
++            # Check what the server logs
++            errors = self.flushLoggedErrors(imap4.IllegalQueryError)
++            self.assertEqual(len(errors), 1)
++
++            # Verify client gets an exception of the proper type and message
++            results.trap(imap4.IMAP4Exception)
++            self.assertTrue(str(results.value).startswith("SEARCH failed:"))
++
++        d.addErrback(errorReceived)
++        d.addErrback(self._ebGeneral)
++        self.loopback()
++        return d
++
++
+ 
+ class FakeMailbox:
+     def __init__(self):
+diff --git twisted/mail/topfiles/4080.bugfix twisted/mail/topfiles/4080.bugfix
+new file mode 100644
+index 0000000..0c23428
+--- /dev/null
++++ twisted/mail/topfiles/4080.bugfix
+@@ -0,0 +1 @@
++twisted.mail.imap4.IMAP4Server now returns an error if passed an invalid search term by an IMAP client (instead of not responding at all)

@@ -1,0 +1,96 @@
+Index: twisted/web/test/test_webclient.py
+===================================================================
+--- twisted/web/test/test_webclient.py	(revision 16454)
++++ twisted/web/test/test_webclient.py	(working copy)
+@@ -4,9 +4,9 @@
+ 
+ from twisted.trial import unittest
+ from twisted.web import server, static, client, error, util, resource
+-from twisted.internet import reactor, defer, interfaces
++from twisted.internet import reactor, defer, interfaces, protocol
++from twisted.internet.error import ConnectionDone
+ from twisted.python.util import sibpath
+-from twisted.python import components
+ 
+ try:
+     from twisted.internet import ssl
+@@ -264,6 +264,79 @@
+         bytes = file(filename, "rb").read()
+         self.assertEquals(bytes, expectedData)
+ 
++class AbortingProtocol(protocol.Protocol):
++    """
++    Protocol that aborts all connections immediately, for
++    AbortedConnectionsTestCase
++    """
++
++    def connectionMade(self):
++        self.transport.loseConnection()
++
++
++class AbortedConnectionsTestCase(unittest.TestCase):
++
++    def setUp(self):
++        self.serverFactory = protocol.ServerFactory()
++        self.serverFactory.protocol = AbortingProtocol
++        self.port = reactor.listenTCP(0, self.serverFactory)
++        self.portNumber = self.port.getHost().port
++
++
++    def tearDown(self):
++        return self.port.stopListening()
++
++
++    def testConnectionLost(self):
++        """
++        Test that when twisted.web.client.HTTPPageGetter connects to an aborted
++        TCP connection that it reports an error, not a successful retrieval of
++        a zero length page
++        """
++        return self.assertFailure(
++            client.getPage('http://127.0.0.1:%d/' % (self.portNumber,)),
++            ConnectionDone)
++
++
++
++class TruncatedHTTPResponseResource(resource.Resource):
++    """
++    Resource that sets Content-Length to a number greater than the length of
++    the data it actually serves.
++    """
++    isLeaf = True
++    def render(self, request):
++        if 'setLength' in request.args:
++            request.setHeader('Content-Length', '1000')
++        request.write('x' * 50)
++        request.channel.transport.loseConnection()
++        return server.NOT_DONE_YET
++
++
++class TruncatedResponseTestCase(unittest.TestCase):
++    def setUp(self):
++        self.serverFactory = server.Site(TruncatedHTTPResponseResource())
++        self.port = reactor.listenTCP(0, self.serverFactory)
++        self.portNumber = self.port.getHost().port
++
++
++    def tearDown(self):
++        return self.port.stopListening()
++
++
++    def testTruncatedResponseChunked(self):
++        return self.assertFailure(
++            client.getPage('http://127.0.0.1:%d/' % (self.portNumber,)),
++            client.PartialDownloadError)
++
++
++    def testTruncatedResponse(self):
++        return self.assertFailure(
++            client.getPage('http://127.0.0.1:%d/?setLength=1' % (self.portNumber,)),
++            client.PartialDownloadError)
++
++
++
+ class WebClientSSLTestCase(WebClientTestCase):
+     def _listen(self, site):
+         from twisted import test

@@ -1,0 +1,130 @@
+Index: twisted/test/test_adbapi.py
+===================================================================
+--- twisted/test/test_adbapi.py	(revision 26733)
++++ twisted/test/test_adbapi.py	(working copy)
+@@ -689,6 +689,7 @@
+         """
+         Don't forward init call.
+         """
++        self.reactor = reactor
+ 
+ 
+ 
+@@ -772,3 +773,28 @@
+         d.addCallback(cbFailed)
+         return d
+ 
++    def test_closeWithoutStartAttributeErrorFix(self):
++        """
++        close() should not raise an AttributeError when called without start()
++        being called first. See Trac Ticket #2680.
++        """
++        pool = ConnectionPool('twisted.test.fakedb')
++        try:
++            pool.close()
++        except AttributeError:
++            self.fail("ConnectionPool.close() raised attribute error")
++
++    def test_instantiateWhileReactorIsRunning(self):
++        """
++        Test that all event triggers are removed by close when the pool is
++        instantiated and the reactor is already running, i.e.
++        reactor.callWhenRunning runs the callable immediately.
++        """
++        from twisted.test.fake_reactor import FakeReactor
++        fakeReactor = FakeReactor(running = True)
++        pool = ConnectionPool('twisted.test.fakedb',
++                              test_reactor = fakeReactor)
++        pool.close()
++        if (fakeReactor.hasUnremovedEventTriggers()):
++            self.fail("ConnectionPool did not remove all event triggers on "
++                      "close")
+Index: twisted/enterprise/adbapi.py
+===================================================================
+--- twisted/enterprise/adbapi.py	(revision 26733)
++++ twisted/enterprise/adbapi.py	(working copy)
+@@ -181,6 +181,9 @@
+ 
+         @param cp_good_sql: an sql query which should always succeed and change
+                             no state (default 'select 1')
++
++        @param test_reactor: use the passed reactor object instead of the usual
++                             twisted.internet.reactor (used by unit tests)
+         """
+ 
+         self.dbapiName = dbapiName
+@@ -192,6 +195,13 @@
+         if getattr(self.dbapi, 'threadsafety', 0) < 1:
+             log.msg('DB API module not sufficiently thread-safe.')
+ 
++        if ('test_reactor' in connkw):
++            self.reactor = connkw['test_reactor']
++            del connkw['test_reactor']
++        else:
++            from twisted.internet import reactor
++            self.reactor = reactor
++
+         self.connargs = connargs
+         self.connkw = connkw
+ 
+@@ -213,9 +223,12 @@
+         self.threadID = thread.get_ident
+         self.threadpool = threadpool.ThreadPool(self.min, self.max)
+ 
+-        from twisted.internet import reactor
+-        self.startID = reactor.callWhenRunning(self._start)
++        # shutdownID is set in start(); set to None here so close() doesn't
++        # raise an exception if called without start() being called first.
++        self.shutdownID = None
+ 
++        self.startID = self.reactor.callWhenRunning(self._start)
++
+     def _start(self):
+         self.startID = None
+         return self.start()
+@@ -228,9 +241,8 @@
+         """
+ 
+         if not self.running:
+-            from twisted.internet import reactor
+             self.threadpool.start()
+-            self.shutdownID = reactor.addSystemEventTrigger('during',
++            self.shutdownID = self.reactor.addSystemEventTrigger('during',
+                                                             'shutdown',
+                                                             self.finalClose)
+             self.running = True
+@@ -257,8 +269,7 @@
+         @return: a Deferred which will fire the return value of
+             C{func(Transaction(...), *args, **kw)}, or a Failure.
+         """
+-        from twisted.internet import reactor
+-        return threads.deferToThreadPool(reactor, self.threadpool,
++        return threads.deferToThreadPool(self.reactor, self.threadpool,
+                                          self._runWithConnection,
+                                          func, *args, **kw)
+ 
+@@ -307,8 +318,7 @@
+         @return: a Deferred which will fire the return value of
+             'interaction(Transaction(...), *args, **kw)', or a Failure.
+         """
+-        from twisted.internet import reactor
+-        return threads.deferToThreadPool(reactor, self.threadpool,
++        return threads.deferToThreadPool(self.reactor, self.threadpool,
+                                          self._runInteraction,
+                                          interaction, *args, **kw)
+ 
+@@ -355,12 +365,11 @@
+     def close(self):
+         """Close all pool connections and shutdown the pool."""
+ 
+-        from twisted.internet import reactor
+         if self.shutdownID:
+-            reactor.removeSystemEventTrigger(self.shutdownID)
++            self.reactor.removeSystemEventTrigger(self.shutdownID)
+             self.shutdownID = None
+         if self.startID:
+-            reactor.removeSystemEventTrigger(self.startID)
++            self.reactor.removeSystemEventTrigger(self.startID)
+             self.startID = None
+         self.finalClose()
+ 

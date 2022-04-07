@@ -1,0 +1,83 @@
+Index: mail/smtp.py
+===================================================================
+--- mail/smtp.py	(revision 26161)
++++ mail/smtp.py	(working copy)
+@@ -1115,7 +1115,7 @@
+         s = basic.FileSender()
+         s.beginFileTransfer(
+             self.getMailData(), self.transport, self.transformChunk
+-        ).addCallback(self.finishedFileTransfer)
++        ).addCallbacks(self.finishedFileTransfer, self._errorFileTransfer)
+         self._expected = SUCCESS
+         self._okresponse = self.smtpState_msgSent
+ 
+@@ -1142,8 +1142,13 @@
+         else:
+             line = '.'
+         self.sendLine(line)
++
++    def _errorFileTransfer(self, reason):
++        # Called if file transfer failed. We cannot send command to server 
++        # here, just disconnect the connection.
++        self.transport.loseConnection(reason)
++
+     ##
+-
+     # these methods should be overriden in subclasses
+     def getMailFrom(self):
+         """Return the email address the mail is from."""
+Index: mail/test/test_smtp.py
+===================================================================
+--- mail/test/test_smtp.py	(revision 26161)
++++ mail/test/test_smtp.py	(working copy)
+@@ -582,6 +582,50 @@
+ 
+ 
+ 
++class MyErrorFile:
++    def read(self, n):
++        self.transport.loseConnection()
++        return '1'
++
++class MyErrorSMTPSender(smtp.SMTPSender):
++    def getMailData(self):
++        ret = MyErrorFile()
++        ret.transport = self.transport
++        return ret
++
++class SMTPClientTransferErrorTestCase(unittest.TestCase):
++    # This test should finish without printing "Unhandled error in Deferred:.."
++    expected_output = [
++        'HELO foo.baz', 'MAIL FROM:<aishimoto@foo.baz>',
++        'RCPT TO:<aishimoto@foo.baz>', 'DATA', 
++        'Subject: hello', '', 'Goodbye', '.']
++ 
++    def testMessages(self):
++        serverFactory = protocol.Factory()
++        serverFactory.protocol = FakeSMTPServer
++        serverPort = reactor.listenTCP(25, serverFactory, interface='127.0.0.1')
++
++        deferred = defer.Deferred()
++        clientFactory = smtp.SMTPSenderFactory("aishimoto@foo.baz", "aishimoto@foo.baz", 
++            StringIO(mail), deferred, retries=0)
++        clientFactory.domain = "foo.baz"
++        clientFactory.protocol = MyErrorSMTPSender
++        clientPort = reactor.connectTCP('127.0.0.1', 25, clientFactory)
++        
++        done = defer.Deferred()
++        def onSent(arg):
++            clientPort.transport.loseConnection()
++            d = serverPort.loseConnection()
++            raise Exception("Never reach here")
++
++        def onError(reason):
++            serverPort.loseConnection()
++            done.callback(True)
++        deferred.addCallbacks(onSent, onError)
++
++        return done
++
++
+ class SingletonRealm(object):
+     """
+     Trivial realm implementation which is constructed with an interface and an

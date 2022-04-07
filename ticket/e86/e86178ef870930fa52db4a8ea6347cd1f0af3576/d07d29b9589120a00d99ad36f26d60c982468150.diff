@@ -1,0 +1,295 @@
+diff --git a/twisted/protocols/ftp.py b/twisted/protocols/ftp.py
+index 19504a7..bb517b6 100644
+--- a/twisted/protocols/ftp.py
++++ b/twisted/protocols/ftp.py
+@@ -30,6 +30,7 @@ from twisted.protocols import basic, policies
+ 
+ from twisted.python import log, failure, filepath
+ from twisted.python.compat import reduce
++from twisted.python.reflect import qual
+ 
+ from twisted.cred import error as cred_error, portal, credentials, checkers
+ 
+@@ -417,6 +418,22 @@ class DTP(object, protocol.Protocol):
+             self._onConnLost.callback(None)
+ 
+     def sendLine(self, line):
++        """
++        Send a line to data channel.
++
++        @type  line: L{bytes}
++        @param line: The line to be sent.
++        """
++        if isinstance(line, unicode):
++            warnings.warn(
++                "Unicode date received in %s. "
++                "Encoded to UTF-8. Please send bytes." % (
++                    qual(self.__class__),),
++                category=DeprecationWarning,
++                stacklevel=2,
++                )
++            line = line.encode('utf-8')
++
+         self.transport.write(line + '\r\n')
+ 
+ 
+@@ -951,7 +968,8 @@ class FTP(object, basic.LineReceiver, policies.TimeoutMixin):
+         def gotListing(results):
+             self.reply(DATA_CNX_ALREADY_OPEN_START_XFR)
+             for (name, attrs) in results:
+-                self.dtpInstance.sendListResponse(name, attrs)
++                nameEncoded = self._getEncodedFilename(name)
++                self.dtpInstance.sendListResponse(nameEncoded, attrs)
+             self.dtpInstance.transport.loseConnection()
+             return (TXFR_COMPLETE_OK,)
+ 
+@@ -1014,7 +1032,8 @@ class FTP(object, basic.LineReceiver, policies.TimeoutMixin):
+             self.reply(DATA_CNX_ALREADY_OPEN_START_XFR)
+             for (name, ignored) in results:
+                 if not glob or (glob and fnmatch.fnmatch(name, glob)):
+-                    self.dtpInstance.sendLine(name)
++                    nameEncoded = self._getEncodedFilename(name)
++                    self.dtpInstance.sendLine(nameEncoded)
+             self.dtpInstance.transport.loseConnection()
+             return (TXFR_COMPLETE_OK,)
+ 
+@@ -1049,6 +1068,25 @@ class FTP(object, basic.LineReceiver, policies.TimeoutMixin):
+         return d
+ 
+ 
++    def _getEncodedFilename(self, name):
++        """
++        Return the UTF-8 encoded filename from an Unicode filename received
++        from IFTPShell.list.
++        """
++        try:
++            result = name.encode('utf-8')
++        except UnicodeDecodeError:
++            warnings.warn(
++                "Non-Unicode date received in %s from IFTPShell.list. "
++                "Data transmitted without "
++                "encoding it. Please send Unicode." % (qual(self.__class__),),
++                category=DeprecationWarning,
++                stacklevel=1,
++                )
++            result = name
++        return result
++
++
+     def ftp_CWD(self, path):
+         try:
+             segments = toSegments(self.workingDirectory, path)
+diff --git a/twisted/test/test_ftp.py b/twisted/test/test_ftp.py
+index 7ba434e..a61b518 100644
+--- a/twisted/test/test_ftp.py
++++ b/twisted/test/test_ftp.py
+@@ -22,6 +22,7 @@ from twisted.internet.interfaces import IConsumer
+ from twisted.cred.error import UnauthorizedLogin
+ from twisted.cred import portal, checkers, credentials
+ from twisted.python import failure, filepath, runtime
++from twisted.python.reflect import qual
+ from twisted.test import proto_helpers
+ 
+ from twisted.protocols import ftp, loopback
+@@ -513,6 +514,40 @@ class BasicFTPServerTestCase(FTPServerTestCase):
+             )
+         return d
+ 
++
++    def test_getEncodedFilename_unicode(self):
++        """
++        When Unicode filenames are received from IFTPShell.list it will
++        be encoded to UTF-8.
++        """
++        unicodeFilename = u'my resum\xe9'
++
++        encodedFilename = self.serverProtocol._getEncodedFilename(
++            unicodeFilename)
++
++        self.assertEqual(
++            unicodeFilename.encode('utf-8'), encodedFilename)
++
++
++    def test_getEncodedFilename_non_unicode(self):
++        """
++        When non-Unicode filenames are received from IFTPShell.list it will
++        pass the data without changing it together with raising a warning.
++        """
++        alreadyEncodedFilename = u'my resum\xe9'.encode('utf-8')
++
++        result = self.assertWarns(
++            DeprecationWarning,
++            "Non-Unicode date received in %s from IFTPShell.list. "
++                "Data transmitted without encoding it. "
++                "Please send Unicode." % (
++                    qual(self.serverProtocol.__class__)),
++            ftp.__file__,
++            self.serverProtocol._getEncodedFilename, alreadyEncodedFilename)
++
++        self.assertIdentical(alreadyEncodedFilename, result)
++
++
+ class FTPServerTestCaseAdvancedClient(FTPServerTestCase):
+     """
+     Test FTP server with the L{ftp.FTPClient} class.
+@@ -672,6 +707,39 @@ class FTPServerPasvDataConnectionTestCase(FTPServerTestCase):
+             self.assertEqual('', download)
+         return d.addCallback(checkDownload)
+ 
++
++    def test_LISTUnicode(self):
++        """
++        LIST will receive Unicode filenames from IFTPShell.list, and will
++        encode them using UTF-8.
++        """
++        d = self._anonymousLogin()
++
++        def patchedFTPShellList(me, segments):
++            """
++            Mock method that patches the IFTPShell.list.
++            """
++            return defer.succeed([(
++                u'my resum\xe9', (0, 1, 0777, 0, 0, 'user', 'group'))])
++
++        def patchFTPShellList(result):
++            """
++            Patch the IFTPShell.list, once we got an instance.
++            """
++            self.patch(self.serverProtocol.shell, 'list', patchedFTPShellList)
++            return result
++        d.addCallback(patchFTPShellList)
++
++        self._download('LIST something', chainDeferred=d)
++
++        def checkDownload(download):
++            self.assertEqual(
++                'drwxrwxrwx   0 user      group                   '
++                '0 Jan 01  1970 my resum\xc3\xa9\r\n',
++                download)
++        return d.addCallback(checkDownload)
++
++
+     def testManyLargeDownloads(self):
+         # Login
+         d = self._anonymousLogin()
+@@ -756,6 +824,35 @@ class FTPServerPasvDataConnectionTestCase(FTPServerTestCase):
+         return d.addCallback(checkDownload)
+ 
+ 
++    def test_NLSTUnicode(self):
++        """
++        NLST will receive Unicode filenames from IFTPShell.list, and will
++        encode them using UTF-8.
++        """
++        d = self._anonymousLogin()
++
++        def patchedFTPShellList(me):
++            """
++            Mock method that patches the IFTPShell.list.
++            """
++            return defer.succeed([(u'my resum\xe9', None)])
++
++        def patchFTPShellList(result):
++            """
++            Patch the IFTPShell.list, once we got an instance.
++            """
++            self.patch(self.serverProtocol.shell, 'list', patchedFTPShellList)
++            return result
++        d.addCallback(patchFTPShellList)
++
++        self._download('NLST something', chainDeferred=d)
++
++        def checkDownload(download):
++            self.assertEqual('my resum\xc3\xa9\r\n', download)
++
++        return d.addCallback(checkDownload)
++
++
+     def test_NLSTOnPathToFile(self):
+         """
+         NLST on an existent file returns only the path to that file.
+@@ -767,6 +864,7 @@ class FTPServerPasvDataConnectionTestCase(FTPServerTestCase):
+         self.dirPath.child('test.txt').touch()
+ 
+         self._download('NLST test.txt', chainDeferred=d)
++
+         def checkDownload(download):
+             filenames = download[:-2].split('\r\n')
+             self.assertEqual(['test.txt'], filenames)
+@@ -982,6 +1080,68 @@ class DTPFactoryTests(unittest.TestCase):
+         return d
+ 
+ 
++class DTPTests(unittest.TestCase):
++    """
++    Tests for L{ftp.DTP}.
++
++    The DTP instances in these tests are generated using
++    DTPFactory.buildProtocol()
++    """
++
++    def setUp(self):
++        """
++        Create a fake protocol interpreter, a L{ftp.DTPFactory} instance,
++        and dummy transport to help with tests.
++        """
++        self.reactor = task.Clock()
++
++        class ProtocolInterpreter(object):
++            dtpInstance = None
++
++        self.protocolInterpreter = ProtocolInterpreter()
++        self.factory = ftp.DTPFactory(
++            self.protocolInterpreter, None, self.reactor)
++        self.transport = proto_helpers.StringTransportWithDisconnection()
++
++
++    def test_sendLine_newline(self):
++        """
++        When sending a line, the newline delimiter will be automatically
++        added.
++        """
++        dtpInstance = self.factory.buildProtocol(None)
++        dtpInstance.makeConnection(self.transport)
++        lineContent = 'line content'
++
++        dtpInstance.sendLine(lineContent)
++
++        dataSent = self.transport.value()
++        self.assertEqual(lineContent + '\r\n', dataSent)
++
++
++    def test_sendLine_unicode(self):
++        """
++        When sending an unicode line, it will be converted to str and
++        a warning is raised.
++        """
++        from twisted.trial import _synctest
++        dtpInstance = self.factory.buildProtocol(None)
++        dtpInstance.makeConnection(self.transport)
++        lineContent = u'my resum\xe9'
++
++        self.assertWarns(
++            DeprecationWarning,
++            "Unicode date received in %s. "
++                "Encoded to UTF-8. Please send bytes." % (
++                    qual(dtpInstance.__class__)),
++            _synctest.__file__,
++            dtpInstance.sendLine, lineContent)
++
++        dataSent = self.transport.value()
++        self.assertTrue(isinstance(dataSent, str))
++        self.assertEqual(lineContent.encode('utf-8') + '\r\n', dataSent)
++
++
+ 
+ # -- Client Tests -----------------------------------------------------------
+ 
+diff --git a/twisted/topfiles/5411.bugfix b/twisted/topfiles/5411.bugfix
+new file mode 100644
+index 0000000..bce9487
+--- /dev/null
++++ b/twisted/topfiles/5411.bugfix
+@@ -0,0 +1 @@
++twisted.protocols.ftp.FTP 'ftp_LIST' and 'ftp_NLST' will encode to UTF-8 all Unicode filenames received from IFTPShell.
+\ No newline at end of file

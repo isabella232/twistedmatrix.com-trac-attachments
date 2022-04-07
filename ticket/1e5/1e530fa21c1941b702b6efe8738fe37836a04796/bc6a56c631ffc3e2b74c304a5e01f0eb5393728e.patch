@@ -1,0 +1,121 @@
+Index: twisted/python/failure.py
+===================================================================
+--- twisted/python/failure.py	(revision 20676)
++++ twisted/python/failure.py	(working copy)
+@@ -149,7 +149,7 @@
+         self.type = self.value = tb = None
+ 
+         #strings Exceptions/Failures are bad, mmkay?
+-        if isinstance(exc_value, (str, unicode)) and exc_type is None:
++        if isinstance(exc_value, basestring) and exc_type is None:
+             import warnings
+             warnings.warn(
+                 "Don't pass strings (like %r) to failure.Failure (replacing with a DefaultException)." %
+@@ -333,18 +333,36 @@
+         if not tb:
+             return
+ 
++        second_last_tb = None
++        last_tb = tb
++        while last_tb.tb_next:
++            second_last_tb = last_tb
++            last_tb = last_tb.tb_next
++
++        # handle raiseException-originated exceptions
++        frame = last_tb.tb_frame
++        if frame.f_code is Failure.raiseException.func_code:
++            return frame.f_locals['self']
++
+         # handle throwExceptionIntoGenerator-originated exceptions
+-        # XXX TOTALLY LIMITED AND NOT GOOD AT ALL
+-        if tb.tb_frame.f_back:
+-            frame = tb.tb_frame.f_back
++        # this is tricky, and differs if the exception was caught
++        # inside the generator, or above it:
++
++        # if the exception was caught above the generator.throw
++        # (outside the generator), it will appear in the tb (as the
++        # second last item):
++        if second_last_tb:
++            frame = second_last_tb.tb_frame
+             if frame.f_code is Failure.throwExceptionIntoGenerator.func_code:
+                 return frame.f_locals['self']
+ 
+-        while tb.tb_next:
+-            tb = tb.tb_next
+-        #handle raiseException-originated exceptions
+-        frame = tb.tb_frame
+-        if frame.f_code is Failure.raiseException.func_code:
++        # if the exception was caught below the generator.throw
++        # (inside the generator), it will appear in the frames' linked
++        # list, above the top-level traceback item (which must be the
++        # generator frame itself, thus its caller is
++        # throwExceptionIntoGenerator).
++        frame = tb.tb_frame.f_back
++        if frame and frame.f_code is Failure.throwExceptionIntoGenerator.func_code:
+             return frame.f_locals['self']
+ 
+ 
+Index: twisted/test/test_failure.py
+===================================================================
+--- twisted/test/test_failure.py	(revision 20676)
++++ twisted/test/test_failure.py	(working copy)
+@@ -268,7 +268,5 @@
+                           ('filename.py', 235, 'method2', None)])
+ 
+ 
+-print sys.version_info[:2]
+ if sys.version_info[:2] >= (2, 5):
+-    print "HEYA!"
+     from twisted.test.generator_failure_tests import TwoPointFiveFailureTests
+Index: twisted/test/generator_failure_tests.py
+===================================================================
+--- twisted/test/generator_failure_tests.py	(revision 20676)
++++ twisted/test/generator_failure_tests.py	(working copy)
+@@ -5,10 +5,30 @@
+ 
+ from twisted.python.failure import Failure
+ from twisted.test.test_failure import getDivisionFailure
++from twisted.internet import defer
+ 
+-
+ class TwoPointFiveFailureTests(TestCase):
+ 
++    def test_inlineCallbacksTracebacks(self):
++        f = getDivisionFailure()
++        d = defer.Deferred()
++        try:
++            f.raiseException()
++        except:
++            d.errback()
++        
++        failures = []
++        def collect_error(result):
++            failures.append(result)
++
++        @defer.inlineCallbacks
++        def ic(d):
++            yield d
++        ic(d).addErrback(collect_error)
++        
++        newFailure, = failures
++        self.assertEquals(traceback.extract_tb(newFailure.getTracebackObject())[-1][-1], "1/0")
++
+     def test_throwExceptionIntoGenerator(self):
+         """
+         It should be possible to throw the exception that a Failure
+Index: twisted/internet/defer.py
+===================================================================
+--- twisted/internet/defer.py	(revision 20676)
++++ twisted/internet/defer.py	(working copy)
+@@ -721,9 +721,7 @@
+         try:
+             # Send the last result back as the result of the yield expression.
+             if isinstance(result, failure.Failure):
+-                # xxx untested and doesn't work anyway.
+-                #result.throwExceptionIntoGenerator(g)
+-                result = g.throw(result.type, result.value, result.tb)
++                result = result.throwExceptionIntoGenerator(g)
+             else:
+                 result = g.send(result)
+         except StopIteration:

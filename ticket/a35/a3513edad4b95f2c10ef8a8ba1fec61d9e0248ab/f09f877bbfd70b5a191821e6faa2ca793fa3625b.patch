@@ -1,0 +1,76 @@
+--- web2/client/http.py	2007-10-19 01:16:52.000000000 -0700
++++ new/web2/client/http.py	2008-04-25 13:29:34.090015000 -0700
+@@ -26,6 +26,11 @@
+     Exception raised when a HTTP error happened.
+     """
+ 
++class PipelineError(Exception):
++    """
++    Exception raised when a HTTP error happened.
++    """
++
+ 
+ 
+ class ClientRequest(object):
+@@ -82,6 +87,7 @@
+         self.closeAfter = closeAfter
+         self.transport = self.channel.transport
+         self.responseDefer = Deferred()
++        self.started = False
+ 
+     def submit(self):
+         l = []
+@@ -152,7 +158,8 @@
+         the C{responseDefer} if no response has been sent yet, or close the
+         stream.
+         """
+-        self.abortParse()
++        if self.started:
++            self.abortParse()
+         if hasattr(self, 'stream') and self.stream is not None:
+             self.stream.finish(err)
+         else:
+@@ -168,6 +175,7 @@
+         self._error(reason)
+ 
+     def gotInitialLine(self, initialLine):
++        self.started = True
+         parts = initialLine.split(' ', 2)
+ 
+         # Parse the initial request line
+@@ -346,19 +354,30 @@
+                 self.transport.loseConnection()
+ 
+     def setReadPersistent(self, persist):
++        oldPersist = self.readPersistent
+         self.readPersistent = persist
+         if not persist:
+             # Tell all requests but first to abort.
+-            for request in self.inRequests[1:]:
+-                request.connectionLost(None)
++            lostRequests = self.inRequests[1:]
+             del self.inRequests[1:]
++            for request in lostRequests:
++                request.connectionLost(PipelineError('Pipelined connection was closed.'))
++        elif (oldPersist is PERSIST_NO_PIPELINE and
++              persist is PERSIST_PIPELINE and
++              self.outRequest is None):
++            self.manager.clientPipelining(self)
+ 
+     def connectionLost(self, reason):
+         self.readPersistent = False
+         self.setTimeout(None)
+         self.manager.clientGone(self)
+-        # Tell all requests to abort.
+-        for request in self.inRequests:
++        # Cancel the current request
++        if self.inRequests and self.inRequests[0] is not None:
++            self.inRequests[0].connectionLost(reason)
++        # Tell all remaining requests to abort.
++        lostRequests = self.inRequests[1:]
++        del self.inRequests[1:]
++        for request in lostRequests:
+             if request is not None:
+-                request.connectionLost(reason)
++                request.connectionLost(PipelineError('Pipelined connection was closed.'))
+ 

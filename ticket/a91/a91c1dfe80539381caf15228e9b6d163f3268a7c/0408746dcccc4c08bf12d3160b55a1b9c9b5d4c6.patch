@@ -1,0 +1,186 @@
+Index: twisted/python/win32.py
+===================================================================
+--- twisted/python/win32.py	(revision 21456)
++++ twisted/python/win32.py	(working copy)
+@@ -1,4 +1,4 @@
+-# Copyright (c) 2001-2004 Twisted Matrix Laboratories.
++# Copyright (c) 2001-2007 Twisted Matrix Laboratories.
+ # See LICENSE for details.
+ 
+ 
+@@ -9,6 +9,7 @@
+ 
+ import re
+ import exceptions
++import os
+ 
+ try:
+     import win32api
+@@ -88,3 +89,42 @@
+     @return: a single string, with the given sequence quoted as necessary.
+     """
+     return ' '.join([cmdLineQuote(a) for a in arguments])
++
++def formatError(errorcode):
++    """
++    Returns the string associated with a Windows error message,
++    such as the ones found in socket.error.
++
++    Attempts direct lookup against the win32 API via ctypes and then
++    pywin32 (if available), then in the error table in the socket
++    module, then finally defaulting to os.strerror.
++
++    @param errorcode: The (integer) Windows error code
++
++    @return: The error message string
++
++    """
++    try:
++        from ctypes import WinError
++    except ImportError:
++        pass
++    else:
++        return WinError(errorcode)[1]
++
++    try:
++        import win32api
++    except ImportError:
++        pass
++    else:
++        return win32api.FormatMessage(errorcode)
++
++    try:
++        from socket import errorTab
++    except ImportError:
++        pass
++    else:
++        r = errorTab.get(errorcode)
++        if r is not None:
++            return r
++
++    return os.strerror(errorcode)
+Index: twisted/test/test_strerror.py
+===================================================================
+--- twisted/test/test_strerror.py	(revision 0)
++++ twisted/test/test_strerror.py	(revision 0)
+@@ -0,0 +1,73 @@
++# Copyright (c) 2007 Twisted Matrix Laboratories.
++# See LICENSE for details.
++
++"""
++Test strerror
++"""
++
++from twisted.trial.unittest import TestCase
++from twisted.internet.tcp import ECONNABORTED
++from twisted.python import win32
++from twisted.python.runtime import platform
++import socket
++import os
++
++class ErrorFormatingTestCase(TestCase):
++    def test_formatMessageSafeToCall(self):
++        """
++        Test that formatMessage gives the same results as
++        os.strerror on non-Windows, ensuring that the fallback
++        worked correctly.
++        """
++        self.assertEqual(
++                os.strerror(ECONNABORTED),
++                win32.formatError(ECONNABORTED)
++            )
++    if platform.getType() == "win32":
++        test_formatMessageSafeToCall.skip = "Test actual functionality on Windows instead"
++    
++    def test_simpleFormatMessage(self):
++        """
++        Test that formatMessage appears to work
++        The error message from Windows changes between
++        window versions, and it's localized. So we can't
++        just check expected output.
++        Call it with a known-good errno and 
++        ensure that it's not what os.strerror returns
++        This will fail if/when os.strerror gets updated to
++        work correcly on win32.
++        """
++        self.assertNotEqual(
++            os.strerror(ECONNABORTED),
++            win32.formatError(ECONNABORTED)
++        )
++    if platform.getType() != "win32":
++        test_simpleFormatMessage = "formatMessage only does anything different on win32"
++            
++    def test_correctLookups(self):
++        """
++        Given an known-good errno, make sure that formatMessage
++        gives results matching either socket.errTab, ctypes.WinError,
++        or win32api.FormatMessage.
++        """
++        acceptable_messages = [socket.errorTab[ECONNABORTED]]
++        try:
++            from ctypes import WinError
++            acceptable_messages.append(WinError(ECONNABORTED)[1])
++        except ImportError:
++            pass
++        try:
++            from win32api import FormatMessage
++            acceptable_messages.append(FormatMessage(ECONNABORTED))
++        except ImportError:
++            pass
++        
++        self.assertIn(
++            win32.formatError(ECONNABORTED),
++            acceptable_messages
++        )
++    if platform.getType() != "win32":
++        test_correctLookups.skip = "This error lookup only works on Windows"
++        
++            
++        
+Index: twisted/internet/tcp.py
+===================================================================
+--- twisted/internet/tcp.py	(revision 21456)
++++ twisted/internet/tcp.py	(working copy)
+@@ -1,5 +1,5 @@
+ # -*- test-case-name: twisted.test.test_tcp -*-
+-# Copyright (c) 2001-2004 Twisted Matrix Laboratories.
++# Copyright (c) 2001-2007 Twisted Matrix Laboratories.
+ # See LICENSE for details.
+ 
+ 
+@@ -56,6 +56,8 @@
+     ENOMEM = object()
+     EAGAIN = EWOULDBLOCK
+     from errno import WSAECONNRESET as ECONNABORTED
++    
++    from twisted.python.win32 import formatError as strerror    
+ else:
+     from errno import EPERM
+     from errno import EINVAL
+@@ -72,6 +74,8 @@
+     from errno import ENOMEM
+     from errno import EAGAIN
+     from errno import ECONNABORTED
++    
++    from os import strerror
+ 
+ from errno import errorcode
+ 
+@@ -524,7 +528,7 @@
+ 
+         err = self.socket.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR)
+         if err:
+-            self.failIfNotConnected(error.getConnectError((err, os.strerror(err))))
++            self.failIfNotConnected(error.getConnectError((err, strerror(err))))
+             return
+ 
+ 
+@@ -550,7 +554,7 @@
+                 self.startWriting()
+                 return
+             else:
+-                self.failIfNotConnected(error.getConnectError((connectResult, os.strerror(connectResult))))
++                self.failIfNotConnected(error.getConnectError((connectResult, strerror(connectResult))))
+                 return
+ 
+         # If I have reached this point without raising or returning, that means

@@ -1,0 +1,380 @@
+Index: twisted/mail/test/test_imap.py
+===================================================================
+--- twisted/mail/test/test_imap.py	(revision 28756)
++++ twisted/mail/test/test_imap.py	(working copy)
+@@ -733,11 +733,36 @@
+         for (query, expected) in zip(inputs, outputs):
+             self.assertEquals(query, expected)
+ 
++    def testInvalidIdListParser(self):
++        inputs = [
++            '*:*',
++            'foo',
++            '4:',
++            'bar:5'
++        ]
++
++        for input in inputs:
++            self.assertRaises(imap4.IllegalIdentifierError,
++                              imap4.parseIdList, input)
++
++    def testInvalidIdListParserTodo(self):
++        inputs = [
++            '0:5',
++            '0:0',
++            '*:0'
++        ]
++
++        for input in inputs:
++            self.assertRaises(imap4.IllegalIdentifierError,
++                              imap4.parseIdList, input)
++    testInvalidIdListParserTodo.todo = "Not sure if these should fail"
++
+     def testIdListParser(self):
+         inputs = [
+             '1:*',
+             '5:*',
+             '1:2,5:*',
++            '*',
+             '1',
+             '1,2',
+             '1,3,5',
+@@ -747,12 +772,14 @@
+             '1,5:10',
+             '1,5:10,15:20',
+             '1:10,15,20:25',
++            '4:2' # RFC says that 2:4 and 4:2 are equivalent
+         ]
+ 
+         outputs = [
+             MessageSet(1, None),
+             MessageSet(5, None),
+             MessageSet(5, None) + MessageSet(1, 2),
++            MessageSet(None, None),
+             MessageSet(1),
+             MessageSet(1, 2),
+             MessageSet(1) + MessageSet(3) + MessageSet(5),
+@@ -762,23 +789,24 @@
+             MessageSet(1) + MessageSet(5, 10),
+             MessageSet(1) + MessageSet(5, 10) + MessageSet(15, 20),
+             MessageSet(1, 10) + MessageSet(15) + MessageSet(20, 25),
++            MessageSet(2, 4),
+         ]
+ 
+         lengths = [
+             None, None, None,
+-            1, 2, 3, 10, 11, 16, 7, 13, 17,
++            1, 1, 2, 3, 10, 11, 16, 7, 13, 17, 3
+         ]
+ 
+         for (input, expected) in zip(inputs, outputs):
+             self.assertEquals(imap4.parseIdList(input), expected)
+ 
+         for (input, expected) in zip(inputs, lengths):
+-            try:
++            if expected is None:
++                self.assertRaises(TypeError, len, imap4.parseIdList(input))
++            else:
+                 L = len(imap4.parseIdList(input))
+-            except TypeError:
+-                L = None
+-            self.assertEquals(L, expected,
+-                "len(%r) = %r != %r" % (input, L, expected))
++                self.assertEquals(L, expected,
++                                  "len(%r) = %r != %r" % (input, L, expected))
+ 
+ class SimpleMailbox:
+     implements(imap4.IMailboxInfo, imap4.IMailbox, imap4.ICloseableMailbox)
+@@ -1569,7 +1597,7 @@
+         self.laterQuery = ["16-Dec-2009"]
+         self.seq = 0
+         self.msg = FakeyMessage({"date" : "Mon, 13 Dec 2009 21:25:10 GMT"}, [],
+-                                '', '', None, None)
++                                '', '', 1234, None)
+ 
+ 
+     def test_searchSentBefore(self):
+@@ -1582,7 +1610,25 @@
+         self.assertTrue(
+             self.server.search_SENTBEFORE(self.laterQuery, self.seq, self.msg))
+ 
++    def test_searchWildcard(self):
++        self.server.search_UID(['2:*'], self.seq, self.msg, (1234, 1))
+ 
++    def test_searchWildcardHigh(self):
++        self.server.search_UID(['1235:*'], self.seq, self.msg, (1234, 1))
++
++        # self.assertFalse(
++        #     self.server.search_SENTBEFORE(self.earlierQuery, self.seq, self.msg))
++        # self.assertTrue(
++        #     self.server.search_SENTBEFORE(self.laterQuery, self.seq, self.msg))
++
++    def test_reversedSearchTerms(self):
++        """
++        L{imap4.IMAP4Server.search_SENTON} returns True if the message date is
++        the same as the query date.
++        """
++        msgset = imap4.parseIdList('4:2')
++        self.assertEquals(list(msgset), [2, 3, 4])
++
+     def test_searchSentOn(self):
+         """
+         L{imap4.IMAP4Server.search_SENTON} returns True if the message date is
+@@ -1617,17 +1663,17 @@
+             self.server.search_OR(
+                 ["SENTSINCE"] + self.earlierQuery +
+                 ["SENTSINCE"] + self.laterQuery,
+-            self.seq, self.msg, None))
++            self.seq, self.msg, (None, None)))
+         self.assertTrue(
+             self.server.search_OR(
+                 ["SENTSINCE"] + self.laterQuery +
+                 ["SENTSINCE"] + self.earlierQuery,
+-            self.seq, self.msg, None))
++            self.seq, self.msg, (None, None)))
+         self.assertFalse(
+             self.server.search_OR(
+                 ["SENTON"] + self.laterQuery +
+                 ["SENTSINCE"] + self.laterQuery,
+-            self.seq, self.msg, None))
++            self.seq, self.msg, (None, None)))
+ 
+ 
+     def test_searchNot(self):
+@@ -1636,9 +1682,11 @@
+         of the expression supplied to it.
+         """
+         self.assertFalse(self.server.search_NOT(
+-                ["SENTSINCE"] + self.earlierQuery, self.seq, self.msg, None))
++                ["SENTSINCE"] + self.earlierQuery, self.seq, self.msg,
++                (None, None)))
+         self.assertTrue(self.server.search_NOT(
+-                ["SENTON"] + self.laterQuery, self.seq, self.msg, None))
++                ["SENTON"] + self.laterQuery, self.seq, self.msg,
++                (None, None)))
+ 
+ 
+ 
+@@ -3651,6 +3699,39 @@
+         return self._messageSetSearchTest('2:*', [2, 3])
+ 
+ 
++    def test_searchMessageSetWithStarFirst(self):
++        """
++        If the search filter starts with a star, it should be identical to it
++        ending with a star.
++        """
++        return self._messageSetSearchTest('*:2', [2, 3])
++
++
++    def test_searchMessageSetUIDWithStar(self):
++        """
++        If the search filter ends with a star, all the message from the
++        starting point are returned (also for the SEARCH UID case).
++        """
++        return self._messageSetSearchTest('UID 10000:*', [2, 3])
++
++
++    def test_searchMessageSetUIDWithStarFirst(self):
++        """
++        If the search filter starts with a star, it should be identical to it
++        ending with a star (also for the SEARCH UID case).
++        """
++        return self._messageSetSearchTest('UID *:10000', [2, 3])
++
++
++    def test_searchMessageSetUIDWithStarAndHighStart(self):
++        """
++        A search filter of 1234:* should include the UID of the last message in
++        the mailbox, even if its UID is less than 1234.
++        """
++        # in our fake mbox the highest message UID is 12345
++        return self._messageSetSearchTest('UID 30000:*', [3])
++
++
+     def test_searchMessageSetWithList(self):
+         """
+         If the search filter contains nesting terms, one of which includes a
+Index: twisted/mail/imap4.py
+===================================================================
+--- twisted/mail/imap4.py	(revision 28756)
++++ twisted/mail/imap4.py	(working copy)
+@@ -229,8 +229,12 @@
+         res = 0
+         for l, h in self.ranges:
+             if l is None:
+-                raise TypeError("Can't size object; last value not set")
+-            res += (h - l) + 1
++                if h is None:
++                    res += 1
++                else:
++                    raise TypeError("Can't size object; last value not set")
++            else:
++                res += (h - l) + 1
+ 
+         return res
+ 
+@@ -499,9 +503,9 @@
+     # IChallengeResponse factories for AUTHENTICATE command
+     challengers = None
+ 
+-    # Search terms the implementation of which needs to be passed the
+-    # last sequence id value.
+-    _requiresLastSequenceId = set(["OR", "NOT"])
++    # Search terms the implementation of which needs to be passed both the last
++    # message identifier (UID) and the last sequence id.
++    _requiresLastMessageInfo = set(["OR", "NOT", "UID"])
+ 
+     state = 'unauth'
+ 
+@@ -1435,13 +1439,16 @@
+             searchResults = []
+         i = 0
+ 
++        # result is a list of tuples (sequenceId, Message)
+         lastSequenceId = result[-1][0]
++        lastMessageId = result[-1][1].getUID()
+ 
+         for (i, (id, msg)) in zip(range(5), result):
+             # searchFilter and singleSearchStep will mutate the query.  Dang.
+             # Copy it here or else things will go poorly for subsequent
+             # messages.
+-            if self._searchFilter(copy.deepcopy(query), id, msg, lastSequenceId):
++            if self._searchFilter(copy.deepcopy(query), id, msg,
++                                  lastSequenceId, lastMessageId):
+                 if uid:
+                     searchResults.append(str(msg.getUID()))
+                 else:
+@@ -1457,7 +1464,7 @@
+             self.sendPositiveResponse(tag, 'SEARCH completed')
+ 
+ 
+-    def _searchFilter(self, query, id, msg, lastSequenceId):
++    def _searchFilter(self, query, id, msg, lastSequenceId, lastMessageId):
+         """
+         Pop search terms from the beginning of C{query} until there are none
+         left and apply them to the given message.
+@@ -1471,16 +1478,20 @@
+         @param lastSequenceId: The highest sequence number of any message in
+             the mailbox being searched.
+ 
++        @param lastMessageId: The highest UID of any message in the mailbox
++            being searched.
++
+         @return: Boolean indicating whether all of the query terms match the
+             message.
+         """
+         while query:
+-            if not self._singleSearchStep(query, id, msg, lastSequenceId):
++            if not self._singleSearchStep(query, id, msg,
++                                          lastSequenceId, lastMessageId):
+                 return False
+         return True
+ 
+ 
+-    def _singleSearchStep(self, query, id, msg, lastSequenceId):
++    def _singleSearchStep(self, query, id, msg, lastSequenceId, lastMessageId):
+         """
+         Pop one search term from the beginning of C{query} (possibly more than
+         one element) and return whether it matches the given message.
+@@ -1494,11 +1505,15 @@
+         @param lastSequenceId: The highest sequence number of any message in
+             the mailbox being searched.
+ 
++        @param lastMessageId: The highest UID of any message in the mailbox
++            being searched.
++
+         @return: Boolean indicating whether the query term matched the message.
+         """
+         q = query.pop(0)
+         if isinstance(q, list):
+-            if not self._searchFilter(q, id, msg, lastSequenceId):
++            if not self._searchFilter(q, id, msg,
++                                      lastSequenceId, lastMessageId):
+                 return False
+         else:
+             c = q.upper()
+@@ -1512,8 +1527,9 @@
+             else:
+                 f = getattr(self, 'search_' + c)
+                 if f is not None:
+-                    if c in self._requiresLastSequenceId:
+-                        result = f(query, id, msg, lastSequenceId)
++                    if c in self._requiresLastMessageInfo:
++                        result = f(query, id, msg, (lastSequenceId,
++                                                    lastMessageId))
+                     else:
+                         result = f(query, id, msg)
+                     if not result:
+@@ -1570,8 +1586,9 @@
+     def search_NEW(self, query, id, msg):
+         return '\\Recent' in msg.getFlags() and '\\Seen' not in msg.getFlags()
+ 
+-    def search_NOT(self, query, id, msg, lastSequenceId):
+-        return not self._singleSearchStep(query, id, msg, lastSequenceId)
++    def search_NOT(self, query, id, msg, (lastSequenceId, lastMessageId)):
++        return not self._singleSearchStep(query, id, msg,
++                                          lastSequenceId, lastMessageId)
+ 
+     def search_OLD(self, query, id, msg):
+         return '\\Recent' not in msg.getFlags()
+@@ -1580,9 +1597,11 @@
+         date = parseTime(query.pop(0))
+         return rfc822.parsedate(msg.getInternalDate()) == date
+ 
+-    def search_OR(self, query, id, msg, lastSequenceId):
+-        a = self._singleSearchStep(query, id, msg, lastSequenceId)
+-        b = self._singleSearchStep(query, id, msg, lastSequenceId)
++    def search_OR(self, query, id, msg, (lastSequenceId, lastMessageId)):
++        a = self._singleSearchStep(query, id, msg,
++                                   lastSequenceId, lastMessageId)
++        b = self._singleSearchStep(query, id, msg,
++                                   lastSequenceId, lastMessageId)
+         return a or b
+ 
+     def search_RECENT(self, query, id, msg):
+@@ -1656,9 +1675,9 @@
+         to = msg.getHeaders(False, 'to').get('to', '')
+         return to.lower().find(query.pop(0).lower()) != -1
+ 
+-    def search_UID(self, query, id, msg):
++    def search_UID(self, query, id, msg, (lastSequenceId, lastMessageId)):
+         c = query.pop(0)
+-        m = parseIdList(c)
++        m = parseIdList(c, lastMessageId)
+         return msg.getUID() in m
+ 
+     def search_UNANSWERED(self, query, id, msg):
+@@ -3761,7 +3780,10 @@
+ 
+ class IllegalIdentifierError(IMAP4Exception): pass
+ 
+-def parseIdList(s):
++def parseIdList(s, lastMessageId=None):
++    """
++    Parse a message set search key into a C{MessageSet}.
++    """
+     res = MessageSet()
+     parts = s.split(',')
+     for p in parts:
+@@ -3776,7 +3798,10 @@
+                     high = None
+                 else:
+                     high = long(high)
+-                res.extend((low, high))
++                if low is high is None:
++                    # *:* does not make sense
++                    raise IllegalIdentifierError(p)
++                res.extend((low or lastMessageId, high or lastMessageId))
+             except ValueError:
+                 raise IllegalIdentifierError(p)
+         else:
+@@ -3788,7 +3813,7 @@
+             except ValueError:
+                 raise IllegalIdentifierError(p)
+             else:
+-                res.extend(p)
++                res.extend(p or lastMessageId)
+     return res
+ 
+ class IllegalQueryError(IMAP4Exception): pass

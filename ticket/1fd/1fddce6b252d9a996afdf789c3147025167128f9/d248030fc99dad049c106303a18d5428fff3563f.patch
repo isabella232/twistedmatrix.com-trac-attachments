@@ -1,0 +1,366 @@
+=== modified file 'doc/names/examples/dns-service.py'
+--- doc/names/examples/dns-service.py	2012-04-02 15:26:04 +0000
++++ doc/names/examples/dns-service.py	2013-01-21 15:35:04 +0000
+@@ -4,42 +4,65 @@
+ # See LICENSE for details.
+ 
+ """
+-Sample app to lookup SRV records in DNS.
+-To run this script:
+-$ python dns-service.py <service> <proto> <domain>
+-where,
+-service = the symbolic name of the desired service.
+-proto = the transport protocol of the desired service; this is usually either TCP or UDP.
+-domain =  the domain name for which this record is valid.
+-e.g.:
+-$ python dns-service.py sip udp yahoo.com
+-$ python dns-service.py xmpp-client tcp gmail.com
++USAGE: python dns-service.py SERVICE PROTO DOMAINNAME
++
++Print the SRV records for a given DOMAINNAME eg
++
++ python dns-service.py xmpp-client tcp gmail.com
++
++SERVICE: the symbolic name of the desired service.
++
++PROTO: the transport protocol of the desired service; this is usually
++       either TCP or UDP.
++
++DOMAINNAME: the domain name for which this record is valid.
+ """
+-
+-from twisted.names import client
+-from twisted.internet import reactor
+ import sys
+ 
+-def printAnswer((answers, auth, add)):
+-    if not len(answers):
+-        print 'No answers'
++from twisted.names import client, error
++from twisted.internet.task import react
++
++
++def printResult(records, domainname):
++    """
++    Print the SRV records for the domainname or an error message if no
++    SRV records were found.
++    """
++    answers, authority, additional = records
++    if answers:
++        sys.stdout.write(
++            domainname + ' IN \n ' +
++            '\n '.join(str(x.payload) for x in answers) +
++            '\n')
+     else:
+-        print '\n'.join([str(x.payload) for x in answers])
+-    reactor.stop()
+-
+-def printFailure(arg):
+-    print "error: could not resolve:", arg
+-    reactor.stop()
+-
+-try:
+-    service, proto, domain = sys.argv[1:]
+-except ValueError:
+-    sys.stderr.write('%s: usage:\n' % sys.argv[0] +
+-                     '  %s SERVICE PROTO DOMAIN\n' % sys.argv[0])
+-    sys.exit(1)
+-
+-resolver = client.Resolver('/etc/resolv.conf')
+-d = resolver.lookupService('_%s._%s.%s' % (service, proto, domain), [1])
+-d.addCallbacks(printAnswer, printFailure)
+-
+-reactor.run()
++        sys.stderr.write(
++            'ERROR: No SRV records found for name %r\n' % (domainname,))
++
++
++def printError(failure, domainname):
++    """
++    Print a friendly error message if the domainname could not be
++    resolved.
++    """
++    failure.trap(error.DNSNameError)
++    sys.stderr.write('ERROR: domain name not found %r\n' % (domainname,))
++
++
++def main(reactor, *argv):
++    try:
++        service, proto, domainname = sys.argv[1:]
++    except ValueError:
++        sys.stderr.write(
++            __doc__.lstrip() + '\n'
++            'ERROR: incorrect command line arguments\n')
++        raise SystemExit(1)
++
++    resolver = client.Resolver('/etc/resolv.conf')
++    domainname = '_%s._%s.%s' % (service, proto, domainname)
++    d = resolver.lookupService(domainname)
++    d.addCallback(printResult, domainname)
++    d.addErrback(printError, domainname)
++    return d
++
++if __name__ == '__main__':
++    react(main, sys.argv[1:])
+
+=== modified file 'doc/names/examples/index.xhtml'
+--- doc/names/examples/index.xhtml	2012-04-02 15:26:04 +0000
++++ doc/names/examples/index.xhtml	2013-01-21 15:30:27 +0000
+@@ -12,10 +12,9 @@
+ 
+     <h2>DNS (Twisted Names)</h2>
+     <ul>
+-        <li><a href="testdns.py">testdns.py</a> - Prints the results of an Address record lookup, Mail-Exchanger record lookup, and Nameserver record lookup for the given hostname for a given hostname.</li>
++        <li><a href="testdns.py">testdns.py</a> - Prints the results of an Address record lookup, Mail-Exchanger record lookup, and Nameserver record lookup for the given domain name.</li>
+         <li><a href="dns-service.py">dns-service.py</a> - Searches for SRV records in DNS.</li>
+         <li><a href="gethostbyname.py">gethostbyname.py</a> - Returns the IP address for a given hostname.</li>
+     </ul>
+ </body>
+ </html>
+-
+
+=== modified file 'doc/names/examples/testdns.py' (properties changed: -x to +x)
+--- doc/names/examples/testdns.py	2012-09-08 21:43:43 +0000
++++ doc/names/examples/testdns.py	2013-01-21 15:30:27 +0000
+@@ -4,29 +4,28 @@
+ # See LICENSE for details.
+ 
+ """
+-Prints the results of an Address record lookup, Mail-Exchanger record
+-lookup, and Nameserver record lookup for the given hostname for a
+-given hostname.
+-
+-To run this script:
+-$ python testdns.py <hostname>
+-e.g.:
+-$ python testdns.py www.google.com
++USAGE: python testdns.py DOMAINNAME
++
++Print the Address records, Mail-Exchanger records and the Nameserver
++records for the given domain name. eg
++
++ python testdns.py google.com
+ """
+ import sys
+ 
+-from twisted.names import client
+-from twisted.internet import defer, reactor
+-from twisted.names import dns, error
+-
+-
+-r = client.Resolver('/etc/resolv.conf')
+-
+-
+-def formatResult(a, heading):
+-    answer, authority, additional = a
++from twisted.internet import defer
++from twisted.internet.task import react
++from twisted.names import client, dns, error
++
++
++def formatRecords(records, heading):
++    """
++    Extract only the answer records and return them as a neatly
++    formatted string beneath the given heading.
++    """
++    answers, authority, additional = records
+     lines = ['# ' + heading]
+-    for a in answer:
++    for a in answers:
+         line = [
+             a.name,
+             dns.QUERY_CLASSES.get(a.cls, 'UNKNOWN (%d)' % (a.cls,)),
+@@ -36,33 +35,48 @@
+     return '\n'.join(line for line in lines)
+ 
+ 
+-def printError(f):
+-    f.trap(defer.FirstError)
+-    f = f.value.subFailure
+-    f.trap(error.DomainError)
+-    print f.value.__class__.__name__, f.value.message.queries
+-
+-
+-def printResults(res):
+-    for r in res:
+-        print r
+-        print
+-
+-
+-if __name__ == '__main__':
+-    domainname = sys.argv[1]
+-
++def printResults(results, domainname):
++    """
++    Print the formatted results for each DNS record type.
++    """
++    sys.stdout.write('# Domain Summary for %r\n' % (domainname,))
++    sys.stdout.write('\n\n'.join(results) + '\n')
++
++
++def printError(failure, domainname):
++    """
++    Print a friendly error message if the hostname could not be
++    resolved.
++    """
++    failure.trap(defer.FirstError)
++    failure = failure.value.subFailure
++    failure.trap(error.DNSNameError)
++    sys.stderr.write('ERROR: domain name not found %r\n' % (domainname,))
++
++
++def main(reactor, *argv):
++    try:
++        domainname = argv[0]
++    except IndexError:
++        sys.stderr.write(
++            __doc__.lstrip() + '\n'
++            'ERROR: missing DOMAINNAME argument\n')
++        raise SystemExit(1)
++
++    r = client.Resolver('/etc/resolv.conf')
+     d = defer.gatherResults([
+             r.lookupAddress(domainname).addCallback(
+-                formatResult, 'Addresses'),
++                formatRecords, 'Addresses'),
+             r.lookupMailExchange(domainname).addCallback(
+-                formatResult, 'Mail Exchangers'),
++                formatRecords, 'Mail Exchangers'),
+             r.lookupNameservers(domainname).addCallback(
+-                formatResult, 'Nameservers'),
++                formatRecords, 'Nameservers'),
+             ], consumeErrors=True)
+ 
+-    d.addCallbacks(printResults, printError)
+-
+-    d.addBoth(lambda ign: reactor.stop())
+-
+-    reactor.run()
++    d.addCallback(printResults, domainname)
++    d.addErrback(printError, domainname)
++    return d
++
++
++if __name__ == '__main__':
++    react(main, sys.argv[1:])
+
+=== added file 'twisted/names/test/test_examples.py'
+--- twisted/names/test/test_examples.py	1970-01-01 00:00:00 +0000
++++ twisted/names/test/test_examples.py	2013-01-21 16:22:20 +0000
+@@ -0,0 +1,115 @@
++# Copyright (c) Twisted Matrix Laboratories.
++# See LICENSE for details.
++
++"""
++Tests for L{twisted.names.tap}.
++"""
++import os
++import sys
++from StringIO import StringIO
++
++from twisted.python.filepath import FilePath
++from twisted.trial.unittest import SkipTest, TestCase
++
++
++class ExampleTestBase(object):
++    """
++    This is a mixin which adds an example to the path, tests it, and then
++    removes it from the path and unimports the modules which the test loaded.
++    Test cases which test example code and documentation listings should use
++    this.
++
++    This is done this way so that examples can live in isolated path entries,
++    next to the documentation, replete with their own plugin packages and
++    whatever other metadata they need.  Also, example code is a rare instance
++    of it being valid to have multiple versions of the same code in the
++    repository at once, rather than relying on version control, because
++    documentation will often show the progression of a single piece of code as
++    features are added to it, and we want to test each one.
++    """
++
++    examplePath = None
++
++    def setUp(self):
++        """
++        Add our example directory to the path and record which modules are
++        currently loaded.
++        """
++        self.fakeErr = StringIO()
++        self.originalErr, sys.stderr = sys.stderr, self.fakeErr
++        self.originalPath = sys.path[:]
++        self.originalModules = sys.modules.copy()
++        here = FilePath(__file__).parent().parent().parent().parent()
++        for childName in self.examplePath:
++            here = here.child(childName)
++        if not here.exists():
++            raise SkipTest("Examples (%s) not found - cannot test" % (here.path,))
++        sys.path.append(here.parent().path)
++        # Import the example as a module
++        moduleName = here.basename().split('.')[0]
++        self.example = __import__(moduleName)
++        self.examplePath = here
++
++
++    def tearDown(self):
++        """
++        Remove the example directory from the path and remove all modules loaded by
++        the test from sys.modules.
++        """
++        sys.modules.clear()
++        sys.modules.update(self.originalModules)
++        sys.path[:] = self.originalPath
++        sys.stderr = self.originalErr
++
++
++    def test_executable(self):
++        """
++        The example scripts should start with the standard shebang
++        line and should be executable.
++        """
++        self.assertEquals(
++            self.examplePath.open().readline().rstrip(),
++            '#!/usr/bin/env python')
++
++        mode = oct(os.stat(self.examplePath.path).st_mode)[-3:]
++        self.assertEquals(
++            mode, '775',
++            'Wrong permissions. %r on %r' % (mode, self.examplePath.path))
++
++
++    def test_usage(self):
++        """
++        The example script prints a usage message to stderr and raises
++        SystemExit if it is passed incorrect command line
++        arguments. The first line should contain a USAGE summary and
++        the last line should contain an ERROR, explaining that
++        incorrect arguments were supplied.
++        """
++        self.assertRaises(SystemExit, self.example.main, None)
++        err = self.fakeErr.getvalue().splitlines()
++        self.assertEquals(err[0][:len('USAGE:')], 'USAGE:')
++        self.assertEquals(err[-1][:len('ERROR:')], 'ERROR:')
++
++
++class TestDnsTests(ExampleTestBase, TestCase):
++    """
++    Tests for the testdns.py example script.
++    """
++
++    examplePath = 'doc/names/examples/testdns.py'.split('/')
++
++
++class GetHostByNameTests(ExampleTestBase, TestCase):
++    """
++    Tests for the gethostbyname.py example script.
++    """
++
++    examplePath = 'doc/names/examples/gethostbyname.py'.split('/')
++
++
++class DnsServiceTests(ExampleTestBase, TestCase):
++    """
++    Tests for the dns-service.py example script.
++    """
++
++    examplePath = 'doc/names/examples/dns-service.py'.split('/')
+

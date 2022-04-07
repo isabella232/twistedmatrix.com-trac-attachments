@@ -1,0 +1,205 @@
+? twisted/protocols/ftp.py.flc
+Index: twisted/protocols/ftp.py
+===================================================================
+RCS file: /cvs/Twisted/twisted/protocols/ftp.py,v
+retrieving revision 1.98
+diff -u -d -r1.98 ftp.py
+--- twisted/protocols/ftp.py	24 Nov 2003 15:18:09 -0000	1.98
++++ twisted/protocols/ftp.py	12 Dec 2003 06:12:08 -0000
+@@ -2002,17 +2002,20 @@
+ 
+         -rw-r--r--   1 root     other        531 Jan 29 03:26 README
+ 
+-    If you need different evil for a wacky FTP server, you can override this.
++    If you need different evil for a wacky FTP server, you can
++    override either C{fileLinePattern} or C{parseDirectoryLine()}.
+ 
+     It populates the instance attribute self.files, which is a list containing
+     dicts with the following keys (examples from the above line):
+-        - filetype: e.g. 'd' for directories, or '-' for an ordinary file
+-        - perms:    e.g. 'rw-r--r--'
+-        - owner:    e.g. 'root'
+-        - group:    e.g. 'other'
+-        - size:     e.g. 531
+-        - date:     e.g. 'Jan 29 03:26'
+-        - filename: e.g. 'README'
++        - filetype:   e.g. 'd' for directories, or '-' for an ordinary file
++        - perms:      e.g. 'rw-r--r--'
++        - nlinks:     e.g. 1
++        - owner:      e.g. 'root'
++        - group:      e.g. 'other'
++        - size:       e.g. 531
++        - date:       e.g. 'Jan 29 03:26'
++        - filename:   e.g. 'README'
++        - linktarget: e.g. 'some/file'
+ 
+     Note that the 'date' value will be formatted differently depending on the
+     date.  Check U{http://cr.yp.to/ftp.html} if you really want to try to parse
+@@ -2021,9 +2024,10 @@
+     @ivar files: list of dicts describing the files in this listing
+     """
+     fileLinePattern = re.compile(
+-        r'^(?P<filetype>.)(?P<perms>.{9})\s+\d*\s*'
++        r'^(?P<filetype>.)(?P<perms>.{9})\s+(?P<nlinks>\d*)\s*'
+         r'(?P<owner>\S+)\s+(?P<group>\S+)\s+(?P<size>\d+)\s+'
+-        r'(?P<date>... .. ..:..)\s+(?P<filename>.*?)\r?$'
++        r'(?P<date>... .. (..:..| \d{4}))\s+(?P<filename>([^ ]|\\ )*?)'
++        r'( -> (?P<linktarget>[^\r]*))?\r?$'
+     )
+     delimiter = '\n'
+ 
+@@ -2031,11 +2035,56 @@
+         self.files = []
+ 
+     def lineReceived(self, line):
++        d = self.parseDirectoryLine(line)
++        if d is None:
++            self.unknownLine(line)
++        else:
++            self.addFile(d)
++
++    def parseDirectoryLine(self, line):
++        """Return a dictionary of fields, or None if line cannot be parsed.
++
++        @param line: line of text expected to contain a directory entry
++        @type line: str
++
++        @return: dict
++        """
+         match = self.fileLinePattern.match(line)
+-        if match:
+-            dict = match.groupdict()
+-            dict['size'] = int(dict['size'])
+-            self.files.append(dict)
++        if match is None:
++            return None
++        else:
++            d = match.groupdict()
++            d['filename'] = d['filename'].replace(r'\ ', ' ')
++            d['nlinks'] = int(d['nlinks'])
++            d['size'] = int(d['size'])
++            if d['linktarget']:
++                d['linktarget'] = d['linktarget'].replace(r'\ ', ' ')
++            return d
++
++    def addFile(self, info):
++        """Append file information dictionary to the list of known files.
++
++        Subclasses can override or extend this method to handle file
++        information differently without affecting the parsing of data
++        from the server.
++
++        @param info: dictionary containing the parsed representation
++                     of the file information
++        @type info: dict
++        """
++        self.files.append(info)
++
++    def unknownLine(self, line):
++        """Deal with received lines which could not be parsed as file
++        information.
++
++        Subclasses can override this to perform any special processing
++        needed.
++
++        @param line: unparsable line as received
++        @type line: str
++        """
++        pass
+ 
+ def parsePWDResponse(response):
+     """Returns the path from a response to a PWD command.
+Index: twisted/test/test_ftp.py
+===================================================================
+RCS file: /cvs/Twisted/twisted/test/test_ftp.py,v
+retrieving revision 1.38
+diff -u -d -r1.38 test_ftp.py
+--- twisted/test/test_ftp.py	23 Nov 2003 06:07:03 -0000	1.38
++++ twisted/test/test_ftp.py	12 Dec 2003 06:12:08 -0000
+@@ -684,17 +684,36 @@
+ # -- Client Tests -----------------------------------------------------------
+ 
+ 
++class PrintLines(protocol.Protocol):
++    """Helper class used by FTPFileListingTests."""
++
++    def __init__(self, lines):
++        self._lines = lines
++
++    def connectionMade(self):
++        for line in self._lines:
++            self.transport.write(line + "\r\n")
++        self.transport.loseConnection()
++
++class MyFTPFileListProtocol(ftp.FTPFileListProtocol):
++    def __init__(self):
++        self.other = []
++        ftp.FTPFileListProtocol.__init__(self)
++
++    def unknownLine(self, line):
++        self.other.append(line)
+ 
+ class FTPFileListingTests(unittest.TestCase):
++    def getFilesForLines(self, lines):
++        fileList = MyFTPFileListProtocol()
++        loopback.loopback(PrintLines(lines), fileList)
++        return fileList.files, fileList.other
++
+     def testOneLine(self):
+         # This example line taken from the docstring for FTPFileListProtocol
+-        fileList = ftp.FTPFileListProtocol()
+-        class PrintLine(protocol.Protocol):
+-            def connectionMade(self):
+-                self.transport.write('-rw-r--r--   1 root     other        531 Jan 29 03:26 README\n')
+-                self.transport.loseConnection()
+-        loopback.loopback(PrintLine(), fileList)
+-        file = fileList.files[0]
++        line = '-rw-r--r--   1 root     other        531 Jan 29 03:26 README'
++        (file,), other = self.getFilesForLines([line])
++        self.failIf(other, 'unexpect unparsable lines: %s' % repr(other))
+         self.failUnless(file['filetype'] == '-', 'misparsed fileitem')
+         self.failUnless(file['perms'] == 'rw-r--r--', 'misparsed perms')
+         self.failUnless(file['owner'] == 'root', 'misparsed fileitem')
+@@ -702,6 +721,41 @@
+         self.failUnless(file['size'] == 531, 'misparsed fileitem')
+         self.failUnless(file['date'] == 'Jan 29 03:26', 'misparsed fileitem')
+         self.failUnless(file['filename'] == 'README', 'misparsed fileitem')
++        self.failUnless(file['nlinks'] == 1, 'misparsed nlinks')
++        self.failIf(file['linktarget'], 'misparsed linktarget')
++
++    def testVariantLines(self):
++        line1 = 'drw-r--r--   2 root     other        531 Jan  9  2003 A'
++        line2 = 'lrw-r--r--   1 root     other          1 Jan 29 03:26 B -> A'
++        line3 = 'woohoo! '
++        (file1, file2), (other,) = self.getFilesForLines([line1, line2, line3])
++        self.failUnless(other == 'woohoo! \r', 'incorrect other line')
++        # file 1
++        self.failUnless(file1['filetype'] == 'd', 'misparsed fileitem')
++        self.failUnless(file1['perms'] == 'rw-r--r--', 'misparsed perms')
++        self.failUnless(file1['owner'] == 'root', 'misparsed owner')
++        self.failUnless(file1['group'] == 'other', 'misparsed group')
++        self.failUnless(file1['size'] == 531, 'misparsed size')
++        self.failUnless(file1['date'] == 'Jan  9  2003', 'misparsed date')
++        self.failUnless(file1['filename'] == 'A', 'misparsed filename')
++        self.failUnless(file1['nlinks'] == 2, 'misparsed nlinks')
++        self.failIf(file1['linktarget'], 'misparsed linktarget')
++        # file 2
++        self.failUnless(file2['filetype'] == 'l', 'misparsed fileitem')
++        self.failUnless(file2['perms'] == 'rw-r--r--', 'misparsed perms')
++        self.failUnless(file2['owner'] == 'root', 'misparsed owner')
++        self.failUnless(file2['group'] == 'other', 'misparsed group')
++        self.failUnless(file2['size'] == 1, 'misparsed size')
++        self.failUnless(file2['date'] == 'Jan 29 03:26', 'misparsed date')
++        self.failUnless(file2['filename'] == 'B', 'misparsed filename')
++        self.failUnless(file2['nlinks'] == 1, 'misparsed nlinks')
++        self.failUnless(file2['linktarget'] == 'A', 'misparsed linktarget')
++
++    def testUnknownLine(self):
++        files, others = self.getFilesForLines(['ABC', 'not a file'])
++        self.failIf(files, 'unexpected file entries')
++        self.failUnless(others == ['ABC\r', 'not a file\r'],
++                        'incorrect unparsable lines: %s' % repr(others))
+ 
+ class FTPClientTests(unittest.TestCase):
+     def testFailedRETR(self):
+

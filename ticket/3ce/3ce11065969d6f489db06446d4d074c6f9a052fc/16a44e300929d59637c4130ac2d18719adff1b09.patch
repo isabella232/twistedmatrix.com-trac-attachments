@@ -1,0 +1,211 @@
+Index: twisted/protocols/amp.py
+===================================================================
+--- twisted/protocols/amp.py	(revision 10)
++++ twisted/protocols/amp.py	(working copy)
+@@ -161,6 +161,8 @@
+ from cStringIO import StringIO
+ from struct import pack
+ 
++from zope.interface import implements, Interface
++
+ from twisted.python.reflect import accumulateClassDict
+ from twisted.python.failure import Failure
+ from twisted.python import log, filepath
+@@ -177,6 +179,8 @@
+ 
+ from twisted.internet.ssl import CertificateOptions, Certificate, DN, KeyPair
+ 
++
++
+ ASK = '_ask'
+ ANSWER = '_answer'
+ COMMAND = '_command'
+@@ -189,8 +193,97 @@
+ MAX_KEY_LENGTH = 0xff
+ MAX_VALUE_LENGTH = 0xffff
+ 
++class IAMPMessageProcessor(Interface):
++    """
++    An L{IAMPMessageProcessor} provider can process messages for AMP.
++    """
++    def ampBoxReceived(self, box):
++        """
++        @param box: an AmpBox that contains a command or a response to a previous command.
++        """
+ 
++class alpha(object):
++    pass
+ 
++class MessageProcessorHelper(object):
++    """
++    I wonder if this will work
++    """
++    implements(IAMPMessageProcessor)
++
++    ampInstance = None
++
++    def __init__(self):
++        pass
++
++    def ampBoxReceived(self, box):
++        """
++        An AmpBox was received.  Respond to it according to its contents.
++
++        @param box: an AmpBox
++        """
++        if self.ampInstance is None:
++            self.ampInstance = self 
++
++        if ANSWER in box:
++            question = self.ampInstance._outstandingRequests.pop(box[ANSWER])
++            question.addErrback(self.ampInstance._puke)
++            question.callback(box)
++        elif ERROR in box:
++            question = self.ampInstance._outstandingRequests.pop(box[ERROR])
++            question.addErrback(self.ampInstance._puke)
++            # protocol-recognized errors
++            errorCode = box[ERROR_CODE]
++            description = box[ERROR_DESCRIPTION]
++            if errorCode in PROTOCOL_ERRORS:
++                exc = PROTOCOL_ERRORS[errorCode](errorCode, description)
++            else:
++                exc = RemoteAmpError(errorCode, description)
++            question.errback(Failure(exc))
++        elif COMMAND in box:
++            cmd = box[COMMAND]
++            def sendAnswer(answerBox):
++                if ASK not in box:
++                    return
++                if self.ampInstance.transport is None:
++                    return
++                if self.ampInstance._locked:
++                    return
++                answerBox[ANSWER] = box[ASK]
++                answerBox._sendTo(self.ampInstance)
++            def sendError(error):
++                if ASK not in box:
++                    return error
++                if error.check(RemoteAmpError):
++                    code = error.value.errorCode
++                    desc = error.value.description
++                    if error.value.fatal:
++                        errorBox = QuitBox()
++                    else:
++                        errorBox = AmpBox()
++                else:
++                    errorBox = QuitBox()
++                    log.err(error) # here is where server-side logging happens
++                                   # if the error isn't handled
++                    code = UNKNOWN_ERROR_CODE
++                    desc = "Unknown Error"
++                errorBox[ERROR] = box[ASK]
++                errorBox[ERROR_DESCRIPTION] = desc
++                errorBox[ERROR_CODE] = code
++                if self.ampInstance.transport is not None:
++                    errorBox._sendTo(self.ampInstance)
++                return None # intentionally stop the error here: don't log the
++                            # traceback if it's handled, do log it (earlier) if
++                            # it isn't
++            self.ampInstance.dispatchCommand(box).addCallbacks(
++                sendAnswer, sendError).addErrback(self.ampInstance._puke)
++        else:
++            raise NoEmptyBoxes(box)
++
++ 
++
++
++
+ class AmpError(Exception):
+     """
+     Base class of all Amp-related exceptions.
+@@ -1515,13 +1608,36 @@
+ 
+ 
+ 
+-class AMP(StatefulStringProtocol, Int16StringReceiver,
++class AMP(MessageProcessorHelper, StatefulStringProtocol, Int16StringReceiver,
+           _AmpParserBase):
+     """
+     This protocol is an AMP connection.  See the module docstring for protocol
+     details.
+     """
++    def __init__(self, processor=None):
++        """
++        create an AMP with the given message processor.
++        """
++        self.processor = processor
++        if self.processor is not None:
++            self.setMessageProcessor(processor)
+ 
++    def ampBoxReceived(self, box):
++        if self.processor is not None:
++            return self.processor.ampBoxReceived(box)
++        else:
++            return super(AMP, self).ampBoxReceived(box)
++
++    _locked = False
++
++    def setMessageProcessor(self, processor):
++        """
++        @param processor: an L{IAMPMessageProcessor} that wil process message setn to this transport
++        @raise ProtocolBusy: if the protocol has already been switched.
++        """
++        # someday there is a way around this circular reference
++        self.processor.ampInstance = self 
++
+     class __metaclass__(type):
+         """
+         Metaclass hack to record decorators.
+@@ -1557,7 +1673,6 @@
+             self.__class__.__name__,
+             self.innerProtocol, id(self))
+ 
+-    _locked = False
+ 
+ 
+     def _lock(self):
+Index: twisted/test/test_amp.py
+===================================================================
+--- twisted/test/test_amp.py	(revision 10)
++++ twisted/test/test_amp.py	(working copy)
+@@ -186,6 +186,9 @@
+         return {'pinged': True}
+     SecuredPing.responder(emitpong)
+ 
++class implementsMessageProcessor(amp.MessageProcessorHelper):
++    pass 
++    
+ 
+ class SimpleSymmetricCommandProtocol(FactoryNotifier):
+     maybeLater = None
+@@ -300,6 +303,7 @@
+         self.boxes.append(box)
+         return
+ 
++
+ class ParsingTest(unittest.TestCase):
+ 
+     def test_booleanValues(self):
+@@ -560,7 +564,22 @@
+         p.flush()
+         self.assertEquals(L[0]['hello'], HELLO)
+ 
++    def test_helloWorldCommandUsingCompose(self):
++        """
++        Verify that a simple command can be sent and its response received with
++        the high-level value parsing API.
++        """
++        c, s, p = connectedServerAndClient(
++            ServerClass=lambda: SimpleSymmetricProtocol(implementsMessageProcessor()),
++            ClientClass=lambda: SimpleSymmetricProtocol(implementsMessageProcessor()))
++        L = []
++        HELLO = 'world'
++        c.sendHello(HELLO).addCallback(L.append)
++        p.flush()
++        self.assertEquals(L[0]['hello'], HELLO)
+ 
++
++
+     def test_helloErrorHandling(self):
+         """
+         Verify that if a known error type is raised and handled, it will be

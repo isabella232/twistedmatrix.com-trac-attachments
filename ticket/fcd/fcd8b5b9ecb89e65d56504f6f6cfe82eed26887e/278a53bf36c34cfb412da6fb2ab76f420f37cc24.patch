@@ -1,0 +1,96 @@
+--- twisted/web/test/test_xmlrpc.py	Sat Dec 10 14:01:08 2005
++++ xmlrpc_auth/twisted/web/test/test_xmlrpc.py	Wed Mar 22 15:16:18 2006
+@@ -7,6 +7,8 @@
+ 
+ """Test XML-RPC support."""
+ 
++import base64
++
+ try:
+     import xmlrpclib
+ except ImportError:
+@@ -29,6 +31,18 @@ class TestRuntimeError(RuntimeError):
+ class TestValueError(ValueError):
+     pass
+ 
++
++class TestProxy(xmlrpc.Proxy):
++    """callRemote() is overridden so that we can conveniently set factory to 
++    self.factory, allowing us to check the attributes of factory in the tests.
++    """
++    def callRemote(self, method, *args):
++        self.factory = xmlrpc.QueryFactory(self.path, self.host, method, self.user, 
++            self.password, *args)
++        reactor.connectTCP(self.host, self.port or 80, self.factory)
++        return self.factory.deferred
++
++
+ class Test(XMLRPC):
+ 
+     FAILURE = 666
+@@ -85,6 +99,21 @@ class Test(XMLRPC):
+ 
+     xmlrpc_dict.help = 'Help for dict.'
+ 
++class TestAuthHeader(Test):
++    """
++    This is used to get the header info so that we can test
++    authentication.
++    """
++    def __init__(self):
++        Test.__init__(self)
++        self.request = None
++
++    def render(self, request):
++        self.request = request
++        return Test.render(self, request)
++
++    def xmlrpc_authheader(self):
++        return self.request.getHeader('Authorization')
+ 
+ class XMLRPCTestCase(unittest.TestCase):
+ 
+@@ -134,6 +163,43 @@ class XMLRPCTestCase2(XMLRPCTestCase):
+     def proxy(self):
+         return xmlrpc.Proxy("http://127.0.0.1:%d" % self.port)
+ 
++
++class XMLRPCTestAuthenticated(XMLRPCTestCase):
++    """Test with authenticated proxy. We run this with the same 
++    inout/ouput as above.
++    """
++
++    def setUp(self):
++        self.p = reactor.listenTCP(0, server.Site(TestAuthHeader()),
++                                   interface="127.0.0.1")
++        self.port = self.p.getHost().port
++        self.auth = "username:asecret"
++
++    def proxy(self):
++        return TestProxy("http://%s@127.0.0.1:%d/" % (self.auth, self.port))
++
++    def testAuthHeader(self):
++        inputOutput = [
++            ("add", (2, 3), 5),
++            ("defer", ("a",), "a"),
++            ("dict", ({"a": 1}, "a"), 1),
++            ("pair", ("a", 1), ["a", 1]),
++            ("complex", (), {"a": ["b", "c", 12, []], "D": "foo"}),
++            ("authheader", (), "Basic %s" % base64.encodestring(self.auth).strip())]
++
++        dl = []
++        for meth, args, outp in inputOutput:
++            p = self.proxy()
++            d = p.callRemote(meth, *args)
++            d.addCallback(self.assertEquals, outp)
++            d.addCallback(self._cbProxyInfo, p)
++            dl.append(d)
++        return defer.DeferredList(dl, fireOnOneErrback=True)
++
++    def _cbProxyInfo(self, ignoredResult, proxy):
++        self.assertEquals("%s:%s" % (proxy.user, proxy.password), self.auth)
++        self.assertEquals("%s:%s" % (proxy.factory.user, proxy.factory.password), 
++            self.auth)
+ 
+ class XMLRPCTestIntrospection(XMLRPCTestCase):
+ 

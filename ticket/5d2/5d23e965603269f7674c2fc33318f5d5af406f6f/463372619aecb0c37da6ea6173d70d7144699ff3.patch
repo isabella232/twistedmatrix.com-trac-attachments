@@ -1,0 +1,297 @@
+Index: twisted/test/test_webclient.py
+===================================================================
+RCS file: /cvs/Twisted/twisted/test/test_webclient.py,v
+retrieving revision 1.4
+diff -u -u -r1.4 test_webclient.py
+--- twisted/test/test_webclient.py	10 Aug 2003 15:16:37 -0000	1.4
++++ twisted/test/test_webclient.py	30 Aug 2003 11:15:35 -0000
+@@ -17,6 +17,8 @@
+ from twisted.trial import unittest
+ from twisted.web import server, static, client, error, util, resource
+ from twisted.internet import reactor, defer
++from twisted.internet import ssl
++from twisted.python.util import sibpath
+ 
+ import os
+ 
+@@ -33,6 +35,8 @@
+         request.finish()
+ 
+ class WebClientTestCase(unittest.TestCase):
++    def _listen(self, site):
++        return reactor.listenTCP(0, site, interface="127.0.0.1")
+ 
+     def setUp(self):
+         name = str(id(self)) + "_webclient"
+@@ -44,7 +48,8 @@
+         r = static.File(name)
+         r.putChild("redirect", util.Redirect("/file"))
+         r.putChild("wait", LongTimeTakingResource())
+-        self.port = reactor.listenTCP(0, server.Site(r, timeout=None), interface="127.0.0.1")
++        site = server.Site(r, timeout=None)
++        self.port = self._listen(site)
+         reactor.iterate(); reactor.iterate()
+         self.portno = self.port.getHost()[2]
+ 
+@@ -79,8 +84,9 @@
+         f.trap(error.Error)
+ 
+     def testFactoryInfo(self):
+-        host, port, url = client._parse(self.getURL('file'))
+-        factory = client.HTTPClientFactory(host, url)
++        url = self.getURL('file')
++        scheme, host, port, path = client._parse(url)
++        factory = client.HTTPClientFactory(url)
+         reactor.connectTCP(host, port, factory)
+         unittest.deferredResult(factory.deferred)
+         self.assertEquals(factory.status, '200')
+@@ -106,3 +112,68 @@
+         self.assertEquals(open(name, "rb").read(), "abcd456789")
+         r = unittest.deferredResult(client.downloadPage(self.getURL("file"), name))
+         self.assertEquals(open(name, "rb").read(), "0123456789")
++
++class WebClientSSLTestCase(WebClientTestCase):
++    def _listen(self, site):
++        return reactor.listenSSL(0, site,
++                                 contextFactory=ssl.DefaultOpenSSLContextFactory(
++            sibpath(__file__, 'server.pem'),
++            sibpath(__file__, 'server.pem'),
++            ),
++                                 interface="127.0.0.1")
++
++    def getURL(self, path):
++        return "https://127.0.0.1:%d/%s" % (self.portno, path)
++
++    def testFactoryInfo(self):
++        url = self.getURL('file')
++        scheme, host, port, path = client._parse(url)
++        factory = client.HTTPClientFactory(url)
++        reactor.connectSSL(host, port, factory, ssl.ClientContextFactory())
++        unittest.deferredResult(factory.deferred)
++        self.assertEquals(factory.status, '200')
++        self.assert_(factory.version.startswith('HTTP/'))
++        self.assertEquals(factory.message, 'OK')
++        self.assertEquals(factory.response_headers['content-length'][0], '10')
++
++class WebClientRedirectBetweenSSLandPlainText(unittest.TestCase):
++    def getHTTPS(self, path):
++        return "https://127.0.0.1:%d/%s" % (self.tlsPortno, path)
++
++    def getHTTP(self, path):
++        return "http://127.0.0.1:%d/%s" % (self.plainPortno, path)
++
++    def setUp(self):
++        plainRoot = static.Data('not me', 'text/plain')
++        tlsRoot = static.Data('me neither', 'text/plain')
++
++        plainSite = server.Site(plainRoot, timeout=None)
++        tlsSite = server.Site(tlsRoot, timeout=None)
++
++        self.tlsPort = reactor.listenSSL(0, tlsSite,
++                                         contextFactory=ssl.DefaultOpenSSLContextFactory(
++            sibpath(__file__, 'server.pem'),
++            sibpath(__file__, 'server.pem'),
++            ),
++                                         interface="127.0.0.1")
++        self.plainPort = reactor.listenTCP(0, plainSite, interface="127.0.0.1")
++
++        reactor.iterate(); reactor.iterate()
++        self.plainPortno = self.plainPort.getHost()[2]
++        self.tlsPortno = self.tlsPort.getHost()[2]
++
++        plainRoot.putChild('one', util.Redirect(self.getHTTPS('two')))
++        tlsRoot.putChild('two', util.Redirect(self.getHTTP('three')))
++        plainRoot.putChild('three', util.Redirect(self.getHTTPS('four')))
++        tlsRoot.putChild('four', static.Data('FOUND IT!', 'text/plain'))
++
++    def tearDown(self):
++        self.plainPort.stopListening()
++        self.tlsPort.stopListening()
++        reactor.iterate(); reactor.iterate();
++        del self.plainPort
++        del self.tlsPort
++
++    def testHoppingAround(self):
++        self.assertEquals(unittest.deferredResult(client.getPage(self.getHTTP("one"))),
++                          "FOUND IT!")
+Index: twisted/web/client.py
+===================================================================
+RCS file: /cvs/Twisted/twisted/web/client.py,v
+retrieving revision 1.29
+diff -u -u -r1.29 client.py
+--- twisted/web/client.py	24 Aug 2003 06:57:04 -0000	1.29
++++ twisted/web/client.py	30 Aug 2003 11:15:36 -0000
+@@ -20,7 +20,7 @@
+ """HTTP client."""
+ 
+ from twisted.protocols import http
+-from twisted.internet import defer, protocol, reactor
++from twisted.internet import defer, protocol, reactor, ssl
+ from twisted.python import failure
+ from twisted.web import error
+ import urlparse, os
+@@ -34,7 +34,7 @@
+ 
+     def connectionMade(self):
+         method = getattr(self.factory, 'method', 'GET')
+-        self.sendCommand(method, self.factory.url)
++        self.sendCommand(method, self.factory.path)
+         self.sendHeader('Host', self.factory.host)
+         self.sendHeader('User-Agent', self.factory.agent)
+         for cookie, cookval in self.factory.cookies.items():
+@@ -73,14 +73,15 @@
+         l = self.headers.get('location')
+         if not l:
+             self.handleStatusDefault()
+-        host, port, url = _parse(l[0], defaultPort=self.transport.addr[1])
+-        # if it's a relative redirect, e.g., /foo, then host==''
+-        if host:
+-            self.factory.host = host
+-        self.factory.port = port
+-        self.factory.url = url
+-
+-        reactor.connectTCP(self.factory.host, self.factory.port, self.factory)
++        url = l[0]
++        scheme, host, port, path = _parse(url, defaultPort=self.transport.addr[1])
++        self.factory.setURL(url)
++
++        if self.factory.scheme == 'https':
++            contextFactory = ssl.ClientContextFactory()
++            reactor.connectSSL(self.factory.host, self.factory.port, self.factory, contextFactory)
++        else:
++            reactor.connectTCP(self.factory.host, self.factory.port, self.factory)
+         self.quietLoss = 1
+         self.transport.loseConnection()
+ 
+@@ -96,6 +97,8 @@
+             self.factory.noPage(reason)
+ 
+     def handleResponse(self, response):
++        if self.quietLoss:
++            return
+         if self.failed:
+             self.factory.noPage(
+                 failure.Failure(
+@@ -157,11 +160,16 @@
+ 
+     protocol = HTTPPageGetter
+ 
+-    def __init__(self, host, url, method='GET', postdata=None, headers=None,
++    url = None
++    scheme = None
++    host = ''
++    port = None
++    path = None
++
++    def __init__(self, url, method='GET', postdata=None, headers=None,
+                  agent="Twisted PageGetter", timeout=0):
+         self.timeout = timeout
+         self.agent = agent
+-        self.url = url
+ 
+         self.cookies = {}
+         if headers is not None:
+@@ -172,17 +180,22 @@
+             self.headers.setdefault('Content-Length', len(postdata))
+         self.postdata = postdata
+         self.method = method
+-        if ':' in host:
+-            self.host, self.port = host.split(':')
+-            self.port = int(self.port)
+-        else:
+-            self.host = host
+-            self.port = 80
++
++        self.setURL(url)
+ 
+         self.waiting = 1
+         self.deferred = defer.Deferred()
+         self.response_headers = None
+ 
++    def setURL(self, url):
++        self.url = url
++        scheme, host, port, path = _parse(url)
++        if scheme and host:
++            self.scheme = scheme
++            self.host = host
++            self.port = port
++        self.path = path
++
+     def buildProtocol(self, addr):
+         p = protocol.ClientFactory.buildProtocol(self, addr)
+         if self.timeout:
+@@ -225,7 +238,7 @@
+     protocol = HTTPPageDownloader
+     value = None
+ 
+-    def __init__(self, host, url, fileName, method='GET', postdata=None, headers=None,
++    def __init__(self, url, fileName, method='GET', postdata=None, headers=None,
+                  agent="Twisted client", supportPartial=0):
+         if supportPartial and os.path.exists(fileName):
+             fileLength = os.path.getsize(fileName)
+@@ -236,7 +249,7 @@
+                 headers["range"] = "bytes=%d-" % fileLength
+         else:
+             self.requestedPartial = 0
+-        HTTPClientFactory.__init__(self, host, url, method=method, postdata=postdata, headers=headers, agent=agent)
++        HTTPClientFactory.__init__(self, url, method=method, postdata=postdata, headers=headers, agent=agent)
+         self.fileName = fileName
+         self.deferred = defer.Deferred()
+         self.waiting = 1
+@@ -279,29 +292,45 @@
+             self.file.write(data)
+ 
+ 
+-def _parse(url, defaultPort=80):
++def _parse(url, defaultPort=None):
+     parsed = urlparse.urlparse(url)
+-    url = urlparse.urlunparse(('','')+parsed[2:])
++    scheme = parsed[0]
++    path = urlparse.urlunparse(('','')+parsed[2:])
++    if defaultPort is None:
++        if scheme == 'https':
++            defaultPort = 443
++        else:
++            defaultPort = 80
+     host, port = parsed[1], defaultPort
+     if ':' in host:
+         host, port = host.split(':')
+         port = int(port)
+-    return host, port, url
++    return scheme, host, port, path
+ 
+-def getPage(url, *args, **kwargs):
++def getPage(url, contextFactory=None, *args, **kwargs):
+     '''download a web page
+ 
+     Download a page. Return a deferred, which will
+     callback with a page or errback with a description
+     of the error.
+     '''
+-    host, port, url = _parse(url)
+-    factory = HTTPClientFactory(host, url, *args, **kwargs)
+-    reactor.connectTCP(host, port, factory)
++    scheme, host, port, path = _parse(url)
++    factory = HTTPClientFactory(url, *args, **kwargs)
++    if scheme == 'https':
++        if contextFactory is None:
++            contextFactory = ssl.ClientContextFactory()
++        reactor.connectSSL(host, port, factory, contextFactory)
++    else:
++        reactor.connectTCP(host, port, factory)
+     return factory.deferred
+ 
+-def downloadPage(url, file, *args, **kwargs):
+-    host, port, url = _parse(url)
+-    factory = HTTPDownloader(host, url, file, *args, **kwargs)
+-    reactor.connectTCP(host, port, factory)
++def downloadPage(url, file, contextFactory=None, *args, **kwargs):
++    scheme, host, port, path = _parse(url)
++    factory = HTTPDownloader(url, file, *args, **kwargs)
++    if scheme == 'https':
++        if contextFactory is None:
++            contextFactory = ssl.ClientContextFactory()
++        reactor.connectSSL(host, port, factory, contextFactory)
++    else:
++        reactor.connectTCP(host, port, factory)
+     return factory.deferred

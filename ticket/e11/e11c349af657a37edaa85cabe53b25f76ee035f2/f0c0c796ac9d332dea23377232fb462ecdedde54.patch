@@ -1,0 +1,458 @@
+diff --git a/twisted/internet/abstract.py b/twisted/internet/abstract.py
+index 64f77b0..c15158f 100644
+--- a/twisted/internet/abstract.py
++++ b/twisted/internet/abstract.py
+@@ -16,6 +16,7 @@ from twisted.python import log, reflect, failure
+ from twisted.persisted import styles
+ from twisted.internet import interfaces, main
+ 
++import socket
+ 
+ class FileDescriptor(object):
+     """An object which can be operated on by select().
+@@ -380,5 +381,16 @@ def isIPAddress(addr):
+         return True
+     return False
+ 
++def isIPv6Address(addr):
++    if '%' in addr:
++        addr, scope = addr.split('%', 1)
++    try:
++        s = socket.inet_pton(socket.AF_INET6, addr)
++    except Exception, ex:
++        print ex
++        return False
++    else:
++        return True
++
+ 
+ __all__ = ["FileDescriptor"]
+diff --git a/twisted/internet/tcp.py b/twisted/internet/tcp.py
+index 23d56b8..e141c3d 100644
+--- a/twisted/internet/tcp.py
++++ b/twisted/internet/tcp.py
+@@ -602,16 +602,7 @@ class BaseClient(Connection):
+         fdesc._setCloseOnExec(s.fileno())
+         return s
+ 
+-    def resolveAddress(self):
+-        if abstract.isIPAddress(self.addr[0]):
+-            self._setRealAddress(self.addr[0])
+-        else:
+-            d = self.reactor.resolve(self.addr[0])
+-            d.addCallbacks(self._setRealAddress, self.failIfNotConnected)
+ 
+-    def _setRealAddress(self, address):
+-        self.realAddress = (address, self.addr[1])
+-        self.doConnect()
+ 
+     def doConnect(self):
+         """I connect the socket.
+@@ -684,38 +675,85 @@ class Client(BaseClient):
+     def __init__(self, host, port, bindAddress, connector, reactor=None):
+         # BaseClient.__init__ is invoked later
+         self.connector = connector
++        self.bindAddress = bindAddress
++        self.reactor = reactor
+         self.addr = (host, port)
+ 
+-        whenDone = self.resolveAddress
+         err = None
+         skt = None
+ 
++        self._start(host, port, True)
++
++    def _start(self, host, port, resolve=False):
++
++        if abstract.isIPAddress(host):
++            self.addressFamily = socket.AF_INET
++            self.realAddress = (host, port)
++
++        elif abstract.isIPv6Address(host):
++            # we need to pass this through getaddrinfo to handle
++            # scope ID, but we don't want it to block, hence
++            # the flags..
++            self.addressFamily = socket.AF_INET6
++            replies = socket.getaddrinfo(host, port,
++                    self.addressFamily,
++                    self.socketType,
++                    0,
++                    socket.AI_NUMERICHOST   # numeric hosts - no DNS!
++                    )
++            if not replies:
++                err = error.DNSResolutionError('couldnt resolve v6 scope '+host)
++                self.failIfNotConnected(err)
++                return
++            # FIXME: what to do about multiple replies?
++            self.realAddress = replies[0][4]
++
++        elif resolve:
++            # resolve is only set on 1st call from "init"; 2nd
++            # call is the answer, we set ourselves as callback
++            # FIXME: currently this only does IPv4 lookups
++            d = self.reactor.resolve(host)
++            d.addCallback(self._start, port).addErrback(self.failIfNotConnected)
++            return
++
++        else:
++            # wtf? 
++            err = error.DNSResolutionError('couldnt resolve '+self.addr[0])
++            self.failIfNotConnected(err)
++            return
++
++        # create our socket
+         try:
+             skt = self.createInternetSocket()
+         except socket.error, se:
+             err = error.ConnectBindError(se[0], se[1])
+-            whenDone = None
+-        if whenDone and bindAddress is not None:
++            self._finishInit(None, skt, err, self.reactor)
++            return
++
++        if self.bindAddress is not None:
+             try:
+-                skt.bind(bindAddress)
++                skt.bind(self.bindAddress)
+             except socket.error, se:
+                 err = error.ConnectBindError(se[0], se[1])
+-                whenDone = None
+-        self._finishInit(whenDone, skt, err, reactor)
++                self._finishInit(None, skt, err, self.reactor)
++                return
++
++        self._finishInit(self.doConnect, skt, None, self.reactor)
+ 
+     def getHost(self):
+         """Returns an IPv4Address.
+ 
+         This indicates the address from which I am connecting.
+         """
+-        return address.IPv4Address('TCP', *(self.socket.getsockname() + ('INET',)))
++        addr = self.socket.getsockname()
++        return address.IPv4Address('TCP', addr[0], addr[1], 'INET')
+ 
+     def getPeer(self):
+         """Returns an IPv4Address.
+ 
+         This indicates the address that I am connected to.
+         """
+-        return address.IPv4Address('TCP', *(self.realAddress + ('INET',)))
++        return address.IPv4Address('TCP', self.realAddress[0], self.realAddress[1], 'INET')
+ 
+     def __repr__(self):
+         s = '<%s to %s at %x>' % (self.__class__, self.addr, unsignedID(self))
+@@ -770,14 +808,15 @@ class Server(Connection):
+ 
+         This indicates the server's address.
+         """
+-        return address.IPv4Address('TCP', *(self.socket.getsockname() + ('INET',)))
++        addr = self.socket.getsockname()
++        return address.IPv4Address('TCP', addr[0], addr[1], 'INET')
+ 
+     def getPeer(self):
+         """Returns an IPv4Address.
+ 
+         This indicates the client's address.
+         """
+-        return address.IPv4Address('TCP', *(self.client + ('INET',)))
++        return address.IPv4Address('TCP', self.client[0], self.client[1], 'INET')
+ 
+ class Port(base.BasePort, _SocketCloser):
+     """
+@@ -827,6 +866,8 @@ class Port(base.BasePort, _SocketCloser):
+         self.factory = factory
+         self.backlog = backlog
+         self.interface = interface
++        if interface and abstract.isIPv6Address(interface):
++            self.addressFamily = socket.AF_INET6
+ 
+     def __repr__(self):
+         if self._realPortNumber is not None:
+@@ -872,8 +913,8 @@ class Port(base.BasePort, _SocketCloser):
+         self.startReading()
+ 
+ 
+-    def _buildAddr(self, (host, port)):
+-        return address._ServerFactoryIPv4Address('TCP', host, port)
++    def _buildAddr(self, addr):
++        return address._ServerFactoryIPv4Address('TCP', addr[0], addr[1])
+ 
+ 
+     def doRead(self):
+@@ -1005,7 +1046,8 @@ class Port(base.BasePort, _SocketCloser):
+ 
+         This indicates the server's address.
+         """
+-        return address.IPv4Address('TCP', *(self.socket.getsockname() + ('INET',)))
++        addr = self.socket.getsockname()
++        return address.IPv4Address('TCP', addr[0], addr[1], 'INET')
+ 
+ class Connector(base.BaseConnector):
+     def __init__(self, host, port, factory, timeout, bindAddress, reactor=None):
+diff --git a/twisted/internet/test/test_ipv6.py b/twisted/internet/test/test_ipv6.py
+new file mode 100644
+index 0000000..b1aa1d5
+--- /dev/null
++++ b/twisted/internet/test/test_ipv6.py
+@@ -0,0 +1,205 @@
++# Copyright (c) 2008-2010 Twisted Matrix Laboratories.
++# See LICENSE for details.
++
++"""
++Tests for implementations of IPv6
++"""
++
++__metaclass__ = type
++
++import socket
++
++from zope.interface import implements
++from zope.interface.verify import verifyObject
++
++from twisted.internet.test.reactormixins import ReactorBuilder
++from twisted.internet.error import DNSLookupError
++from twisted.internet.interfaces import IResolverSimple, IConnector, IListeningPort
++from twisted.internet.address import IPv4Address
++from twisted.internet.defer import succeed, fail, maybeDeferred
++from twisted.internet.protocol import ServerFactory, ClientFactory, Protocol, DatagramProtocol
++from twisted.python import log
++
++class Stop(ClientFactory):
++    """
++    A client factory which stops a reactor when a connection attempt fails.
++    """
++    def __init__(self, reactor):
++        self.reactor = reactor
++
++
++    def clientConnectionFailed(self, connector, reason):
++        self.reactor.stop()
++
++class v6TestsBuilder(ReactorBuilder):
++    def _freePort(self, interface='::1'):
++        probe = socket.socket(socket.AF_INET6)
++        try:
++            probe.bind((interface, 0))
++            ip, port, flow, scope = probe.getsockname()
++            return (ip, port)
++        finally:
++            probe.close()
++
++
++    def test_clientConnectionFailedStopsReactor(self):
++        host, port = self._freePort()
++
++        reactor = self.buildReactor()
++
++        reactor.connectTCP('::1', port, Stop(reactor))
++        reactor.run()
++
++
++    def test_addresses(self):
++        """
++        A client's transport's C{getHost} and C{getPeer} return L{IPv4Address}
++        instances which give the dotted-quad string form of the local and
++        remote endpoints of the connection respectively.
++        """
++        host, port = self._freePort()
++        reactor = self.buildReactor()
++
++        serverFactory = ServerFactory()
++        serverFactory.protocol = Protocol
++        server = reactor.listenTCP(0, serverFactory, interface='::1')
++        serverAddress = server.getHost()
++
++        addresses = {'host': None, 'peer': None}
++        class CheckAddress(Protocol):
++            def makeConnection(self, transport):
++                addresses['host'] = transport.getHost()
++                addresses['peer'] = transport.getPeer()
++                reactor.stop()
++
++        clientFactory = Stop(reactor)
++        clientFactory.protocol = CheckAddress
++        reactor.connectTCP('::1', server.getHost().port, clientFactory, bindAddress=('::1', port))
++
++        reactor.run() # self.runReactor(reactor)
++
++        self.assertEqual(
++            addresses['host'],
++            IPv4Address('TCP', '::1', port))
++        self.assertEqual(
++            addresses['peer'],
++            IPv4Address('TCP', '::1', serverAddress.port))
++
++    def test_mixed4to6(self):
++        reactor = self.buildReactor()
++
++        addresses = {'server': None, 'client': None, 'cserver': None}
++
++        class SvProto(Protocol):
++            def connectionMade(self):
++                addresses['client'] = self.transport.getPeer()
++                addresses['server'] = self.transport.getHost()
++
++        serverFactory = ServerFactory()
++        serverFactory.protocol = SvProto
++        host, sport = self._freePort()
++        server = reactor.listenTCP(sport, serverFactory, interface='::')
++
++        class ClProto(Protocol):
++            def makeConnection(self, transport):
++                addresses['cserver'] = transport.getPeer()
++                reactor.stop()
++
++        clientFactory = Stop(reactor)
++        clientFactory.protocol = ClProto
++
++        host, cport = self._freePort()
++        server = reactor.connectTCP('127.0.0.1', sport, clientFactory, bindAddress=('', cport))
++
++        reactor.run()
++
++        self.assertEqual(
++            addresses['client'],
++            IPv4Address('TCP', '::ffff:127.0.0.1', cport))
++        self.assertEqual(
++            addresses['cserver'],
++            IPv4Address('TCP', '127.0.0.1', sport))
++
++
++
++class UDP6ServerTestsBuilder(ReactorBuilder):
++    def _freePort(self, interface='::1'):
++        probe = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
++        try:
++            probe.bind((interface, 0))
++            ip, port, flow, scope = probe.getsockname()
++            return (ip, port)
++        finally:
++            probe.close()
++
++    def test_interface(self):
++        reactor = self.buildReactor()
++        port = reactor.listenUDP(0, DatagramProtocol(), interface='::')
++        self.assertTrue(verifyObject(IListeningPort, port))
++
++    def test_traffic(self):
++        reactor = self.buildReactor()
++
++        dgs = []
++        class Accum(DatagramProtocol):
++            def datagramReceived(self, data, addr):
++                dgs.append((addr, data))
++                self.transport.write('r'+data, addr)
++
++        class Xmit(DatagramProtocol):
++            def perform(self, addr, port):
++                self.transport.write('msg', (addr, port))
++            def datagramReceived(self, data, addr):
++                dgs.append((addr, data))
++                reactor.stop()
++
++        ip, lport = self._freePort()
++        p = reactor.listenUDP(lport, Accum(), interface='::1')
++        
++        ip, xport = self._freePort()
++        xmit = Xmit()
++        p = reactor.listenUDP(xport, xmit, interface='::1')
++
++        reactor.callLater(0, xmit.perform, '::1', lport)
++        reactor.callLater(10, reactor.stop)
++        reactor.run()
++
++        self.assertEqual(
++                dgs,
++                [(('::1', xport), 'msg'), (('::1', lport), 'rmsg')]
++                )
++
++    def test_mixed4to6(self):
++        reactor = self.buildReactor()
++
++        dgs = []
++        class Accum(DatagramProtocol):
++            def datagramReceived(self, data, addr):
++                dgs.append((addr, data))
++                self.transport.write('r'+data, addr)
++
++        class Xmit(DatagramProtocol):
++            def perform(self, addr, port):
++                self.transport.write('msg', (addr, port))
++            def datagramReceived(self, data, addr):
++                dgs.append((addr, data))
++                reactor.stop()
++
++        ip, lport = self._freePort()
++        p = reactor.listenUDP(lport, Accum(), interface='::')
++        
++        ip, xport = self._freePort()
++        xmit = Xmit()
++        p = reactor.listenUDP(xport, xmit)
++
++        reactor.callLater(0, xmit.perform, '127.0.0.1', lport)
++        reactor.callLater(10, reactor.stop)
++        reactor.run()
++
++        self.assertEqual(
++                dgs,
++                [(('::ffff:127.0.0.1', xport), 'msg'), (('127.0.0.1', lport), 'rmsg')]
++                )
++
++globals().update(v6TestsBuilder.makeTestCaseClasses())
++globals().update(UDP6ServerTestsBuilder.makeTestCaseClasses())
+diff --git a/twisted/internet/udp.py b/twisted/internet/udp.py
+index 3a21453..c5672c0 100644
+--- a/twisted/internet/udp.py
++++ b/twisted/internet/udp.py
+@@ -62,6 +62,8 @@ class Port(base.BasePort):
+         self.interface = interface
+         self.setLogStr()
+         self._connectedAddr = None
++        if interface and abstract.isIPv6Address(interface):
++            self.addressFamily = socket.AF_INET6
+ 
+     def __repr__(self):
+         if self._realPortNumber is not None:
+@@ -127,6 +129,7 @@ class Port(base.BasePort):
+             else:
+                 read += len(data)
+                 try:
++                    addr = (addr[0], addr[1])
+                     self.protocol.datagramReceived(data, addr)
+                 except:
+                     log.err()
+@@ -160,7 +163,9 @@ class Port(base.BasePort):
+                     raise
+         else:
+             assert addr != None
+-            if not addr[0].replace(".", "").isdigit() and addr[0] != "<broadcast>":
++            if abstract.isIPAddress(addr[0]) or abstract.isIPv6Address(addr[0]):
++                pass
++            elif addr[0] != "<broadcast>":
+                 warnings.warn("Please only pass IPs to write(), not hostnames",
+                               DeprecationWarning, stacklevel=2)
+             try:
+@@ -188,7 +193,7 @@ class Port(base.BasePort):
+         """
+         if self._connectedAddr:
+             raise RuntimeError, "already connected, reconnecting is not currently supported (talk to itamar if you want this)"
+-        if not abstract.isIPAddress(host):
++        if not abstract.isIPAddress(host) and not abstract.isIPv6Address(host):
+             raise ValueError, "please pass only IP addresses, not domain names"
+         self._connectedAddr = (host, port)
+         self.socket.connect((host, port))
+@@ -242,10 +247,11 @@ class Port(base.BasePort):
+ 
+         This indicates the address from which I am connecting.
+         """
+-        return address.IPv4Address('UDP', *(self.socket.getsockname() + ('INET_UDP',)))
+-
++        addr = self.socket.getsockname()
++        return address.IPv4Address('UDP', addr[0], addr[1], 'INET_UDP')
+ 
+ 
++# FIXME: implement ipv6 multicast...
+ class MulticastMixin:
+     """
+     Implement multicast functionality.

@@ -1,0 +1,252 @@
+=== modified file 'twisted/web/http.py' (properties changed: -x to +x)
+--- twisted/web/http.py	2009-01-26 00:53:09 +0000
++++ twisted/web/http.py	2009-04-13 06:14:44 +0000
+@@ -470,6 +470,10 @@
+             self.setLineMode(rest)
+ 
+ 
++class StopWritingHeaders(Exception):
++    """
++    """
++
+ 
+ # response codes that must have empty bodies
+ NO_BODY_CODES = (204, 304)
+@@ -812,39 +816,73 @@
+         @type data: C{str}
+         @param data: Some bytes to be sent as part of the response body.
+         """
++
+         if not self.startedWriting:
+             self.startedWriting = 1
+             version = self.clientproto
+             l = []
+-            l.append('%s %s %s\r\n' % (version, self.code,
+-                                       self.code_message))
+-            # if we don't have a content length, we send data in
+-            # chunked mode, so that we can support pipelining in
+-            # persistent connections.
+-            if ((version == "HTTP/1.1") and
+-                (self.responseHeaders.getRawHeaders('content-length') is None) and
+-                self.method != "HEAD" and self.code not in NO_BODY_CODES):
+-                l.append("%s: %s\r\n" % ('Transfer-Encoding', 'chunked'))
+-                self.chunked = 1
+-
+-            if self.lastModified is not None:
+-                if self.responseHeaders.hasHeader('last-modified'):
+-                    log.msg("Warning: last-modified specified both in"
+-                            " header list and lastModified attribute.")
+-                else:
+-                    self.responseHeaders.setRawHeaders(
+-                        'last-modified',
+-                        [datetimeToString(self.lastModified)])
+-
+-            if self.etag is not None:
+-                self.responseHeaders.setRawHeaders('ETag', [self.etag])
+-
+-            for name, values in self.responseHeaders.getAllRawHeaders():
+-                for value in values:
+-                    l.append("%s: %s\r\n" % (name, value))
+-
+-            for cookie in self.cookies:
+-                l.append('%s: %s\r\n' % ("Set-Cookie", cookie))
++
++            try:
++                responseLine = '%s %s %s' % (version, self.code, self.code_message)
++                if '\n' in responseLine or '\r' in responseLine:
++                    log.msg("Warning: sending error 500 to %s because response line became %s" % (str(self.transport.getPeer()), repr(responseLine)))
++                    l.append("HTTP/1.1 500 Internal Server Error\r\n")
++                    raise StopWritingHeaders()
++
++                if self.lastModified is not None:
++                    if self.responseHeaders.hasHeader('last-modified'):
++                        log.msg("Warning: last-modified specified both in"
++                                " header list and lastModified attribute.")
++                    else:
++                        self.responseHeaders.setRawHeaders(
++                            'last-modified',
++                            [datetimeToString(self.lastModified)])
++
++                if self.etag is not None:
++                    self.responseHeaders.setRawHeaders('ETag', [self.etag])
++
++                allRawHeaders = list(self.responseHeaders.getAllRawHeaders())
++
++                # self.cookies could mutate under us, so copy it.
++                _cookies = self.cookies[:]
++
++                for name, values in allRawHeaders:
++                    for value in values:
++                        nameAndValue = '%s: %s' % (name, value)
++                        if '\n' in nameAndValue or '\r' in nameAndValue:
++                            log.msg("Warning: sending error 500 to %s because of header name or value %s" %
++                                (str(self.transport.getPeer()), repr(nameAndValue)))
++                            l.append("HTTP/1.1 500 Internal Server Error\r\n")
++                            raise StopWritingHeaders()
++
++                for cookie in _cookies:
++                    if '\n' in cookie or '\r' in cookie:
++                        log.msg("Warning: sending error 500 to %s because of cookie value %s" %
++                            (str(self.transport.getPeer()), repr(cookie)))
++                        l.append("HTTP/1.1 500 Internal Server Error\r\n")
++                        raise StopWritingHeaders()
++
++                l.append(responseLine + '\r\n')
++
++                for name, values in allRawHeaders:
++                    for value in values:
++                        l.append("%s: %s\r\n" % (name, value))
++
++                for cookie in _cookies:
++                    l.append('%s: %s\r\n' % ("Set-Cookie", cookie))
++            except StopWritingHeaders:
++                # we not longer want to send the data we originally intended to
++                data = ''
++            finally:
++                # if we don't have a content length, we send data in
++                # chunked mode, so that we can support pipelining in
++                # persistent connections.
++                if ((version == "HTTP/1.1") and
++                    (self.responseHeaders.getRawHeaders('content-length') is None) and
++                    self.method != "HEAD" and self.code not in NO_BODY_CODES):
++                    l.append("%s: %s\r\n" % ('Transfer-Encoding', 'chunked'))
++                    self.chunked = 1
++
+ 
+             l.append("\r\n")
+ 
+
+=== modified file 'twisted/web/test/test_http.py' (properties changed: -x to +x)
+--- twisted/web/test/test_http.py	2009-01-26 00:53:09 +0000
++++ twisted/web/test/test_http.py	2009-04-13 06:11:41 +0000
+@@ -1282,3 +1282,129 @@
+         req.connectionLost(Failure(ConnectionLost("Finished")))
+         self.assertTrue(content.closed)
+         self.assertIdentical(req.channel, None)
++
++
++
++class ResponseSplittingTests(unittest.TestCase, ResponseTestMixin):
++    """
++    """
++    def test_badHeaders(self):
++        """
++        """
++        req = http.Request(DummyChannel(), None)
++
++        trans = StringTransport()
++
++        req.transport = trans
++
++        req.setResponseCode(200)
++        req.clientproto = "HTTP/1.0"
++        req.setHeader('X', 'Y')
++        req.setHeader('Y\n\nLowercased', '\r\n\r\nHTTP/1.1 200 OK\r\n\r\nBad')
++        req.write('Hello')
++
++        self.assertEquals(
++            trans.value(),
++            """HTTP/1.1 500 Internal Server Error\r\n\r\n""")
++
++    # unfixed version asserted something like this:
++
++#        self.assertEquals(
++#            trans.value(),
++#            """\
++#HTTP/1.0 200 OK\r
++#X: Y\r
++#Y
++#
++#lowercased: \r
++#\r
++#HTTP/1.1 200 OK\r
++#\r
++#Bad""")
++
++
++    def test_badCodeMessage(self):
++        """
++        """
++        req = http.Request(DummyChannel(), None)
++
++        trans = StringTransport()
++
++        req.transport = trans
++
++        req.setResponseCode(200)
++        req.clientproto = "HTTP/1.0"
++
++        req.code_message = "\r"
++
++        req.write('anything')
++
++        self.assertEquals(
++            trans.value(),
++            """HTTP/1.1 500 Internal Server Error\r\n\r\n""")
++
++
++    def test_badCookieName(self):
++        """
++        """
++        req = http.Request(DummyChannel(), None)
++
++        trans = StringTransport()
++
++        req.transport = trans
++
++        req.setResponseCode(200)
++        req.clientproto = "HTTP/1.0"
++
++        req.addCookie('ba\rd1', 'bad2')
++
++        req.write('anything')
++
++        self.assertEquals(
++            trans.value(),
++            """HTTP/1.1 500 Internal Server Error\r\n\r\n""")
++
++
++
++    def test_badCookieValue(self):
++        """
++        """
++        req = http.Request(DummyChannel(), None)
++
++        trans = StringTransport()
++
++        req.transport = trans
++
++        req.setResponseCode(200)
++        req.clientproto = "HTTP/1.0"
++
++        req.addCookie('bad1', 'ba\rd2')
++
++        req.write('anything')
++
++        self.assertEquals(
++            trans.value(),
++            """HTTP/1.1 500 Internal Server Error\r\n\r\n""")
++
++
++
++    def test_badEtag(self):
++        """
++        """
++        req = http.Request(DummyChannel(), None)
++
++        trans = StringTransport()
++
++        req.transport = trans
++
++        req.setResponseCode(200)
++        req.clientproto = "HTTP/1.0"
++
++        req.etag = '\n'
++
++        req.write('anything')
++
++        self.assertEquals(
++            trans.value(),
++            """HTTP/1.1 500 Internal Server Error\r\n\r\n""")
++
+

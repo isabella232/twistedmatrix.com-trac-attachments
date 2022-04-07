@@ -1,0 +1,231 @@
+Index: twisted/internet/test/test_pollingfile.py
+===================================================================
+--- twisted/internet/test/test_pollingfile.py	(revision 38262)
++++ twisted/internet/test/test_pollingfile.py	(working copy)
+@@ -5,18 +5,197 @@
+ Tests for L{twisted.internet._pollingfile}.
+ """
+ 
++from zope.interface import implements
+ from twisted.python.runtime import platform
+ from twisted.trial.unittest import TestCase
++from twisted.internet import interfaces, defer, reactor
++from twisted.protocols import basic
+ 
+ if platform.isWindows():
++    import win32pipe
++    import win32security
++
+     from twisted.internet import _pollingfile
++
++    from twisted.internet._pollingfile import _PollingTimer, _PollableReadPipe
++    from twisted.internet._pollingfile import _PollableWritePipe
++    _skipNotWindows = False
++    _oldPollingFile = True
+ else:
+-    _pollingfile = None
++    _skipNotWindows = True
++    _PollingTimer = object
+ 
+ 
+ 
+-class TestPollableWritePipe(TestCase):
++class _TestProducer(object):
+     """
++    Test producer based on the Produce() class in:
++    doc/core/examples/streaming.py except that it produces a series of
++    integer messages.
++    
++    It is configured as a push-producer if streaming is True otherwise it is
++    configured as a pull-producer.
++    """
++
++    implements(interfaces.IPushProducer)
++
++    def __init__(self, transport, streaming, count, msgFormat):
++        self._transport = transport
++        self._goal = count
++        self._produced = 0
++        self._paused = False
++        self.pauseCount = 0
++        self.resumeCount = 0
++        self.stopCount = 0
++        self.msgFormat = msgFormat
++        if streaming:
++            self.resumeProducing = self._resumeProducingPush
++        else:
++            self.resumeProducing = self._resumeProducingPull
++
++    def pauseProducing(self):
++        self._paused = True
++        self.pauseCount += 1
++
++
++    def _resumeProducingPush(self):
++        self._paused = False
++        self.resumeCount += 1
++
++        while not self._paused and self._produced < self._goal:
++            self._transport.write(self.msgFormat % self._produced)
++            self._produced += 1
++
++        if self._produced == self._goal:
++            self._transport.unregisterProducer()
++            self._transport.writer.close()
++
++
++    def _resumeProducingPull(self):
++        self.resumeCount += 1
++
++        if self._produced < self._goal:
++            self._transport.write(self.msgFormat % self._produced)
++            self._produced += 1
++
++        if self._produced == self._goal:
++            self._transport.unregisterProducer()
++            self._transport.writer.close()
++
++
++    def stopProducing(self):
++        self._produced = self._goal
++        self.stopCount += 1
++
++
++
++class _PipeRunner(_PollingTimer):
++    """
++    Builds, initializes and runs a pair of read/write pipes.
++    """
++    def __init__(self, pipeSize, doneReadCB, doneWriteCB, receivedCB, reactor=reactor):
++        _PollingTimer.__init__(self, reactor)
++        sAttrs = win32security.SECURITY_ATTRIBUTES()
++        sAttrs.bInheritHandle = 1
++        hRead, hWrite = win32pipe.CreatePipe(sAttrs, pipeSize)
++        self.reader = _PollableReadPipe(hRead, receivedCB, doneReadCB)
++        self.writer = _PollableWritePipe(hWrite, doneWriteCB)
++        self._addPollableResource(self.reader)
++        self._addPollableResource(self.writer)
++
++    def write(self, data):
++        self.writer.write(data)
++
++    def writeSequence(self, seq):
++        self.writer.writeSequence(seq)
++
++    def registerProducer(self, producer, streaming):
++        self.writer.registerProducer(producer, streaming)
++
++    def unregisterProducer(self):
++        self.writer.unregisterProducer()
++
++
++
++class TestPollablePipes(TestCase):
++    """
++    Tests for L{_pollingfile._PollableWritePipe} and
++    L{_pollingfile._PollableReadPipe}.
++    """
++    def setUp(self):
++        if _oldPollingFile:
++            self._oldBufferSize = _pollingfile.FULL_BUFFER_SIZE
++
++
++    def tearDown(self):
++        if _oldPollingFile:
++            _pollingfile.FULL_BUFFER_SIZE = self._oldBufferSize
++
++
++
++    class TestConsumerProtocol(basic.LineReceiver):
++        """
++        Expects a series of ascending integer messages, possibly including
++        a large number of leading zeros.
++
++        Counts the number of messages, records any that aren't in sequence.
++        """
++        from os import linesep as delimiter
++        counter = 0
++        errors = []
++
++        def lineReceived(self, line):
++            if int(line) != self.counter:
++                self.errors.append((int(line), self.counter))
++            self.counter += 1
++
++
++
++    def test_pushProducerCheckResumeProducing(self):
++        """
++        Test write pipe as a consumer using a push producer.
++
++                    vvvv--- to be changed
++        See Ticket #5413: bufferEmpty sets producerPaused attribute on the
++        producer instead of on itself.
++        """
++        if _oldPollingFile:
++            _pollingfile.FULL_BUFFER_SIZE = 512 # restrict write buffer size
++
++        pipeSize = 4096
++        totalMessages = 1000
++        msgFormat  = '%08d\r\n'
++        totalResumeCounts = 19
++
++        d = defer.Deferred()
++
++        def doneReadCB():
++            d.callback(None)
++            self.assertEqual(producer.stopCount, 0)
++            self.assertEqual(protocol.counter, totalMessages)
++            self.assertEqual(protocol.errors, [])
++            self.assertEqual(producer.pauseCount, totalResumeCounts)
++            self.assertEqual(producer.resumeCount, totalResumeCounts+1)
++            diff_producer_attribs = set(dir(producer)).difference(pre_producer_attribs)
++            self.assertEqual(diff_producer_attribs, set())
++
++        protocol = self.TestConsumerProtocol()
++        transport = _PipeRunner(pipeSize,
++                                doneReadCB,
++                                lambda: None,
++                                protocol.dataReceived)
++        protocol._transport = transport
++        transport.writer.bufferSize = 512
++        producer = _TestProducer(transport, True, totalMessages, msgFormat)
++        pre_producer_attribs = set(dir(producer))
++        transport.registerProducer(producer, True)
++        producer.resumeProducing()
++        return d
++
++
++
++class TestPollableWritePipeUnicode(TestCase):
++    """
+     Tests for L{_pollingfile._PollableWritePipe}.
+     """
+ 
+@@ -25,7 +204,7 @@
+         L{_pollingfile._PollableWritePipe.write} raises a C{TypeError} if an
+         attempt is made to append unicode data to the output buffer.
+         """
+-        p = _pollingfile._PollableWritePipe(1, lambda: None)
++        p = _PollableWritePipe(1, lambda: None)
+         self.assertRaises(TypeError, p.write, u"test")
+ 
+ 
+@@ -35,12 +214,14 @@
+         if unicode data is part of the data sequence to be appended to the
+         output buffer.
+         """
+-        p = _pollingfile._PollableWritePipe(1, lambda: None)
++        p = _PollableWritePipe(1, lambda: None)
+         self.assertRaises(TypeError, p.writeSequence, [u"test"])
+         self.assertRaises(TypeError, p.writeSequence, (u"test", ))
+ 
+ 
+ 
++if _skipNotWindows:
++    skipMessage = "Test will run only on Windows."
++    TestPollablePipes.skip = skipMessage
++    TestPollableWritePipeUnicode.skip = skipMessage
+ 
+-if _pollingfile is None:
+-    TestPollableWritePipe.skip = "Test will run only on Windows."

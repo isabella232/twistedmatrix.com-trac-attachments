@@ -1,0 +1,91 @@
+Index: test/test_xmlrpc.py
+===================================================================
+RCS file: /cvs/Twisted/twisted/test/test_xmlrpc.py,v
+retrieving revision 1.9
+diff -u -r1.9 test_xmlrpc.py
+--- test/test_xmlrpc.py	27 Aug 2003 06:26:31 -0000	1.9
++++ test/test_xmlrpc.py	16 Feb 2004 02:16:58 -0000
+@@ -38,6 +38,7 @@
+ 
+     FAILURE = 666
+     NOT_FOUND = 23
++    SESSION_EXPIRED = 42
+ 
+     # the doc string is part of the test
+     def xmlrpc_add(self, a, b):
+@@ -78,6 +79,15 @@
+     def xmlrpc_dict(self, map, key):
+         return map[key]
+ 
++    def _getFunction(self, functionPath):
++        try:
++            return XMLRPC._getFunction(self, functionPath)
++        except xmlrpc.NoSuchFunction:
++            if functionPath.startswith("SESSION"):
++                raise xmlrpc.Fault(self.SESSION_EXPIRED, "Session non-existant/expired.")
++            else:
++                raise
++
+     xmlrpc_dict.help = 'Help for dict.'
+ 
+ 
+@@ -112,7 +122,7 @@
+     def testErrors(self):
+         for code, methodName in [(666, "fail"), (666, "deferFail"),
+                                  (12, "fault"), (23, "noSuchMethod"),
+-                                 (17, "deferFault")]:
++                                 (17, "deferFault"), (42, "SESSION_TEST")]:
+             l = []
+             d = self.proxy().callRemote(methodName).addErrback(l.append)
+             while not l:
+Index: web/xmlrpc.py
+===================================================================
+RCS file: /cvs/Twisted/twisted/web/xmlrpc.py,v
+retrieving revision 1.31
+diff -u -r1.31 xmlrpc.py
+--- web/xmlrpc.py	23 Dec 2003 05:19:13 -0000	1.31
++++ web/xmlrpc.py	16 Feb 2004 02:16:58 -0000
+@@ -51,7 +51,7 @@
+ DateTime = xmlrpclib.DateTime
+ 
+ 
+-class NoSuchFunction(Exception):
++class NoSuchFunction(Fault):
+     """There is no function by the given name."""
+     pass
+ 
+@@ -123,11 +123,8 @@
+         args, functionPath = xmlrpclib.loads(request.content.read())
+         try:
+             function = self._getFunction(functionPath)
+-        except NoSuchFunction:
+-            self._cbRender(
+-                Fault(self.NOT_FOUND, "no such function %s" % functionPath),
+-                request
+-            )
++        except Fault, f:
++            self._cbRender(f, request)
+         else:
+             request.setHeader("content-type", "text/xml")
+             defer.maybeDeferred(function, *args).addErrback(
+@@ -172,14 +169,16 @@
+         if functionPath.find(self.separator) != -1:
+             prefix, functionPath = functionPath.split(self.separator, 1)
+             handler = self.getSubHandler(prefix)
+-            if handler is None: raise NoSuchFunction
++            if handler is None: raise NoSuchFunction(self.NOT_FOUND, "no such subHandler %s" % prefix)
+             return handler._getFunction(functionPath)
+ 
+         f = getattr(self, "xmlrpc_%s" % functionPath, None)
+-        if f and callable(f):
+-            return f
++        if not f:
++            raise NoSuchFunction(self.NOT_FOUND, "function %s not found" % functionPath)
++        elif not callable(f):
++            raise NoSuchFunction(self.NOT_FOUND, "function %s not callable" % functionPath)
+         else:
+-            raise NoSuchFunction
++            return f
+ 
+     def _listFunctions(self):
+         """Return a list of the names of all xmlrpc methods."""

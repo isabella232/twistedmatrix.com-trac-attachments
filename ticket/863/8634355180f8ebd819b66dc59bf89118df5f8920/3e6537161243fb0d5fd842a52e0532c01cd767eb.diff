@@ -1,0 +1,99 @@
+Index: twisted/web/wsgi.py
+===================================================================
+--- twisted/web/wsgi.py	(revision 27511)
++++ twisted/web/wsgi.py	(working copy)
+@@ -98,7 +98,12 @@
+         """
+         if size == -1:
+             size = None
+-        return self._wrapped.readline(size)
++        # We'll do it like this because tempfiles (used for large POSTs)
++        # don't like being given None as an argument.
++        if(size is None):
++            return self._wrapped.readline()
++        else:
++            return self._wrapped.readline(size)
+ 
+ 
+     def readlines(self, size=None):
+Index: twisted/web/test/test_wsgi.py
+===================================================================
+--- twisted/web/test/test_wsgi.py	(revision 27511)
++++ twisted/web/test/test_wsgi.py	(working copy)
+@@ -7,6 +7,8 @@
+ 
+ __metaclass__ = type
+ 
++import tempfile
++
+ from sys import exc_info
+ from urllib import quote
+ from StringIO import StringIO
+@@ -113,7 +115,7 @@
+     def lowLevelRender(
+         self, requestFactory, applicationFactory, channelFactory, method,
+         version, resourceSegments, requestSegments, query=None, headers=[],
+-        body=None, safe=''):
++        body=None, safe='', use_tempfile=False):
+         """
+         @param method: A C{str} giving the request method to use.
+ 
+@@ -156,7 +158,12 @@
+             request.requestHeaders.addRawHeader(k, v)
+         request.gotLength(0)
+         if body:
+-            request.content = StringIO(body)
++            if use_tempfile:
++                request.content = tempfile.TemporaryFile()
++                request.content.write(body)
++                request.content.seek(0)
++            else:
++                request.content = StringIO(body)
+         uri = '/' + '/'.join([quote(seg, safe) for seg in requestSegments])
+         if query is not None:
+             uri += '?' + '&'.join(['='.join([quote(k, safe), quote(v, safe)])
+@@ -602,8 +609,31 @@
+             self.assertEqual, [
+                 'hello, world\n', 'how are you\n', 'I am great\n',
+                 'goodbye now\n', 'no da', 'ta he', 're\n'])
+-
+-
++       
++        inputReadlineNonePOST, appFactory = appFactoryFactory(
++            lambda input: [input.readline(), input.readline(-1),
++                           input.readline(None), input.readline(),
++                           input.readline(-1)])
++        
++        self.lowLevelRender(
++            Request, appFactory, DummyChannel,
++            'POST', '1.1', [], [''], None, [
++                ('Content-Type', 'multipart/form-data; boundary=---------------------------168072824752491622650073'),
++                ('Content-Length', '130'),
++            ],
++            "\n".join((["-----------------------------168072824752491622650073\n"
++            "Content-Disposition: form-data; name=\"search-query\"\n\n"
++            "this-is-my-search-query\n"])),
++            use_tempfile=True)
++        inputReadlineNonePOST.addCallback(
++            self.assertEqual, [
++                '-----------------------------168072824752491622650073\n',
++                'Content-Disposition: form-data; name="search-query"\n',
++                '\n',
++                'this-is-my-search-query\n',
++                ''
++            ])
++        
+         inputReadlinesNoArg, appFactory = appFactoryFactory(
+             lambda input: input.readlines())
+         self.lowLevelRender(
+@@ -648,8 +678,8 @@
+             self.assertEqual, ['foo\n', 'bar\n'])
+ 
+         return gatherResults([
+-                inputRead, inputReadline, inputReadlinesNoArg,
+-                inputReadlinesNone, inputReadlinesLength,
++                inputRead, inputReadline, inputReadlineNonePOST,
++                inputReadlinesNoArg, inputReadlinesNone, inputReadlinesLength,
+                 inputIter])
+ 
+ 

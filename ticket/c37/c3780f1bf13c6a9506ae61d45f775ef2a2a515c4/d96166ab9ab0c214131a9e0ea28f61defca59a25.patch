@@ -1,0 +1,211 @@
+Index: application/app.py
+===================================================================
+--- application/app.py	(revision 18499)
++++ application/app.py	(working copy)
+@@ -49,7 +49,7 @@
+         sys.exit('\n' + s + '\n')
+ 
+     p = profile.Profile()
+-    p.runcall(reactor.run)
++    exitStatus = p.runcall(reactor.run)
+     if config['savestats']:
+         p.dump_stats(config['profile'])
+     else:
+@@ -59,6 +59,8 @@
+         sys.stdout, tmp = tmp, sys.stdout
+         tmp.close()
+ 
++    return exitStatus
++
+ def runWithHotshot(reactor, config):
+     """Run reactor under hotshot profiler."""
+     try:
+@@ -78,7 +80,7 @@
+ 
+     # this writes stats straight out
+     p = hotshot.Profile(config["profile"])
+-    p.runcall(reactor.run)
++    exitStatus = p.runcall(reactor.run)
+     if config["savestats"]:
+         # stats are automatically written to file, nothing to do
+         return
+@@ -91,6 +93,8 @@
+         sys.stdout, tmp = tmp, sys.stdout
+         tmp.close()
+ 
++    return exitStatus
++
+ def fixPdb():
+     def do_stop(self, arg):
+         self.clear_all_breaks()
+@@ -114,9 +118,9 @@
+     try:
+         if config['profile']:
+             if not config['nothotshot']:
+-                runWithHotshot(reactor, config)
++                return runWithHotshot(reactor, config)
+             else:
+-                runWithProfiler(reactor, config)
++                return runWithProfiler(reactor, config)
+         elif config['debug']:
+             sys.stdout = oldstdout
+             sys.stderr = oldstderr
+@@ -124,9 +128,9 @@
+                 signal.signal(signal.SIGUSR2, lambda *args: pdb.set_trace())
+                 signal.signal(signal.SIGINT, lambda *args: pdb.set_trace())
+             fixPdb()
+-            pdb.runcall(reactor.run)
++            return pdb.runcall(reactor.run)
+         else:
+-            reactor.run()
++            return reactor.run()
+     except:
+         if config['nodaemon']:
+             file = oldstdout
+@@ -135,6 +139,7 @@
+         traceback.print_exc(file=file)
+         file.flush()
+ 
++        return 1
+ 
+ def getPassphrase(needed):
+     if needed:
+@@ -163,7 +168,11 @@
+     @ivar config: The config object, which provides a dict-like interface.
+     @ivar application: Available in postApplication, but not
+     preApplication. This is the application object.
++    @ivar exitStatus: The exit status returned by the application.
+     """
++
++    exitStatus = 0
++
+     def __init__(self, config):
+         self.config = config
+ 
+@@ -173,6 +182,7 @@
+         self.application = self.createOrGetApplication()
+         self.postApplication()
+ 
++        return self.exitStatus
+ 
+     def preApplication(self):
+         """
+@@ -360,8 +370,10 @@
+     except usage.error, ue:
+         print config
+         print "%s: %s" % (sys.argv[0], ue)
++
++        return 2
+     else:
+-        runApp(config)
++        return runApp(config)
+ 
+ 
+ def initialLog():
+Index: internet/base.py
+===================================================================
+--- internet/base.py	(revision 18499)
++++ internet/base.py	(working copy)
+@@ -262,6 +262,7 @@
+ 
+     installed = 0
+     usingThreads = 0
++    exitStatus = 0
+     resolver = BlockingResolver()
+ 
+     __name__ = "twisted.internet.reactor"
+@@ -335,11 +336,12 @@
+ 
+     # IReactorCore
+ 
+-    def stop(self):
++    def stop(self, exitStatus=0):
+         """See twisted.internet.interfaces.IReactorCore.stop.
+         """
+         if not self.running:
+             raise RuntimeError, "can't stop reactor that isn't running"
++        self.exitStatus = exitStatus
+         self.fireSystemEvent("shutdown")
+ 
+     def crash(self):
+@@ -351,19 +353,19 @@
+         """Handle a SIGINT interrupt.
+         """
+         log.msg("Received SIGINT, shutting down.")
+-        self.callFromThread(self.stop)
++        self.callFromThread(self.stop, 1)
+ 
+     def sigBreak(self, *args):
+         """Handle a SIGBREAK interrupt.
+         """
+         log.msg("Received SIGBREAK, shutting down.")
+-        self.callFromThread(self.stop)
++        self.callFromThread(self.stop, 1)
+ 
+     def sigTerm(self, *args):
+         """Handle a SIGTERM interrupt.
+         """
+         log.msg("Received SIGTERM, shutting down.")
+-        self.callFromThread(self.stop)
++        self.callFromThread(self.stop, 1)
+ 
+     def disconnectAll(self):
+         """Disconnect every reader, and writer in the system.
+Index: internet/posixbase.py
+===================================================================
+--- internet/posixbase.py	(revision 18499)
++++ internet/posixbase.py	(working copy)
+@@ -216,6 +216,8 @@
+     def run(self, installSignalHandlers=1):
+         self.startRunning(installSignalHandlers=installSignalHandlers)
+         self.mainLoop()
++        
++        return self.exitStatus
+ 
+     def mainLoop(self):
+         while self.running:
+Index: scripts/_twistd_unix.py
+===================================================================
+--- scripts/_twistd_unix.py	(revision 18499)
++++ scripts/_twistd_unix.py	(working copy)
+@@ -212,7 +212,7 @@
+         clean up PID files and such.
+         """
+         startApplication(self.config, self.application)
+-        app.runReactorWithLogging(self.config, self.oldstdout, self.oldstderr)
++        self.exitStatus = app.runReactorWithLogging(self.config, self.oldstdout, self.oldstderr)
+         removePID(self.config['pidfile'])
+         app.reportProfile(self.config['report-profile'],
+                           service.IProcess(self.application).processName)
+Index: scripts/_twistw.py
+===================================================================
+--- scripts/_twistw.py	(revision 18499)
++++ scripts/_twistw.py	(working copy)
+@@ -55,8 +55,7 @@
+         service.IService(self.application).privilegedStartService()
+         app.startApplication(self.application, not self.config['no_save'])
+         app.startApplication(internet.TimerService(0.1, lambda:None), 0)
+-        app.runReactorWithLogging(self.config, self.oldstdout, self.oldstderr)
++        self.exitStatus = app.runReactorWithLogging(self.config, self.oldstdout, self.oldstderr)
+         app.reportProfile(self.config['report-profile'],
+                           service.IProcess(self.application).processName)
+         log.msg("Server Shut Down.")
+-
+Index: scripts/twistd.py
+===================================================================
+--- scripts/twistd.py	(revision 18499)
++++ scripts/twistd.py	(working copy)
+@@ -20,11 +20,11 @@
+ 
+ 
+ def runApp(config):
+-    _SomeApplicationRunner(config).run()
++    return _SomeApplicationRunner(config).run()
+ 
+ 
+ def run():
+-    app.run(runApp, ServerOptions)
++    return app.run(runApp, ServerOptions)
+ 
+ 
+ __all__ = ['run', 'runApp']

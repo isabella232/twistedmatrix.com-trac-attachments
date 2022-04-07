@@ -1,0 +1,253 @@
+Index: twisted/python/log.py
+===================================================================
+--- twisted/python/log.py	(revision 32801)
++++ twisted/python/log.py	(working copy)
+@@ -275,12 +275,29 @@
+         These forms work (sometimes) by accident and will be disabled
+         entirely in the future.
+         """
++        self._publishMessage(self.observers, *message, **kw)
++
++
++    def _publishMessage(self, observers, *message, **kw):
++        """
++        Prepare an C{eventDict} from C{message} and C{kw} and send it to
++        C{observers}.
++
++        @param observers: A list of observers to which the C{eventDict} should
++            be sent (by calling each observer with the said C{eventDict}).
++        @type observers: C{list} of L{ILogObserver}s
++
++        @param message: Optional encoded string describing the event being
++            logged. See also L{msg}.
++
++        @param kw: Additional keys to be added to the C{eventDict}.
++        """
+         actualEventDict = (context.get(ILogContext) or {}).copy()
+         actualEventDict.update(kw)
+         actualEventDict['message'] = message
+         actualEventDict['time'] = time.time()
+         failed = []
+-        for observer in reversed(self.observers):
++        for observer in reversed(observers):
+             try:
+                 observer(actualEventDict)
+             except KeyboardInterrupt:
+@@ -291,27 +308,35 @@
+             except:
+                 try:
+                     fail = failure.Failure()
+-                    why = "Log observer %s failed." % (observer,)
+-                    publisher = LogPublisher()
+-                    for o in self.observers:
++                    why = ("Log observer %s failed." %
++                           (reflect.safe_str(observer),))
++                    innocentObservers = []
++                    for o in observers:
+                         if o is not observer:
+-                            publisher.addObserver(o)
+-                    failed.append((publisher, fail, why))
++                            innocentObservers.append(o)
++                    failed.append((innocentObservers, fail, why))
+                 except Exception:
+-                    # OOM, stack overflow or an observer with broken __str__.
+-                    # Give up.
++                    # OOM or stack overflow. Give up.
+                     pass
+-        for publisher, fail, why in failed:
+-            publisher._err(fail, why)
++        for innocentObservers, fail, why in failed:
++            try:
++                self._err(innocentObservers, fail, why)
++            except (MemoryError, RuntimeError):
++                # OOM or stack overflow. Give up.
++                pass
+ 
+ 
+-    def _err(self, failure, why):
++    def _err(self, observers, failure, why):
+         """
+         Log a failure.
+ 
+-        Similar in functionality to the global {err} function, but the failure
+-        gets published only to observers attached to this publisher.
++        Similar in functionality to the global L{err} function, but the failure
++        gets published only to specified observers.
+ 
++        @param observers: A list of observers that will be called to log the
++            failure.
++        @type observers: C{list} of L{ILogObserver}s
++
+         @param failure: The failure to log.
+         @type failure: L{Failure}.
+ 
+@@ -320,7 +345,7 @@
+             occurred.
+         @type why: C{str}
+         """
+-        self.msg(failure=failure, why=why, isError=1)
++        self._publishMessage(observers, failure=failure, why=why, isError=1)
+ 
+ 
+     def showwarning(self, message, category, filename, lineno, file=None,
+Index: twisted/test/test_log.py
+===================================================================
+--- twisted/test/test_log.py	(revision 32801)
++++ twisted/test/test_log.py	(working copy)
+@@ -137,7 +137,7 @@
+             # calling self._err()... which also fails with recursion error:
+             oldError = publisher._err
+ 
+-            def failingErr(failure, why, **kwargs):
++            def failingErr(observers, failure, why, **kwargs):
+                 errors.append(failure.value)
+                 raise RuntimeError("Fake recursion error")
+ 
+@@ -160,6 +160,39 @@
+         self.assertIsInstance(errors[0], RuntimeError)
+ 
+ 
++    def test_doubleErrorNeverRemovesObserver(self):
++        """
++        If an exception is raised while trying to report a broken observer,
++        that observer isn't removed from the L{log.LogPublisher}.
++        """
++        observerError = RuntimeError("brokenObserver")
++        def brokenObserver(eventDict):
++            raise observerError
++
++        errors = []
++        def brokenFailure(*args):
++            errors.append(sys.exc_info()[1])
++            raise RuntimeError("Failure")
++
++        events = []
++        def report(eventDict):
++            events.append(eventDict)
++
++        publisher = log.LogPublisher()
++        publisher.addObserver(brokenObserver)
++        publisher.addObserver(report)
++        patcher = self.patch(log.failure, "Failure", brokenFailure)
++        try:
++            publisher.msg("Hello!")
++        finally:
++            patcher.restore()
++
++        self.assertEqual(errors, [observerError])
++        self.assertEqual(len(events), 1)
++        self.assertEqual(events[0]["message"], ("Hello!",))
++        self.assertEqual(publisher.observers, [brokenObserver, report])
++
++
+     def test_showwarning(self):
+         """
+         L{twisted.python.log.showwarning} emits the warning as a message
+@@ -292,7 +325,7 @@
+ 
+     def test_multipleBuggyObservers(self):
+         """
+-        L{LogPublisher.msg} handles buggy observers one by one, so that
++        L{log.LogPublisher.msg} handles buggy observers one by one, so that
+         they have a chance to report about other buggy observers, even if
+         they both failed in the same L{log.msg} call.
+         """
+@@ -321,8 +354,9 @@
+ 
+     def test_noObserverSkipped(self):
+         """
+-        All observers added to a L{LogPublisher} are given a chance to report
+-        an event, even if observers are being removed during the C{msg} call.
++        All observers added to a L{log.LogPublisher} are given a chance to
++        report an event, even if observers are being removed during the C{msg}
++        call.
+ 
+         However, that means that some observers might be given a chance
+         to report the same log event multiple times.
+@@ -348,7 +382,77 @@
+         self.assertTrue(events, events)
+ 
+ 
++    def test_keyboardInterruptRespected(self):
++        """
++        L{log.LogPublisher.msg} does not swallow KeyboardInterrupt errors.
++        """
++        def simulatedUser(eventDict):
++            raise KeyboardInterrupt
+ 
++        publisher = log.LogPublisher()
++        publisher.addObserver(simulatedUser)
++
++        self.assertRaises(KeyboardInterrupt, publisher.msg, "Hello!")
++        self.assertEqual(publisher.observers, [simulatedUser])
++
++
++    def test_keyboardInterruptRespectedDuringErrorHandling(self):
++        """
++        L{log.LogPublisher.msg} does not swallow KeyboardInterrupt errors even
++        while handling buggy log observers.
++        """
++        observerError = RuntimeError("buggyObserver")
++        def buggyObserver(eventDict):
++            raise observerError
++
++        errors = []
++        def interruptedErr(observers, failure, why):
++            errors.append(failure.value)
++            raise KeyboardInterrupt
++
++        publisher = log.LogPublisher()
++        publisher.addObserver(buggyObserver)
++        publisher._err = interruptedErr
++
++        self.assertRaises(KeyboardInterrupt, publisher.msg, "Hello!")
++        self.assertEqual(publisher.observers, [buggyObserver])
++        self.assertEqual(errors, [observerError])
++
++
++    def test_brokenObserverWithBrokenStr(self):
++        """
++        An observer that raises an error is reported even if its C{__str__}
++        method raises an error.
++        """
++        observerError = RuntimeError("Observer")
++        class Observer(object):
++
++            def __call__(self, eventDict):
++                raise observerError
++
++            def __str__(self):
++                raise ValueError("arbitrary")
++
++        errors = []
++        messages = []
++        def report(eventDict):
++            if eventDict["isError"]:
++                errors.append(eventDict["failure"].value)
++            else:
++                messages.append(eventDict["message"][0])
++
++        observer = Observer()
++        publisher = log.LogPublisher()
++        publisher.addObserver(observer)
++        publisher.addObserver(report)
++
++        publisher.msg("Hello!")
++        self.assertEqual(errors, [observerError])
++        self.assertEqual(messages, ["Hello!"])
++        self.assertEqual(publisher.observers, [observer, report])
++
++
++
+ class FakeFile(list):
+     def write(self, bytes):
+         self.append(bytes)
+@@ -606,7 +710,7 @@
+         self.assertIn("Hello!", fakeFile.getvalue())
+         self.assertIsInstance(sys.stdout, log.StdioOnnaStick)
+         self.assertEqual(sys.stdout.isError, False)
+-        self.assertEqual(sys.stdout.encoding, 
++        self.assertEqual(sys.stdout.encoding,
+                          origStdout.encoding or sys.getdefaultencoding())
+         self.assertIsInstance(sys.stderr, log.StdioOnnaStick)
+         self.assertEqual(sys.stderr.isError, True)

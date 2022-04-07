@@ -1,0 +1,134 @@
+
+D:\HOME\_testen\foolscap-trunk>python C:\Python25\Scripts\hg diff 
+diff -r c8fa1e90dc51 foolscap/call.py
+--- a/foolscap/call.py	Mon Jul 02 02:19:58 2007 -0700
++++ b/foolscap/call.py	Tue Jul 10 17:38:13 2007 +0200
+@@ -1,3 +1,4 @@
++import exceptions
+ 
+ from twisted.python import failure, log, reflect
+ from twisted.internet import defer
+@@ -781,19 +782,48 @@ class FailureSlicer(slicer.BaseSlicer):
+         state['parents'] = obj.parents
+         return state
+ 
+-class CopiedFailure(failure.Failure, copyable.RemoteCopyOldStyle):
+-    # this is a RemoteCopyOldStyle because you can't raise new-style
+-    # instances as exceptions.
+-
++class UnknownRemoteException(Exception):
++    """I represent an unknown exception thrown on the remote end,
++    that might be a derived exception or a string exception.
++    """
++
++_knownExceptionModules = {
++        'exceptions.' : exceptions,
++        'foolscap.tokens.' : tokens,
++    }
++
++def resolveExceptionType(exctype, excvalue):
++    """Given string representations of an exception type and instance,
++    return a tuple containing the actual type object (if it is a known
++    one) and a new string representation of the instance.
++    For unknown exception types the returned type is ...
++    """
++    for key, value in _knownExceptionModules.items():
++        if exctype.startswith(key):
++            try:
++                exctype = getattr(value, exctype[len(key):])
++                break
++            except AttributeError:
++                pass # ALARM: a very strange exception
++    else:
++        # not found: use a special exception and add type string to value
++        excvalue = "%s: %s" % (exctype, excvalue)
++        exctype = UnknownRemoteException
++    return exctype, excvalue
++
++class CopiedFailure(failure.Failure, copyable.RemoteCopy):
+     """I am a shadow of some remote Failure instance. I contain less
+     information than the original did.
+ 
+     You can still extract a (brief) printable traceback from me. My .parents
+     attribute is a list of strings describing the class of the exception
+     that I contain, just like the real Failure had, so my trap() and check()
+-    methods work fine. My .type and .value attributes are string
+-    representations of the original exception class and exception instance,
+-    respectively. The most significant effect is that you cannot access
++    methods work fine. My .type attribute is the original exception type iff
++    it is a builtin exception type, otherwise it is UnknownRemoteException.
++    My .value attribute is a string representation of the original exception
++    instance. Iff .type is UnknownRemoteException the string representation
++    of the unknown exception is prepended to .value.
++    The most significant effect is that you cannot access
+     f.value.args, and should instead just use f.value .
+ 
+     My .frames and .stack attributes are empty, although this may change in
+@@ -802,9 +832,10 @@ class CopiedFailure(failure.Failure, cop
+ 
+     nonCyclic = True
+     stateSchema = FailureConstraint()
++    copytype = None
+ 
+     def __init__(self):
+-        copyable.RemoteCopyOldStyle.__init__(self)
++        copyable.RemoteCopy.__init__(self)
+ 
+     def setCopyableState(self, state):
+         #self.__dict__.update(state)
+@@ -814,6 +845,7 @@ class CopiedFailure(failure.Failure, cop
+         #self.value = state['value']
+         #self.traceback = state['traceback']
+         #self.parents = state['parents']
++        self.type, self.value = resolveExceptionType(self.type, self.value)
+         self.tb = None
+         self.frames = []
+         self.stack = []
+diff -r c8fa1e90dc51 foolscap/copyable.py
+--- a/foolscap/copyable.py	Mon Jul 02 02:19:58 2007 -0700
++++ b/foolscap/copyable.py	Tue Jul 10 17:38:13 2007 +0200
+@@ -338,11 +338,6 @@ class _RemoteCopyBase:
+     def setCopyableState(self, state):
+         self.__dict__ = state
+ 
+-class RemoteCopyOldStyle(_RemoteCopyBase):
+-    # note that these will not auto-register for you, because old-style
+-    # classes do not do metaclass magic
+-    copytype = None
+-
+ class RemoteCopy(_RemoteCopyBase, object):
+     # Set 'copytype' to a unique string that is shared between the
+     # sender-side Copyable and the receiver-side RemoteCopy. This RemoteCopy
+diff -r c8fa1e90dc51 foolscap/test/test_copyable.py
+--- a/foolscap/test/test_copyable.py	Mon Jul 02 02:19:58 2007 -0700
++++ b/foolscap/test/test_copyable.py	Tue Jul 10 17:38:13 2007 +0200
+@@ -121,7 +121,7 @@ class Copyable(TargetMixin, unittest.Tes
+     def _testFailure1_1(self, (f,)):
+         #print "CopiedFailure is:", f
+         #print f.__dict__
+-        self.failUnlessEqual(f.type, "exceptions.RuntimeError")
++        self.failUnlessEqual(f.type, RuntimeError)
+         self.failUnlessEqual(f.value, "message here")
+         self.failUnlessEqual(f.frames, [])
+         self.failUnlessEqual(f.tb, None)
+@@ -141,7 +141,7 @@ class Copyable(TargetMixin, unittest.Tes
+     def _testFailure2_1(self, (f,)):
+         #print "CopiedFailure is:", f
+         #print f.__dict__
+-        self.failUnlessEqual(f.type, "exceptions.RuntimeError")
++        self.failUnlessEqual(f.type, RuntimeError)
+         self.failUnlessEqual(f.value, "message here")
+         self.failUnlessEqual(f.frames, [])
+         self.failUnlessEqual(f.tb, None)
+diff -r c8fa1e90dc51 foolscap/test/test_pb.py
+--- a/foolscap/test/test_pb.py	Mon Jul 02 02:19:58 2007 -0700
++++ b/foolscap/test/test_pb.py	Tue Jul 10 17:38:13 2007 +0200
+@@ -617,7 +617,7 @@ class TestService(unittest.TestCase):
+         return d
+     testBadMethod2.timeout = 5
+     def _testBadMethod2_eb(self, f):
+-        self.failUnlessEqual(f.type, 'exceptions.AttributeError')
++        self.failUnlessEqual(f.type, AttributeError)
+         self.failUnlessSubstring("TargetWithoutInterfaces", f.value)
+         self.failUnlessSubstring(" has no attribute 'remote_missing'", f.value)
+ 

@@ -1,0 +1,1273 @@
+Index: twisted/internet/default.py
+===================================================================
+RCS file: /cvs/Twisted/twisted/internet/default.py,v
+retrieving revision 1.89
+diff -u -r1.89 default.py
+--- twisted/internet/default.py	3 Dec 2003 17:32:43 -0000	1.89
++++ twisted/internet/default.py	1 Jan 2004 00:54:37 -0000
+@@ -154,14 +154,18 @@
+ 
+     # IReactorProcess
+ 
+-    def spawnProcess(self, processProtocol, executable, args=(), env={}, path=None,
+-                     uid=None, gid=None, usePTY = 0):
++    def spawnProcess(self, processProtocol, executable, args=(),
++                     env={}, path=None,
++                     uid=None, gid=None, usePTY=0, childFDs=None):
+         p = platform.getType()
+         if p == 'posix':
+             if usePTY:
+-                return process.PTYProcess(self, executable, args, env, path, processProtocol, uid, gid, usePTY)
++                assert childFDs == None
++                return process.PTYProcess(self, executable, args, env, path,
++                                          processProtocol, uid, gid, usePTY)
+             else:
+-                return process.Process(self, executable, args, env, path, processProtocol, uid, gid)
++                return process.Process(self, executable, args, env, path,
++                                       processProtocol, uid, gid, childFDs)
+         # This is possible, just needs work - talk to itamar if you want this.
+         #elif p == "win32":
+         #    if win32process:
+@@ -171,7 +175,8 @@
+         #    else:
+         #        raise NotImplementedError, "process not available since win32all is not installed"
+         else:
+-            raise NotImplementedError, "process only available in this reactor on POSIX, use win32eventreactor on Windows"
++            raise NotImplementedError, "process only available in this " \
++                  "reactor on POSIX, use win32eventreactor on Windows"
+ 
+ 
+     # IReactorUDP
+Index: twisted/internet/process.py
+===================================================================
+RCS file: /cvs/Twisted/twisted/internet/process.py,v
+retrieving revision 1.60
+diff -u -r1.60 process.py
+--- twisted/internet/process.py	11 Dec 2003 10:33:27 -0000	1.60
++++ twisted/internet/process.py	1 Jan 2004 00:54:37 -0000
+@@ -28,9 +28,12 @@
+ 
+ try:
+     import pty
+-    import fcntl, termios
+-except:
++except ImportError:
+     pty = None
++try:
++    import fcntl, termios
++except ImportError:
++    fcntl = None
+ 
+ try:
+     import pwd, grp
+@@ -85,7 +88,8 @@
+     try:
+         aux_pid, status = os.waitpid(pid, os.WNOHANG)
+     except:
+-        log.deferr()
++        log.msg('Failed to reap %d:' % pid)
++        log.err()
+         aux_pid = None
+     if aux_pid:
+         process.processEnded(status)
+@@ -101,26 +105,33 @@
+ 
+ 
+ class ProcessWriter(abstract.FileDescriptor, styles.Ephemeral):
+-    """(Internal) Helper class to write to Process's stdin.
++    """(Internal) Helper class to write into a Process's input pipe.
+ 
+     I am a helper which describes a selectable asynchronous writer to a
+-    process's stdin.
++    process's input pipe, including stdin.
+     """
+     connected = 1
+     ic = 0
+ 
+-    def __init__(self, proc):
++    def __init__(self, reactor, proc, name, fileno):
+         """Initialize, specifying a Process instance to connect to.
+         """
+-        abstract.FileDescriptor.__init__(self)
++        abstract.FileDescriptor.__init__(self, reactor)
+         self.proc = proc
++        self.name = name
++        self.fd = fileno
++
++    def fileno(self):
++        """Return the fileno() of my process's stdin.
++        """
++        return self.fd
+ 
+     # Copy relevant parts of the protocol
+     def writeSomeData(self, data):
+         """Write some data to the open process.
+         """
+         try:
+-            rv = os.write(self.proc.stdin, data)
++            rv = os.write(self.fd, data)
+             if rv == len(data):
+                 self.startReading()
+             return rv
+@@ -140,9 +151,10 @@
+         abstract.FileDescriptor.write(self, data)
+ 
+     def doRead(self):
+-        """This does nothing.
++        """The only way this pipe can become readable is at EOF, because the
++        child has closed it.
+         """
+-        fd = self.fileno()
++        fd = self.fd
+         r, w, x = select.select([fd], [fd], [], 0)
+         if r and w:
+             return CONNECTION_LOST
+@@ -151,51 +163,62 @@
+         """See abstract.FileDescriptor.connectionLost.
+         """
+         abstract.FileDescriptor.connectionLost(self, reason)
+-        os.close(self.proc.stdin)
+-        self.proc.inConnectionLost()
++        os.close(self.fd)
++        self.proc.connectionLost(self.name)
+ 
+-    def fileno(self):
+-        """Return the fileno() of my process's stdin.
+-        """
+-        return self.proc.stdin
++class ProcessReader(abstract.FileDescriptor):
++    """ProcessReader
+ 
+-class ProcessError(abstract.FileDescriptor):
+-    """ProcessError
+-
+-    I am a selectable representation of a process's stderr.
++    I am a selectable representation of a process's output pipe, including
++    stdout and stderr.
+     """
+-    def __init__(self, proc):
++    def __init__(self, reactor, proc, name, fileno):
+         """Initialize, specifying a process to connect to.
+         """
+-        abstract.FileDescriptor.__init__(self)
++        abstract.FileDescriptor.__init__(self, reactor)
+         self.proc = proc
++        self.name = name
++        self.fd = fileno
+ 
+     def fileno(self):
+         """Return the fileno() of my process's stderr.
+         """
+-        return self.proc.stderr
++        return self.fd
++
++    def writeSomeData(self, data):
++        # the only time this is actually called is after .loseConnection Any
++        # actual write attempt would fail, so we must avoid that. This hack
++        # allows us to use .loseConnection on both readers and writers.
++        assert data == ""
++        return CONNECTION_LOST
+ 
+     def doRead(self):
+-        """Call back to my process's doError.
++        """This is called when the pipe becomes readable.
+         """
+-        return self.proc.doError()
++        return fdesc.readFromFD(self.fd, self.dataReceived)
++
++    def dataReceived(self, data):
++        self.proto.dataReceived(self.name, data)
+ 
+     def connectionLost(self, reason):
+-        """I close my process's stderr.
++        """Close my end of the pipe, signal the Process (which signals the
++        ProcessProtocol).
+         """
+         abstract.FileDescriptor.connectionLost(self, reason)
+-        os.close(self.proc.stderr)
+-        self.proc.errConnectionLost()
++        os.close(self.fd)
++        self.proc.connectionLost(self.name)
+ 
+ class ProcessExitedAlready(Exception):
+     """The process has already excited, and the operation requested can no longer be performed."""
+     pass
+ 
+-class Process(abstract.FileDescriptor, styles.Ephemeral):
++class Process(styles.Ephemeral):
+     """An operating-system Process.
+ 
+-    This represents an operating-system process with standard input,
+-    standard output, and standard error streams connected to it.
++    This represents an operating-system process with arbitrary input/output
++    pipes connected to it. Those pipes may represent standard input,
++    standard output, and standard error, or they represent something more
++    complicated.
+ 
+     On UNIX, this is implemented using fork(), exec(), pipe()
+     and fcntl(). These calls may not exist elsewhere so this
+@@ -204,7 +227,7 @@
+     """
+ 
+     def __init__(self, reactor, command, args, environment, path, proto,
+-                 uid=None, gid=None):
++                 uid=None, gid=None, childFDs=None):
+         """Spawn an operating-system process.
+ 
+         This is where the hard work of disconnecting all currently open
+@@ -215,8 +238,29 @@
+         specified.  (Implementation Note: this doesn't support all the arcane
+         nuances of setXXuid on UNIX: it will assume that either your effective
+         or real UID is 0.)
++
++        @param childFDs: a dictionary mapping 
++            fd_in_child -> current_fd_in_parent/'r'/'w'
++
++             If the value is a number, it specifies one of the parent's fds
++             that will be remapped to the child's fd. This is useful for
++             things like inetd and shell-like file redirection.
++
++             If it is the string 'r', a pipe will be created and attached to
++             the child at that fd number, and the parent will be able to
++             read from the pipe. This is useful for the child's stdout and
++             stderr.
++
++             If it is the string 'w', a pipe will be created and attached,
++             and the parent will be able to write into that pipe. This is
++             useful for the child's stdin.
++             
++            If childFDs is not passed, the default behaviour is to use a
++            mapping that opens the usual stdin/stdout/stderr pipes.
+         """
+-        abstract.FileDescriptor.__init__(self, reactor)
++
++        self.lostProcess = False
++
+         settingUID = (uid is not None) or (gid is not None)
+         if settingUID:
+             curegid = os.getegid()
+@@ -230,36 +274,74 @@
+             # prepare to change UID in subprocess
+             os.setuid(0)
+             os.setgid(0)
+-        stdout_read, stdout_write = os.pipe()
+-        stderr_read, stderr_write = os.pipe()
+-        stdin_read,  stdin_write  = os.pipe()
++
++        self.pipes = {}
++        # keys are childFDs, we can sense them closing
++        # values are ProcessReader/ProcessWriters
++
++        helpers = {}
++        # keys are childFDs
++        # values are parentFDs
++
++        if childFDs is None:
++            childFDs = {0: "w", # we write to the child's stdin
++                        1: "r", # we read from their stdout
++                        2: "r", # and we read from their stderr
++                        }
++
++        debug = False
++        if debug: print "childFDs", childFDs
++
++        # fdmap.keys() are filenos of pipes that are used by the child.
++        fdmap = {} # maps childFD to parentFD
++        for childFD, target in childFDs.items():
++            if debug: print "[%d]" % childFD, target
++            if target == "r":
++                # we need a pipe that the parent can read from
++                readFD, writeFD = os.pipe()
++                if debug: print "readFD=%d, writeFD%d" % (readFD, writeFD)
++                fdmap[childFD] = writeFD     # child writes to this
++                helpers[childFD] = readFD    # parent reads from this
++                fdesc.setNonBlocking(readFD)
++            elif target == "w":
++                # we need a pipe that the parent can write to
++                readFD, writeFD = os.pipe()
++                if debug: print "readFD=%d, writeFD=%d" % (readFD, writeFD)
++                fdmap[childFD] = readFD      # child reads from this
++                helpers[childFD] = writeFD   # parent writes to this
++                fdesc.setNonBlocking(writeFD)
++            else:
++                assert type(target) == int
++                fdmap[childFD] = target      # parent ignores this
++        if debug: print "fdmap", fdmap
++        if debug: print "helpers", helpers
++        # the child only cares about fdmap.values()
++
+         self.pid = os.fork()
+         if self.pid == 0: # pid is 0 in the child process
+-            # stop debugging, if I am!  I don't care anymore!
+-            sys.settrace(None)
+-            # Destroy my stdin / stdout / stderr (in that order)
++            # do not put *any* code outside the try block. The child process
++            # must either exec or _exit. If it gets outside this block (due
++            # to an exception that is not handled here, but which might be
++            # handled higher up), there will be two copies of the parent
++            # running in parallel, doing all kinds of damage.
++
++            # After each change to this code, review it to make sure there
++            # are no exit paths.
++
+             try:
+-                os.dup2(stdin_read, 0)
+-                os.dup2(stdout_write, 1)
+-                os.dup2(stderr_write, 2)
+-                # XXX TODO FIXME: 256 is a magic number here; really we need a
+-                # way of saying "close all open FDs except 0, 1, 2".  This will
+-                # fail in a surprising and subtle way if the current process
+-                # has more than 256 FDs open.  On linux this would be
+-                # "[os.close(int(fd)) for fd in os.listdir('/proc/self/fd')]"
+-                # but I seriously doubt that's portable.
+-                for fd in range(3, 256):
+-                    try:    os.close(fd)
+-                    except: pass
+-                if path:
+-                    os.chdir(path)
+-                # set the UID before I actually exec the process
+-                if settingUID:
+-                    switch_uid(uid, gid)
+-                os.execvpe(command, args, environment)
++                # stop debugging, if I am!  I don't care anymore!
++                sys.settrace(None)
++                # close all parent-side pipes
++                self._setupChild(fdmap)
++                self._execChild(path, settingUID, uid, gid,
++                                command, args, environment)
+             except:
+                 # If there are errors, bail and try to write something
+                 # descriptive to stderr.
++                # XXX: The parent's stderr isn't necessarily fd 2 anymore, or
++                #      even still available
++                # XXXX: however even libc assumes write(2,err) is a useful
++                #       thing to attempt
+                 try:
+                     stderr = os.fdopen(2,'w')
+                     stderr.write("Upon execvpe %s %s in environment %s\n:" %
+@@ -272,31 +354,147 @@
+                 except:
+                     pass # make *sure* the child terminates
+             os._exit(1)
++
++        # we are the parent
++
+         if settingUID:
+             os.setregid(currgid, curegid)
+             os.setreuid(curruid, cureuid)
+-        self.status = -1
+-        for fd in stdout_write, stderr_write, stdin_read:
+-            os.close(fd)
+-        for fd in (stdout_read, stderr_read, stdin_write):
+-            fdesc.setNonBlocking(fd)
+-        self.stdout = stdout_read # os.fdopen(stdout_read, 'r')
+-        self.stderr = stderr_read # os.fdopen(stderr_read, 'r')
+-        self.stdin = stdin_write
+-        # ok now I really have a fileno()
+-        self.writer = ProcessWriter(self)
+-        self.writer.startReading()
+-        self.err = ProcessError(self)
+-        self.err.startReading()
+-        self.startReading()
+-        self.connected = 1
++        self.status = -1 # this records the exit status of the child
++
++        # arrange for the parent-side pipes to be read and written
++        for childFD, parentFD in helpers.items():
++            os.close(fdmap[childFD])
++
++            if childFDs[childFD] == "r":
++                reader = ProcessReader(reactor, self, childFD, parentFD)
++                reader.proto = proto
++                self.pipes[childFD] = reader
++                reader.startReading()
++
++            if childFDs[childFD] == "w":
++                writer = ProcessWriter(reactor, self, childFD, parentFD)
++                writer.proto = proto
++                self.pipes[childFD] = writer
++                # we do startReading here to watch for EOF. We won't do an
++                # actual .startWriting until some data has been written to
++                # the transmit buffer.
++                writer.startReading()
++
+         self.proto = proto
+         try:
++            # the 'transport' is used for some compatibility methods
+             self.proto.makeConnection(self)
+         except:
+             log.deferr()
+         registerReapProcessHandler(self.pid, self)
+ 
++    def _setupChild(self, fdmap):
++        """
++        fdmap[childFD] = parentFD
++
++        The child wants to end up with 'childFD' attached to what used to be
++        the parent's parentFD. As an example, a bash command run like
++        'command 2>&1' would correspond to an fdmap of {0:0, 1:1, 2:1}.
++        'command >foo.txt' would be {0:0, 1:os.open('foo.txt'), 2:2}.
++        
++        Step 1: close all file descriptors that aren't values of fdmap.
++        This means 0 .. maxfds.
++
++        Step 2: for each childFD:
++         if fdmap[childFD] == childFD, the descriptor is already in place.
++         Make sure the CLOEXEC flag is not set, then delete the entry from
++         fdmap.
++
++         if childFD is in fdmap.values(), then the target descriptor is
++         busy. Use os.dup() to move it elsewhere, update all fdmap[childFD]
++         items that point to it, then close the original. Then fall through
++         to the next case.
++
++         now fdmap[childFD] is not in fdmap.values(), and is free. Use
++         os.dup2() to move it to the right place, then close the original.
++
++        """
++
++        debug = False
++        if debug:
++            errfd = open("/tmp/p.err", "a", 0)
++            print >>errfd, "starting _setupChild"
++
++        destList = fdmap.values()
++        try:
++            import resource
++            maxfds = resource.getrlimit(resource.RLIMIT_NOFILE)[1] + 1
++        except:
++            maxfds = 256
++
++        for fd in range(maxfds):
++            if fd in destList:
++                continue
++            if debug and fd == errfd.fileno():
++                continue
++            try:    os.close(fd)
++            except: pass
++
++        # at this point, the only fds still open are the ones that need to
++        # be moved to their appropriate positions in the child (the targets
++        # of fdmap, i.e. fdmap.values() )
++
++        if debug: print >>errfd, "fdmap", fdmap
++        childlist = fdmap.keys()
++        childlist.sort()
++        
++        for child in childlist:
++            target = fdmap[child]
++            if target == child:
++                # fd is already in place
++                if debug: print >>errfd, "%d already in place" % target
++                if fcntl and hasattr(fcntl, 'FD_CLOEXEC'):
++                    old = fcntl.fcntl(child, fcntl.F_GETFD)
++                    fcntl.fcntl(child,
++                                fcntl.F_SETFD, old & ~fcntl.FD_CLOEXEC)
++            else:
++                if child in fdmap.values():
++                    # we can't replace child-fd yet, as some other mapping
++                    # still needs the fd it wants to target. We must preserve
++                    # that old fd by duping it to a new home.
++                    newtarget = os.dup(child) # give it a safe home
++                    if debug: print >>errfd, "os.dup(%d) -> %d" % (child,
++                                                                   newtarget)
++                    os.close(child) # close the original
++                    for c,p in fdmap.items():
++                        if p == child:
++                            fdmap[c] = newtarget # update all pointers
++                # now it should be available
++                if debug: print >>errfd, "os.dup2(%d,%d)" % (target, child)
++                os.dup2(target, child)
++
++        # At this point, the child has everything it needs. We want to close
++        # everything that isn't going to be used by the child, i.e.
++        # everything not in fdmap.keys(). The only remaining fds open are
++        # those in fdmap.values().
++
++        # Any given fd may appear in fdmap.values() multiple times, so we
++        # need to remove duplicates first.
++
++        old = []
++        for fd in fdmap.values():
++            if not fd in old:
++                if not fd in fdmap.keys():
++                    old.append(fd)
++        if debug: print >>errfd, "old", old
++        for fd in old:
++            os.close(fd)
++
++    def _execChild(self, path, settingUID, uid, gid,
++                   command, args, environment):
++        if path:
++            os.chdir(path)
++        # set the UID before I actually exec the process
++        if settingUID:
++            switch_uid(uid, gid)
++        os.execvpe(command, args, environment)
++        
+     def reapProcess(self):
+         """Try to reap a process (without blocking) via waitpid.
+ 
+@@ -312,34 +510,37 @@
+         try:
+             pid, status = os.waitpid(self.pid, os.WNOHANG)
+         except:
+-            log.deferr()
++            log.msg('Failed to reap %d:' % self.pid)
++            log.err()
+             pid = None
+         if pid:
+             self.processEnded(status)
+             del reapProcessHandlers[pid]
+ 
++    def writeToChild(self, childFD, data):
++        self.pipes[childFD].write(data)
++    def closeChildFD(self, childFD):
++        # for writer pipes, loseConnection tries to write the remaining data
++        # out to the pipe before closing it
++        self.pipes[childFD].loseConnection()
++
++    # compatibility
+     def closeStdin(self):
+         """Call this to close standard input on this process.
+         """
+-        if hasattr(self, "writer"):
+-            self.writer.loseConnection()
+-
+-    def closeStderr(self):
+-        """Close stderr."""
+-        if hasattr(self, "err"):
+-             self.err.stopReading()
+-             self.err.connectionLost(None)
+-
++        self.closeChildFD(0)
+     def closeStdout(self):
+-        """Close stdout."""
+-        if not self.lostOutConnection:
+-            self.stopReading()
+-            self.connectionLost(None)
+-
++        self.closeChildFD(1)
++    def closeStderr(self):
++        self.closeChildFD(2)
+     def loseConnection(self):
+         self.closeStdin()
+         self.closeStderr()
+         self.closeStdout()
++    def write(self,data):
++        """Call this to write to standard input on this process.
++        """
++        self.pipes[0].write(data)
+ 
+     def signalProcess(self, signalID):
+         if signalID in ('HUP', 'STOP', 'INT', 'KILL'):
+@@ -348,99 +549,55 @@
+             raise ProcessExitedAlready
+         os.kill(self.pid, signalID)
+ 
+-    def doError(self):
+-        """Called when my standard error stream is ready for reading.
+-        """
+-        return fdesc.readFromFD(self.stderr, self.proto.errReceived)
+-
+-    def doRead(self):
+-        """Called when my standard output stream is ready for reading.
+-        """
+-        return fdesc.readFromFD(self.stdout, self.proto.outReceived)
+-
+-    def doWrite(self):
+-        """Called when my standard output stream is ready for writing.
+-
+-        This will only happen in the case where the pipe to write to is
+-        broken.
+-        """
+-        return CONNECTION_DONE
+-
+-    def write(self,data):
+-        """Call this to write to standard input on this process.
+-        """
+-        self.writer.write(data)
+-
+-    def fileno(self):
+-        """This returns the file number of standard output on this process.
+-        """
+-        return self.stdout
+-
+-    lostErrorConnection = 0
+-    lostOutConnection = 0
+-    lostInConnection = 0
+-    lostProcess = 0
+-
+-    def maybeCallProcessEnded(self):
+-        if (self.lostErrorConnection and
+-            self.lostOutConnection and
+-            self.lostInConnection):
+-            if self.lostProcess:
+-                try:
+-                    exitCode = sig = None
+-                    if self.status != -1:
+-                        if os.WIFEXITED(self.status):
+-                            exitCode = os.WEXITSTATUS(self.status)
+-                        else:
+-                            sig = os.WTERMSIG(self.status)
+-                    else:
+-                        pass # wonder when this happens
+-                    if exitCode or sig:
+-                        e = error.ProcessTerminated(exitCode, sig, self.status)
+-                    else:
+-                        e = error.ProcessDone(self.status)
+-                    self.proto.processEnded(failure.Failure(e))
+-                except:
+-                    log.deferr()
+-            else:
+-                self.reapProcess()
+-
+     def processEnded(self, status):
++        # this is called when the child terminates (SIGCHLD)
+         self.status = status
+-        self.lostProcess = 1
++        self.lostProcess = True
+         self.pid = None
+-        self.closeStdin()
++        #for fd, helper in self.pipes.items():
++        #    helper.connectionLost(None)
++        ##self.closeStdin()
+         self.maybeCallProcessEnded()
+ 
+-    def inConnectionLost(self):
++    def connectionLost(self, childFD):
++        # this is called when one of the helpers (ProcessReader or
++        # ProcessWriter) notices their pipe has been closed
++        del self.pipes[childFD]
+         try:
+-            self.proto.inConnectionLost()
++            self.proto.connectionLost(childFD)
+         except:
+             log.deferr()
+-        del self.writer
+-        self.lostInConnection = 1
+         self.maybeCallProcessEnded()
+ 
+-    def errConnectionLost(self):
+-        self.lostErrorConnection = 1
+-        del self.err
+-        try:
+-            self.proto.errConnectionLost()
+-        except:
+-            log.deferr()
+-        self.maybeCallProcessEnded()
+-
+-    def connectionLost(self, reason):
+-        """stdout closed.
+-        """
+-        self.lostOutConnection = 1
+-        abstract.FileDescriptor.connectionLost(self, reason)
+-        os.close(self.stdout)
++    def maybeCallProcessEnded(self):
++        # we don't call ProcessProtocol.processEnded until:
++        #  the child has terminated, AND
++        #  all writers have indicated an error status, AND
++        #  all readers have indicated EOF
++        # This insures that we've gathered all output from the process.
++        if self.pipes:
++            #print "maybe, but pipes still", self.pipes.keys()
++            return
++        if not self.lostProcess:
++            #print "maybe, but haven't .lostProcess yet"
++            self.reapProcess()
++            return
+         try:
+-            self.proto.outConnectionLost()
++            exitCode = sig = None
++            if self.status != -1:
++                if os.WIFEXITED(self.status):
++                    exitCode = os.WEXITSTATUS(self.status)
++                else:
++                    sig = os.WTERMSIG(self.status)
++            else:
++                pass # don't think this can happen
++            if exitCode or sig:
++                e = error.ProcessTerminated(exitCode, sig, self.status)
++            else:
++                e = error.ProcessDone(self.status)
++            self.proto.processEnded(failure.Failure(e))
+         except:
+             log.deferr()
+-        self.maybeCallProcessEnded()
+ 
+ 
+ class PTYProcess(abstract.FileDescriptor, styles.Ephemeral):
+Index: twisted/internet/protocol.py
+===================================================================
+RCS file: /cvs/Twisted/twisted/internet/protocol.py,v
+retrieving revision 1.47
+diff -u -r1.47 protocol.py
+--- twisted/internet/protocol.py	14 Nov 2003 03:28:02 -0000	1.47
++++ twisted/internet/protocol.py	1 Jan 2004 00:54:37 -0000
+@@ -405,6 +422,12 @@
+     """Processes have some additional methods besides receiving data.
+     """
+ 
++    def dataReceived(self, childFD, data):
++        if childFD == 1:
++            self.outReceived(data)
++        elif childFD == 2:
++            self.errReceived(data)
++
+     def outReceived(self, data):
+         """Some data was received from stdout."""
+ 
+@@ -412,15 +435,21 @@
+         """Some data was received from stderr.
+         """
+ 
+-    def errConnectionLost(self):
+-        """This will be called when stderr is closed.
+-        """
+-
+-    def outConnectionLost(self):
+-        """Called when stdout is shut down."""
++    def connectionLost(self, childFD):
++        if childFD == 0:
++            self.inConnectionLost()
++        elif childFD == 1:
++            self.outConnectionLost()
++        elif childFD == 2:
++            self.errConnectionLost()
+ 
+     def inConnectionLost(self):
+         """Called when stdin is shut down."""
++    def outConnectionLost(self):
++        """Called when stdout is shut down."""
++    def errConnectionLost(self):
++        """This will be called when stderr is closed.
++        """
+ 
+     def processEnded(self, reason):
+         """This will be called when the subprocess is finished.
+Index: twisted/test/test_process.py
+===================================================================
+RCS file: /cvs/Twisted/twisted/test/test_process.py,v
+retrieving revision 1.47
+diff -u -r1.47 test_process.py
+--- twisted/test/test_process.py	29 Sep 2003 17:13:25 -0000	1.47
++++ twisted/test/test_process.py	1 Jan 2004 00:54:37 -0000
+@@ -152,7 +152,7 @@
+         p = TestProcessProtocol()
+         reactor.spawnProcess(p, exe, [exe, "-u", scriptPath], env=None)
+         while not p.finished:
+-            reactor.iterate()
++            reactor.iterate(0.1)
+         self.assertEquals(p.stages, [1, 2, 3, 4, 5])
+ 
+         # test status code
+@@ -304,6 +304,103 @@
+         while not self.done:
+             reactor.iterate(0.01)
+             self.check()
++
++class FDChecker(protocol.ProcessProtocol):
++    state = 0
++    data = ""
++    done = False
++    failed = None
++
++    def fail(self, why):
++        self.failed = why
++        self.done = True
++
++    def connectionMade(self):
++        self.transport.writeToChild(0, "abcd")
++        self.state = 1
++
++    def dataReceived(self, childFD, data):
++        #print "[%d] dataReceived(%d,%s)" % (self.state, childFD, data)
++        if self.state == 1:
++            if childFD != 1:
++                self.fail("read '%s' on fd %d (not 1) during state 1" \
++                          % (childFD, data))
++                return
++            self.data += data
++            #print "len", len(self.data)
++            if len(self.data) == 6:
++                if self.data != "righto":
++                    self.fail("got '%s' on fd1, expected 'righto'" \
++                              % self.data)
++                    return
++                self.data = ""
++                self.state = 2
++                #print "state2", self.state
++                self.transport.writeToChild(3, "efgh")
++                return
++        if self.state == 2:
++            self.fail("read '%s' on fd %s during state 2" % (childFD, data))
++            return
++        if self.state == 3:
++            if childFD != 1:
++                self.fail("read '%s' on fd %s (not 1) during state 3" \
++                          % (childFD, data))
++                return
++            self.data += data
++            if len(self.data) == 6:
++                if self.data != "closed":
++                    self.fail("got '%s' on fd1, expected 'closed'" \
++                              % self.data)
++                    return
++                self.state = 4
++            return
++        if self.state == 4:
++            self.fail("read '%s' on fd %s during state 4" % (childFD, data))
++            return
++
++    def connectionLost(self, childFD):
++        #print "[%d] connectionLost(%d)" % (self.state, childFD)
++        if self.state == 1:
++            self.fail("got connectionLost(%d) during state 1" % childFD)
++            return
++        if self.state == 2:
++            if childFD != 4:
++                self.fail("got connectionLost(%d) (not 4) during state 2" \
++                          % childFD)
++                return
++            self.state = 3
++            self.transport.closeChildFD(5)
++            return
++
++    def processEnded(self, status):
++        #print "[%d] processEnded" % self.state
++        rc = status.value.exitCode
++        if self.state != 4:
++            self.fail("processEnded early, rc %d" % rc)
++            return
++        if status.value.signal != None:
++            self.fail("processEnded with signal %s" % status.value.signal)
++            return
++        if rc != 0:
++            self.fail("processEnded with rc %d" % rc)
++            return
++        self.done = True
++
++class FDTest(unittest.TestCase):
++    def testFD(self):
++        exe = sys.executable
++        scriptPath = util.sibpath(__file__, "process_fds.py")
++        p = FDChecker()
++        reactor.spawnProcess(p, exe, [exe, "-u", scriptPath], env=None,
++                             path=None,
++                             childFDs={0:"w", 1:"r", 2:2,
++                                       3:"w", 4:"r", 5:"w"})
++        timeout = time.time() + 5
++        while not p.done and time.time() < timeout:
++            reactor.iterate(0.01)
++        self.failUnless(p.done, "timeout")
++        self.failIf(p.failed, p.failed)
++
+ 
+ class Accumulator(protocol.ProcessProtocol):
+     """Accumulate data from a process."""
+Index: doc/howto/process.xhtml
+===================================================================
+RCS file: /cvs/Twisted/doc/howto/process.xhtml,v
+retrieving revision 1.2
+diff -u -r1.2 process.xhtml
+--- doc/howto/process.xhtml	23 Oct 2003 18:33:43 -0000	1.2
++++ doc/howto/process.xhtml	1 Jan 2004 01:04:30 -0000
+@@ -39,53 +39,72 @@
+ mypp = MyProcessProtocol()
+ reactor.spawnProcess(processProtocol, executable, args=[program, arg1, arg2],
+                      env={'HOME': os.environ['HOME']}, path,
+-                     uid, gid, usePTY)
++                     uid, gid, usePTY, childFDs)
+ </pre>
+ 
+ <ul>
+ 
+-  <li><code>processProtocol</code> should be an instance of a subclass of <code
+-  class="API">twisted.internet.protocol.ProcessProtocol</code>. The
++  <li><code>processProtocol</code> should be an instance of a subclass of
++  <code class="API">twisted.internet.protocol.ProcessProtocol</code>. The
+   interface is described below.</li>
+ 
+-  <li><code>executable</code> is the full path of the program to run. It will be
+-  connected to processProtocol.</li>
++  <li><code>executable</code> is the full path of the program to run. It
++  will be connected to processProtocol.</li>
+ 
+-  <li><code>args</code> is a list of command line arguments to be passed to the
+-  process. <code>args[0]</code> should be the name of the process.</li>
++  <li><code>args</code> is a list of command line arguments to be passed to
++  the process. <code>args[0]</code> should be the name of the process.</li>
+ 
+   <li><code>env</code> is a dictionary containing the environment to pass
+   through to the process.</li>
+ 
+-  <li><code>path</code> is the directory to run the process in. The child will
+-  switch to the given directory just before starting the new program. The
+-  default is to stay in the current directory.</li>
+-
+-  <li><code>uid</code> and <code>gid</code> are the user ID and group ID to run the
+-  subprocess as. Of course, changing identities will be more likely to
+-  succeed if you start as root.</li>
++  <li><code>path</code> is the directory to run the process in. The child
++  will switch to the given directory just before starting the new program.
++  The default is to stay in the current directory.</li>
++
++  <li><code>uid</code> and <code>gid</code> are the user ID and group ID to
++  run the subprocess as. Of course, changing identities will be more likely
++  to succeed if you start as root.</li>
+ 
+-  <li><code>usePTY</code> specifies whether the child process should be run with
+-  a pty, or if it should just get a pair of pipes. Interactive programs
++  <li><code>usePTY</code> specifies whether the child process should be run
++  with a pty, or if it should just get a pair of pipes. Interactive programs
+   (where you don't know when it may read or write) need to be run with
+   ptys.</li>
+ 
++  <li><code>childFDs</code> lets you specify how the child's file
++  descriptors should be set up. Each key is a file descriptor number (an
++  integer) as seen by the child. 0, 1, and 2 are usually stdin, stdout, and
++  stderr, but some programs may be instructed to use additional fds through
++  command-line arguments or environment variables. Each value is either an
++  integer specifying one of the parent's current file descriptors, the
++  string <q>r</q> which creates a pipe that the parent can read from, or the
++  string <q>w</q> which creates a pipe that the parent can write to. If
++  <code>childFDs</code> is not provided, a default is used which creates the
++  usual stdin-writer, stdout-reader, and stderr-reader pipes.</li>
++
+ </ul>
+ 
+-<p><code>args</code> and <code>env</code> have empty default values, but many
+-programs depend upon them to be set correctly. At the very least,
+-<code>args[0]</code> should probably be the same as <code>executable</code>. If you
+-just provide <code>os.environ</code> for <code>env</code>, the child program will
+-inherit the environment from the current process, which is usually the
+-civilized thing to do (unless you want to explicitly clean the environment
+-as a security precaution). </p>
++<p><code>args</code> and <code>env</code> have empty default values, but
++many programs depend upon them to be set correctly. At the very least,
++<code>args[0]</code> should probably be the same as <code>executable</code>.
++If you just provide <code>os.environ</code> for <code>env</code>, the child
++program will inherit the environment from the current process, which is
++usually the civilized thing to do (unless you want to explicitly clean the
++environment as a security precaution). The default is to give an empty
++<code>env</code> to the child.</p>
+   
+ <p><code class="python">reactor.spawnProcess()</code> returns an instance
+ that implements the <code
+ class="API">twisted.internet.interfaces.IProcessTransport</code>.</p>
+ 
+   <h2>Writing a ProcessProtocol</h2>
+-    <p>The ProcessProtocol you pass to spawnProcess is your interaction with the process.  It has a very similar signature to a regular Protocol, but it has several extra methods to deal with events specific to a process.  In our example, we will interface with 'wc' to create a word count of user-given text.  First, we'll start by importing the required modules, and writing the initialization for our ProcessProtocol.</p>
++
++<p>The ProcessProtocol you pass to spawnProcess is your interaction with the
++process. It has a very similar signature to a regular Protocol, but it has
++several extra methods to deal with events specific to a process. In our
++example, we will interface with 'wc' to create a word count of user-given
++text. First, we'll start by importing the required modules, and writing the
++initialization for our ProcessProtocol.</p>
++
+ <pre class="python">
+ from twisted.internet import protocol
+ class WCProcessProtocol(protocol.ProcessProtocol):
+@@ -94,14 +113,22 @@
+         self.text = text
+ </pre>
+ 
+-    <p>When the ProcessProtocol is connected to the protocol, it has the connectionMade method called.  In our protocol, we will write our text to the standard input of our process and then close standard input, to the let the process know we are done writing to it.</p>
++<p>When the ProcessProtocol is connected to the protocol, it has the
++connectionMade method called. In our protocol, we will write our text to the
++standard input of our process and then close standard input, to the let the
++process know we are done writing to it.</p>
++
+ <pre class="python">
+     def connectionMade(self):
+         self.transport.write(self.text)
+         self.transport.closeStdin()
+ </pre>
+ 
+-    <p>At this point, the process has receieved the data, and it's time for us to read the results.  Instead of being receieved in dataReceived, data from standard output is receieve in outReceived.  This is to distinguish it from data on standard error.</p>
++<p>At this point, the process has receieved the data, and it's time for us
++to read the results. Instead of being receieved in dataReceived, data from
++standard output is receieve in outReceived. This is to distinguish it from
++data on standard error.</p>
++
+ <pre class="python">
+     def outReceived(self, data):
+         fieldLength = len(data) / 3
+@@ -112,7 +139,11 @@
+         self.receiveCounts(lines, words, chars)
+ </pre>
+ 
+-    <p>Now, the process has parsed the output, and ended the connection to the process.  Then it sends the results on to the final method, receiveCounts.  This is for users of the class to override, so as to do other things with the data.  For our demonstration, we will just print the results.</p>
++<p>Now, the process has parsed the output, and ended the connection to the
++process. Then it sends the results on to the final method, receiveCounts.
++This is for users of the class to override, so as to do other things with
++the data. For our demonstration, we will just print the results.</p>
++
+ <pre class="python">
+     def receiveCounts(self, lines, words, chars):
+         print 'Received counts from wc.'
+@@ -121,7 +152,9 @@
+         print 'Characters:', chars
+ </pre>
+ 
+-    <p>We're done!  To use our WCProcessProtocol, we create an instance, and pass it to spawnProcess.</p>
++<p>We're done! To use our WCProcessProtocol, we create an instance, and pass
++it to spawnProcess.</p>
++
+ <pre class="python">
+ from twisted.internet import reactor
+ wcProcess = WCProcessProtocol("accessing protocols through Twisted is fun!\n")
+@@ -137,9 +170,9 @@
+ 
+ <ul>
+ 
+-  <li><code>.connectionMade</code>: This is called when the program is started,
+-  and makes a good place to write data into the stdin pipe (using <code
+-  class="python">self.transport.write()</code>).</li>
++  <li><code>.connectionMade</code>: This is called when the program is
++  started, and makes a good place to write data into the stdin pipe (using
++  <code class="python">self.transport.write()</code>).</li>
+ 
+   <li><code>.outReceived(data)</code>: This is called with data that was
+   received from the process' stdout pipe. Pipes tend to provide data in
+@@ -147,8 +180,8 @@
+   may not experience the <q>random dribs and drabs</q> behavior typical of
+   network sockets, but regardless you should be prepared to deal if you
+   don't get all your data in a single call. To do it properly,
+-  <code>outReceived</code> ought to simply accumulate the data and put off doing
+-  anything with it until the process has finished.</li>
++  <code>outReceived</code> ought to simply accumulate the data and put off
++  doing anything with it until the process has finished.</li>
+ 
+   <li><code>.errReceived(data)</code>: This is called with data from the
+   process' stderr pipe. It behaves just like <code>outReceived</code>.</li>
+@@ -162,8 +195,8 @@
+   <li><code>.outConnectionLost</code>: This is called when the program closes
+   its stdout pipe. This usually happens when the program terminates.</li>
+ 
+-  <li><code>.errConnectionLost</code>: Same as <code>outConnectionLost</code>, but
+-  for stderr instead of stdout.</li>
++  <li><code>.errConnectionLost</code>: Same as
++  <code>outConnectionLost</code>, but for stderr instead of stdout.</li>
+ 
+   <li><p><code>.processEnded(status)</code>: This is called when the child
+   process has been reaped, and receives information about the process' exit
+@@ -231,8 +264,8 @@
+ <h2>Verbose Example</h2>
+ 
+ <p>Here is an example that is rather verbose about exactly when all the
+-methods are called. It writes a number of lines into the <code>wc</code> program
+-and then parses the output.</p>
++methods are called. It writes a number of lines into the <code>wc</code>
++program and then parses the output.</p>
+ 
+ <a href="listings/process/process.py" class="py-listing">process.py</a>
+ 
+@@ -274,6 +307,206 @@
+ useful. Here is an example:</p>
+ 
+ <a href="listings/process/trueandfalse.py" class="py-listing">trueandfalse.py</a>
++
++<h2>Mapping File Descriptors</h2>
++
++<p><q>stdin</q>, <q>stdout</q>, and <q>stderr</q> are just conventions.
++Programs which operate as filters generally accept input on fd0, write their
++output on fd1, and emit error messages on fd2. This is common enough that
++the standard C library provides macros like <q>stdin</q> to mean fd0, and
++shells interpret the pipe character <q>|</q> to mean <q>redirect fd1 from
++one command into fd0 of the next command</q>.</p>
++
++<p>But these are just conventions, and programs are free to use additional
++file descriptors or even ignore the standard three entirely. The
++<q>childFDs</q> argument allows you to specify exactly what kind of files
++descriptors the child process should be given.</p>
++
++<p>Each child FD can be put into one of three states:</p>
++
++<ul>
++  <li>Mapped to a parent FD: this causes the child's reads and writes to
++  come from or go to the same source/destination as the parent.</li>
++
++  <li>Feeding into a pipe which can be read by the parent.</li>
++
++  <li>Feeding from a pipe which the parent writes into.</li>
++</ul>
++
++<p>Mapping the child FDs to the parent's is very commonly used to send the
++child's stderr output to the same place as the parent's. When you run a
++program from the shell, it will typically leave fds 0, 1, and 2 mapped to
++the shell's 0, 1, and 2, allowing you to see the child program's output on
++the same terminal you used to launch the child. Likewise, inetd will
++typically map both stdin and stdout to the network socket, and may map
++stderr to the same socket or to some kind of logging mechanism. This allows
++the child program to be implemented with no knowledge of the network: it
++merely speaks its protocol by doing reads on fd0 and writes on fd1.</p>
++
++<p>Feeding into a parent's read pipe is used to gather output from the
++child, and is by far the most common way of interacting with child
++processes.</p>
++
++<p>Feeding from a parent's write pipe allows the parent to control the
++child. Programs like <q>bc</q> or <q>ftp</q> can be controlled this way, by
++writing commands into their stdin stream.</p>
++
++<p>The <q>childFDs</q> dictionary maps file descriptor numbers (as will be
++seen by the child process) to one of these three states. To map the fd to
++one of the parent's fds, simply provide the fd number as the value. To map
++it to a read pipe, use the string <q>r</q> as the value. To map it to a
++write pipe, use the string <q>w</q>.</p>
++
++<p>For example, the default mapping sets up the standard stdin/stdout/stderr
++pipes. It is implemented with the following dictionary:</p>
++
++<pre class="python">
++childFDs = { 0: "w", 1: "r", 2: "r" }
++</pre>
++
++<p>To launch a process which reads and writes to the same places that the
++parent python program does, use this:</p>
++
++<pre class="python">
++childFDs = { 0: 0, 1: 1, 2: 2}
++</pre>
++
++<p>To write into an additional fd (say it is fd number 4), use this:</p>
++
++<pre class="python">
++childFDs = { 0: "w", 1: "r", 2: "r" , 4: "w"}
++</pre>
++
++
++
++<h3>ProcessProtocols with extra file descriptors</h3>
++
++<p>When you provide a <q>childFDs</q> dictionary with more than the normal
++three fds, you need addtional methods to access those pipes. These methods
++are more generalized than the <code>.outReceived</code> ones described
++above. In fact, those methods are actually just wrappers left in for
++compatibility with older code, written before this generalized fd mapping
++was implemented. The new list of things that can happen to your
++ProcessProtocol is as follows:</p>
++
++<ul>
++
++  <li><code>.connectionMade</code>: This is called when the program is
++  started.</li>
++
++  <li><code>.dataReceived(childFD, data)</code>: This is called with data
++  that was received from one of the process' output pipes (i.e. where the
++  childFDs value was <q>r</q>. The actual file number (from the point of
++  view of the child process) is in <q>childFD</q>. For compatibility, the
++  default implementation of <code>.dataReceived</code> dispatches to
++  <code>.outReceived</code> or <code>.errReceived</code> when <q>childFD</q>
++  is 1 or 2.</li>
++
++  <li><code>.connectionLost(childFD)</code>: This is called when the reactor
++  notices that one of the process' pipes has been closed. This either means
++  you have just closed down the parent's end of the pipe (with
++  <code>.transport.closeChildFD</code>), the child closed the pipe
++  explicitly (sometimes to indicate EOF), or the child process has
++  terminated and the kernel has closed all of its pipes. The <q>childFD</q>
++  argument tells you which pipe was closed. Note that you can only find out
++  about file descriptors which were mapped to pipes: when they are mapped to
++  existing fds the parent has no way to notice when they've been closed. For
++  compatibility, the default implementation dispatches to
++  <code>.inConnectionLost</code>, <code>.outConnectionLost</code>, or
++  <code>.errConnectionLost</code>.</li>
++
++  <li><code>.processEnded(status)</code>: This is called when the child
++  process has been reaped, and all pipes have been closed. This insures that
++  all data written by the child prior to its death will be received before
++  <code>.processEnded</code> is invoked.</li>
++
++</ul>
++
++<p>In addition to those methods, there are other methods available to
++influence the child process:</p>
++
++
++<ul>
++
++  <li><code>self.transport.writeToChild(childFD, data)</code>: Stuff some
++  data into an input pipe. <code>.write</code> simply writes to
++  childFD=0.</li>
++
++  <li><code>self.transport.closeChildFD(childFD)</code>: Close one of the
++  child's pipes. Closing an input pipe is a common way to indicate EOF to
++  the child process. Closing an output pipe is neither very friendly nor
++  very useful.</li>
++
++  <li><code>os.kill(self.transport.pid, signal.SIGKILL)</code>: Kill the child
++  process. This will eventually result in <code>processEnded</code> being
++  called.</li>
++  
++</ul>
++
++<h3>Examples</h3>
++
++<p>GnuPG, the encryption program, can use additional file descriptors to
++accept a passphrase and emit status output. These are distinct from stdin
++(used to accept the crypttext), stdout (used to emit the plaintext), and
++stderr (used to emit human-readable status/warning messages). The passphrase
++FD reads until the pipe is closed and uses the resulting string to unlock
++the secret key that performs the actual decryption. The status FD emits
++machine-parseable status messages to indicate the validity of the signature,
++which key the message was encrypted to, etc.</p>
++
++<p>gpg accepts command-line arguments to specify what these fds are, and
++then assumes that they have been opened by the parent before the gpg process
++is started. It simply performs reads and writes to these fd numbers.</p>
++
++<p>To invoke gpg in decryption/verification mode, you would do something
++like the following:</p>
++
++<pre class="python">
++
++
++class GPGProtocol(ProcessProtocol):
++    def __init__(self, crypttext):
++        self.crypttext = crypttext
++        self.plaintext = ""
++        self.status = ""
++    def connectionMade(self):
++        self.transport.writeToChild(3, self.passphrase)
++        self.transport.closeChildFD(3)
++        self.transport.writeToChild(0, self.crypttext)
++        self.transport.closeChildFD(0)
++    def dataReceived(self, childFD, data):
++        if childFD == 1: self.plaintext += data
++        if childFD == 4: self.status += data
++    def processEnded(self, status):
++        rc = status.value.exitCode
++        if rc == 0:
++            self.deferred.callback(self)
++        else:
++            self.deferred.errback(rc)
++
++def decrypt(crypttext):
++    gp = GPGProtocol(crypttext)
++    gp.deferred = Deferred()
++    cmd = ["gpg", "--decrypt", "--passphrase-fd", "3", "--status-fd", "4",
++           "--batch"]
++    p = reactor.spawnProcess(gp, cmd[0], cmd, env=None,
++                             childFDs={0:"w", 1:"r", 2:2, 3:"w", 4:"r"})
++    return gp.deferred
++</pre>
++
++<p>In this example, the status output could be parsed after the fact. It
++could, of course, be parsed on the fly, as it is a simple line-oriented
++protocol. Methods from LineReceiver could be mixed in to make this parsing
++more convenient.</p>
++
++<p>The stderr mapping (<q>2:2</q>) used will cause any GPG errors to be
++emitted by the parent program, just as if those errors had caused in the
++parent itself. This is sometimes desireable (it roughly corresponds to
++letting exceptions propagate upwards), especially if you do not expect to
++encounter errors in the child process and want them to be more visible to
++the end user. The alternative is to map stderr to a read-pipe and handle any
++such output from within the ProcessProtocol (roughly corresponding to
++catching the exception locally).</p>
+ 
+   </body>
+ </html>

@@ -1,0 +1,439 @@
+Index: twisted/words/test/test_irc.py
+===================================================================
+--- twisted/words/test/test_irc.py	(revision 33073)
++++ twisted/words/test/test_irc.py	(working copy)
+@@ -1879,3 +1879,142 @@
+         self.protocol.privmsg = privmsg
+         self.protocol.irc_NOTICE(
+             'spam', ['#greasyspooncafe', "I don't want any spam!"])
++
++
++
++class CollectorClient(irc.IRCClient):
++    """A client that saves in a list the name of the methods that got called."""
++    def __init__(self, methods_list):
++        # methods_list is a list of methods' names that should be replaced
++        self.methods = []
++        self.nickname = 'Wolf'
++
++        for method in methods_list:
++            def fake_method(method=method):
++                def inner(*args):
++                    self.methods.append((method, args))
++                return inner
++            setattr(self, method, fake_method())
++
++
++
++class TestServerToClient(TestCase):
++    """Tests for the irc_* methods sent from the server to the client."""
++    def setUp(self):
++        methods_list = ['joined', 'userJoined', 'left', 'userLeft', 'userQuit',
++                        'noticed', 'kickedFrom', 'userKicked', 'topicUpdated']
++        self.client = CollectorClient(methods_list)
++
++    def test_irc_JOIN(self):
++        self.client.irc_JOIN('Wolf!~wolf@yok.utu.fi', ['#twisted'])
++        self.client.irc_JOIN('Svadilfari!~svadi@yok.utu.fi', ['#python'])
++        self.assertEqual(self.client.methods,
++                         [('joined', ('#twisted',)),
++                          ('userJoined', ('Svadilfari', '#python'))])
++
++    def test_irc_PART(self):
++        self.client.irc_PART('Wolf!~wolf@yok.utu.fi', ['#twisted'])
++        self.client.irc_PART('Svadilfari!~svadi@yok.utu.fi', ['#python'])
++        self.assertEqual(self.client.methods,
++                         [('left', ('#twisted',)),
++                          ('userLeft', ('Svadilfari', '#python'))])
++
++    def test_irc_QUIT(self):
++        self.client.irc_QUIT('Wolf!~wolf@yok.utu.fi', ['Farewell.'])
++        self.assertEqual(self.client.methods,
++                         [('userQuit', ('Wolf', 'Farewell.'))])
++
++    def test_irc_NOTICE(self):
++        user = 'Wolf!~wolf@yok.utu.fi'
++        msg = ('%(X)cextended%(X)cdata1%(X)cextended%(X)cdata2%(X)c%(EOL)s' %
++               {'X': irc.X_DELIM, 'EOL': irc.CR + irc.LF})
++        self.client.irc_NOTICE(user, ['#twisted', msg])
++        self.assertEqual(self.client.methods,
++                         [('noticed', (user, '#twisted', 'data1 data2'))])
++
++    def test_irc_KICK(self):
++        # fight!
++        self.client.irc_KICK('Wolf!~wolf@yok.utu.fi',
++                             ['#twisted', 'Svadilfari', 'hadouken!'])
++        self.client.irc_KICK('Svadilfari!~svadi@yok.utu.fi',
++                             ['#python', 'WOLF', 'shoryuken!'])
++        self.assertEqual(self.client.methods,
++                         [('userKicked',
++                           ('Svadilfari', '#twisted', 'Wolf', 'hadouken!')),
++                          ('kickedFrom',
++                           ('#python', 'Svadilfari', 'shoryuken!'))])
++
++    def test_irc_TOPIC(self):
++        self.client.irc_TOPIC('Wolf!~wolf@yok.utu.fi',
++                              ['#twisted', 'new topic is new'])
++        self.assertEqual(self.client.methods,
++                         [('topicUpdated',
++                           ('Wolf', '#twisted', 'new topic is new'))])
++
++    def test_irc_RPL_TOPIC(self):
++        self.client.irc_RPL_TOPIC('Wolf!~wolf@yok.utu.fi',
++                              ['?', '#twisted', 'new topic is new'])
++        self.assertEqual(self.client.methods,
++                         [('topicUpdated',
++                           ('Wolf', '#twisted', 'new topic is new'))])
++
++    def test_irc_RPL_NOTOPIC(self):
++        self.client.irc_RPL_NOTOPIC('Wolf!~wolf@yok.utu.fi', ['?', '#twisted'])
++        self.assertEqual(self.client.methods,
++                         [('topicUpdated', ('Wolf', '#twisted', ''))])
++
++
++
++class TestCTCPQuery(TestCase):
++    """Tests for the ctcpQuery_* methods."""
++    def setUp(self):
++        self.client = CollectorClient(['ctcpMakeReply'])
++
++    def test_ctcpQuery_PING(self):
++        self.client.ctcpQuery_PING('Wolf!~wolf@yok.utu.fi', '#twisted', 'data')
++        self.assertEqual(self.client.methods,
++                         [('ctcpMakeReply', ('Wolf', [('PING', 'data')]))])
++
++    def test_ctcpQuery_FINGER(self):
++        self.patch(self.client, 'fingerReply', 'reply')
++        self.client.ctcpQuery_FINGER('Wolf!~wolf@yok.utu.fi',
++                                     '#twisted', 'data')
++        self.assertEqual(self.client.methods,
++                         [('ctcpMakeReply', ('Wolf', [('FINGER', 'reply')]))])
++
++    def test_ctcpQuery_SOURCE(self):
++        self.patch(self.client, 'sourceURL', 'url')
++        self.client.ctcpQuery_SOURCE('Wolf!~wolf@yok.utu.fi',
++                                     '#twisted', 'data')
++        self.assertEqual(self.client.methods,
++                         [('ctcpMakeReply', ('Wolf', [('SOURCE', 'url'),
++                                                      ('SOURCE', None)]))])
++
++    def test_ctcpQuery_USERINFO(self):
++        self.patch(self.client, 'userinfo', 'info')
++        self.client.ctcpQuery_USERINFO('Wolf!~wolf@yok.utu.fi',
++                                       '#twisted', 'data')
++        self.assertEqual(self.client.methods,
++                         [('ctcpMakeReply', ('Wolf', [('USERINFO', 'info')]))])
++
++    def test_ctcpQuery_CLIENTINFO(self):
++        self.client.ctcpQuery_CLIENTINFO('Wolf!~wolf@yok.utu.fi',
++                                         '#twisted', '')
++        self.client.ctcpQuery_CLIENTINFO('Wolf!~wolf@yok.utu.fi',
++                                         '#twisted', 'PING PONG')
++        info = ('CLIENTINFO PING DCC SOURCE VERSION '
++                'USERINFO TIME ACTION ERRMSG FINGER')
++        self.assertEqual(self.client.methods,
++                         [('ctcpMakeReply', ('Wolf', [('CLIENTINFO', info)])),
++                          ('ctcpMakeReply', ('Wolf', [('CLIENTINFO', None)]))])
++
++    def test_ctcpQuery_TIME(self):
++        self.client.ctcpQuery_TIME('Wolf!~wolf@yok.utu.fi', '#twisted', 'data')
++        self.assertEqual(self.client.methods[0][1][0], 'Wolf')
++
++    def test_ctcpQuery_DCC(self):
++        self.client.ctcpQuery_DCC('Wolf!~wolf@yok.utu.fi', '#twisted', 'data')
++        self.assertEqual(self.client.methods,
++                         [('ctcpMakeReply',
++                           ('Wolf', [('ERRMSG',
++                                      "DCC data :Unknown DCC type 'DATA'")]))])
+Index: twisted/words/protocols/irc.py
+===================================================================
+--- twisted/words/protocols/irc.py	(revision 33073)
++++ twisted/words/protocols/irc.py	(working copy)
+@@ -273,7 +273,7 @@
+             raise ValueError, "Somebody screwed up, 'cuz this doesn't" \
+                   " look like a command to me: %s" % command
+ 
+-        line = string.join([command] + list(parameter_list))
++        line = ' '.join([command] + list(parameter_list))
+         if prefix.has_key('prefix'):
+             line = ":%s %s" % (prefix['prefix'], line)
+         self.sendLine(line)
+@@ -1765,7 +1765,7 @@
+         if not (size is None):
+             args.append(size)
+ 
+-        args = string.join(args, ' ')
++        args = ' '.join(args)
+ 
+         self.ctcpMakeQuery(user, [('DCC', args)])
+ 
+@@ -1849,7 +1849,7 @@
+         """
+         Called when a user joins a channel.
+         """
+-        nick = string.split(prefix,'!')[0]
++        nick = prefix.split('!')[0]
+         channel = params[-1]
+         if nick == self.nickname:
+             self.joined(channel)
+@@ -1860,7 +1860,7 @@
+         """
+         Called when a user leaves a channel.
+         """
+-        nick = string.split(prefix,'!')[0]
++        nick = prefix.split('!')[0]
+         channel = params[0]
+         if nick == self.nickname:
+             self.left(channel)
+@@ -1871,7 +1871,7 @@
+         """
+         Called when a user has quit.
+         """
+-        nick = string.split(prefix,'!')[0]
++        nick = prefix.split('!')[0]
+         self.userQuit(nick, params[0])
+ 
+ 
+@@ -1932,7 +1932,7 @@
+             if not m['normal']:
+                 return
+ 
+-            message = string.join(m['normal'], ' ')
++            message = ' '.join(m['normal'])
+ 
+         self.privmsg(user, channel, message)
+ 
+@@ -1952,7 +1952,7 @@
+             if not m['normal']:
+                 return
+ 
+-            message = string.join(m['normal'], ' ')
++            message = ' '.join(m['normal'])
+ 
+         self.noticed(user, channel, message)
+ 
+@@ -1960,7 +1960,7 @@
+         """
+         Called when a user changes their nickname.
+         """
+-        nick = string.split(prefix,'!', 1)[0]
++        nick = prefix.split('!', 1)[0]
+         if nick == self.nickname:
+             self.nickChanged(params[0])
+         else:
+@@ -1970,11 +1970,11 @@
+         """
+         Called when a user is kicked from a channel.
+         """
+-        kicker = string.split(prefix,'!')[0]
++        kicker = prefix.split('!')[0]
+         channel = params[0]
+         kicked = params[1]
+         message = params[-1]
+-        if string.lower(kicked) == string.lower(self.nickname):
++        if kicked.lower() == self.nickname.lower():
+             # Yikes!
+             self.kickedFrom(channel, kicker, message)
+         else:
+@@ -1984,7 +1984,7 @@
+         """
+         Someone in the channel set the topic.
+         """
+-        user = string.split(prefix, '!')[0]
++        user = prefix.split('!')[0]
+         channel = params[0]
+         newtopic = params[1]
+         self.topicUpdated(user, channel, newtopic)
+@@ -1994,13 +1994,13 @@
+         Called when the topic for a channel is initially reported or when it
+         subsequently changes.
+         """
+-        user = string.split(prefix, '!')[0]
++        user = prefix.split('!')[0]
+         channel = params[1]
+         newtopic = params[2]
+         self.topicUpdated(user, channel, newtopic)
+ 
+     def irc_RPL_NOTOPIC(self, prefix, params):
+-        user = string.split(prefix, '!')[0]
++        user = prefix.split('!')[0]
+         channel = params[1]
+         newtopic = ""
+         self.topicUpdated(user, channel, newtopic)
+@@ -2109,7 +2109,7 @@
+         self.action(user, channel, data)
+ 
+     def ctcpQuery_PING(self, user, channel, data):
+-        nick = string.split(user,"!")[0]
++        nick = user.split('!')[0]
+         self.ctcpMakeReply(nick, [("PING", data)])
+ 
+     def ctcpQuery_FINGER(self, user, channel, data):
+@@ -2124,7 +2124,7 @@
+         else:
+             reply = str(self.fingerReply)
+ 
+-        nick = string.split(user,"!")[0]
++        nick = user.split('!')[0]
+         self.ctcpMakeReply(nick, [('FINGER', reply)])
+ 
+     def ctcpQuery_VERSION(self, user, channel, data):
+@@ -2133,7 +2133,7 @@
+                                % (user, data))
+ 
+         if self.versionName:
+-            nick = string.split(user,"!")[0]
++            nick = user.split('!')[0]
+             self.ctcpMakeReply(nick, [('VERSION', '%s:%s:%s' %
+                                        (self.versionName,
+                                         self.versionNum or '',
+@@ -2144,7 +2144,7 @@
+             self.quirkyMessage("Why did %s send '%s' with a SOURCE query?"
+                                % (user, data))
+         if self.sourceURL:
+-            nick = string.split(user,"!")[0]
++            nick = user.split('!')[0]
+             # The CTCP document (Zeuge, Rollo, Mesander 1994) says that SOURCE
+             # replies should be responded to with the location of an anonymous
+             # FTP server in host:directory:file format.  I'm taking the liberty
+@@ -2157,7 +2157,7 @@
+             self.quirkyMessage("Why did %s send '%s' with a USERINFO query?"
+                                % (user, data))
+         if self.userinfo:
+-            nick = string.split(user,"!")[0]
++            nick = user.split('!')[0]
+             self.ctcpMakeReply(nick, [('USERINFO', self.userinfo)])
+ 
+     def ctcpQuery_CLIENTINFO(self, user, channel, data):
+@@ -2169,7 +2169,7 @@
+         the usage of that tag.
+         """
+ 
+-        nick = string.split(user,"!")[0]
++        nick = user.split('!')[0]
+         if not data:
+             # XXX: prefixedMethodNames gets methods from my *class*,
+             # but it's entirely possible that this *instance* has more
+@@ -2177,10 +2177,9 @@
+             names = reflect.prefixedMethodNames(self.__class__,
+                                                 'ctcpQuery_')
+ 
+-            self.ctcpMakeReply(nick, [('CLIENTINFO',
+-                                       string.join(names, ' '))])
++            self.ctcpMakeReply(nick, [('CLIENTINFO', ' '.join(names))])
+         else:
+-            args = string.split(data)
++            args = data.split()
+             method = getattr(self, 'ctcpQuery_%s' % (args[0],), None)
+             if not method:
+                 self.ctcpMakeReply(nick, [('ERRMSG',
+@@ -2195,7 +2194,7 @@
+     def ctcpQuery_ERRMSG(self, user, channel, data):
+         # Yeah, this seems strange, but that's what the spec says to do
+         # when faced with an ERRMSG query (not a reply).
+-        nick = string.split(user,"!")[0]
++        nick = user.split('!')[0]
+         self.ctcpMakeReply(nick, [('ERRMSG',
+                                    "%s :No error has occoured." % data)])
+ 
+@@ -2203,7 +2202,7 @@
+         if data is not None:
+             self.quirkyMessage("Why did %s send '%s' with a TIME query?"
+                                % (user, data))
+-        nick = string.split(user,"!")[0]
++        nick = user.split('!')[0]
+         self.ctcpMakeReply(nick,
+                            [('TIME', ':%s' %
+                              time.asctime(time.localtime(time.time())))])
+@@ -2221,7 +2220,7 @@
+             data = data[len(dcctype)+1:]
+             handler(user, channel, data)
+         else:
+-            nick = string.split(user,"!")[0]
++            nick = user.split('!')[0]
+             self.ctcpMakeReply(nick, [('ERRMSG',
+                                        "DCC %s :Unknown DCC type '%s'"
+                                        % (data, dcctype))])
+@@ -2391,9 +2390,7 @@
+         """When I get a message that's so broken I can't use it.
+         """
+         log.msg(line)
+-        log.msg(string.join(traceback.format_exception(excType,
+-                                                        excValue,
+-                                                        tb),''))
++        log.msg(''.join(traceback.format_exception(excType, excValue, tb)))
+ 
+     def quirkyMessage(self, s):
+         """This is called when I receive a message which is peculiar,
+@@ -2658,7 +2655,7 @@
+ 
+     def dataReceived(self, data):
+         self.buffer = self.buffer + data
+-        lines = string.split(self.buffer, LF)
++        lines = self.buffer.split(LF)
+         # Put the (possibly empty) element after the last LF back in the
+         # buffer
+         self.buffer = lines.pop()
+@@ -2697,7 +2694,7 @@
+     """
+ 
+     orig_data = data
+-    data = string.split(data)
++    data = data.split()
+     if len(data) < 4:
+         return orig_data
+ 
+@@ -2719,7 +2716,7 @@
+                 )
+             # The mapping to 'int' is to get rid of those accursed
+             # "L"s which python 1.5.2 puts on the end of longs.
+-            address = string.join(map(str,map(int,address)), ".")
++            address = '.'.join(map(str,map(int,address)))
+ 
+     if dcctype == 'SEND':
+         filename = arg
+@@ -2890,7 +2887,7 @@
+     retval = {'extended': extended_messages,
+               'normal': normal_messages }
+ 
+-    messages = string.split(message, X_DELIM)
++    messages = message.split(X_DELIM)
+     odd = 0
+ 
+     # X1 extended data X2 nomal data X3 extended data X4 normal...
+@@ -2906,7 +2903,7 @@
+ 
+     extended_messages[:] = map(ctcpDequote, extended_messages)
+     for i in xrange(len(extended_messages)):
+-        m = string.split(extended_messages[i], SPC, 1)
++        m = extended_messages[i].split(SPC, 1)
+         tag = m[0]
+         if len(m) > 1:
+             data = m[1]
+@@ -2937,7 +2934,7 @@
+ 
+ def lowQuote(s):
+     for c in (M_QUOTE, NUL, NL, CR):
+-        s = string.replace(s, c, mQuoteTable[c])
++        s = s.replace(c, mQuoteTable[c])
+     return s
+ 
+ def lowDequote(s):
+@@ -2967,7 +2964,7 @@
+ 
+ def ctcpQuote(s):
+     for c in (X_QUOTE, X_DELIM):
+-        s = string.replace(s, c, xQuoteTable[c])
++        s = s.replace(c, xQuoteTable[c])
+     return s
+ 
+ def ctcpDequote(s):
+@@ -3006,7 +3003,7 @@
+         m = "%s%s%s" % (X_DELIM, m, X_DELIM)
+         coded_messages.append(m)
+ 
+-    line = string.join(coded_messages, '')
++    line = ''.join(coded_messages)
+     return line
+ 
+ 

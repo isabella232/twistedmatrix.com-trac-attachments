@@ -1,0 +1,81 @@
+--- a/twisted/internet/test/test_inotify.py
++++ b/twisted/internet/test/test_inotify.py
+@@ -16,6 +16,9 @@
+ else:
+     from twisted.internet import inotify
+ 
++import sys
++if sys.version_info < (3,):
++    range = xrange
+ 
+ 
+ class TestINotify(unittest.TestCase):
+@@ -502,3 +505,34 @@
+         for i, filename in enumerate(someFiles):
+             filename.setContent(filename.path)
+         return d
++
++    def test_overflowEvent(self):
++        """
++        L{inotify.INotify} will callback the overflow-callback in case of
++        IN_Q_OVERFLOW.
++        """
++        def overflow():
++            #there could be more than just one overflow
++            if not d.called:
++                in_.stopReading()
++                d.callback(None)
++        subdir = self.dirname.child('test')
++        subdir.makedirs()
++        d = defer.Deferred()
++        in_ = inotify.INotify(overflow = overflow)
++        in_.watch(subdir)
++        try:
++            f = filepath.FilePath('/proc/sys/fs/inotify/max_queued_events')
++            f = f.open('r')
++            num = int(f.readline())
++            f.close()
++        except:
++            num = 16384
++        # since touch and remove should create lots of events half should
++        # be enough
++        num/=2
++        for i in xrange(num):
++            subdir.child(str(i)).touch()
++        subdir.remove()
++        in_.startReading()
++        return d
+--- a/twisted/internet/inotify.py
++++ b/twisted/internet/inotify.py
+@@ -152,10 +152,12 @@
+ 
+     @ivar _watchpaths: a C{dict} that maps from watched paths to the
+         inotify watch ids
++
++    @ivar _overflow: a C{f} which gets called in case of IN_Q_OVERFLOW
+     """
+     _inotify = _inotify
+ 
+-    def __init__(self, reactor=None):
++    def __init__(self, reactor=None, overflow=None):
+         FileDescriptor.__init__(self, reactor=reactor)
+ 
+         # Smart way to allow parametrization of libc so I can override
+@@ -175,6 +177,7 @@
+         self._buffer = ''
+         self._watchpoints = {}
+         self._watchpaths = {}
++        self._overflow = overflow
+ 
+ 
+     def _addWatch(self, path, mask, autoAdd, callbacks):
+@@ -253,6 +256,9 @@
+ 
+             self._buffer = self._buffer[16 + size:]
+ 
++            if mask & IN_Q_OVERFLOW and self._overflow:
++                self._overflow()
++
+             try:
+                 iwp = self._watchpoints[wd]
+             except KeyError:

@@ -1,0 +1,214 @@
+diff --git a/twisted/internet/protocol.py b/twisted/internet/protocol.py
+index 4c455bd..0122c05 100644
+--- a/twisted/internet/protocol.py
++++ b/twisted/internet/protocol.py
+@@ -104,6 +104,7 @@ class Factory:
+         return p
+ 
+ 
++
+ class ClientFactory(Factory):
+     """A Protocol factory for clients.
+ 
+@@ -136,6 +137,29 @@ class ClientFactory(Factory):
+         """
+ 
+ 
++
++class FalseFactory(ClientFactory):
++    """
++    Factory that always builds the same protocol instance.
++
++    @ivar instance: The L{Protocol} which will be "built" each time.
++    """
++    def __init__(self, instance):
++        self.instance = instance
++
++
++    def __repr__(self):
++        return "<%s: %r>" % (self.__class__.__name__, self.instance)
++
++
++    def buildProtocol(self, addr):
++        """
++        Return the pre-constructed protocol instance.
++        """
++        return self.instance
++
++
++
+ class _InstanceFactory(ClientFactory):
+     """
+     Factory used by ClientCreator.
+@@ -824,4 +848,4 @@ class FileWrapper:
+ __all__ = ["Factory", "ClientFactory", "ReconnectingClientFactory", "connectionDone",
+            "Protocol", "ProcessProtocol", "FileWrapper", "ServerFactory",
+            "AbstractDatagramProtocol", "DatagramProtocol", "ConnectedDatagramProtocol",
+-           "ClientCreator"]
++           "ClientCreator", "FalseFactory"]
+diff --git a/twisted/internet/test/connectionmixins.py b/twisted/internet/test/connectionmixins.py
+index a239f0d..1ef803d 100644
+--- a/twisted/internet/test/connectionmixins.py
++++ b/twisted/internet/test/connectionmixins.py
+@@ -21,7 +21,8 @@ from twisted.python.runtime import platform
+ from twisted.python.log import ILogContext, msg, err
+ from twisted.internet.defer import Deferred, gatherResults
+ from twisted.internet.interfaces import IConnector, IReactorFDSet
+-from twisted.internet.protocol import ClientFactory, Protocol, ServerFactory
++from twisted.internet.protocol import (
++    ClientFactory, Protocol, ServerFactory, FalseFactory)
+ from twisted.trial.unittest import SkipTest
+ from twisted.internet.test.reactormixins import needsRunningReactor
+ from twisted.test.test_tcp import ClosingProtocol
+@@ -129,23 +130,6 @@ class EndpointCreator:
+ 
+ 
+ 
+-class _SingleProtocolFactory(ClientFactory):
+-    """
+-    Factory to be used by L{runProtocolsWithReactor}.
+-
+-    It always returns the same protocol (i.e. is intended for only a single
+-    connection).
+-    """
+-
+-    def __init__(self, protocol):
+-        self._protocol = protocol
+-
+-
+-    def buildProtocol(self, addr):
+-        return self._protocol
+-
+-
+-
+ def runProtocolsWithReactor(reactorBuilder, serverProtocol, clientProtocol,
+                             endpointCreator):
+     """
+@@ -170,8 +154,8 @@ def runProtocolsWithReactor(reactorBuilder, serverProtocol, clientProtocol,
+     reactor = reactorBuilder.buildReactor()
+     serverProtocol._setAttributes(reactor, Deferred())
+     clientProtocol._setAttributes(reactor, Deferred())
+-    serverFactory = _SingleProtocolFactory(serverProtocol)
+-    clientFactory = _SingleProtocolFactory(clientProtocol)
++    serverFactory = FalseFactory(serverProtocol)
++    clientFactory = FalseFactory(clientProtocol)
+ 
+     # Listen on a port:
+     serverEndpoint = endpointCreator.server(reactor)
+diff --git a/twisted/internet/test/test_protocol.py b/twisted/internet/test/test_protocol.py
+index 00d1b8f..94e9a7a 100644
+--- a/twisted/internet/test/test_protocol.py
++++ b/twisted/internet/test/test_protocol.py
+@@ -16,7 +16,7 @@ from twisted.internet.interfaces import (IProtocol, ILoggingContext,
+ from twisted.internet.defer import CancelledError
+ from twisted.internet.protocol import (
+     Protocol, ClientCreator, Factory, ProtocolToConsumerAdapter,
+-    ConsumerToProtocolAdapter)
++    ConsumerToProtocolAdapter, FalseFactory)
+ from twisted.trial.unittest import TestCase
+ from twisted.test.proto_helpers import MemoryReactorClock, StringTransport
+ 
+@@ -412,3 +412,27 @@ class AdapterTests(TestCase):
+         protocol.dataReceived(b"hello")
+         self.assertEqual(result, [b"hello"])
+         self.assertIsInstance(protocol, ConsumerToProtocolAdapter)
++
++
++
++class FalseFactoryTests(TestCase):
++    """
++    Tests for L{FalseFactory}
++    """
++    def setUp(self):
++        self.protocol = Protocol()
++        self.factory = FalseFactory(self.protocol)
++
++
++    def test_alwaysBuildsTheSameProtocol(self):
++        """
++        L{FalseFactory} takes a protocol instance and returns it every time
++        L{FalseFactory.buildProtocol} is called.
++        """
++        self.assertIs(self.factory.buildProtocol(None), self.protocol)
++        self.assertIs(self.factory.buildProtocol(None), self.protocol)
++
++
++    def test_repr(self):
++        self.assertEqual(
++            repr(self.factory), "<FalseFactory: %r>" % self.protocol)
+diff --git a/twisted/protocols/loopback.py b/twisted/protocols/loopback.py
+index 0e0ba3b..8ac5bc1 100644
+--- a/twisted/protocols/loopback.py
++++ b/twisted/protocols/loopback.py
+@@ -16,6 +16,7 @@ from zope.interface import implementer
+ # Twisted Imports
+ from twisted.protocols import policies
+ from twisted.internet import interfaces, protocol, main, defer
++from twisted.internet.protocol import FalseFactory
+ from twisted.internet.task import deferLater
+ from twisted.python import failure
+ from twisted.internet.interfaces import IAddress
+@@ -317,15 +318,12 @@ class LoopbackRelay:
+ 
+ 
+ 
+-class LoopbackClientFactory(protocol.ClientFactory):
++class LoopbackClientFactory(FalseFactory):
+ 
+     def __init__(self, protocol):
++        FalseFactory.__init__(self, protocol)
+         self.disconnected = 0
+         self.deferred = defer.Deferred()
+-        self.protocol = protocol
+-
+-    def buildProtocol(self, addr):
+-        return self.protocol
+ 
+     def clientConnectionLost(self, connector, reason):
+         self.disconnected = 1
+diff --git a/twisted/test/test_policies.py b/twisted/test/test_policies.py
+index 956cf19..c149bf9 100644
+--- a/twisted/test/test_policies.py
++++ b/twisted/test/test_policies.py
+@@ -40,15 +40,6 @@ class SimpleProtocol(protocol.Protocol):
+ 
+ 
+ 
+-class SillyFactory(protocol.ClientFactory):
+-
+-    def __init__(self, p):
+-        self.p = p
+-
+-    def buildProtocol(self, addr):
+-        return self.p
+-
+-
+ class EchoProtocol(protocol.Protocol):
+     paused = False
+ 
+@@ -364,11 +355,13 @@ class ThrottlingTestCase(unittest.TestCase):
+         n = p.getHost().port
+ 
+         def _connect123(results):
+-            reactor.connectTCP("127.0.0.1", n, SillyFactory(c1))
++            reactor.connectTCP("127.0.0.1", n, protocol.FalseFactory(c1))
+             c1.dConnected.addCallback(
+-                lambda r: reactor.connectTCP("127.0.0.1", n, SillyFactory(c2)))
++                lambda r: reactor.connectTCP(
++                    "127.0.0.1", n, protocol.FalseFactory(c2)))
+             c2.dConnected.addCallback(
+-                lambda r: reactor.connectTCP("127.0.0.1", n, SillyFactory(c3)))
++                lambda r: reactor.connectTCP(
++                    "127.0.0.1", n, protocol.FalseFactory(c3)))
+             return c3.dDisconnected
+ 
+         def _check123(results):
+@@ -383,7 +376,7 @@ class ThrottlingTestCase(unittest.TestCase):
+             return c1.dDisconnected
+ 
+         def _connect4(results):
+-            reactor.connectTCP("127.0.0.1", n, SillyFactory(c4))
++            reactor.connectTCP("127.0.0.1", n, protocol.FalseFactory(c4))
+             return c4.dConnected
+ 
+         def _check4(results):

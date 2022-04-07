@@ -1,0 +1,168 @@
+Index: twisted/internet/_pollingfile.py
+===================================================================
+--- twisted/internet/_pollingfile.py	(revision 38381)
++++ twisted/internet/_pollingfile.py	(working copy)
+@@ -165,6 +165,7 @@
+ 
+     def __init__(self, writePipe, lostCallback):
+         self.disconnecting = False
++        self.disconnected = False
+         self.producer = None
+         self.producerPaused = 0
+         self.streamingProducer = 0
+@@ -227,6 +228,7 @@
+ 
+     def writeConnectionLost(self):
+         self.deactivate()
++        self.disconnected = True
+         try:
+             win32api.CloseHandle(self.writePipe)
+         except pywintypes.error:
+@@ -246,6 +248,8 @@
+         """
+         if unicode in map(type, seq):
+             raise TypeError("Unicode not allowed in output buffer.")
++        if self.disconnected:
++            return
+         self.outQueue.extend(seq)
+ 
+ 
+@@ -260,7 +264,7 @@
+         """
+         if isinstance(data, unicode):
+             raise TypeError("Unicode not allowed in output buffer.")
+-        if self.disconnecting:
++        if self.disconnected:
+             return
+         self.outQueue.append(data)
+         if sum(map(len, self.outQueue)) > FULL_BUFFER_SIZE:
+Index: twisted/internet/test/test_pollingfile.py
+===================================================================
+--- twisted/internet/test/test_pollingfile.py	(revision 38381)
++++ twisted/internet/test/test_pollingfile.py	(working copy)
+@@ -4,17 +4,114 @@
+ """
+ Tests for L{twisted.internet._pollingfile}.
+ """
++import os
+ 
+ from twisted.python.runtime import platform
+ from twisted.trial.unittest import TestCase
++from twisted.protocols import basic
++from twisted.internet.test.reactormixins import ReactorBuilder
+ 
++
++
+ if platform.isWindows():
++    import win32pipe
++    import win32security
++
+     from twisted.internet import _pollingfile
++
++    from twisted.internet._pollingfile import _PollingTimer
++    _skipNotWindows = None
+ else:
+-    _pollingfile = None
++    _skipNotWindows = "Test will run only on Windows."
++    _PollingTimer = object
++ 
+ 
++ 
++class PipeRunner(_PollingTimer):
++    """
++    Builds, initializes and runs a pair of read/write pipes.
++    """
++    def __init__(self, pipeSize, doneReadCB, doneWriteCB, receivedCB, reactor):
++        _PollingTimer.__init__(self, reactor)
++        sAttrs = win32security.SECURITY_ATTRIBUTES()
++        sAttrs.bInheritHandle = 1
++        hRead, hWrite = win32pipe.CreatePipe(sAttrs, pipeSize)
++        self.reader = _pollingfile._PollableReadPipe(hRead, receivedCB, doneReadCB)
++        self.writer = _pollingfile._PollableWritePipe(hWrite, doneWriteCB)
++        self._addPollableResource(self.reader)
++        self._addPollableResource(self.writer)
+ 
+ 
++
++class TestPollablePipes(ReactorBuilder):
++    """
++    Tests for L{_pollingfile._PollableWritePipe} and
++    L{_pollingfile._PollableReadPipe}.
++    """
++    def setUp(self):
++        self._oldBufferSize = _pollingfile.FULL_BUFFER_SIZE
++
++
++    def tearDown(self):
++        _pollingfile.FULL_BUFFER_SIZE = self._oldBufferSize
++
++
++    def test_pullProducerDataDroppedAtLoseConnection(self):
++        """
++        Test write pipe as a consumer using a push producer.
++
++        If a producer has sent a consumer data, the consumer should
++        honor a disconnect request made using loseConnection() when the data
++        sent by the producer has been written.
++
++        This test depends on the tickets: #2835, #2839, #5365, #6492 and #6493
++        being resolved first.
++
++        See Ticket #6491: data written gets dropped while the pipe is still
++        disconnecting.
++        """
++        pipeSize = 4096  # avoid Ticket #5365 issues
++        _pollingfile.FULL_BUFFER_SIZE = 1024
++        testMessage = '0' * 1024
++
++        class TestProtocol(basic.LineReceiver):
++            lineCount = 0
++            def lineReceived(self, line):
++                if self.lineCount == 10:
++                    transport.writer.close()
++                self.lineCount += 1
++                self.testResponse = line
++
++        class TestProducer(object):
++            count = 0
++            paused = False
++            totalMessages = 100
++            def resumeProducing(self):
++                self.paused = False
++                while not self.paused and self.count < self.totalMessages:
++                    transport.writer.write(testMessage+"\r\n")
++                    self.count += 1
++
++            def pauseProducing(self):
++                self.paused = True
++
++            def stopProducing(self):
++                self.count = self.totalMessages
++
++        reactor = self.buildReactor()
++        r, w = lambda: reactor.stop(), lambda: None
++        protocol, producer = TestProtocol(), TestProducer()
++        transport = PipeRunner(pipeSize, r, w, protocol.dataReceived, reactor)
++        transport.writer.registerProducer(producer, True)
++        producer.resumeProducing()
++        self.runReactor(reactor)
++        self.assertEqual(testMessage, protocol.testResponse)
++        self.assertEqual(100, protocol.lineCount)
++
++
++globals().update(TestPollablePipes.makeTestCaseClasses())
++
++
+ class TestPollableWritePipe(TestCase):
+     """
+     Tests for L{_pollingfile._PollableWritePipe}.
+@@ -41,6 +138,7 @@
+ 
+ 
+ 
++if _skipNotWindows:
++    TestPollablePipes.skip = skipMessage
++    TestPollableWritePipeUnicode.skip = skipMessage
+ 
+-if _pollingfile is None:
+-    TestPollableWritePipe.skip = "Test will run only on Windows."

@@ -1,0 +1,206 @@
+diff --git twisted/python/test/test_urlpath.py twisted/python/test/test_urlpath.py
+index 4919cdc..aa86ecb 100644
+--- twisted/python/test/test_urlpath.py
++++ twisted/python/test/test_urlpath.py
+@@ -42,3 +42,67 @@ class URLPathTestCase(unittest.TestCase):
+         self.assertEqual(str(self.path.here()), 'http://example.com/foo/')
+         self.assertEqual(str(self.path.child('').here()), 'http://example.com/foo/bar/')
+ 
++
++    def test_child_noQuote(self):
++        """
++        C{child} should not quote special characters when quoting is disabled
++        (default).
++        """
++        path = urlpath.URLPath.fromString('http://example.com/foo/bar')
++        self.assertEquals(str(path.child('" +-\\/')),
++                          'http://example.com/foo/bar/" +-\\/')
++
++
++    def test_child_quote(self):
++        """
++        C{child} should quote special characters when quoting is enabled
++        """
++        path = urlpath.URLPath.fromString('http://example.com/foo/bar',
++                                          quote=True)
++        self.assertEquals(str(path.child('" +-\\/')),
++                          'http://example.com/foo/bar/%22%20%2B-%5C%2F')
++        self.assertEquals(str(path.child('').child('"/')),
++                          'http://example.com/foo/bar/%22%2F')
++
++
++    def test_sibling_noQuote(self):
++        """
++        C{sibling} should not quote special characters when quoting is disabled
++        (default behavior).
++        """
++        path = urlpath.URLPath.fromString('http://example.com/foo/bar')
++        self.assertEquals(str(path.sibling('"+/')),
++                          'http://example.com/foo/"+/')
++
++
++    def test_sibling_quote(self):
++        """
++        C{sibling} should quote special characters when quoting is enabled.
++        """
++        path = urlpath.URLPath.fromString('http://example.com/foo/bar',
++                                          quote=True)
++        self.assertEquals(str(path.sibling('"+/')),
++                          'http://example.com/foo/%22%2B%2F')
++
++
++    def test_click_noQuote(self):
++        """
++        The object returned by C{click} should not quote special characters by
++        default.
++        """
++        path = urlpath.URLPath.fromString('http://example.com/foo/bar')
++        self.assertEquals(str(path.click('foo/bar').child('+/')),
++                          'http://example.com/foo/foo/bar/+/')
++
++
++    def test_click_quote(self):
++        """
++        The object returned by C{click} should inherit the quoting behavior of
++        the base L{URLPath}
++        """
++        path = urlpath.URLPath.fromString('http://example.com/foo/bar',
++                                          quote=True)
++        self.assertEquals(str(path.click('foo/bar').child('+/')),
++                          'http://example.com/foo/foo/bar/%2B%2F')        
++
++
+diff --git twisted/python/urlpath.py twisted/python/urlpath.py
+index 1c15f09..a8eeb68 100644
+--- twisted/python/urlpath.py
++++ twisted/python/urlpath.py
+@@ -8,16 +8,28 @@ import urlparse
+ import urllib
+ 
+ class URLPath:
++    """
++    @ivar _quote: See L{__init__}
++    """
+     def __init__(self, scheme='', netloc='localhost', path='',
+-                 query='', fragment=''):
++                 query='', fragment='', quote=False):
++        """
++        @param quote: If C{False} (default) then I won't quote path segments
++            passed to L{sibling} or L{child} (the caller is responsible for
++            doing any needed quoting in this case).
++            If C{True} then I will quote path segments, and the caller
++            I{should not} quote the path segments.
++        """
+         self.scheme = scheme or 'http'
+         self.netloc = netloc
+         self.path = path or '/'
+         self.query = query
+         self.fragment = fragment
++        self._quote = quote
+ 
+     _qpathlist = None
+     _uqpathlist = None
++    _quote = False
+     
+     def pathList(self, unquote=0, copy=1):
+         if self._qpathlist is None:
+@@ -32,9 +44,15 @@ class URLPath:
+         else:
+             return result
+ 
+-    def fromString(klass, st):
++    def fromString(klass, st, quote=False):
++        """
++        Create a L{URLPath} from a string.
++
++        @param st: A I{quoted} url.
++        @param quote: See L{__init__}
++        """
+         t = urlparse.urlsplit(st)
+-        u = klass(*t)
++        u = klass(*t, quote=quote)
+         return u
+ 
+     fromString = classmethod(fromString)
+@@ -52,22 +70,55 @@ class URLPath:
+         return URLPath(self.scheme,
+                         self.netloc,
+                         '/'.join(newpathsegs),
+-                        query)
++                        query,
++                        quote=self._quote)
++
+ 
+-    def sibling(self, path, keepQuery=0):
++    def _maybeQuoteSegment(self, segment):
++        """
++        Return the URL quoted version of C{segment} if quoting is enabled (see
++        L{__init__.quote<__init__>}) otherwise return C{segment} as-is.
++        """
++        if self._quote:
++            return urllib.quote(segment, '')
++        else:
++            return segment
++
++
++    def sibling(self, path, keepQuery=False):
+         l = self.pathList()
+-        l[-1] = path
++        l[-1] = self._maybeQuoteSegment(path)
+         return self._pathMod(l, keepQuery)
+ 
+-    def child(self, path, keepQuery=0):
++
++    def child(self, path, keepQuery=False):
++        """
++        Add a child segment to URL path part. 
++        
++        @param path: The path segment to add.  The segment should be quoted
++            (using L{urllib.quote} for instance) unless I have been told to
++            do the quoting (see L{__init.quote<__init__>}).
++        @type path: C{str}
++
++        @param keepQuery: If set to True, keep the current query part in the
++            result, otherwise discard it.
++        @type keepQuery: C{bool}
++
++        @return: A new L{URLPath} object with the same values as this one,
++            but with C{path} added as a new segment to the path.
++        @rtype: L{URLPath}
++        """
++        # Store the quoted version
++        fixedPath = self._maybeQuoteSegment(path)
+         l = self.pathList()
+         if l[-1] == '':
+-            l[-1] = path
++            l[-1] = fixedPath
+         else:
+-            l.append(path)
++            l.append(fixedPath)
+         return self._pathMod(l, keepQuery)
+ 
+-    def parent(self, keepQuery=0):
++
++    def parent(self, keepQuery=False):
+         l = self.pathList()
+         if l[-1] == '':
+             del l[-2]
+@@ -78,7 +129,7 @@ class URLPath:
+             l[-1] = ''
+         return self._pathMod(l, keepQuery)
+ 
+-    def here(self, keepQuery=0):
++    def here(self, keepQuery=False):
+         l = self.pathList()
+         if l[-1] != '':
+             l[-1] = ''
+@@ -106,7 +157,8 @@ class URLPath:
+                         netloc,
+                         path,
+                         query,
+-                        fragment)
++                        fragment,
++                        quote=self._quote)
+ 
+ 
+     

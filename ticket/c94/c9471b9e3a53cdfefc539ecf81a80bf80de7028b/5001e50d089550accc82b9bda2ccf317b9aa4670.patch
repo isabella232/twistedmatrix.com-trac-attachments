@@ -1,0 +1,237 @@
+Index: twisted/web/http.py
+===================================================================
+--- twisted/web/http.py	(revision 30541)
++++ twisted/web/http.py	(working copy)
+@@ -441,7 +441,41 @@
+         self.handleHeader(key, val)
+         if key.lower() == 'content-length':
+             self.length = int(val)
++            def dataReceived(self, data):
++                """Protocol.dataReceived.
++                Translates bytes into lines, and calls lineReceived (or
++                rawDataReceived, depending on mode.)
++                """
+ 
++                self.__buffer = self.__buffer + data
++                while self.line_mode and not self.paused:
++                    try:
++                        if "\r\n" in self.__buffer:
++                            delimiter = "\r\n"
++                        else:
++                            delimiter = "\n"
++                        line, self.__buffer = self.__buffer.split(delimiter, 1)
++                    except ValueError:
++                        if len(self.__buffer) > self.MAX_LENGTH:
++                            line, self.__buffer = self.__buffer, ''
++                            return self.lineLengthExceeded(line)
++                        break
++                    else:
++                        linelength = len(line)
++                        if linelength > self.MAX_LENGTH:
++                            exceeded = line + self.__buffer
++                            self.__buffer = ''
++                            return self.lineLengthExceeded(exceeded)
++                        why = self.lineReceived(line)
++                        if why or self.transport and self.transport.disconnecting:
++                            return why
++                else:
++                    if not self.paused:
++                        data=self.__buffer
++                        self.__buffer=''
++                        if data:
++                            return self.rawDataReceived(data)
++    
+ 
+     def lineReceived(self, line):
+         """
+Index: twisted/web/test/test_http.py
+===================================================================
+--- twisted/web/test/test_http.py	(revision 30541)
++++ twisted/web/test/test_http.py	(working copy)
+@@ -50,6 +50,114 @@
+         self.finish()
+ 
+ 
++class DummyHTTPBrokenSeparatorHandler(http.Request):
++
++    def process(self):
++        self.content.seek(0, 0)
++        data = self.content.read()
++        length = self.getHeader('content-length')
++        request = "'''\n"+str(length)+"\n"+data+"'''\n"
++        self.setResponseCode(200)
++        self.setHeader("Request", self.uri)
++        self.setHeader("Command", self.method)
++        self.setHeader("Version", self.clientproto)
++        self.setHeader("Content-Length", len(request))
++        self.write(request)
++        self.finish()
++    
++    def finish(self):
++        """
++        Indicate that all response data has been written to this L{Request}.
++        """
++        if self._disconnected:
++            raise RuntimeError(
++                "Request.finish called on a request after its connection was lost; "
++                "use Request.notifyFinish to keep track of this.")
++        if self.finished:
++            warnings.warn("Warning! request.finish called twice.", stacklevel=2)
++            return
++
++        if not self.startedWriting:
++            # write headers
++            self.write('')
++
++        if self.chunked:
++            # write last chunk and closing CRLF
++            self.transport.write("0\n\n")
++
++        # log request
++        if hasattr(self.channel, "factory"):
++            self.channel.factory.log(self)
++
++        self.finished = 1
++        if not self.queued:
++            self._cleanup()
++
++    def write(self, data):
++        """
++        Write some data as a result of an HTTP request.  The first
++        time this is called, it writes out response data.
++
++        @type data: C{str}
++        @param data: Some bytes to be sent as part of the response body.
++        """
++        NO_BODY_CODES = (204, 304)
++        
++        if not self.startedWriting:
++            self.startedWriting = 1
++            version = self.clientproto
++            l = []
++            l.append('%s %s %s\n' % (version, self.code,
++                                       self.code_message))
++            # if we don't have a content length, we send data in
++            # chunked mode, so that we can support pipelining in
++            # persistent connections.
++            if ((version == "HTTP/1.1") and
++                (self.responseHeaders.getRawHeaders('content-length') is None) and
++                self.method != "HEAD" and self.code not in NO_BODY_CODES):
++                l.append("%s: %s\n" % ('Transfer-Encoding', 'chunked'))
++                self.chunked = 1
++
++            if self.lastModified is not None:
++                if self.responseHeaders.hasHeader('last-modified'):
++                    log.msg("Warning: last-modified specified both in"
++                            " header list and lastModified attribute.")
++                else:
++                    self.responseHeaders.setRawHeaders(
++                        'last-modified',
++                        [datetimeToString(self.lastModified)])
++
++            if self.etag is not None:
++                self.responseHeaders.setRawHeaders('ETag', [self.etag])
++
++            for name, values in self.responseHeaders.getAllRawHeaders():
++                for value in values:
++                    l.append("%s: %s\n" % (name, value))
++
++            for cookie in self.cookies:
++                l.append('%s: %s\n' % ("Set-Cookie", cookie))
++
++            l.append("\n")
++
++            self.transport.writeSequence(l)
++
++            # if this is a "HEAD" request, we shouldn't return any data
++            if self.method == "HEAD":
++                self.write = lambda data: None
++                return
++
++            # for certain result codes, we should never return any data
++            if self.code in NO_BODY_CODES:
++                self.write = lambda data: None
++                return
++
++        self.sentLength = self.sentLength + len(data)
++        if data:
++            if self.chunked:
++                self.transport.writeSequence(toChunk(data))
++            else:
++                self.transport.write(data)
++
+ class LoopbackHTTPClient(http.HTTPClient):
+ 
+     def connectionMade(self):
+@@ -86,9 +194,31 @@
+             content = rest[:len(expectedContent)]
+             responses = rest[len(expectedContent):]
+             self.assertEqual(content, expectedContent)
++    
++    def assertResponseEqualsLFOnly(self, responses, expected):
++        """
++        Assert that the C{responses} matches the C{expected} responses when using \n separator.
+ 
++        @type responses: C{str}
++        @param responses: The bytes sent in response to one or more requests.
+ 
++        @type expected: C{list} of C{tuple} of C{str}
++        @param expected: The expected values for the responses.  Each tuple
++            element of the list represents one response.  Each string element
++            of the tuple is a full header line without delimiter, except for
++            the last element which gives the full response body.
++        """
++        for response in expected:
++            expectedHeaders, expectedContent = response[:-1], response[-1]
++            headers, rest = responses.split('\n\n', 1)
++            headers = headers.splitlines()
++            self.assertEqual(set(headers), set(expectedHeaders))
++            content = rest[:len(expectedContent)]
++            responses = rest[len(expectedContent):]
++            self.assertEqual(content, expectedContent)
+ 
++
++
+ class HTTP1_0TestCase(unittest.TestCase, ResponseTestMixin):
+     requests = (
+         "GET / HTTP/1.0\r\n"
+@@ -119,6 +249,22 @@
+         a.connectionLost(IOError("all one"))
+         value = b.value()
+         self.assertResponseEquals(value, self.expected_response)
++    
++    def test_bufferBrokenSeparator(self):
++        """
++        Send requests over a channel and check responses match what is expected.
++        Simulates broken servers that use \n instead of \r\n for line separators.
++        """
++        b = StringTransport()
++        a = http.HTTPChannel()
++        a.requestFactory = DummyHTTPBrokenSeparatorHandler
++        a.makeConnection(b)
++        # one byte at a time, to stress it.
++        for byte in self.requests:
++            a.dataReceived(byte)
++        a.connectionLost(IOError("all one"))
++        value = b.value()
++        self.assertResponseEqualsLFOnly(value, self.expected_response)
+ 
+ 
+     def test_requestBodyTimeout(self):
+@@ -212,11 +358,15 @@
+     requests = (
+         "GET /\r\n")
+ 
+-    expected_response = "HTTP/1.1 400 Bad Request\r\n\r\n"
++    expected_response = "HTTP/1.1 400 Bad Request\r\n\r\n"  
+ 
+ 
+     def assertResponseEquals(self, response, expectedResponse):
+         self.assertEquals(response, expectedResponse)
++    
++    
++    def test_bufferBrokenSeparator(self):
++        pass
+ 
+ 
+ class HTTPLoopbackTestCase(unittest.TestCase):

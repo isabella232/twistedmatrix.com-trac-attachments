@@ -1,0 +1,131 @@
+Index: twisted/trial/test/test_runner.py
+===================================================================
+--- twisted/trial/test/test_runner.py	(revision 26936)
++++ twisted/trial/test/test_runner.py	(working copy)
+@@ -477,7 +477,24 @@
+         self.assertEqual(['runcall'], debugger._calls)
+ 
+ 
++    def test_noMarker(self):
++        """
++        Specifying a temp directory that does not have a trial marker results
++        in an exception and does not remove the specified directory.
++        """
++        tempPath = self.mktemp()
++        # Create our working directory outside of trial.
++        os.mkdir(tempPath)
++        self.parseOptions(['--temp-directory', tempPath,
++                           'twisted.trial.test.sample'])
++        myRunner = self.getRunner()
++        loader = runner.TestLoader()
++        suite = loader.loadByName('twisted.trial.test.sample', True)
++        self.assertRaises(runner._NoTrialMarker, myRunner.run, suite)
++        self.assertTrue(os.path.exists(tempPath))
+ 
++
++
+ class TestTrialSuite(unittest.TestCase):
+ 
+     def test_imports(self):
+Index: twisted/trial/runner.py
+===================================================================
+--- twisted/trial/runner.py	(revision 26936)
++++ twisted/trial/runner.py	(working copy)
+@@ -9,11 +9,11 @@
+ """
+ 
+ 
+-import pdb, shutil
++import pdb
+ import os, types, warnings, sys, inspect, imp
+ import random, doctest, time
+ 
+-from twisted.python import reflect, log, failure, modules
++from twisted.python import reflect, log, failure, modules, filepath
+ from twisted.python.util import dsu
+ from twisted.python.compat import set
+ from twisted.python.lockfile import FilesystemLock
+@@ -40,6 +40,16 @@
+ 
+ 
+ 
++class _NoTrialMarker(Exception):
++    """
++    No trial marker file could be found.
++
++    Raised when trial attempts to remove a trial temporary working directory
++    that does not contain a marker file.
++    """
++
++
++
+ def isPackage(module):
+     """Given an object return True if the object looks like a package"""
+     if not isinstance(module, types.ModuleType):
+@@ -697,15 +707,26 @@
+ 
+ 
+     def _removeSafely(self, path):
++        """
++        Safely remove a path, recursively.
++
++        If C{path} does not contain a node named C{_trial_marker}, a
++        L{_NoTrialmarker} exception is raised and the path is not removed.
++        """
++        if not path.child('_trial_marker').exists():
++            raise _NoTrialMarker(
++                '%r is not a trial temporary path, refusing to remove it'
++                % (path,))
++
+         try:
+-            shutil.rmtree(path)
++            path.remove()
+         except OSError, e:
+             print ("could not remove %r, caught OSError [Errno %s]: %s"
+-                   % (path, e.errno,e.strerror))
++                   % (path, e.errno, e.strerror))
+             try:
+-                os.rename(path,
+-                          os.path.abspath("_trial_temp_old%s"
+-                                          % random.randint(0, 99999999)))
++                newPath = FilePath('_trial_temp_old%s'
++                                   % random.randint(0, 99999999))
++                path.moveTo(newPath)
+             except OSError, e:
+                 print ("could not rename path, caught OSError [Errno %s]: %s"
+                        % (e.errno,e.strerror))
+@@ -715,18 +736,18 @@
+     def _setUpTestdir(self):
+         self._tearDownLogFile()
+         currentDir = os.getcwd()
+-        base = os.path.normpath(os.path.abspath(self.workingDirectory))
++        base = filepath.FilePath(self.workingDirectory)
+         counter = 0
+         while True:
+             if counter:
+-                testdir = '%s-%d' % (base, counter)
++                testdir = base.sibling('%s-%d' % (base.basename(), counter))
+             else:
+                 testdir = base
+ 
+-            self._testDirLock = FilesystemLock(testdir + '.lock')
++            self._testDirLock = FilesystemLock(testdir.path + '.lock')
+             if self._testDirLock.lock():
+                 # It is not in use
+-                if os.path.exists(testdir):
++                if testdir.exists():
+                     # It exists though - delete it
+                     self._removeSafely(testdir)
+                 break
+@@ -737,8 +758,9 @@
+                 else:
+                     raise _WorkingDirectoryBusy()
+ 
+-        os.mkdir(testdir)
+-        os.chdir(testdir)
++        testdir.makedirs()
++        os.chdir(testdir.path)
++        file('_trial_marker', 'w').close()
+         return currentDir
+ 
+ 

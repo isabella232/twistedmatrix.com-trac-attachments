@@ -1,0 +1,112 @@
+Index: twisted/internet/defer.py
+===================================================================
+--- twisted/internet/defer.py	(revision 18842)
++++ twisted/internet/defer.py	(working copy)
+@@ -664,6 +664,99 @@
+     return mergeFunctionMetadata(f, unwindGenerator)
+ 
+ 
++def deferredCoroutine(f):
++    """
++    API Stability: semi-stable
++
++    deferredCoroutine helps you write Deferred-using code
++    that looks like it's blocking (but isn't really), with the help of
++    generators.  The new generator features in Python 2.5 make this
++    possible with a much simpler syntax than was possible previously.
++    Hence, deferredCoroutine should replace the combination of
++    L{waitForDeferred} and L{deferredGenerator} for Python 2.5 and above.
++
++    deferredCoroutine is used like this::
++
++        def thingummy():
++            thing = (yield someFunctionResultingInDeferred())
++            print thing #the result! yippee!
++        thingummy = deferredCoroutine(thingummy)
++
++    deferredCoroutine takes a generator and converts it into a function
++    that returns a Deferred. The result of the Deferred will be the last
++    value yielded by the generator, unless the last value is a Deferred
++    instance, in which case the result will be C{None}.  If the function
++    raises an unhandled exception, the Deferred will errback instead.
++    Remember that 'return result' won't work; use 'yield result; return'
++    in place of that.
++
++    Note that not yielding anything from your generator will make the
++    Deferred result in None.
++
++    The Deferred returned from deferredCoroutine may also errback if your
++    generator raised an exception.  For example::
++
++        def thingummy():
++            thing = (yield someFunctionResultingInDeferred())
++            if thing == 'I love Twisted':
++                # will become the result of the Deferred
++                yield 'TWISTED IS GREAT!'
++                return
++            else:
++                # will trigger an errback
++                raise Exception('DESTROY ALL LIFE')
++        thingummy = deferredGenerator(thingummy)
++
++    Basically, this function allows you to write a chain of callbacks/errbacks
++    in one block of code.  Whenever you would normally return a deferred to be
++    passed on to another callback, you instead simply yield the deferred.
++    When the deferred fires a value, it will be sent back in to the generator
++    as the value of the yield expression, or if the deferred fires an errback,
++    the yield expression will raise an exception.  In either case, execution
++    continues inside your generator, rather than in another callback function.
++    """
++    def unwindCoroutine(*args, **kwargs):
++        return _deferCoroutine(f(*args, **kwargs))
++    return mergeFunctionMetadata(f, unwindCoroutine)
++
++
++def _deferCoroutine(g, deferred=None, result=None):
++    """
++    See L{deferredCoroutine}.
++    """
++    while True:
++        if deferred is None:
++            deferred = defer.Deferred()
++        try:
++            if isinstance(result, failure.Failure):
++                result = g.throw(result.type, result.value, result.tb)
++            else:
++                result = g.send(result)
++        except StopIteration:
++            deferred.callback(result)
++            return deferred
++        except:
++            deferred.errback()
++            return deferred
++
++        if isinstance(result, defer.Deferred):
++            waiting = [True, None]
++            # Pass vars in so they don't get changed going around the loop
++            def gotResult(r, waiting=waiting):
++                if waiting[0]:
++                    waiting[0] = False
++                    waiting[1] = r
++                else:
++                    _deferCoroutine(g, deferred, r)
++            result.addBoth(gotResult)
++            if waiting[0]:
++                # Haven't called back yet, set flag so that the callback
++                # will reinvoke _deferCoroutine when it fires, and return
++                waiting[0] = False
++                return deferred
++            result = waiting[1] # pass the result around to the next iteration
++
++
+ class _ConcurrencyPrimitive(object):
+     def __init__(self):
+         self.waiting = []
+@@ -846,5 +939,6 @@
+ __all__ = ["Deferred", "DeferredList", "succeed", "fail", "FAILURE", "SUCCESS",
+            "AlreadyCalledError", "TimeoutError", "gatherResults",
+            "maybeDeferred", "waitForDeferred", "deferredGenerator",
+-           "DeferredLock", "DeferredSemaphore", "DeferredQueue",
++           "deferredCoroutine", "DeferredLock", "DeferredSemaphore",
++           "DeferredQueue",
+           ]

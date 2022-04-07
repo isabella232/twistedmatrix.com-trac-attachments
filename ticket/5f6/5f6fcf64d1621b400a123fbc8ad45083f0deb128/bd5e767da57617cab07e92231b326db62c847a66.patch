@@ -1,0 +1,541 @@
+diff --git setup3.py setup3.py
+index cc54546..d76bce1 100644
+--- setup3.py
++++ setup3.py
+@@ -74,6 +74,7 @@ modules = [
+     "twisted.python.deprecate",
+     "twisted.python.failure",
+     "twisted.python.filepath",
++    "twisted.python.lockfile",
+     "twisted.python.log",
+     "twisted.python.monkey",
+     "twisted.python.randbytes",
+diff --git twisted/internet/defer.py twisted/internet/defer.py
+index d16b51d..2b8865a 100644
+--- twisted/internet/defer.py
++++ twisted/internet/defer.py
+@@ -25,8 +25,8 @@ from sys import exc_info
+ from functools import wraps
+ 
+ # Twisted imports
+-from twisted.python.compat import _PY3, comparable, cmp
+-from twisted.python import log, failure
++from twisted.python.compat import cmp, comparable
++from twisted.python import lockfile, log, failure
+ from twisted.python.deprecate import warnAboutFunction
+ 
+ 
+@@ -1485,108 +1485,104 @@ class DeferredQueue(object):
+ 
+ 
+ 
+-# Re-add to Python 3 in #5960:
+-if not _PY3:
+-    from twisted.python import lockfile
+-
+-    class AlreadyTryingToLockError(Exception):
+-        """
+-        Raised when L{DeferredFilesystemLock.deferUntilLocked} is called twice on a
+-        single L{DeferredFilesystemLock}.
+-        """
+ 
++class AlreadyTryingToLockError(Exception):
++    """
++    Raised when L{DeferredFilesystemLock.deferUntilLocked} is called twice on a
++    single L{DeferredFilesystemLock}.
++    """
+ 
+ 
+-    class DeferredFilesystemLock(lockfile.FilesystemLock):
+-        """
+-        A L{FilesystemLock} that allows for a L{Deferred} to be fired when the lock is
+-        acquired.
++class DeferredFilesystemLock(lockfile.FilesystemLock):
++    """
++    A L{FilesystemLock} that allows for a L{Deferred} to be fired when the lock is
++    acquired.
+ 
+-        @ivar _scheduler: The object in charge of scheduling retries. In this
+-            implementation this is parameterized for testing.
++    @ivar _scheduler: The object in charge of scheduling retries. In this
++        implementation this is parameterized for testing.
+ 
+-        @ivar _interval: The retry interval for an L{IReactorTime} based scheduler.
++    @ivar _interval: The retry interval for an L{IReactorTime} based scheduler.
+ 
+-        @ivar _tryLockCall: A L{DelayedCall} based on C{_interval} that will manage
+-            the next retry for aquiring the lock.
++    @ivar _tryLockCall: A L{DelayedCall} based on C{_interval} that will manage
++        the next retry for aquiring the lock.
+ 
+-        @ivar _timeoutCall: A L{DelayedCall} based on C{deferUntilLocked}'s timeout
+-            argument.  This is in charge of timing out our attempt to acquire the
+-            lock.
+-        """
+-        _interval = 1
+-        _tryLockCall = None
+-        _timeoutCall = None
++    @ivar _timeoutCall: A L{DelayedCall} based on C{deferUntilLocked}'s timeout
++        argument.  This is in charge of timing out our attempt to acquire the
++        lock.
++    """
++    _interval = 1
++    _tryLockCall = None
++    _timeoutCall = None
+ 
+ 
+-        def __init__(self, name, scheduler=None):
+-            """
+-            @param name: The name of the lock to acquire
+-            @param scheduler: An object which provides L{IReactorTime}
+-            """
+-            lockfile.FilesystemLock.__init__(self, name)
++    def __init__(self, name, scheduler=None):
++        """
++        @param name: The name of the lock to acquire
++        @param scheduler: An object which provides L{IReactorTime}
++        """
++        lockfile.FilesystemLock.__init__(self, name)
+ 
+-            if scheduler is None:
+-                from twisted.internet import reactor
+-                scheduler = reactor
++        if scheduler is None:
++            from twisted.internet import reactor
++            scheduler = reactor
+ 
+-            self._scheduler = scheduler
++        self._scheduler = scheduler
+ 
+ 
+-        def deferUntilLocked(self, timeout=None):
+-            """
+-            Wait until we acquire this lock.  This method is not safe for
+-            concurrent use.
++    def deferUntilLocked(self, timeout=None):
++        """
++        Wait until we acquire this lock.  This method is not safe for
++        concurrent use.
+ 
+-            @type timeout: C{float} or C{int}
+-            @param timeout: the number of seconds after which to time out if the
+-                lock has not been acquired.
++        @type timeout: C{float} or C{int}
++        @param timeout: the number of seconds after which to time out if the
++            lock has not been acquired.
+ 
+-            @return: a L{Deferred} which will callback when the lock is acquired, or
+-                errback with a L{TimeoutError} after timing out or an
+-                L{AlreadyTryingToLockError} if the L{deferUntilLocked} has already
+-                been called and not successfully locked the file.
+-            """
+-            if self._tryLockCall is not None:
+-                return fail(
+-                    AlreadyTryingToLockError(
+-                        "deferUntilLocked isn't safe for concurrent use."))
++        @return: a L{Deferred} which will callback when the lock is acquired, or
++            errback with a L{TimeoutError} after timing out or an
++            L{AlreadyTryingToLockError} if the L{deferUntilLocked} has already
++            been called and not successfully locked the file.
++        """
++        if self._tryLockCall is not None:
++            return fail(
++                AlreadyTryingToLockError(
++                    "deferUntilLocked isn't safe for concurrent use."))
+ 
+-            d = Deferred()
++        d = Deferred()
+ 
+-            def _cancelLock():
+-                self._tryLockCall.cancel()
+-                self._tryLockCall = None
+-                self._timeoutCall = None
++        def _cancelLock():
++            self._tryLockCall.cancel()
++            self._tryLockCall = None
++            self._timeoutCall = None
+ 
+-                if self.lock():
+-                    d.callback(None)
+-                else:
+-                    d.errback(failure.Failure(
+-                            TimeoutError("Timed out aquiring lock: %s after %fs" % (
+-                                    self.name,
+-                                    timeout))))
++            if self.lock():
++                d.callback(None)
++            else:
++                d.errback(failure.Failure(
++                        TimeoutError("Timed out aquiring lock: %s after %fs" % (
++                                self.name,
++                                timeout))))
+ 
+-            def _tryLock():
+-                if self.lock():
+-                    if self._timeoutCall is not None:
+-                        self._timeoutCall.cancel()
+-                        self._timeoutCall = None
++        def _tryLock():
++            if self.lock():
++                if self._timeoutCall is not None:
++                    self._timeoutCall.cancel()
++                    self._timeoutCall = None
+ 
+-                    self._tryLockCall = None
++                self._tryLockCall = None
+ 
+-                    d.callback(None)
+-                else:
+-                    if timeout is not None and self._timeoutCall is None:
+-                        self._timeoutCall = self._scheduler.callLater(
+-                            timeout, _cancelLock)
++                d.callback(None)
++            else:
++                if timeout is not None and self._timeoutCall is None:
++                    self._timeoutCall = self._scheduler.callLater(
++                        timeout, _cancelLock)
+ 
+-                    self._tryLockCall = self._scheduler.callLater(
+-                        self._interval, _tryLock)
++                self._tryLockCall = self._scheduler.callLater(
++                    self._interval, _tryLock)
+ 
+-            _tryLock()
++        _tryLock()
+ 
+-            return d
++        return d
+ 
+ 
+ 
+diff --git twisted/python/lockfile.py twisted/python/lockfile.py
+index a044957..cb441d9 100644
+--- twisted/python/lockfile.py
++++ twisted/python/lockfile.py
+@@ -16,7 +16,7 @@ from time import time as _uniquefloat
+ from twisted.python.runtime import platform
+ 
+ def unique():
+-    return str(long(_uniquefloat() * 1000))
++    return str(int(_uniquefloat() * 1000))
+ 
+ from os import rename
+ if not platform.isWindows():
+@@ -40,7 +40,7 @@ else:
+         def kill(pid, signal):
+             try:
+                 OpenProcess(0, 0, pid)
+-            except pywintypes.error, e:
++            except pywintypes.error as e:
+                 if e.args[0] == ERROR_ACCESS_DENIED:
+                     return
+                 elif e.args[0] == ERROR_INVALID_PARAMETER:
+@@ -70,7 +70,7 @@ else:
+     def readlink(filename):
+         try:
+             fObj = _open(os.path.join(filename,'symlink'), 'rb')
+-        except IOError, e:
++        except IOError as e:
+             if e.errno == errno.ENOENT or e.errno == errno.EIO:
+                 raise OSError(e.errno, None)
+             raise
+@@ -125,7 +125,7 @@ class FilesystemLock:
+         while True:
+             try:
+                 symlink(str(os.getpid()), self.name)
+-            except OSError, e:
++            except OSError as e:
+                 if _windows and e.errno in (errno.EACCES, errno.EIO):
+                     # The lock is in the middle of being deleted because we're
+                     # on Windows where lock removal isn't atomic.  Give up, we
+@@ -134,13 +134,13 @@ class FilesystemLock:
+                 if e.errno == errno.EEXIST:
+                     try:
+                         pid = readlink(self.name)
+-                    except OSError, e:
++                    except OSError as e:
+                         if e.errno == errno.ENOENT:
+                             # The lock has vanished, try to claim it in the
+                             # next iteration through the loop.
+                             continue
+                         raise
+-                    except IOError, e:
++                    except IOError as e:
+                         if _windows and e.errno == errno.EACCES:
+                             # The lock is in the middle of being
+                             # deleted because we're on Windows where
+@@ -152,13 +152,13 @@ class FilesystemLock:
+                     try:
+                         if kill is not None:
+                             kill(int(pid), 0)
+-                    except OSError, e:
++                    except OSError as e:
+                         if e.errno == errno.ESRCH:
+                             # The owner has vanished, try to claim it in the next
+                             # iteration through the loop.
+                             try:
+                                 rmlink(self.name)
+-                            except OSError, e:
++                            except OSError as e:
+                                 if e.errno == errno.ENOENT:
+                                     # Another process cleaned up the lock.
+                                     # Race them to acquire it in the next
+diff --git twisted/test/test_defer.py twisted/test/test_defer.py
+index da787db..1438d78 100644
+--- twisted/test/test_defer.py
++++ twisted/test/test_defer.py
+@@ -11,10 +11,12 @@ import warnings
+ import gc, traceback
+ import re
+ 
++from twisted.python import failure, log
+ from twisted.python.compat import _PY3
++from twisted.internet import defer, reactor
++from twisted.internet.task import Clock
+ from twisted.trial import unittest
+-from twisted.internet import defer
+-from twisted.python import failure, log
++
+ 
+ 
+ class GenericError(Exception):
+@@ -913,9 +915,9 @@ class DeferredTestCase(unittest.SynchronousTestCase, ImmediateFailureMixin):
+         d.addCallback(circularCallback)
+         d.callback("foo")
+ 
+-        warnings = self.flushWarnings([circularCallback])
+-        self.assertEqual(len(warnings), 1)
+-        warning = warnings[0]
++        warnings_ = self.flushWarnings([circularCallback])
++        self.assertEqual(len(warnings_), 1)
++        warning = warnings_[0]
+         self.assertEqual(warning['category'], DeprecationWarning)
+         pattern = "Callback returned the Deferred it was attached to"
+         self.assertTrue(
+@@ -2012,108 +2014,103 @@ class OtherPrimitives(unittest.SynchronousTestCase, ImmediateFailureMixin):
+         self.assertEqual(len(done), 1)
+ 
+ 
+-# Enable on Python 3 as part of #5960:
+-if not _PY3:
+-    from twisted.internet import reactor
+-    from twisted.internet.task import Clock
++class DeferredFilesystemLockTestCase(unittest.TestCase):
++    """
++    Test the behavior of L{DeferredFilesystemLock}
++    """
++
++    def setUp(self):
++        self.clock = Clock()
++        self.lock = defer.DeferredFilesystemLock(self.mktemp(),
++                                                 scheduler=self.clock)
++
+ 
+-    class DeferredFilesystemLockTestCase(unittest.TestCase):
++    def test_waitUntilLockedWithNoLock(self):
+         """
+-        Test the behavior of L{DeferredFilesystemLock}
++        Test that the lock can be acquired when no lock is held
+         """
++        d = self.lock.deferUntilLocked(timeout=1)
+ 
+-        def setUp(self):
+-            self.clock = Clock()
+-            self.lock = defer.DeferredFilesystemLock(self.mktemp(),
+-                                                     scheduler=self.clock)
+-
++        return d
+ 
+-        def test_waitUntilLockedWithNoLock(self):
+-            """
+-            Test that the lock can be acquired when no lock is held
+-            """
+-            d = self.lock.deferUntilLocked(timeout=1)
+ 
+-            return d
++    def test_waitUntilLockedWithTimeoutLocked(self):
++        """
++        Test that the lock can not be acquired when the lock is held
++        for longer than the timeout.
++        """
++        self.failUnless(self.lock.lock())
+ 
++        d = self.lock.deferUntilLocked(timeout=5.5)
++        self.assertFailure(d, defer.TimeoutError)
+ 
+-        def test_waitUntilLockedWithTimeoutLocked(self):
+-            """
+-            Test that the lock can not be acquired when the lock is held
+-            for longer than the timeout.
+-            """
+-            self.failUnless(self.lock.lock())
++        self.clock.pump([1] * 10)
+ 
+-            d = self.lock.deferUntilLocked(timeout=5.5)
+-            self.assertFailure(d, defer.TimeoutError)
++        return d
+ 
+-            self.clock.pump([1] * 10)
+ 
+-            return d
++    def test_waitUntilLockedWithTimeoutUnlocked(self):
++        """
++        Test that a lock can be acquired while a lock is held
++        but the lock is unlocked before our timeout.
++        """
++        def onTimeout(f):
++            f.trap(defer.TimeoutError)
++            self.fail("Should not have timed out")
+ 
++        self.failUnless(self.lock.lock())
+ 
+-        def test_waitUntilLockedWithTimeoutUnlocked(self):
+-            """
+-            Test that a lock can be acquired while a lock is held
+-            but the lock is unlocked before our timeout.
+-            """
+-            def onTimeout(f):
+-                f.trap(defer.TimeoutError)
+-                self.fail("Should not have timed out")
++        self.clock.callLater(1, self.lock.unlock)
++        d = self.lock.deferUntilLocked(timeout=10)
++        d.addErrback(onTimeout)
+ 
+-            self.failUnless(self.lock.lock())
++        self.clock.pump([1] * 10)
+ 
+-            self.clock.callLater(1, self.lock.unlock)
+-            d = self.lock.deferUntilLocked(timeout=10)
+-            d.addErrback(onTimeout)
++        return d
+ 
+-            self.clock.pump([1] * 10)
+ 
+-            return d
++    def test_defaultScheduler(self):
++        """
++        Test that the default scheduler is set up properly.
++        """
++        lock = defer.DeferredFilesystemLock(self.mktemp())
+ 
++        self.assertEqual(lock._scheduler, reactor)
+ 
+-        def test_defaultScheduler(self):
+-            """
+-            Test that the default scheduler is set up properly.
+-            """
+-            lock = defer.DeferredFilesystemLock(self.mktemp())
+ 
+-            self.assertEqual(lock._scheduler, reactor)
++    def test_concurrentUsage(self):
++        """
++        Test that an appropriate exception is raised when attempting
++        to use deferUntilLocked concurrently.
++        """
++        self.lock.lock()
++        self.clock.callLater(1, self.lock.unlock)
+ 
++        d = self.lock.deferUntilLocked()
++        d2 = self.lock.deferUntilLocked()
+ 
+-        def test_concurrentUsage(self):
+-            """
+-            Test that an appropriate exception is raised when attempting
+-            to use deferUntilLocked concurrently.
+-            """
+-            self.lock.lock()
+-            self.clock.callLater(1, self.lock.unlock)
++        self.assertFailure(d2, defer.AlreadyTryingToLockError)
+ 
+-            d = self.lock.deferUntilLocked()
+-            d2 = self.lock.deferUntilLocked()
++        self.clock.advance(1)
+ 
+-            self.assertFailure(d2, defer.AlreadyTryingToLockError)
++        return d
+ 
+-            self.clock.advance(1)
+ 
++    def test_multipleUsages(self):
++        """
++        Test that a DeferredFilesystemLock can be used multiple times
++        """
++        def lockAquired(ign):
++            self.lock.unlock()
++            d = self.lock.deferUntilLocked()
+             return d
+ 
++        self.lock.lock()
++        self.clock.callLater(1, self.lock.unlock)
+ 
+-        def test_multipleUsages(self):
+-            """
+-            Test that a DeferredFilesystemLock can be used multiple times
+-            """
+-            def lockAquired(ign):
+-                self.lock.unlock()
+-                d = self.lock.deferUntilLocked()
+-                return d
++        d = self.lock.deferUntilLocked()
++        d.addCallback(lockAquired)
+ 
+-            self.lock.lock()
+-            self.clock.callLater(1, self.lock.unlock)
++        self.clock.advance(1)
+ 
+-            d = self.lock.deferUntilLocked()
+-            d.addCallback(lockAquired)
+-
+-            self.clock.advance(1)
+-
+-            return d
++        return d
+diff --git twisted/topfiles/5960.feature twisted/topfiles/5960.feature
+new file mode 100644
+index 0000000..9b5d7f3
+--- /dev/null
++++ twisted/topfiles/5960.feature
+@@ -0,0 +1 @@
++Port twisted.python.lockfile to Python 3, enabling twisted.python.defer.DeferredFilesystemLock and tests.
+diff --git twisted/trial/util.py twisted/trial/util.py
+index a3103f0..3c8ed80 100644
+--- twisted/trial/util.py
++++ twisted/trial/util.py
+@@ -23,11 +23,11 @@ from __future__ import division, absolute_import, print_function
+ import sys
+ from random import randrange
+ 
+-from twisted.python.compat import _PY3
+ from twisted.internet import defer, utils, interfaces
+ from twisted.python.failure import Failure
+ from twisted.python import deprecate, versions
+ from twisted.python.filepath import FilePath
++from twisted.python.lockfile import FilesystemLock
+ 
+ __all__ = [
+     'DEFAULT_TIMEOUT_DURATION',
+@@ -157,7 +157,7 @@ class _Janitor(object):
+         reactor = self._getReactor()
+         if interfaces.IReactorThreads.providedBy(reactor):
+             if reactor.threadpool is not None:
+-                # Stop the threadpool now so that a new one is created. 
++                # Stop the threadpool now so that a new one is created.
+                 # This improves test isolation somewhat (although this is a
+                 # post class cleanup hook, so it's only isolating classes
+                 # from each other, not methods from each other).
+@@ -379,7 +379,6 @@ def _unusedTestDirectory(base):
+         same name until the lock is released, either explicitly or by this
+         process exiting.
+     """
+-    from twisted.python.lockfile import FilesystemLock
+     counter = 0
+     while True:
+         if counter:
+@@ -405,7 +404,3 @@ def _unusedTestDirectory(base):
+                 counter += 1
+             else:
+                 raise _WorkingDirectoryBusy()
+-
+-# Remove this, and move lockfile import, after ticket #5960 is resolved:
+-if _PY3:
+-    del _unusedTestDirectory

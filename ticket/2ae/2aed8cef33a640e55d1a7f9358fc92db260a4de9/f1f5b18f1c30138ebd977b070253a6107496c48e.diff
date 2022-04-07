@@ -1,0 +1,541 @@
+Index: twisted/protocols/ftp.py
+===================================================================
+--- twisted/protocols/ftp.py	(revision 18477)
++++ twisted/protocols/ftp.py	(working copy)
+@@ -1715,11 +1715,11 @@
+     def write(self, data):
+         self.transport.write(data)
+ 
+-    def registerProducer(self):
+-        pass
++    def registerProducer(self, producer, streaming):
++        self.transport.registerProducer(producer, streaming)
+ 
+     def unregisterProducer(self):
+-        pass
++        self.transport.unregisterProducer()
+ 
+     def finish(self):
+         self.transport.loseConnection()
+@@ -1962,6 +1962,8 @@
+ 
+     @ivar passive: See description in __init__.
+     """
++    connectFactory = reactor.connectTCP
++
+     def __init__(self, username='anonymous',
+                  password='twisted@twistedmatrix.com',
+                  passive=1):
+@@ -2044,7 +2046,7 @@
+                 host, port = decodeHostPort(response[-1][4:])
+ 
+                 f = _PassiveConnectionFactory(protocol)
+-                _mutable[0] = reactor.connectTCP(host, port, f)
++                _mutable[0] = self.connectFactory(host, port, f)
+ 
+             pasvCmd = FTPCommand('PASV')
+             self.queueCommand(pasvCmd)
+@@ -2330,8 +2332,8 @@
+ 
+     If I can't find the path, I return C{None}.
+     """
+-    match = re.search('".*"', response)
++    match = re.search('(".*")', response)
+     if match:
+-        return match.groups()[0]
++        return match.groups()[0][1:-1]
+     else:
+         return None
+Index: twisted/test/test_ftp.py
+===================================================================
+--- twisted/test/test_ftp.py	(revision 18477)
++++ twisted/test/test_ftp.py	(working copy)
+@@ -18,6 +18,7 @@
+ from twisted.internet import reactor, protocol, defer, error
+ from twisted.cred import portal, checkers, credentials
+ from twisted.python import failure
++from twisted.test import proto_helpers
+ 
+ from twisted.protocols import ftp, loopback
+ 
+@@ -591,6 +592,480 @@
+         self.failUnless(m, m)
+ 
+ 
++class FTPClientTestCase(unittest.TestCase):
++    """
++    Test advanced FTP client commandst.
++    """
++    def setUp(self):
++        """
++        Create a FTP client and connect it to fake transport.
++        """
++        self.client = ftp.FTPClient()
++        self.transport = proto_helpers.StringTransport()
++        self.client.makeConnection(self.transport)
++
++    def tearDown(self):
++        """
++        Clean the client.
++        """
++        self.client.connectionLost(error.ConnectionLost())
++
++    def _testLogin(self):
++        """
++        Test the login part.
++        """
++        self.assertEquals(self.transport.value(), '')
++        self.client.lineReceived(
++            '331 Guest login ok, type your email address as password.')
++        self.assertEquals(self.transport.value(), 'USER anonymous\r\n')
++        self.transport.clear()
++        self.client.lineReceived(
++            '230 Anonymous login ok, access restrictions apply.')
++        self.assertEquals(self.transport.value(), 'TYPE I\r\n')
++        self.transport.clear()
++        self.client.lineReceived('200 Type set to I.')
++
++    def testCDUP(self):
++        """
++        Test the CDUP command.
++        """
++        def cbCdup(res):
++            self.assertEquals(res[0], '250 Requested File Action Completed OK')
++        self._testLogin()
++        d = self.client.cdup().addCallback(cbCdup)
++        self.assertEquals(self.transport.value(), 'CDUP\r\n')
++        self.transport.clear()
++        self.client.lineReceived('250 Requested File Action Completed OK')
++        return d
++
++    def testFailedCDUP(self):
++        """
++        Test a failure in CDUP command.
++        """
++        self._testLogin()
++        d = self.client.cdup()
++        self.assertFailure(d, ftp.CommandFailed)
++        self.assertEquals(self.transport.value(), 'CDUP\r\n')
++        self.transport.clear()
++        self.client.lineReceived('550 ..: No such file or directory')
++        return d
++
++    def testPWD(self):
++        """
++        Test the PWD command.
++        """
++        def cbPwd(res):
++            self.assertEquals(ftp.parsePWDResponse(res[0]), "/bar/baz")
++        self._testLogin()
++        d = self.client.pwd().addCallback(cbPwd)
++        self.assertEquals(self.transport.value(), 'PWD\r\n')
++        self.client.lineReceived('257 "/bar/baz"')
++        return d
++
++    def testFailedPWD(self):
++        """
++        Test a failure in PWD command.
++        """
++        self._testLogin()
++        d = self.client.pwd()
++        self.assertFailure(d, ftp.CommandFailed)
++        self.assertEquals(self.transport.value(), 'PWD\r\n')
++        self.client.lineReceived('550 /bar/baz: No such file or directory')
++        return d
++
++    def testCWD(self):
++        """
++        Test the CWD command.
++        """
++        def cbCwd(res):
++            self.assertEquals(res[0], '250 Requested File Action Completed OK')
++        self._testLogin()
++        d = self.client.cwd("bar/foo").addCallback(cbCwd)
++        self.assertEquals(self.transport.value(), 'CWD bar/foo\r\n')
++        self.client.lineReceived('250 Requested File Action Completed OK')
++        return d
++
++    def testFailedCWD(self):
++        """
++        Test a failure in CWD command.
++        """
++        self._testLogin()
++        d = self.client.cwd("bar/foo")
++        self.assertFailure(d, ftp.CommandFailed)
++        self.assertEquals(self.transport.value(), 'CWD bar/foo\r\n')
++        self.client.lineReceived('550 bar/foo: No such file or directory')
++        return d
++
++    def testPassiveRETR(self):
++        """
++        Test the RETR command in passive mode: get a file and verify its
++        content.
++        """
++        def cbRetr(res, proto):
++            self.assertEquals(proto.buffer, 'x' * 1000)
++        def cbConnect(host, port, factory):
++            self.assertEquals(host, '127.0.0.1')
++            self.assertEquals(port, 12345)
++            proto = factory.buildProtocol((host, port))
++            proto.makeConnection(proto_helpers.StringTransport())
++            self.client.lineReceived(
++                '150 File status okay; about to open data connection.')
++            proto.dataReceived("x" * 1000)
++            proto.connectionLost(failure.Failure(error.ConnectionDone("")))
++        self.client.connectFactory = cbConnect
++        self._testLogin()
++        proto = _BufferingProtocol()
++        d = self.client.retrieveFile("spam", proto
++            ).addCallback(cbRetr, proto)
++        self.assertEquals(self.transport.value(), 'PASV\r\n')
++        self.transport.clear()
++        self.client.lineReceived('227 Entering Passive Mode (%s).' %
++            (ftp.encodeHostPort('127.0.0.1', 12345),))
++        self.assertEquals(self.transport.value(), 'RETR spam\r\n')
++        self.transport.clear()
++        self.client.lineReceived('226 Transfer Complete.')
++        return d
++    
++    def testRETR(self):
++        """
++        Test the RETR command in non-passive mode.
++        """
++        self.client.passive = False
++        def generatePort(portCmd):
++            portCmd.text = 'PORT %s' % (ftp.encodeHostPort('127.0.0.1', 9876),)
++            portCmd.protocol.makeConnection(proto_helpers.StringTransport())
++            portCmd.protocol.dataReceived("x" * 1000)
++            portCmd.protocol.connectionLost(
++                failure.Failure(error.ConnectionDone("")))
++        def cbRetr(res, proto):
++            self.assertEquals(proto.buffer, 'x' * 1000)
++        self.client.generatePortCommand = generatePort
++        self._testLogin()
++        proto = _BufferingProtocol()
++        d = self.client.retrieveFile("spam", proto
++            ).addCallback(cbRetr, proto)
++        self.assertEquals(self.transport.value(), 'PORT %s\r\n' %
++            (ftp.encodeHostPort('127.0.0.1', 9876),))
++        self.transport.clear()
++        self.client.lineReceived('200 PORT OK')
++        self.assertEquals(self.transport.value(), 'RETR spam\r\n')
++        self.transport.clear()
++        self.client.lineReceived('226 Transfer Complete.')
++        return d
++    
++    def testFailedRETR(self):
++        """
++        Try to RETR an unexisting file.
++        """
++        def cbConnect(host, port, factory):
++            self.assertEquals(host, '127.0.0.1')
++            self.assertEquals(port, 12345)
++            proto = factory.buildProtocol((host, port))
++            proto.makeConnection(proto_helpers.StringTransport())
++            self.client.lineReceived(
++                '150 File status okay; about to open data connection.')
++            proto.connectionLost(failure.Failure(error.ConnectionDone("")))
++        self.client.connectFactory = cbConnect
++        self._testLogin()
++        proto = _BufferingProtocol()
++        d = self.client.retrieveFile("spam", proto)
++        self.assertFailure(d, ftp.CommandFailed)
++        self.assertEquals(self.transport.value(), 'PASV\r\n')
++        self.transport.clear()
++        self.client.lineReceived('227 Entering Passive Mode (%s).' %
++            (ftp.encodeHostPort('127.0.0.1', 12345),))
++        self.assertEquals(self.transport.value(), 'RETR spam\r\n')
++        self.transport.clear()
++        self.client.lineReceived('550 spam: No such file or directory')
++        return d
++ 
++    def testPassiveSTOR(self):
++        """
++        Test the STOR command: send a file and verify its content.
++        """
++        tr = proto_helpers.StringTransport()
++        def cbStore(sender):
++            self.client.lineReceived(
++                '150 File status okay; about to open data connection.')
++            sender.transport.write("x" * 1000)
++            sender.finish()
++            sender.connectionLost(failure.Failure(error.ConnectionDone("")))
++        def cbFinish(ign):
++            self.assertEquals(tr.value(), "x" * 1000)
++        def cbConnect(host, port, factory):
++            self.assertEquals(host, '127.0.0.1')
++            self.assertEquals(port, 12345)
++            proto = factory.buildProtocol((host, port))
++            proto.makeConnection(tr)
++        self.client.connectFactory = cbConnect
++        self._testLogin()
++        d1, d2 = self.client.storeFile("spam")
++        d1.addCallback(cbStore)
++        d2.addCallback(cbFinish)
++        self.assertEquals(self.transport.value(), 'PASV\r\n')
++        self.transport.clear()
++        self.client.lineReceived('227 Entering Passive Mode (%s).' %
++            (ftp.encodeHostPort('127.0.0.1', 12345),))
++        self.assertEquals(self.transport.value(), 'STOR spam\r\n')
++        self.transport.clear()
++        self.client.lineReceived('226 Transfer Complete.')
++        return defer.gatherResults([d1, d2])
++
++    def testFailedSTOR(self):
++        """
++        Test a failure in the STOR command.
++        """
++        tr = proto_helpers.StringTransport()
++        def cbStore(sender):
++            self.client.lineReceived(
++                '150 File status okay; about to open data connection.')
++            sender.transport.write("x" * 1000)
++            sender.finish()
++            sender.connectionLost(failure.Failure(error.ConnectionDone("")))
++        def cbConnect(host, port, factory):
++            self.assertEquals(host, '127.0.0.1')
++            self.assertEquals(port, 12345)
++            proto = factory.buildProtocol((host, port))
++            proto.makeConnection(tr)
++        self.client.connectFactory = cbConnect
++        self._testLogin()
++        d1, d2 = self.client.storeFile("spam")
++        d1.addCallback(cbStore)
++        self.assertFailure(d2, ftp.CommandFailed)
++        self.assertEquals(self.transport.value(), 'PASV\r\n')
++        self.transport.clear()
++        self.client.lineReceived('227 Entering Passive Mode (%s).' %
++            (ftp.encodeHostPort('127.0.0.1', 12345),))
++        self.assertEquals(self.transport.value(), 'STOR spam\r\n')
++        self.transport.clear()
++        self.client.lineReceived(
++            '426 Transfer aborted.  Data connection closed.')
++        return defer.gatherResults([d1, d2])
++
++    def testSTOR(self):
++        """
++        Test the STOR command in non-passive mode.
++        """
++        tr = proto_helpers.StringTransport()
++        self.client.passive = False
++        def generatePort(portCmd):
++            portCmd.text = 'PORT %s' % ftp.encodeHostPort('127.0.0.1', 9876)
++            portCmd.protocol.makeConnection(tr)
++        def cbStore(sender):
++            self.assertEquals(self.transport.value(), 'PORT %s\r\n' %
++                (ftp.encodeHostPort('127.0.0.1', 9876),))
++            self.transport.clear()
++            self.client.lineReceived('200 PORT OK')
++            self.assertEquals(self.transport.value(), 'STOR spam\r\n')
++            self.transport.clear()
++            self.client.lineReceived(
++                '150 File status okay; about to open data connection.')
++            sender.transport.write("x" * 1000)
++            sender.finish()
++            sender.connectionLost(failure.Failure(error.ConnectionDone("")))
++            self.client.lineReceived('226 Transfer Complete.')
++        def cbFinish(ign):
++            self.assertEquals(tr.value(), "x" * 1000)
++        self.client.generatePortCommand = generatePort
++        self._testLogin()
++        d1, d2 = self.client.storeFile("spam")
++        d1.addCallback(cbStore)
++        d2.addCallback(cbFinish)
++        return defer.gatherResults([d1, d2])
++
++    def testPassiveLIST(self):
++        """
++        Test the LIST command.
++        """
++        def cbList(res, fileList):
++            fls = [f["filename"] for f in fileList.files]
++            expected = ["foo", "bar", "baz"]
++            expected.sort()
++            fls.sort()
++            self.assertEquals(fls, expected)
++        def cbConnect(host, port, factory):
++            self.assertEquals(host, '127.0.0.1')
++            self.assertEquals(port, 12345)
++            proto = factory.buildProtocol((host, port))
++            proto.makeConnection(proto_helpers.StringTransport())
++            self.client.lineReceived(
++                '150 File status okay; about to open data connection.')
++            sending = [
++                '-rw-r--r--    0 spam      egg      100 Oct 10 2006 foo\r\n',
++                '-rw-r--r--    3 spam      egg      100 Oct 10 2006 bar\r\n',
++                '-rw-r--r--    4 spam      egg      100 Oct 10 2006 baz\r\n',
++            ]
++            for i in sending:
++                proto.dataReceived(i)
++            proto.connectionLost(failure.Failure(error.ConnectionDone("")))
++        self.client.connectFactory = cbConnect
++        self._testLogin()
++        fileList = ftp.FTPFileListProtocol()
++        d = self.client.list('foo/bar', fileList).addCallback(cbList, fileList)
++        self.assertEquals(self.transport.value(), 'PASV\r\n')
++        self.transport.clear()
++        self.client.lineReceived('227 Entering Passive Mode (%s).' %
++            (ftp.encodeHostPort('127.0.0.1', 12345),))
++        self.assertEquals(self.transport.value(), 'LIST foo/bar\r\n')
++        self.client.lineReceived('226 Transfer Complete.')
++        return d
++
++    def testLIST(self):
++        """
++        Test the LIST command in non-passive mode.
++        """
++        self.client.passive = False
++        def generatePort(portCmd):
++            portCmd.text = 'PORT %s' % (ftp.encodeHostPort('127.0.0.1', 9876),)
++            portCmd.protocol.makeConnection(proto_helpers.StringTransport())
++            self.client.lineReceived(
++                '150 File status okay; about to open data connection.')
++            sending = [
++                '-rw-r--r--    0 spam      egg      100 Oct 10 2006 foo\r\n',
++                '-rw-r--r--    3 spam      egg      100 Oct 10 2006 bar\r\n',
++                '-rw-r--r--    4 spam      egg      100 Oct 10 2006 baz\r\n',
++            ]
++            for i in sending:
++                portCmd.protocol.dataReceived(i)
++            portCmd.protocol.connectionLost(
++                failure.Failure(error.ConnectionDone("")))
++        def cbList(res, fileList):
++            fls = [f["filename"] for f in fileList.files]
++            expected = ["foo", "bar", "baz"]
++            expected.sort()
++            fls.sort()
++            self.assertEquals(fls, expected)
++        self.client.generatePortCommand = generatePort
++        self._testLogin()
++        fileList = ftp.FTPFileListProtocol()
++        d = self.client.list('foo/bar', fileList).addCallback(cbList, fileList)
++        self.assertEquals(self.transport.value(), 'PORT %s\r\n' %
++            (ftp.encodeHostPort('127.0.0.1', 9876),))
++        self.transport.clear()
++        self.client.lineReceived('200 PORT OK')
++        self.assertEquals(self.transport.value(), 'LIST foo/bar\r\n')
++        self.transport.clear()
++        self.client.lineReceived('226 Transfer Complete.')
++        return d
++
++    def testFailedLIST(self):
++        """
++        Test a failure in LIST command.
++        """
++        def cbConnect(host, port, factory):
++            self.assertEquals(host, '127.0.0.1')
++            self.assertEquals(port, 12345)
++            proto = factory.buildProtocol((host, port))
++            proto.makeConnection(proto_helpers.StringTransport())
++            self.client.lineReceived(
++                '150 File status okay; about to open data connection.')
++            proto.connectionLost(failure.Failure(error.ConnectionDone("")))
++        self.client.connectFactory = cbConnect
++        self._testLogin()
++        fileList = ftp.FTPFileListProtocol()
++        d = self.client.list('foo/bar', fileList)
++        self.assertFailure(d, ftp.CommandFailed)
++        self.assertEquals(self.transport.value(), 'PASV\r\n')
++        self.transport.clear()
++        self.client.lineReceived('227 Entering Passive Mode (%s).' %
++            (ftp.encodeHostPort('127.0.0.1', 12345),))
++        self.assertEquals(self.transport.value(), 'LIST foo/bar\r\n')
++        self.client.lineReceived('550 foo/bar: No such file or directory')
++        return d
++
++    def testNLST(self):
++        """
++        Test the NLST command in non-passive mode.
++        """
++        self.client.passive = False
++        def generatePort(portCmd):
++            portCmd.text = 'PORT %s' % (ftp.encodeHostPort('127.0.0.1', 9876),)
++            portCmd.protocol.makeConnection(proto_helpers.StringTransport())
++            self.client.lineReceived(
++                '150 File status okay; about to open data connection.')
++            portCmd.protocol.dataReceived('foo\r\n')
++            portCmd.protocol.dataReceived('bar\r\n')
++            portCmd.protocol.dataReceived('baz\r\n')
++            portCmd.protocol.connectionLost(
++                failure.Failure(error.ConnectionDone("")))
++        def cbList(res, proto):
++            fls = proto.buffer.splitlines()
++            expected = ["foo", "bar", "baz"]
++            expected.sort()
++            fls.sort()
++            self.assertEquals(fls, expected)
++        self.client.generatePortCommand = generatePort
++        self._testLogin()
++        lstproto = _BufferingProtocol()
++        d = self.client.nlst('foo/bar', lstproto).addCallback(cbList, lstproto)
++        self.assertEquals(self.transport.value(), 'PORT %s\r\n' %
++            (ftp.encodeHostPort('127.0.0.1', 9876),))
++        self.transport.clear()
++        self.client.lineReceived('200 PORT OK')
++        self.assertEquals(self.transport.value(), 'NLST foo/bar\r\n')
++        self.client.lineReceived('226 Transfer Complete.')
++        return d
++    
++    def testPassiveNLST(self):
++        """
++        Test the NLST command.
++        """
++        def cbList(res, proto):
++            fls = proto.buffer.splitlines()
++            expected = ["foo", "bar", "baz"]
++            expected.sort()
++            fls.sort()
++            self.assertEquals(fls, expected)
++        def cbConnect(host, port, factory):
++            self.assertEquals(host, '127.0.0.1')
++            self.assertEquals(port, 12345)
++            proto = factory.buildProtocol((host, port))
++            proto.makeConnection(proto_helpers.StringTransport())
++            self.client.lineReceived(
++                '150 File status okay; about to open data connection.')
++            proto.dataReceived('foo\r\n')
++            proto.dataReceived('bar\r\n')
++            proto.dataReceived('baz\r\n')
++            proto.connectionLost(failure.Failure(error.ConnectionDone("")))
++        self.client.connectFactory = cbConnect
++        self._testLogin()
++        lstproto = _BufferingProtocol()
++        d = self.client.nlst('foo/bar', lstproto).addCallback(cbList, lstproto)
++        self.assertEquals(self.transport.value(), 'PASV\r\n')
++        self.transport.clear()
++        self.client.lineReceived('227 Entering Passive Mode (%s).' %
++            (ftp.encodeHostPort('127.0.0.1', 12345),))
++        self.assertEquals(self.transport.value(), 'NLST foo/bar\r\n')
++        self.client.lineReceived('226 Transfer Complete.')
++        return d
++
++    def testFailedNLST(self):
++        """
++        Test a failure in NLST command.
++        """
++        tr = proto_helpers.StringTransport()
++        def cbConnect(host, port, factory):
++            self.assertEquals(host, '127.0.0.1')
++            self.assertEquals(port, 12345)
++            proto = factory.buildProtocol((host, port))
++            proto.makeConnection(tr)
++            self.client.lineReceived(
++                '150 File status okay; about to open data connection.')
++            proto.connectionLost(failure.Failure(error.ConnectionDone("")))
++        self.client.connectFactory = cbConnect
++        self._testLogin()
++        lstproto = _BufferingProtocol()
++        d = self.client.nlst('foo/bar', lstproto)
++        self.assertFailure(d, ftp.CommandFailed)
++        self.assertEquals(self.transport.value(), 'PASV\r\n')
++        self.transport.clear()
++        self.client.lineReceived('227 Entering Passive Mode (%s).' %
++            (ftp.encodeHostPort('127.0.0.1', 12345),))
++        self.assertEquals(self.transport.value(), 'NLST foo/bar\r\n')
++        self.client.lineReceived('550 foo/bar: No such file or directory')
++        return d
++
++
+ class DummyTransport:
+     def write(self, bytes):
+         pass

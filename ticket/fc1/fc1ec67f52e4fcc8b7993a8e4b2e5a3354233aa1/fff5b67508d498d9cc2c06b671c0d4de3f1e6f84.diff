@@ -1,0 +1,184 @@
+Index: twisted/words/test/test_irc.py
+===================================================================
+--- twisted/words/test/test_irc.py	(revision 27155)
++++ twisted/words/test/test_irc.py	(working copy)
+@@ -170,12 +170,14 @@
+     def test_parsePrefixParam(self):
+         """
+         L{ServerSupportedFeatures._parsePrefixParam} parses the ISUPPORT PREFIX
+-        parameter into a mapping from modes to prefix symbols, or returns
+-        C{None} if there is no parseable prefix information.
++        parameter into a mapping from modes to prefix symbols, returns
++        C{None} if there is no parseable prefix parameter or raises
++        C{ValueError} if the prefix parameter is malformed.
+         """
+-        self.assertEquals(irc.ServerSupportedFeatures._parsePrefixParam(''), None)
+-        self.assertEquals(irc.ServerSupportedFeatures._parsePrefixParam('hello'), None)
+-        self.assertEquals(irc.ServerSupportedFeatures._parsePrefixParam('(ov)@+'),
++        _parsePrefixParam = irc.ServerSupportedFeatures._parsePrefixParam
++        self.assertEquals(_parsePrefixParam(''), None)
++        self.assertRaises(ValueError, _parsePrefixParam, 'hello')
++        self.assertEquals(_parsePrefixParam('(ov)@+'),
+                           {'o': ('@', 0),
+                            'v': ('+', 1)})
+ 
+@@ -209,16 +211,28 @@
+         supported.parse(['-INVEX'])
+ 
+ 
++    def _parse(self, features):
++        """
++        Parse all specified features according to the ISUPPORT specifications.
++
++        @type features: C{list} of C{(featureName, value)}
++        @param features: Feature names and values to parse
++
++        @rtype: L{irc.ServerSupportedFeatures}
++        """
++        supported = irc.ServerSupportedFeatures()
++        features = ['%s=%s' % (name, value or '')
++                    for name, value in features]
++        supported.parse(features)
++        return supported
++
++
+     def _parseFeature(self, name, value=None):
+         """
+         Parse a feature, with the given name and value, according to the
+         ISUPPORT specifications and return the parsed value.
+         """
+-        supported = irc.ServerSupportedFeatures()
+-        feature = name
+-        if value is not None:
+-            feature += '=%s' % (value,)
+-        supported.parse([feature])
++        supported = self._parse([(name, value)])
+         return supported.getFeature(name)
+ 
+ 
+@@ -237,6 +251,22 @@
+             42)
+ 
+ 
++    def _testFeatureDefault(self, name, features=None):
++        """
++        Features known to have default values are reported as being present by
++        L{irc.ServerSupportedFeatures.hasFeature}, and their value defaults
++        correctly, when they don't appear in an ISUPPORT message.
++        """
++        default = irc.ServerSupportedFeatures()._features[name]
++
++        if features is None:
++            features = [('DEFINITELY_NOT', 'a_feature')]
++
++        supported = self._parse(features)
++        self.assertTrue(supported.hasFeature(name))
++        self.assertEquals(supported.getFeature(name), default)
++
++
+     def test_support_CHANMODES(self):
+         """
+         The CHANMODES ISUPPORT parameter is parsed into a C{dict} giving the
+@@ -354,6 +384,8 @@
+         The CHANTYPES support parameter is parsed into a tuple of
+         valid channel prefix characters.
+         """
++        self._testFeatureDefault('CHANTYPES')
++
+         self.assertEquals(
+             self._parseFeature('CHANTYPES', '#&%'),
+             ('#', '&', '%'))
+@@ -372,13 +404,13 @@
+         The PREFIX support parameter is parsed into a dictionary mapping
+         modes to two-tuples of status symbol and priority.
+         """
++        self._testFeatureDefault('PREFIX')
++        self._testFeatureDefault('PREFIX', [('PREFIX', 'hello')])
++
+         self.assertEquals(
+             self._parseFeature('PREFIX', None),
+             None)
+         self.assertEquals(
+-            self._parseFeature('PREFIX', 'hello'),
+-            None)
+-        self.assertEquals(
+             self._parseFeature('PREFIX', '(ohv)@%+'),
+             {'o': ('@', 0),
+              'h': ('%', 1),
+@@ -398,7 +430,32 @@
+         self._testIntOrDefaultFeature('TOPICLEN')
+ 
+ 
++    def test_support_MODES(self):
++        """
++        The MODES support parameter is parsed into an integer value
++        indicating the maximum number of "variable" modes (defined as being
++        modes from C{addressModes}, C{param} or C{setParam} categories for
++        the C{CHANMODES} ISUPPORT parameter) which may by set on a channel
++        by a single MODE command from a client.
++        """
++        self._testIntOrDefaultFeature('MODES')
+ 
++
++    def test_support_EXCEPTS(self):
++        """
++        The EXCEPTS support parameter is parsed into the mode character
++        to be used for "ban exception" modes. If no parameter is specified
++        then the character C{e} is assumed.
++        """
++        self.assertEquals(
++            self._parseFeature('EXCEPTS', 'Z'),
++            'Z')
++        self.assertEquals(
++            self._parseFeature('EXCEPTS'),
++            'e')
++
++
++
+ class IRCClientWithoutLogin(irc.IRCClient):
+     performLogin = 0
+ 
+Index: twisted/words/protocols/irc.py
+===================================================================
+--- twisted/words/protocols/irc.py	(revision 27155)
++++ twisted/words/protocols/irc.py	(working copy)
+@@ -551,7 +551,7 @@
+     def __init__(self):
+         self._features = {
+             'CHANNELLEN': 200,
+-            'CHANTYPES': '#&',
++            'CHANTYPES': tuple('#&'),
+             'MODES': 3,
+             'NICKLEN': 9,
+             'PREFIX': self._parsePrefixParam('(ov)@+')}
+@@ -648,7 +648,7 @@
+         if not prefix:
+             return None
+         if prefix[0] != '(' and ')' not in prefix:
+-            return None
++            raise ValueError('Malformed PREFIX parameter')
+         modes, symbols = prefix.split(')', 1)
+         symbols = zip(symbols, xrange(len(symbols)))
+         modes = modes[1:]
+@@ -825,7 +825,10 @@
+         """
+         Mapping of channel modes that clients may have to status flags.
+         """
+-        return self._parsePrefixParam(params[0])
++        try:
++            return self._parsePrefixParam(params[0])
++        except:
++            return self.getFeature('PREFIX')
+ 
+ 
+     def isupport_SAFELIST(self, params):
+@@ -1781,8 +1784,8 @@
+ 
+     def irc_RPL_ISUPPORT(self, prefix, params):
+         args = params[1:-1]
++        self.supported.parse(args)
+         self.isupport(args)
+-        self.supported.parse(args)
+ 
+     def irc_RPL_LUSERCLIENT(self, prefix, params):
+         self.luserClient(params[1])

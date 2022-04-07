@@ -1,0 +1,269 @@
+Index: twisted/words/test/test_irc_service.py
+===================================================================
+--- twisted/words/test/test_irc_service.py	(revision 27352)
++++ twisted/words/test/test_irc_service.py	(working copy)
+@@ -21,15 +21,23 @@
+         Sets up a Realm, Portal, Factory, IRCUser, Transport, and Connection
+         for our tests.
+         """
+-        self.wordsRealm = InMemoryWordsRealm("example.com")
++        self.hostname = 'example.com'
++        self.wordsRealm = InMemoryWordsRealm(self.hostname)
+         self.portal = portal.Portal(self.wordsRealm,
+-            [checkers.InMemoryUsernamePasswordDatabaseDontUse(john="pass")])
++            [checkers.InMemoryUsernamePasswordDatabaseDontUse(
++                john="pass",
++                jane="pass")])
+         self.factory = IRCFactory(self.wordsRealm, self.portal)
++
+         self.ircUser = self.factory.buildProtocol(None)
+         self.stringTransport = proto_helpers.StringTransport()
+         self.ircUser.makeConnection(self.stringTransport)
+ 
++        self.ircUser2 = self.factory.buildProtocol(None)
++        self.stringTransport2 = proto_helpers.StringTransport()
++        self.ircUser2.makeConnection(self.stringTransport2)
+ 
++
+     def test_sendMessage(self):
+         """
+         Sending a message to a user after they have sent NICK, but before they
+@@ -38,28 +46,28 @@
+         self.ircUser.irc_NICK("", ["mynick"])
+         self.stringTransport.clear()
+         self.ircUser.sendMessage("foo")
+-        self.assertEquals(":example.com foo mynick\r\n",
++        self.assertEquals(":%s foo mynick\r\n" % (self.hostname,),
+                           self.stringTransport.value())
+ 
+ 
+-    def response(self):
++    def response(self, ircUser):
+         """
+         Grabs our responses and then clears the transport
+         """
+-        response = self.ircUser.transport.value().splitlines()
+-        self.ircUser.transport.clear()
++        response = ircUser.transport.value().splitlines()
++        ircUser.transport.clear()
+         return map(irc.parsemsg, response)
+ 
+ 
+     def scanResponse(self, response, messageType):
+         """
+         Gets messages out of a response
+-        
++
+         @param response: The parsed IRC messages of the response, as returned
+         by L{IRCServiceTestCase.response}
+-        
++
+         @param messageType: The string type of the desired messages.
+-        
++
+         @return: An iterator which yields 2-tuples of C{(index, ircMessage)}
+         """
+         for n, message in enumerate(response):
+@@ -74,13 +82,13 @@
+         Pidgin) before a connection is considered to be fully established.
+         """
+         self.ircUser.irc_NICK("", ["mynick"])
+-        response = self.response()
++        response = self.response(self.ircUser)
+         start = list(self.scanResponse(response, irc.RPL_MOTDSTART))
+         end = list(self.scanResponse(response, irc.RPL_ENDOFMOTD))
+         self.assertEquals(start,
+-            [(0, ('example.com', '375', ['mynick', '- example.com Message of the Day - ']))])
++            [(0, (self.hostname, '375', ['mynick', '- example.com Message of the Day - ']))])
+         self.assertEquals(end,
+-            [(1, ('example.com', '376', ['mynick', 'End of /MOTD command.']))])
++            [(1, (self.hostname, '376', ['mynick', 'End of /MOTD command.']))])
+ 
+ 
+     def test_fullLogin(self):
+@@ -92,19 +100,75 @@
+         self.ircUser.irc_PASS("", ["pass"])
+         self.ircUser.irc_NICK("", ["john"])
+ 
+-        version = ('Your host is example.com, running version %s' %
+-            (self.factory._serverInfo["serviceVersion"],))
++        version = ('Your host is %s, running version %s' %
++            (self.hostname, self.factory._serverInfo["serviceVersion"],))
+ 
+         creation = ('This server was created on %s' %
+             (self.factory._serverInfo["creationDate"],))
+ 
+-        self.assertEquals(self.response(),
+-            [('example.com', '375',
++        self.assertEquals(self.response(self.ircUser),
++            [(self.hostname, '375',
+               ['john', '- example.com Message of the Day - ']),
+-             ('example.com', '376', ['john', 'End of /MOTD command.']),
+-             ('example.com', '001', ['john', 'connected to Twisted IRC']),
+-             ('example.com', '002', ['john', version]),
+-             ('example.com', '003', ['john', creation]),
+-             ('example.com', '004',
+-              ['john', 'example.com', self.factory._serverInfo["serviceVersion"],
++             (self.hostname, '376', ['john', 'End of /MOTD command.']),
++             (self.hostname, '001', ['john', 'connected to Twisted IRC']),
++             (self.hostname, '002', ['john', version]),
++             (self.hostname, '003', ['john', creation]),
++             (self.hostname, '004',
++              ['john', self.hostname, self.factory._serverInfo["serviceVersion"],
+                'w', 'n'])])
++
++
++    def test_awayMessage(self):
++        '''
++        Receiving AWAY <msg> should put the user into the AWAY state.
++        PRIVMSG commands directed at that user should not be delivered; instead,
++        a RPL_AWAY response with the message should be returned. Also check for
++        RPL_NOWAWAY and RPL_UNAWAY responses to the AWAY command.
++        '''
++
++        # First, login both clients
++        self.ircUser.irc_USER('', ['john doe'])
++        self.ircUser.irc_PASS('', ['pass'])
++        self.ircUser.irc_NICK('', ['john'])
++        self.response(self.ircUser) # just dump these responses
++
++        self.ircUser2.irc_USER('', ['jane doe'])
++        self.ircUser2.irc_PASS('', ['pass'])
++        self.ircUser2.irc_NICK('', ['jane'])
++        self.response(self.ircUser2) # just dump these responses
++
++        # user2 tries to msg user1
++        self.ircUser2.irc_PRIVMSG('', ['john', 'Are you there?'])
++        self.assertEquals(self.response(self.ircUser2), [])
++
++        # user1 gets the message
++        self.assertEquals(self.response(self.ircUser),
++            [('jane!jane@%s' % (self.hostname,), 'PRIVMSG',
++                ['john', 'Are you there?'])])
++
++        # set user1 away
++        self.ircUser.irc_AWAY('', ['I am away.'])
++        self.assertEquals(self.response(self.ircUser),
++            [(self.hostname, irc.RPL_NOWAWAY,
++                ['john', 'You have been marked as being away'])])
++
++        # user2 tries to msg user1
++        self.ircUser2.irc_PRIVMSG('', ['john', 'Are you there?'])
++        self.assertEquals(self.response(self.ircUser2),
++            [(self.hostname, irc.RPL_AWAY,
++                ['jane', 'I am away.'])])
++
++        # user1 comes back
++        self.ircUser.irc_AWAY('', [])
++        self.assertEquals(self.response(self.ircUser),
++            [(self.hostname, irc.RPL_UNAWAY,
++                ['john', 'You are no longer marked as being away'])])
++
++        # user2 tries to msg user1
++        self.ircUser2.irc_PRIVMSG('', ['john', 'Are you there?'])
++        self.assertEquals(self.response(self.ircUser2), [])
++
++        # user1 gets the message
++        self.assertEquals(self.response(self.ircUser),
++            [('jane!jane@%s' % (self.hostname,), 'PRIVMSG',
++                ['john', 'Are you there?'])])
+Index: twisted/words/service.py
+===================================================================
+--- twisted/words/service.py	(revision 27352)
++++ twisted/words/service.py	(working copy)
+@@ -1,5 +1,5 @@
+ # -*- test-case-name: twisted.words.test.test_service -*-
+-# Copyright (c) 2001-2008 Twisted Matrix Laboratories.
++# Copyright (c) 2001-2009 Twisted Matrix Laboratories.
+ # See LICENSE for details.
+ 
+ """
+@@ -129,6 +129,22 @@
+ 
+ 
+ class User(object):
++    """
++    Object representing a user's avatar
++
++    @ivar realm: The L{IRealm} this user is logged into
++    @type realm: L{IRealm}
++    @ivar mind: The L{IChatClient} object that handles this user's connection
++    @type mind: L{IChatClient}
++    @ivar name: This user's name
++    @type name: C{str}
++    @ivar groups: The L{Group}s this user is a member of
++    @type groups: C{list} of C{str}
++    @ivar lastMessage: Time (time.time()) this user's last message was sent
++    @type lastMessage: C{float}
++    @ivar awayMessage: This user's away message or C{None} if not away
++    @type awayMessage: C{str} or C{NoneType}
++    """
+     implements(iwords.IUser)
+ 
+     realm = None
+@@ -138,6 +154,7 @@
+         self.name = name
+         self.groups = []
+         self.lastMessage = time()
++        self.awayMessage = None
+ 
+ 
+     def loggedIn(self, realm, mind):
+@@ -247,11 +264,15 @@
+             recipientName = recipient.name
+ 
+         text = message.get('text', '<an unrepresentable message>')
+-        for L in text.splitlines():
+-            self.privmsg(
+-                '%s!%s@%s' % (sender.name, sender.name, self.hostname),
+-                recipientName,
+-                L)
++        away = recipient.avatar.awayMessage
++        if away:
++            sender.sendMessage(irc.RPL_AWAY, ':' + away)
++        else:
++            for L in text.splitlines():
++                self.privmsg(
++                    '%s!%s@%s' % (sender.name, sender.name, self.hostname),
++                    recipientName,
++                    L)
+ 
+ 
+     def groupMetaUpdate(self, group, meta):
+@@ -860,6 +881,27 @@
+         self.realm.lookupUser(user).addCallbacks(cbUser, ebUser)
+ 
+ 
++    def irc_AWAY(self, prefix, params):
++        """
++        Away status
++
++        @param prefix: The prefix substring of the line received.
++        @type prefix: C{str}
++        @param params: Parameters to this command.
++            "AWAY [message]"
++            sets away when given a message, unaway when no parameter.
++        @type params: C{list} of C{str}
++        """
++        if len(params) > 0:
++            self.avatar.awayMessage = params[-1]
++            self.sendMessage(irc.RPL_NOWAWAY,
++                ':You have been marked as being away')
++        else:
++            self.avatar.awayMessage = None
++            self.sendMessage(irc.RPL_UNAWAY,
++                ':You are no longer marked as being away')
++
++
+     # Unsupported commands, here for legacy compatibility
+     def irc_OPER(self, prefix, params):
+         """Oper message
+@@ -872,7 +914,7 @@
+ class IRCFactory(protocol.ServerFactory):
+     """
+     IRC server that creates instances of the L{IRCUser} protocol.
+-    
++
+     @ivar _serverInfo: A dictionary mapping:
+         "serviceName" to the name of the server,
+         "serviceVersion" to the copyright version,

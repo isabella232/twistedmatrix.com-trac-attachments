@@ -1,0 +1,214 @@
+Index: twisted/internet/fdesc.py
+===================================================================
+--- twisted/internet/fdesc.py	(revision 35633)
++++ twisted/internet/fdesc.py	(working copy)
+@@ -16,8 +16,8 @@
+ 
+ # twisted imports
+ from twisted.internet.main import CONNECTION_LOST, CONNECTION_DONE
+-from twisted.python.runtime import platformType
+ 
++
+ def setNonBlocking(fd):
+     """
+     Make a file descriptor non-blocking.
+@@ -84,7 +84,7 @@
+     """
+     try:
+         output = os.read(fd, 8192)
+-    except (OSError, IOError), ioe:
++    except (OSError, IOError) as ioe:
+         if ioe.args[0] in (errno.EAGAIN, errno.EINTR):
+             return
+         else:
+@@ -109,7 +109,7 @@
+     """
+     try:
+         return os.write(fd, data)
+-    except (OSError, IOError), io:
++    except (OSError, IOError) as io:
+         if io.errno in (errno.EAGAIN, errno.EINTR):
+             return 0
+         return CONNECTION_LOST
+Index: twisted/test/test_fdesc.py
+===================================================================
+--- twisted/test/test_fdesc.py	(revision 35633)
++++ twisted/test/test_fdesc.py	(working copy)
+@@ -15,12 +15,43 @@
+ else:
+     from twisted.internet import fdesc
+ 
+-from twisted.python.util import untilConcludes
++from twisted.python._utilpy3 import untilConcludes
+ from twisted.trial import unittest
+ 
+ 
+-class ReadWriteTestCase(unittest.TestCase):
++
++class NonBlockingTestCase(unittest.SynchronousTestCase):
+     """
++    Tests for L{fdesc.setNonBlocking} and L{fdesc.setBlocking}.
++    """
++
++    def test_setNonBlocking(self):
++        """
++        L{fdesc.setNonBlocking} sets a file descriptor to non-blocking.
++        """
++        r, w = os.pipe()
++        self.addCleanup(os.close, r)
++        self.addCleanup(os.close, w)
++        self.assertFalse(fcntl.fcntl(r, fcntl.F_GETFL) & os.O_NONBLOCK)
++        fdesc.setNonBlocking(r)
++        self.assertTrue(fcntl.fcntl(r, fcntl.F_GETFL) & os.O_NONBLOCK)
++
++
++    def test_setBlocking(self):
++        """
++        L{fdesc.setBlocking} sets a file descriptor to blocking.
++        """
++        r, w = os.pipe()
++        self.addCleanup(os.close, r)
++        self.addCleanup(os.close, w)
++        fdesc.setNonBlocking(r)
++        fdesc.setBlocking(r)
++        self.assertFalse(fcntl.fcntl(r, fcntl.F_GETFL) & os.O_NONBLOCK)
++
++
++
++class ReadWriteTestCase(unittest.SynchronousTestCase):
++    """
+     Tests for fdesc.readFromFD, fdesc.writeToFD.
+     """
+ 
+@@ -64,7 +95,7 @@
+             if l:
+                 return l[0]
+             else:
+-                return ""
++                return b""
+         else:
+             return res
+ 
+@@ -74,11 +105,11 @@
+         Test that the number of bytes L{fdesc.writeToFD} reports as written
+         with its return value are seen by L{fdesc.readFromFD}.
+         """
+-        n = self.write("hello")
++        n = self.write(b"hello")
+         self.failUnless(n > 0)
+         s = self.read()
+         self.assertEqual(len(s), n)
+-        self.assertEqual("hello"[:n], s)
++        self.assertEqual(b"hello"[:n], s)
+ 
+ 
+     def test_writeAndReadLarge(self):
+@@ -86,7 +117,7 @@
+         Similar to L{test_writeAndRead}, but use a much larger string to verify
+         the behavior for that case.
+         """
+-        orig = "0123456879" * 10000
++        orig = b"0123456879" * 10000
+         written = self.write(orig)
+         self.failUnless(written > 0)
+         result = []
+@@ -97,7 +128,7 @@
+             resultlength += len(result[-1])
+             # Increment a counter to be sure we'll exit at some point
+             i += 1
+-        result = "".join(result)
++        result = b"".join(result)
+         self.assertEqual(len(result), written)
+         self.assertEqual(orig[:written], result)
+ 
+@@ -128,7 +159,7 @@
+         results in a connection lost indicator.
+         """
+         os.close(self.r)
+-        self.assertEqual(self.write("s"), fdesc.CONNECTION_LOST)
++        self.assertEqual(self.write(b"s"), fdesc.CONNECTION_LOST)
+ 
+ 
+     def test_readFromInvalid(self):
+@@ -146,7 +177,7 @@
+         closed results in a connection lost indicator.
+         """
+         os.close(self.w)
+-        self.assertEqual(self.write("s"), fdesc.CONNECTION_LOST)
++        self.assertEqual(self.write(b"s"), fdesc.CONNECTION_LOST)
+ 
+ 
+     def test_writeErrors(self):
+@@ -160,7 +191,7 @@
+             raise err
+         os.write = eagainWrite
+         try:
+-            self.assertEqual(self.write("s"), 0)
++            self.assertEqual(self.write(b"s"), 0)
+         finally:
+             os.write = oldOsWrite
+ 
+@@ -170,21 +201,21 @@
+             raise err
+         os.write = eintrWrite
+         try:
+-            self.assertEqual(self.write("s"), 0)
++            self.assertEqual(self.write(b"s"), 0)
+         finally:
+             os.write = oldOsWrite
+ 
+ 
+ 
+-class CloseOnExecTests(unittest.TestCase):
++class CloseOnExecTests(unittest.SynchronousTestCase):
+     """
+     Tests for L{fdesc._setCloseOnExec} and L{fdesc._unsetCloseOnExec}.
+     """
+     program = '''
+ import os, errno
+ try:
+-    os.write(%d, 'lul')
+-except OSError, e:
++    os.write(%d, b'lul')
++except OSError as e:
+     if e.errno == errno.EBADF:
+         os._exit(0)
+     os._exit(5)
+@@ -215,7 +246,7 @@
+         by a new process image created with one of the exec family of
+         functions.
+         """
+-        fObj = file(self.mktemp(), 'w')
++        fObj = open(self.mktemp(), 'wb')
+         fdesc._setCloseOnExec(fObj.fileno())
+         status = self._execWithFileDescriptor(fObj)
+         self.assertTrue(os.WIFEXITED(status))
+@@ -227,7 +258,7 @@
+         A file descriptor passed to L{fdesc._unsetCloseOnExec} is inherited by
+         a new process image created with one of the exec family of functions.
+         """
+-        fObj = file(self.mktemp(), 'w')
++        fObj = open(self.mktemp(), 'wb')
+         fdesc._setCloseOnExec(fObj.fileno())
+         fdesc._unsetCloseOnExec(fObj.fileno())
+         status = self._execWithFileDescriptor(fObj)
+Index: admin/_twistedpython3.py
+===================================================================
+--- admin/_twistedpython3.py	(revision 35635)
++++ admin/_twistedpython3.py	(working copy)
+@@ -22,6 +22,7 @@
+     "twisted.internet",
+     "twisted.internet.defer",
+     "twisted.internet.interfaces",
++    "twisted.internet.fdesc",
+     "twisted.internet.main",
+     "twisted.internet.test",
+     "twisted.internet.test.reactormixins",
+@@ -67,6 +68,7 @@
+     "twisted.test.test_context",
+     "twisted.test.test_defer",
+     "twisted.test.test_failure",
++    "twisted.test.test_fdesc",
+     "twisted.test.test_log",
+     "twisted.test.test_monkey",
+     "twisted.test.test_paths",

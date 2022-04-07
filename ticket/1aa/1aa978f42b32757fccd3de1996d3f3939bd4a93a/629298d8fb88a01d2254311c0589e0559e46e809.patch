@@ -1,0 +1,276 @@
+=== modified file 'twisted/protocols/basic.py'
+--- twisted/protocols/basic.py	2008-12-14 21:41:04 +0000
++++ twisted/protocols/basic.py	2010-04-14 13:41:34 +0000
+@@ -133,7 +133,8 @@
+ 
+     def dataReceived(self, data):
+         """Translates bytes into lines, and calls lineReceived."""
+-        lines  = (self._buffer+data).split(self.delimiter)
++        dataSoFar = self._buffer + data
++        lines = dataSoFar.split(self.delimiter)
+         self._buffer = lines.pop(-1)
+         for line in lines:
+             if self.transport.disconnecting:
+@@ -143,7 +144,9 @@
+                 # the one that told it to close.
+                 return
+             if len(line) > self.MAX_LENGTH:
+-                return self.lineLengthExceeded(line)
++                why = self.lineLengthExceeded(line)
++                if why:
++                    return why
+             else:
+                 self.lineReceived(line)
+         if len(self._buffer) > self.MAX_LENGTH:
+@@ -163,6 +166,7 @@
+         """Called when the maximum line length has been reached.
+         Override if it needs to be dealt with in some special way.
+         """
++        self.transport.loseConnection()
+         return error.ConnectionLost('Line length exceeded')
+ 
+ 
+@@ -227,15 +231,16 @@
+             except ValueError:
+                 if len(self.__buffer) > self.MAX_LENGTH:
+                     line, self.__buffer = self.__buffer, ''
+-                    return self.lineLengthExceeded(line)
++                    why = self.lineLengthExceeded(line)
++                    if why or self.transport and self.transport.disconnecting:
++                        return why
+                 break
+             else:
+                 linelength = len(line)
+                 if linelength > self.MAX_LENGTH:
+-                    exceeded = line + self.__buffer
+-                    self.__buffer = ''
+-                    return self.lineLengthExceeded(exceeded)
+-                why = self.lineReceived(line)
++                    why = self.lineLengthExceeded(line)
++                else:
++                    why = self.lineReceived(line)
+                 if why or self.transport and self.transport.disconnecting:
+                     return why
+         else:
+@@ -291,7 +296,8 @@
+         be more than one line, or may be only the initial portion of the
+         line.
+         """
+-        return self.transport.loseConnection()
++        self.transport.loseConnection()
++        return error.ConnectionLost('Line length exceeded')
+ 
+ 
+ class StringTooLongError(AssertionError):
+
+=== modified file 'twisted/test/test_protocols.py'
+--- twisted/test/test_protocols.py	2009-02-14 21:04:19 +0000
++++ twisted/test/test_protocols.py	2010-04-14 13:56:04 +0000
+@@ -85,25 +85,6 @@
+             self.setLineMode(line[self.MAX_LENGTH + 1:])
+ 
+ 
+-class LineOnlyTester(basic.LineOnlyReceiver):
+-    """
+-    A buffering line only receiver.
+-    """
+-    delimiter = '\n'
+-    MAX_LENGTH = 64
+-
+-    def connectionMade(self):
+-        """
+-        Create/clean data received on connection.
+-        """
+-        self.received = []
+-
+-    def lineReceived(self, line):
+-        """
+-        Save received data.
+-        """
+-        self.received.append(line)
+-
+ class WireTestCase(unittest.TestCase):
+     """
+     Test wire protocols.
+@@ -297,37 +278,164 @@
+         self.assertEqual(protocol.rest, '')
+ 
+ 
++class LineOnlyReceiverTestsMixin:
++    """
++    Tests to apply to both LineReceiver and LineOnlyReceiver.
++    """
+ 
+-class LineOnlyReceiverTestCase(unittest.TestCase):
+-    """
+-    Test line only receiveer.
+-    """
+     buffer = """foo
+     bleakness
+     desolation
+     plastic forks
+     """
+ 
++    def makeLineReceiver(self, disconnectOnLongLine=True):
++        """
++        Construct a line receiver for testing with.
++
++        It will be a simple subclass of whatever self.lineReceiverClass is.
++        The subclass will log calls to lineReceived and lineLengthExceeded to a
++        '.calls' attribute.
++        """
++        transport = protocol.FileWrapper(proto_helpers.StringIOWithoutClosing())
++        baseClass = self.klass
++        class LoggingLineReceiver(baseClass):
++            """
++            A line receiver subclass that records calls made to it, but
++            otherwise behaves like its base class.
++            """
++            delimiter = '\n'
++            MAX_LENGTH = 64
++
++            def connectionMade(self):
++                self.calls = []
++                return baseClass.connectionMade(self)
++
++            def lineReceived(self, line):
++                self.calls.append(('lineReceived', line))
++
++            def lineLengthExceeded(self, line):
++                self.calls.append(('lineLengthExceeded', line))
++                if disconnectOnLongLine:
++                    return baseClass.lineLengthExceeded(self, line)
++            
++        lineReceiver = LoggingLineReceiver()
++        lineReceiver.makeConnection(transport)
++        return lineReceiver
++
+     def test_buffer(self):
+         """
+         Test buffering over line protocol: data received should match buffer.
+         """
+-        t = proto_helpers.StringTransport()
+-        a = LineOnlyTester()
+-        a.makeConnection(t)
++        lineReceiver = self.makeLineReceiver()
+         for c in self.buffer:
+-            a.dataReceived(c)
+-        self.assertEquals(a.received, self.buffer.split('\n')[:-1])
++            lineReceiver.dataReceived(c)
++        expectedLines = self.buffer.split('\n')[:-1]
++        expectedCalls = [('lineReceived', line) for line in expectedLines]
++        self.assertEquals(expectedCalls, lineReceiver.calls)
+ 
+     def test_lineTooLong(self):
+         """
+-        Test sending a line too long: it should close the connection.
+-        """
+-        t = proto_helpers.StringTransport()
+-        a = LineOnlyTester()
+-        a.makeConnection(t)
+-        res = a.dataReceived('x'*200)
+-        self.assertIsInstance(res, error.ConnectionLost)
++        When a line greater than MAX_LENGTH is received, lineLengthExceeded is
++        called.  The default implementation lineLengthExceeded closes the
++        connection, and returns a ConnectionLost error.
++        """
++        lineReceiver = self.makeLineReceiver()
++        res = lineReceiver.dataReceived('x'*200)
++        self.failUnlessEqual(
++            [('lineLengthExceeded', 'x'*200)], lineReceiver.calls)
++        self.assertTrue(lineReceiver.transport.closed)
++        self.assertIsInstance(res, error.ConnectionLost)
++        self.assertEqual(('Line length exceeded',), res.args)
++
++    def test_secondLineTooLong(self):
++        """
++        When two lines are received together and the second line is too long
++        (but not the first), lineLengthExceeded is only called with the
++        too-long line.
++        """
++        lineReceiver = self.makeLineReceiver()
++        res = lineReceiver.dataReceived('short line\n' + 'x' * 200 + '\n')
++        self.failUnlessEqual(
++            [('lineReceived', 'short line'),
++             ('lineLengthExceeded', 'x'*200)],
++            lineReceiver.calls)
++        self.assertTrue(lineReceiver.transport.closed)
++        self.assertIsInstance(res, error.ConnectionLost)
++        self.assertEqual(('Line length exceeded',), res.args)
++
++    def test_shortLineAfterLong(self):
++        lineReceiver = self.makeLineReceiver()
++        res = lineReceiver.dataReceived('x' * 200 + '\nshort line\n')
++        self.failUnlessEqual(
++            [('lineLengthExceeded', 'x'*200)], lineReceiver.calls)
++        self.assertTrue(lineReceiver.transport.closed)
++        self.assertIsInstance(res, error.ConnectionLost)
++        self.assertEqual(('Line length exceeded',), res.args)
++
++    def test_lineLengthExceededWithoutLoseConnection(self):
++        lineReceiver = self.makeLineReceiver(disconnectOnLongLine=False)
++        longLine = 'x' * 200 + '\n'
++        res = lineReceiver.dataReceived(longLine + longLine + 'short line\n')
++        self.failUnlessEqual(
++            [('lineLengthExceeded', 'x'*200),
++             ('lineLengthExceeded', 'x'*200),
++             ('lineReceived', 'short line')],
++            lineReceiver.calls)
++        self.assertFalse(lineReceiver.transport.closed)
++
++    def test_longLineWithDelimiter(self):
++        """
++        When MAX_LENGTH is exceeded *and* a delimiter has been received,
++        lineLengthExceeded is called with the right bytes.
++
++        See http://twistedmatrix.com/trac/ticket/3277
++        """
++        # Set up a line receiver with a short MAX_LENGTH that logs
++        # lineLengthExceeded events.
++        lineReceiver = self.makeLineReceiver()
++        lineReceiver.MAX_LENGTH = 10
++        # Call dataReceived with two lines, the first longer than MAX_LENGTH.
++        longLine = ('x' * 11) + '\n'
++        nextLine = 'next line\n'
++        lineReceiver.dataReceived(longLine + nextLine)
++        # We expect lineLengthExceeded to be called with just the first long
++        # line.  lineReceived is not called.
++        expectedCalls = [('lineLengthExceeded', longLine[:-1])]
++        self.assertEqual(expectedCalls, lineReceiver.calls)
++
++    def test_lineReceiverAsProducer(self):
++        """
++        Test produce/unproduce in receiving.
++        """
++        lineReceiver = self.makeLineReceiver()
++        if isinstance(lineReceiver, basic.LineOnlyReceiver):
++            raise unittest.SkipTest(
++                'LineOnlyReceiver does not implement IPushProducer')
++        lineReceiver.transport.registerProducer(lineReceiver, False)
++        lineReceiver.dataReceived('hello world\n')
++        lineReceiver.transport.unregisterProducer()
++        lineReceiver.dataReceived('goodbye\n')
++        self.assertEquals(
++            [('lineReceived', 'hello world'), ('lineReceived', 'goodbye')],
++            lineReceiver.calls)
++
++
++class LineOnlyReceiverTestCase(unittest.TestCase, LineOnlyReceiverTestsMixin):
++    """
++    LineOnlyReceiverTestsMixin applied to LineOnlyReceiver.
++    """
++
++    klass = basic.LineOnlyReceiver
++
++
++class LineReceiverLineOnlyTestCase(unittest.TestCase,
++    LineOnlyReceiverTestsMixin):
++    """
++    LineOnlyReceiverTestsMixin applied to LineReceiver.
++    """
++
++    klass = basic.LineReceiver
+ 
+ 
+ 
+

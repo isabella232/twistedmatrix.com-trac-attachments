@@ -1,0 +1,260 @@
+Index: twisted/topfiles/4159.enhancement
+===================================================================
+--- twisted/topfiles/4159.enhancement	(revision 0)
++++ twisted/topfiles/4159.enhancement	(revision 0)
+@@ -0,0 +1 @@
++twisted.reactor.spawnProcess accepts a setupChild argument, which is a called with args, environment, fdmap (may be None) and winStartupInfo (may be None) for the new process.
+Index: twisted/internet/posixbase.py
+===================================================================
+--- twisted/internet/posixbase.py	(revision 32801)
++++ twisted/internet/posixbase.py	(working copy)
+@@ -319,17 +319,20 @@
+ 
+     def spawnProcess(self, processProtocol, executable, args=(),
+                      env={}, path=None,
+-                     uid=None, gid=None, usePTY=0, childFDs=None):
++                     uid=None, gid=None, usePTY=0, childFDs=None,
++                     setupChild=None):
+         args, env = self._checkProcessArgs(args, env)
+         if platformType == 'posix':
+             if usePTY:
+                 if childFDs is not None:
+                     raise ValueError("Using childFDs is not supported with usePTY=True.")
+                 return process.PTYProcess(self, executable, args, env, path,
+-                                          processProtocol, uid, gid, usePTY)
++                                          processProtocol, uid, gid, usePTY,
++                                          setupChild)
+             else:
+                 return process.Process(self, executable, args, env, path,
+-                                       processProtocol, uid, gid, childFDs)
++                                       processProtocol, uid, gid, childFDs,
++                                       setupChild)
+         elif platformType == "win32":
+             if uid is not None or gid is not None:
+                 raise ValueError("The uid and gid parameters are not supported on Windows.")
+@@ -340,7 +343,8 @@
+ 
+             if win32process:
+                 from twisted.internet._dumbwin32proc import Process
+-                return Process(self, processProtocol, executable, args, env, path)
++                return Process(self, processProtocol, executable, args, env,
++                               path, setupChild)
+             else:
+                 raise NotImplementedError, "spawnProcess not available since pywin32 is not installed."
+         else:
+Index: twisted/internet/test/test_process.py
+===================================================================
+--- twisted/internet/test/test_process.py	(revision 32801)
++++ twisted/internet/test/test_process.py	(working copy)
+@@ -46,6 +46,32 @@
+ 
+ 
+ 
++class _CollectOutputProcessProtocol(ProcessProtocol):
++    """
++    An L{IProcessProtocol} which fires a Deferred with (stdout, stderr) when
++    the process it is associated with ends.
++    """
++    def __init__(self, whenFinished):
++        self.whenFinished = whenFinished
++        self.stdout = []
++        self.stderr = []
++
++
++    def outReceived(self, data):
++        self.stdout.append(data)
++
++
++    def errReceived(self, data):
++        self.stderr.append(data)
++
++
++    def processEnded(self, reason):
++        self.stdout = ''.join(self.stdout)
++        self.stderr = ''.join(self.stderr)
++        self.whenFinished.callback((self.stdout, self.stderr))
++
++
++
+ class ProcessTestsBuilderBase(ReactorBuilder):
+     """
+     Base class for L{IReactorProcess} tests which defines some tests which
+@@ -640,6 +666,103 @@
+ 
+         reactor.callWhenRunning(spawnChild)
+         self.runReactor(reactor)
++
++
++    def test_processChangeArgs(self):
++        """
++        setupChild can successfully change the arguments of a Process.
++        """
++
++        result = []
++        reactor = self.buildReactor()
++
++        def shutdown(result):
++            reactor.stop()
++            return result
++
++        def setupChild(args, environment, fdmap, winStartupInfo):
++            args[-1:] = ['import sys; sys.stdout.write("success")']
++
++        ended = Deferred()
++        reactor.callWhenRunning(
++            reactor.spawnProcess,
++            _CollectOutputProcessProtocol(ended), sys.executable,
++            [sys.executable, '-Wignore', "-c", ""],
++            setupChild=setupChild
++        )
++        ended.addBoth(result.append)
++        ended.addBoth(shutdown)
++        self.runReactor(reactor)
++        self.assertEqual(1,len(result))
++        self.assertEqual(("success", ""), result[0])
++
++
++    def test_processChangeEnvironment(self):
++        """
++        setupChild can successfully change the environment of a Process.
++        """
++
++        result = []
++        reactor = self.buildReactor()
++
++        def shutdown(result):
++            reactor.stop()
++            return result
++
++        def setupChild(args, environment, fdmap, winStartupInfo):
++            environment["PREEXEC_TEST_RESULT"] = "success"
++
++        ended = Deferred()
++        reactor.callWhenRunning(
++            reactor.spawnProcess,
++            _CollectOutputProcessProtocol(ended), sys.executable,
++            [sys.executable, '-Wignore', "-c",
++             'import os, sys; '
++             'sys.stdout.write(os.environ.get("PREEXEC_TEST_RESULT"))'],
++            setupChild=setupChild
++        )
++        ended.addBoth(result.append)
++        ended.addBoth(shutdown)
++        self.runReactor(reactor)
++        self.assertEqual(1,len(result))
++        self.assertEqual(("success", ""), result[0])
++
++
++    def test_processRedirectOutput(self):
++        """
++        setupChild can successfully change the FD map of a Process.
++        """
++
++        result = []
++        reactor = self.buildReactor()
++
++        def shutdown(result):
++            reactor.stop()
++            return result
++
++        def setupChild(args, environment, fdmap, winStartupInfo):
++            os.close(fdmap[1])
++            fdmap[1] = fdmap[2]
++
++        ended = Deferred()
++        reactor.callWhenRunning(
++            reactor.spawnProcess,
++            _CollectOutputProcessProtocol(ended), sys.executable,
++            [sys.executable, '-Wignore', "-c", 'import sys;'
++             'sys.stdout.write("success")'],
++            setupChild=setupChild
++        )
++        ended.addBoth(result.append)
++        ended.addBoth(shutdown)
++        self.runReactor(reactor)
++        self.assertEqual(1,len(result))
++        self.assertEqual(("", "success"), result[0])
++
++    if platform.isWindows():
++        test_processRedirectOutput.skip = \
++            "Child fdmap is not supported on Windows."
++
++
+ globals().update(ProcessTestsBuilder.makeTestCaseClasses())
+ 
+ 
+Index: twisted/internet/_dumbwin32proc.py
+===================================================================
+--- twisted/internet/_dumbwin32proc.py	(revision 32801)
++++ twisted/internet/_dumbwin32proc.py	(working copy)
+@@ -116,7 +116,8 @@
+ 
+     closedNotifies = 0
+ 
+-    def __init__(self, reactor, protocol, command, args, environment, path):
++    def __init__(self, reactor, protocol, command, args, environment, path,
++                 setupChild=None):
+         """
+         Create a new child process.
+         """
+@@ -144,6 +145,10 @@
+         StartupInfo.hStdInput  = hStdinR
+         StartupInfo.dwFlags = win32process.STARTF_USESTDHANDLES
+ 
++        if setupChild:
++            setupChild(args, environment, fdmap=None,
++                       winStartupInfo=StartupInfo)
++
+         # Create new handles whose inheritance property is false
+         currentPid = win32api.GetCurrentProcess()
+ 
+Index: twisted/internet/process.py
+===================================================================
+--- twisted/internet/process.py	(revision 32801)
++++ twisted/internet/process.py	(working copy)
+@@ -409,6 +409,10 @@
+                 try:
+                     # Stop debugging. If I am, I don't care anymore.
+                     sys.settrace(None)
++                    if self.setupChild:
++                        self.setupChild(args, environment,
++                                        fdmap=kwargs.get('fdmap'),
++                                        winStartupInfo=None)
+                     self._setupChild(**kwargs)
+                     self._execChild(path, settingUID, uid, gid,
+                                     executable, args, environment)
+@@ -615,7 +619,7 @@
+ 
+     def __init__(self,
+                  reactor, executable, args, environment, path, proto,
+-                 uid=None, gid=None, childFDs=None):
++                 uid=None, gid=None, childFDs=None, setupChild=None):
+         """
+         Spawn an operating-system process.
+ 
+@@ -633,6 +637,8 @@
+             assert 'w' not in childFDs.values()
+         _BaseProcess.__init__(self, proto)
+ 
++        self.setupChild = setupChild
++
+         self.pipes = {}
+         # keys are childFDs, we can sense them closing
+         # values are ProcessReader/ProcessWriters
+@@ -929,7 +935,7 @@
+     pid = None
+ 
+     def __init__(self, reactor, executable, args, environment, path, proto,
+-                 uid=None, gid=None, usePTY=None):
++                 uid=None, gid=None, usePTY=None, setupChild=None):
+         """
+         Spawn an operating-system process.
+ 
+@@ -948,6 +954,7 @@
+                 "cannot use PTYProcess on platforms without the pty module.")
+         abstract.FileDescriptor.__init__(self, reactor)
+         _BaseProcess.__init__(self, proto)
++        self.setupChild = setupChild
+ 
+         if isinstance(usePTY, (tuple, list)):
+             masterfd, slavefd, ttyname = usePTY

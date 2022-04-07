@@ -1,0 +1,118 @@
+--- udp.py	2007-06-26 16:03:41.000000000 +0300
++++ udp2.py	2007-09-29 21:02:14.000000000 +0200
+@@ -1,6 +1,6 @@
+ # -*- test-case-name: twisted.test.test_udp -*-
+ 
+-# Copyright (c) 2001-2004 Twisted Matrix Laboratories.
++# Copyright (c) 2001-2007 Twisted Matrix Laboratories.
+ # See LICENSE for details.
+ 
+ 
+@@ -41,6 +41,8 @@
+ import abstract, error, interfaces
+ 
+ 
++class BufferFull(Exception): pass
++
+ class Port(base.BasePort):
+     """UDP port, listening for packets."""
+ 
+@@ -49,6 +51,7 @@
+     addressFamily = socket.AF_INET
+     socketType = socket.SOCK_DGRAM
+     maxThroughput = 256 * 1024 # max bytes we read in one eventloop iteration
++    minSocketBuffer = 1024 # The minimal socket buffer usable in major platforms
+ 
+     # Actual port number being listened on, only set to a non-None
+     # value when we are actually listening.
+@@ -88,6 +91,7 @@
+         try:
+             skt = self.createInternetSocket()
+             skt.bind((self.interface, self.port))
++            skt.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, self.minSocketBuffer)
+         except socket.error, le:
+             raise error.CannotListenError, (self.interface, self.port, le)
+ 
+@@ -104,7 +108,18 @@
+     def _connectToProtocol(self):
+         self.protocol.makeConnection(self)
+         self.startReading()
++        self.startWriting()
++
++    # Inherit registerProducer/unregisterProducer/stopConsuming from
++    # abstract.py (It doesn't do anything with its buffers)
+ 
++    def doWrite(self):
++        """Called when my socket is ready for writing."""
++        self.stopWriting()
++        if self.producer is not None:
++            self.producer.resumeProducing()
++            if self.streamingProducer:
++                self.producer.pauseProducing()
+ 
+     def doRead(self):
+         """Called when my socket is ready for reading."""
+@@ -129,6 +144,23 @@
+                     log.err()
+ 
+ 
++    def _write(self, writer, *args):
++        self.startWriting()
++        try:
++            return writer(*args)
++        except socket.error, se:
++            no = se.args[0]
++            if no == EINTR:
++                return self.write(datagram)
++            elif no == EMSGSIZE:
++                raise error.MessageLengthError, "message too long"
++            elif no == ECONNREFUSED:
++                self.protocol.connectionRefused()
++            elif no == EAGAIN:
++                raise BufferFull()
++            else:
++                raise
++                    
+     def write(self, datagram, addr=None):
+         """Write a datagram.
+ 
+@@ -136,37 +168,12 @@
+         """
+         if self._connectedAddr:
+             assert addr in (None, self._connectedAddr)
+-            try:
+-                return self.socket.send(datagram)
+-            except socket.error, se:
+-                no = se.args[0]
+-                if no == EINTR:
+-                    return self.write(datagram)
+-                elif no == EMSGSIZE:
+-                    raise error.MessageLengthError, "message too long"
+-                elif no == ECONNREFUSED:
+-                    self.protocol.connectionRefused()
+-                else:
+-                    raise
++            self._write(self.socket.send, datagram)
+         else:
+             assert addr != None
+             if not addr[0].replace(".", "").isdigit():
+                 warnings.warn("Please only pass IPs to write(), not hostnames", DeprecationWarning, stacklevel=2)
+-            try:
+-                return self.socket.sendto(datagram, addr)
+-            except socket.error, se:
+-                no = se.args[0]
+-                if no == EINTR:
+-                    return self.write(datagram, addr)
+-                elif no == EMSGSIZE:
+-                    raise error.MessageLengthError, "message too long"
+-                elif no == ECONNREFUSED:
+-                    # in non-connected UDP ECONNREFUSED is platform dependent, I think
+-                    # and the info is not necessarily useful. Nevertheless maybe we
+-                    # should call connectionRefused? XXX
+-                    return
+-                else:
+-                    raise
++            self._write(self.socket.sendto, datagram, addr)
+ 
+     def writeSequence(self, seq, addr):
+         self.write("".join(seq), addr)

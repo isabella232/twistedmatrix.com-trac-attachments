@@ -1,0 +1,102 @@
+Index: twisted/python/test/test_dist.py
+===================================================================
+--- twisted/python/test/test_dist.py	(revision 31665)
++++ twisted/python/test/test_dist.py	(working copy)
+@@ -55,7 +55,22 @@
+         self.assertEquals(ext.define_macros, [("whatever", 2), ("WIN32", 1)])
+ 
+ 
++class MSIBuilderTest(TestCase):
++    """
++    Test for L{dist.bdist_msi_twisted}.
++    """
++    def test_metadataGetVersion(self):
++        """
++        Test that distribution.metadata.get_version is patched.
++        """
++        args = get_setup_args()
++        bdist_command = args["cmdclass"]["bdist_msi"](Distribution())
++        old_hash = hash(bdist_command.distribution.metadata.get_version)
++        bdist_command._patch_get_version()
++        new_hash = hash(bdist_command.distribution.metadata.get_version)
++        self.assertNotEquals(old_hash, new_hash)
+ 
++
+ class GetVersionTest(TestCase):
+     """
+     Tests for L{dist.getVersion}.
+Index: twisted/python/dist.py
+===================================================================
+--- twisted/python/dist.py	(revision 31665)
++++ twisted/python/dist.py	(working copy)
+@@ -7,7 +7,10 @@
+ """
+ 
+ import sys, os
++import inspect
++import types
+ from distutils.command import build_scripts, install_data, build_ext, build_py
++from distutils.command import bdist_msi
+ from distutils.errors import CompileError
+ from distutils import core
+ from distutils.core import Extension
+@@ -73,12 +76,17 @@
+             kw.setdefault('py_modules', []).extend(py_modules)
+             del kw['plugins']
+ 
+-    if 'cmdclass' not in kw:
+-        kw['cmdclass'] = {
+-            'install_data': install_data_twisted,
+-            'build_scripts': build_scripts_twisted}
+-        if sys.version_info[:3] < (2, 3, 0):
+-            kw['cmdclass']['build_py'] = build_py_twisted
++    if 'cmdclass' in kw:
++        print "Twisted Warning: cmdclass override from setup.py may fail"
++    else:
++        kw['cmdclass'] = {}
++    kw['cmdclass'].update({
++        'install_data': install_data_twisted,
++        'build_scripts': build_scripts_twisted,
++        'bdist_msi': bdist_msi_twisted,
++    })
++    if sys.version_info[:3] < (2, 3, 0):
++        kw['cmdclass']['build_py'] = build_py_twisted
+ 
+     if "conditionalExtensions" in kw:
+         extensions = kw["conditionalExtensions"]
+@@ -286,6 +294,35 @@
+ 
+ 
+ 
++class bdist_msi_twisted(bdist_msi.bdist_msi):
++    """
++    MSI builder requires version to be in the x.x.x format
++
++    @see: http://bugs.python.org/issue6040
++    @since: 11.1
++    """
++    def _patch_get_version(self):
++        """
++        Patches DistributionMetadata.get_version() call to return normalized
++        version when called from distutils.bdist_msi.bdist_msi.run()
++        """
++        def monkey_get_version(self):
++            if inspect.stack()[1][1].endswith('bdist_msi.py'):
++                # strip revision from version (if any), e.g. 11.0.0-r31546
++                return self.version.split('-')[0]
++            else:
++                return self.version
++
++        self.distribution.metadata.get_version = \
++            types.MethodType(monkey_get_version, self.distribution.metadata)
++
++    def run(self):
++        # We can't just modify distribution.metadata.version for the duration
++        # of bdist_msi.run(), because run() triggers `build` command
++        self._patch_get_version()
++        bdist_msi.bdist_msi.run(self)
++
++
+ class install_data_twisted(install_data.install_data):
+     """I make sure data files are installed in the package directory."""
+     def finalize_options(self):

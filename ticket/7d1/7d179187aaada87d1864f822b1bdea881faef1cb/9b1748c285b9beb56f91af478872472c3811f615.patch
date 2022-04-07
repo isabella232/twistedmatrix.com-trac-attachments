@@ -1,0 +1,106 @@
+Index: twisted/protocols/test/test_tls.py
+===================================================================
+--- twisted/protocols/test/test_tls.py	(Revision 45078)
++++ twisted/protocols/test/test_tls.py	(Arbeitskopie)
+@@ -663,8 +663,7 @@
+     def test_loseConnectionAfterHandshake(self):
+         """
+         L{TLSMemoryBIOProtocol.loseConnection} sends a TLS close alert and
+-        shuts down the underlying connection cleanly on both sides, after
+-        transmitting all buffered data.
++        shuts down the underlying connection cleanly on both sides.
+         """
+         class NotifyingProtocol(ConnectionLostNotifyingProtocol):
+             def __init__(self, onConnectionLost):
+@@ -697,17 +696,9 @@
+         sslServerProtocol = wrapperFactory.buildProtocol(None)
+ 
+         loopbackAsync(sslServerProtocol, sslClientProtocol)
+-        chunkOfBytes = b"123456890" * 100000
+ 
+         # Wait for the handshake before dropping the connection.
+         def cbHandshake(ignored):
+-            # Write more than a single bio_read, to ensure client will still
+-            # have some data it needs to write when it receives the TLS close
+-            # alert, and that simply doing a single bio_read won't be
+-            # sufficient. Thus we will verify that any amount of buffered data
+-            # will be written out before the connection is closed, rather than
+-            # just small amounts that can be returned in a single bio_read:
+-            clientProtocol.transport.write(chunkOfBytes)
+             serverProtocol.transport.loseConnection()
+ 
+             # Now wait for the client and server to notice.
+@@ -722,9 +713,6 @@
+             clientProtocol.lostConnectionReason.trap(ConnectionDone)
+             serverProtocol.lostConnectionReason.trap(ConnectionDone)
+ 
+-            # The server should have received all bytes sent by the client:
+-            self.assertEqual(b"".join(serverProtocol.data), chunkOfBytes)
+-
+             # The server should have closed its underlying transport, in
+             # addition to whatever it did to shut down the TLS layer.
+             self.assertTrue(serverProtocol.transport.q.disconnect)
+@@ -1034,16 +1022,9 @@
+         clientProtocol.transport.writeSequence([b" ", b"world"])
+ 
+         # Unregister producer; this should trigger TLS shutdown:
++        self.flushTwoTLSProtocols(tlsProtocol, serverTLSProtocol)
+         clientProtocol.transport.unregisterProducer()
+         self.assertNotEqual(tlsProtocol.transport.value(), b"")
+-        self.assertEqual(tlsProtocol.transport.disconnecting, False)
+-
+-        # Additional writes should not go through:
+-        clientProtocol.transport.write(b"won't")
+-        clientProtocol.transport.writeSequence([b"won't!"])
+-
+-        # Finish TLS close handshake:
+-        self.flushTwoTLSProtocols(tlsProtocol, serverTLSProtocol)
+         self.assertEqual(tlsProtocol.transport.disconnecting, True)
+ 
+         # Bytes made it through, as long as they were written before producer
+Index: twisted/protocols/tls.py
+===================================================================
+--- twisted/protocols/tls.py	(Revision 45078)
++++ twisted/protocols/tls.py	(Arbeitskopie)
+@@ -366,9 +366,6 @@
+                 # TLS has shut down and no more TLS data will be received over
+                 # this connection.
+                 self._shutdownTLS()
+-                # Passing in None means the user protocol's connnectionLost
+-                # will get called with reason from underlying transport:
+-                self._tlsShutdownFinished(None)
+             except Error as e:
+                 # Something went pretty wrong.  For example, this might be a
+                 # handshake failure (because there were no shared ciphers, because
+@@ -427,20 +424,13 @@
+         Initiate, or reply to, the shutdown handshake of the TLS layer.
+         """
+         try:
+-            shutdownSuccess = self._tlsConnection.shutdown()
++            self._tlsConnection.shutdown()
+         except Error:
+-            # Mid-handshake, a call to shutdown() can result in a
+-            # WantWantReadError, or rather an SSL_ERR_WANT_READ; but pyOpenSSL
+-            # doesn't allow us to get at the error.  See:
+-            # https://github.com/pyca/pyopenssl/issues/91
+-            shutdownSuccess = False
++            pass
++
+         self._flushSendBIO()
+-        if shutdownSuccess:
+-            # Both sides have shutdown, so we can start closing lower-level
+-            # transport. This will also happen if we haven't started
+-            # negotiation at all yet, in which case shutdown succeeds
+-            # immediately.
+-            self.transport.loseConnection()
++        self._lostTLSConnection = True
++        self.transport.loseConnection()
+ 
+ 
+     def _tlsShutdownFinished(self, reason):
+Index: twisted/topfiles/7926.bugfix
+===================================================================
+--- twisted/topfiles/7926.bugfix	(Revision 0)
++++ twisted/topfiles/7926.bugfix	(Arbeitskopie)
+@@ -0,0 +1 @@
++twisted.protocols.TLSMemoryBIOProtocol._shutdownTLS() now calls transport.loseConnection() also without reply to ssl shutdown

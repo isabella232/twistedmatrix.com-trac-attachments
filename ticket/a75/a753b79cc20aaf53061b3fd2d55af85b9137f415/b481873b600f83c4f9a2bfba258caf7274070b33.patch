@@ -1,0 +1,111 @@
+=== modified file 'twisted/scripts/_twistd_unix.py'
+--- twisted/scripts/_twistd_unix.py	2009-09-13 18:29:24 +0000
++++ twisted/scripts/_twistd_unix.py	2010-07-14 11:07:02 +0000
+@@ -19,7 +19,7 @@
+ 
+     optFlags = [['nodaemon','n',  "don't daemonize, don't use default umask of 0077"],
+                 ['originalname', None, "Don't try to change the process name"],
+-                ['syslog', None,   "Log to syslog, not to file"],
++                ['syslog', None, "Log to syslog, not to file"],
+                 ['euid', '',
+                  "Set only effective user-id rather than real user-id. "
+                  "(This option has no effect unless the server is running as "
+@@ -27,6 +27,8 @@
+                  "after binding ports, retaining the option to regain "
+                  "privileges in cases such as spawning processes. "
+                  "Use with caution.)"],
++                ['nologrotation', None,
++                 "Don't rotate the log file but re-open it on SIGUSR1."],
+                ]
+ 
+     optParameters = [
+@@ -111,6 +113,7 @@
+         self._syslog = options.get("syslog", False)
+         self._syslogPrefix = options.get("prefix", "")
+         self._nodaemon = options.get("nodaemon", False)
++        self._nologrotation = options.get("nologrotation", False)
+ 
+ 
+     def _getLogObserver(self):
+@@ -136,7 +139,11 @@
+         else:
+             if not self._logfilename:
+                 self._logfilename = 'twistd.log'
+-            logFile = logfile.LogFile.fromFullPath(self._logfilename)
++            if self._nologrotation:
++                logFile = logfile.LogFile.fromFullPath(
++                    self._logfilename, rotateLength=None)
++            else:
++                logFile = logfile.LogFile.fromFullPath(self._logfilename)
+             try:
+                 import signal
+             except ImportError:
+@@ -144,10 +151,15 @@
+             else:
+                 # Override if signal is set to None or SIG_DFL (0)
+                 if not signal.getsignal(signal.SIGUSR1):
+-                    def rotateLog(signal, frame):
+-                        from twisted.internet import reactor
+-                        reactor.callFromThread(logFile.rotate)
+-                    signal.signal(signal.SIGUSR1, rotateLog)
++                    if self._nologrotation:
++                        def signalHandler(signal, frame):
++                            from twisted.internet import reactor
++                            reactor.callFromThread(logFile.reopen)
++                    else:
++                        def signalHandler(signal, frame):
++                            from twisted.internet import reactor
++                            reactor.callFromThread(logFile.rotate)
++                    signal.signal(signal.SIGUSR1, signalHandler)
+         return log.FileLogObserver(logFile).emit
+ 
+ 
+
+=== modified file 'twisted/test/test_twistd.py'
+--- twisted/test/test_twistd.py	2010-07-13 12:57:52 +0000
++++ twisted/test/test_twistd.py	2010-07-14 10:59:26 +0000
+@@ -1224,8 +1224,41 @@
+             d.callback(None)
+         logFiles[0].rotate = rotate
+ 
+-        rotateLog = self.signals[0][1]
+-        rotateLog(None, None)
++        # Simulate the signal.
++        signalHandler = self.signals[0][1]
++        signalHandler(None, None)
++        return d
++
++
++    def test_getLogObserverFile_nologrotation(self):
++        """
++        When C{logfile} contains a file name but C{nologrotation} is set,
++        L{app.AppLogger._getLogObserver} rerotateLengthturns a log observer pointing at
++        the specified path, and a signal handler re-opening the log is
++        installed. Automatic rotation is disabled.
++        """
++        logFiles = _patchFileLogObserver(self.patch)
++        filename = self.mktemp()
++        logger = UnixAppLogger({"logfile": filename, "nologrotation": True})
++        observer = logger._getLogObserver()
++
++        self.assertEquals(len(logFiles), 1)
++        self.assertEquals(logFiles[0].path,
++                          os.path.abspath(filename))
++        self.assert_(logFiles[0].rotateLength is None)
++                          
++
++        self.assertEquals(len(self.signals), 1)
++        self.assertEquals(self.signals[0][0], signal.SIGUSR1)
++
++        d = Deferred()
++        def reopen():
++            d.callback(None)
++        logFiles[0].reopen = reopen
++
++        # Simulate the signal.
++        signalHandler = self.signals[0][1]
++        signalHandler(None, None)
+         return d
+ 
+ 
+

@@ -1,0 +1,217 @@
+Index: web2/test/test_stream.py
+===================================================================
+--- web2/test/test_stream.py	(revision 15740)
++++ web2/test/test_stream.py	(working copy)
+@@ -129,8 +129,7 @@
+         self.assertRaises(ValueError, self.makeStream, 0, 20)
+ 
+ 
+-class TestSubstream(unittest.TestCase):
+-    data = """I was angry with my friend:
++testdata = """I was angry with my friend:
+ I told my wrath, my wrath did end.
+ I was angry with my foe:
+ I told it not, my wrath did grow.
+@@ -149,8 +148,11 @@
+ When the night had veil'd the pole:
+ In the morning glad I see
+ My foe outstretch'd beneath the tree"""
++
++class TestSubstream(unittest.TestCase):
+     
+     def setUp(self):
++        self.data = testdata
+         self.s = stream.MemoryStream(self.data)
+ 
+     def suckTheMarrow(self, s):
+@@ -179,8 +181,56 @@
+     def testPastEnd(self):
+         size = len(self.data)
+         self.assertRaises(ValueError, stream.substream, self.s, size-4, size+8)
+-        
+ 
++
++class TestBufferedStream(unittest.TestCase):
++
++    def setUp(self):
++        self.data = testdata.replace('\n', '\r\n')
++        s = stream.MemoryStream(self.data)
++        self.s = stream.BufferedStream(s)
++
++    def _cbGotData(self, data, expected):
++        self.assertEqual(data, expected)
++
++    def test_readline(self):
++        d = self.s.readline()
++        d.addCallback(self._cbGotData, 'I was angry with my friend:')
++        return d
++
++    def test_readline_size(self):
++        d = self.s.readline(size = 5)
++        d.addCallback(self._cbGotData, 'I was')
++        return d
++
++    def test_readline_zero(self):
++        d = self.s.readline(size = 0)
++        d.addCallback(self._cbGotData, '')
++        return d
++
++    def test_readline_finished(self):
++        nolines = len(self.data.split('\r\n'))
++        for i in range(nolines):
++            self.s.readline()
++        d = self.s.readline()
++        d.addCallback(self._cbGotData, '')
++        return d
++
++    def test_readline_sizeneg(self):
++        self.assertRaises(ValueError, self.s.readline, size = -1)
++
++    def test_readline_maxlength(self):
++        d = self.s.readline(maxLength = 1)
++        self.assertFailure(d, RuntimeError)
++
++    def test_readExactly(self):
++        d = self.s.readExactly()
++        d.addCallback(self._cbGotData, self.data)
++        return d
++
++    def test_read(self):
++        self.assertEqual(str(self.s.read()), self.data)
++
+ class TestStreamer:
+     implements(stream.IStream, stream.IByteStream)
+ 
+Index: web2/test/test_wsgi.py
+===================================================================
+--- web2/test/test_wsgi.py	(revision 15740)
++++ web2/test/test_wsgi.py	(working copy)
+@@ -162,6 +162,44 @@
+             (WSGI(application), 'http://host/', {}, None, None, '', "These\nare\nlines"),
+             (200, {"Content-Length": 18}, "These\nXare\nXlines\n"))
+ 
++    def test_readInputLineSizeNegZero(self):
++        def application(environ, start_response):
++            input = environ['wsgi.input']
++
++            out = [input.read(5)] # 'Line '
++            out += ["X", input.readline(-1)] # 'blah blah\n'
++            out += ["X", input.readline(0)]  # ''
++            out += ["X", input.readline(-1)] # 'Oh Line\n'
++            out += ["X", input.readline()]   # ''
++
++            start_response("200 OK", {})
++            return out
++
++        return self.assertResponse(
++            (WSGI(application), 'http://host/', {}, None, None, '',
++             "Line blah blah\nOh Line\n"),
++            (200, {"Content-Length": 27},
++             "Line Xblah blah\nXXOh Line\nX"))
++
++    def test_readInputLineSize(self):
++        def application(environ, start_response):
++            input = environ['wsgi.input']
++
++            out = [input.read(5)]           # 'Line '
++            out += ["X", input.readline(5)] # 'blah '
++            out += ["X", input.readline()]  # 'blah\n'
++            out += ["X", input.readline(1)]     # '0'
++            out += ["X", input.readline()]  # 'h Line\n'
++
++            start_response("200 OK", {})
++            return out
++
++        return self.assertResponse(
++            (WSGI(application), 'http://host/', {}, None, None, '',
++             "Line blah blah\nOh Line\n"),
++            (200, {"Content-Length": 27},
++             "Line Xblah Xblah\nXOXh Line\n"))
++
+     def test_readInputMixed(self):
+         def application(environ, start_response):
+             input = environ['wsgi.input']
+@@ -174,7 +212,8 @@
+             return out
+         
+         return self.assertResponse(
+-            (WSGI(application), 'http://host/', {}, None, None, '', "Line blah blah\nOh Line\n"),
++            (WSGI(application), 'http://host/', {}, None, None, '',
++             "Line blah blah\nOh Line\n"),
+             (200, {"Content-Length": 26}, "Line Xblah blah\nXOXh Line\n"))
+ 
+ class TestWSGIEnvironment(BaseCase):
+Index: web2/stream.py
+===================================================================
+--- web2/stream.py	(revision 15740)
++++ web2/stream.py	(working copy)
+@@ -1003,17 +1003,29 @@
+         return self._readUntil(gotdata)
+     
+         
+-    def readline(self, delimiter='\r\n', maxLength=None):
++    def readline(self, delimiter='\r\n', maxLength=None, size=None):
+         """Read a line of data from the string, bounded by delimiter"""
++        if size is not None and size < 0:
++            raise ValueError("readExactly: size cannot be negative: %s", size)
++
+         def gotdata():
+-            data = self.data.split(delimiter, 1)
++            postdata = ''
++            predata  = self.data
++            if size is not None and len(predata) >= size:
++                predata, postdata = predata[:size], predata[size:]
++            data = predata.split(delimiter, 1)
+             if len(data) == 2:
+-                self.data=data[1]
++                self.data=data[1] + postdata
+                 if maxLength and len(data[0]) > maxLength:
+-                    raise LineTooLongException(data[0])
++                    raise RuntimeError(
++                        "Line data too long at %d" % len(data[0]))
+                 return data[0]
++            elif size is not None: # len(data) == 1
++                if postdata:
++                    self.data = postdata
++                    return predata
+             if maxLength and len(self.data) > maxLength:
+-                raise LineTooLongException(self.data)
++                raise RuntimeError("Line data too long at %d" % len(self.data))
+         return self._readUntil(gotdata)
+ 
+     def pushback(self, pushed):
+Index: web2/wsgi.py
+===================================================================
+--- web2/wsgi.py	(revision 15740)
++++ web2/wsgi.py	(working copy)
+@@ -65,9 +65,28 @@
+             size = None
+         return callInReactor(self.stream.readExactly, size)
+ 
+-    def readline(self):
++    def readline(self, size=None):
+         # Called in application thread
+-        return callInReactor(self.stream.readline, '\n')+'\n'
++        if size < 0:
++            size = None
++
++        if size is not None:
++            # we need to return maximum byte count of size 'including' the
++            # trailing newline
++            if size == 0:
++                return ''
++
++            size -= 1
++            data = callInReactor(self.stream.readline, '\n', size = size)
++            if len(data) == size:
++                # no newline - try to read one more byte
++                return data + callInReactor(self.stream.readExactly, 1)
++            return data + '\n'
++
++        data = callInReactor(self.stream.readline, '\n')
++        if data: # test that there was data in the stream
++            data += '\n'
++        return data
+     
+     def readlines(self, hint=None):
+         # Called in application thread

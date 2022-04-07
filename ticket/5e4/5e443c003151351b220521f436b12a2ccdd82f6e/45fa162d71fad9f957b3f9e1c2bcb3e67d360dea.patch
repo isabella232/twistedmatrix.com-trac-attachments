@@ -1,0 +1,211 @@
+diff --git twisted/python/compat.py twisted/python/compat.py
+index 39def97..5aa0503 100644
+--- twisted/python/compat.py
++++ twisted/python/compat.py
+@@ -505,7 +505,14 @@ except ImportError:
+     # Python 3+
+     FileType = IOBase
+ 
+-
++try:
++    import _winreg as winreg
++except ImportError:
++    try:
++        # Python 3+
++        import winreg
++    except ImportError:
++        pass
+ 
+ # Dealing with the differences in items/iteritems
+ if _PY3:
+diff --git twisted/python/test/test_win32.py twisted/python/test/test_win32.py
+index 8494436..3151534 100644
+--- twisted/python/test/test_win32.py
++++ twisted/python/test/test_win32.py
+@@ -9,6 +9,11 @@ from twisted.trial import unittest
+ from twisted.python.runtime import platform
+ from twisted.python import win32
+ 
++try:
++    from twisted.python.compat import winreg
++except ImportError:
++    winreg = NotImplemented
++
+ 
+ class CommandLineQuotingTests(unittest.TestCase):
+     """
+@@ -39,6 +44,25 @@ class CommandLineQuotingTests(unittest.TestCase):
+         self.assertEqual(win32.cmdLineQuote(''), '""')
+ 
+ 
++class FakeOpenKey(object):
++    """Standin for winreg.OpenKey which sets self.closed if Close() is called"""
++    def __init__(self):
++        self.closed = False
++
++    def __call__(self, *args, **kwargs):
++        return self
++
++    def Close(self):
++        self.closed = True
++
++
++class TestException(Exception):
++    """Raised by raise_exception() in a test"""
++
++
++def raise_exception(*args, **kwargs):
++    raise TestException
++
+ 
+ class ProgramPathsTests(unittest.TestCase):
+     """
+@@ -51,20 +75,81 @@ class ProgramPathsTests(unittest.TestCase):
+         platforms. On non-win32 it will try to figure out the path by
+         examining the registry.
+         """
++        path = win32.getProgramsMenuPath()
+         if not platform.isWindows():
+-            self.assertEqual(win32.getProgramsMenuPath(),
+-                "C:\\Windows\\Start Menu\\Programs")
++            self.assertEqual(path, "C:\\Windows\\Start Menu\\Programs")
+         else:
+-            self.assertIsInstance(win32.getProgramsMenuPath(), str)
++            shell_folders = winreg.OpenKey(
++                winreg.HKEY_LOCAL_MACHINE,
++                "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\"
++                "Explorer\\Shell Folders",
++                0, winreg.KEY_READ
++            )
++            try:
++                value, _ = winreg.QueryValueEx(shell_folders, "Common Programs")
++                self.assertEqual(path, value)
++            finally:
++                shell_folders.Close()
++
++    def test_getProgramsMenuPath_closes_key(self):
++        open_key = FakeOpenKey()
++        self.patch(winreg, "OpenKey", open_key)
++        self.patch(winreg, "QueryValueEx", lambda *args, **kwargs: (None, None))
++        win32.getProgramsMenuPath()
++        self.assertTrue(open_key.closed)
++
++        # We should still close the key if there's an exception
++        open_key = FakeOpenKey()
++        self.patch(winreg, "OpenKey", open_key)
++        self.patch(winreg, "QueryValueEx", raise_exception)
++        try:
++            win32.getProgramsMenuPath()
++        except TestException:
++            pass
++        self.assertTrue(open_key.closed)
+ 
++    if not platform.isWindows():
++        test_getProgramsMenuPath_closes_key.skip = (
++            "test_getProgramsMenuPath_closes_key is a Windows only test")
+ 
+     def test_getProgramFilesPath(self):
+         """
+         L{getProgramFilesPath} returns the "program files" path on win32.
+         """
+-        self.assertIsInstance(win32.getProgramFilesPath(), str)
++        path = win32.getProgramFilesPath()
++        current_value = winreg.OpenKey(
++            winreg.HKEY_LOCAL_MACHINE,
++            "SOFTWARE\\Microsoft\\Windows\\CurrentVersion",
++            0, winreg.KEY_READ
++        )
++        try:
++            value, _ = winreg.QueryValueEx(current_value, "ProgramFilesDir")
++            self.assertEqual(value, path)
++        finally:
++            current_value.Close()
+ 
+     if not platform.isWindows():
+         test_getProgramFilesPath.skip = (
+             "Cannot figure out the program files path on non-win32 platform")
+ 
++    def test_getProgramFilesPath_closes_key(self):
++        open_key = FakeOpenKey()
++        self.patch(winreg, "OpenKey", open_key)
++        self.patch(winreg, "QueryValueEx", lambda *args, **kwargs: (None, None))
++        win32.getProgramFilesPath()
++        self.assertTrue(open_key.closed)
++
++        # We should still close the key if there's an exception
++        open_key = FakeOpenKey()
++        self.patch(winreg, "OpenKey", open_key)
++        self.patch(winreg, "QueryValueEx", raise_exception)
++        try:
++            win32.getProgramFilesPath()
++        except TestException:
++            pass
++        self.assertTrue(open_key.closed)
++
++    if not platform.isWindows():
++        test_getProgramsMenuPath_closes_key.skip = (
++            "test_getProgramsMenuPath_closes_key is a Windows only test")
++
+diff --git twisted/python/win32.py twisted/python/win32.py
+index 6e983cd..bed1d4d 100644
+--- twisted/python/win32.py
++++ twisted/python/win32.py
+@@ -23,6 +23,10 @@ except ImportError:
+     pass
+ 
+ from twisted.python.runtime import platform
++try:
++    from twisted.python.compat import winreg
++except ImportError:
++    winreg = NotImplemented
+ 
+ # http://msdn.microsoft.com/library/default.asp?url=/library/en-us/debug/base/system_error_codes.asp
+ ERROR_FILE_NOT_FOUND = 2
+@@ -43,7 +47,6 @@ try:
+ except NameError:
+     WindowsError = FakeWindowsError
+ 
+-# XXX fix this to use python's builtin _winreg?
+ 
+ def getProgramsMenuPath():
+     """
+@@ -56,18 +59,31 @@ def getProgramsMenuPath():
+     """
+     if not platform.isWindows():
+         return "C:\\Windows\\Start Menu\\Programs"
+-    keyname = 'SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Shell Folders'
+-    hShellFolders = win32api.RegOpenKeyEx(win32con.HKEY_LOCAL_MACHINE,
+-                                          keyname, 0, win32con.KEY_READ)
+-    return win32api.RegQueryValueEx(hShellFolders, 'Common Programs')[0]
++
++    shell_folders = winreg.OpenKey(
++        winreg.HKEY_LOCAL_MACHINE,
++        "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Shell Folders",
++        0, winreg.KEY_READ
++    )
++    try:
++        value, _ = winreg.QueryValueEx(shell_folders, "Common Programs")
++        return value
++    finally:
++        shell_folders.Close()
+ 
+ 
+ def getProgramFilesPath():
+     """Get the path to the Program Files folder."""
+-    keyname = 'SOFTWARE\\Microsoft\\Windows\\CurrentVersion'
+-    currentV = win32api.RegOpenKeyEx(win32con.HKEY_LOCAL_MACHINE,
+-                                     keyname, 0, win32con.KEY_READ)
+-    return win32api.RegQueryValueEx(currentV, 'ProgramFilesDir')[0]
++    current_value = winreg.OpenKey(
++        winreg.HKEY_LOCAL_MACHINE,
++        "SOFTWARE\\Microsoft\\Windows\\CurrentVersion",
++        0, winreg.KEY_READ
++    )
++    try:
++        value, _ = winreg.QueryValueEx(current_value, "ProgramFilesDir")
++        return value
++    finally:
++        current_value.Close()
+ 
+ 
+ _cmdLineQuoteRe = re.compile(r'(\\*)"')

@@ -1,0 +1,206 @@
+Index: twisted/mail/test/test_imap.py
+===================================================================
+--- twisted/mail/test/test_imap.py	(revision 27366)
++++ twisted/mail/test/test_imap.py	(working copy)
+@@ -3156,7 +3156,7 @@
+                 'content-transfer-encoding': '8BIT',
+             }, (), '', 'Body\nText\nGoes\nHere\n', 919293, None)]
+         self.expected = {0: {'BODYSTRUCTURE': [
+-            'text', 'plain', [['name', 'thing'], ['key', 'value']],
++            'text', 'plain', ['name', 'thing', 'key', 'value'],
+             'this-is-the-content-id', 'describing-the-content-goes-here!',
+             '8BIT', '20', '4', None, None, None]}}
+         return self._fetchWork(uid)
+@@ -3164,6 +3164,29 @@
+     def testFetchBodyStructureUID(self):
+         return self.testFetchBodyStructure(1)
+ 
++    def testFetchMultipartBodyStructure(self):
++        self.function = self.client.fetchBodyStructure
++        self.messages = '3:9,10:*'
++        headers = util.OrderedDict()
++        headers['content-type'] = 'multipart/alternative; boundary="xyz"'
++        innerHeaders = util.OrderedDict()
++        innerHeaders['content-type'] = 'text/plain;'
++        innerHeaders['content-disposition'] = 'attachment; filename="name.txt"'
++        self.msgObjs = [FakeyMessage(
++            headers, (), None, '', 123,
++            [FakeyMessage(innerHeaders, (), None, 'test\r\n',
++                          None, None)],
++            )]
++        self.expected = {0: {'BODYSTRUCTURE': [
++            ['text', 'plain', None, None, None, None, '6', '1',
++             None,
++             ['attachment', ['filename', 'name.txt']],
++             None],
++            'alternative',
++            ['boundary', 'xyz'],
++             None, None]}}
++        return self._fetchWork(False)
++
+     def testFetchSimplifiedBody(self, uid=0):
+         self.function = self.client.fetchSimplifiedBody
+         self.messages = '21'
+@@ -3174,7 +3197,7 @@
+         )]
+         self.expected = {0:
+             {'BODY':
+-                [None, None, [], None, None, None,
++                [None, None, None, None, None, None,
+                     '12'
+                 ]
+             }
+@@ -3192,7 +3215,7 @@
+             (), '', 'Yea whatever', 91825, None)]
+         self.expected = {0:
+             {'BODY':
+-                ['text', 'plain', [], None, None, None,
++                ['text', 'plain', None, None, None, None,
+                     '12', '1'
+                 ]
+             }
+@@ -3214,10 +3237,10 @@
+         )]
+         self.expected = {0:
+             {'BODY':
+-                ['message', 'rfc822', [], None, None, None,
++                ['message', 'rfc822', None, None, None, None,
+                     '12', [None, None, [[None, None, None]],
+                     [[None, None, None]], None, None, None,
+-                    None, None, None], ['image', 'jpg', [],
++                    None, None, None], ['image', 'jpg', None,
+                     None, None, None, '14'], '1'
+                 ]
+             }
+@@ -3376,12 +3399,12 @@
+                 'INTERNALDATE': '25-Jul-2010 06:20:30 -0400',
+                 'RFC822.SIZE': '6',
+                 'ENVELOPE': [None, None, [[None, None, None]], [[None, None, None]], None, None, None, None, None, None],
+-                'BODY': [None, None, [], None, None, None, '6']},
++                'BODY': [None, None, None, None, None, None, '6']},
+             1: {'FLAGS': ['\\One', '\\Two', 'Three'],
+                 'INTERNALDATE': '14-Apr-2003 19:43:44 -0400',
+                 'RFC822.SIZE': '12',
+                 'ENVELOPE': [None, None, [[None, None, None]], [[None, None, None]], None, None, None, None, None, None],
+-                'BODY': [None, None, [], None, None, None, '12']},
++                'BODY': [None, None, None, None, None, None, '12']},
+         }
+         return self._fetchWork(uid)
+ 
+Index: twisted/mail/imap4.py
+===================================================================
+--- twisted/mail/imap4.py	(revision 27366)
++++ twisted/mail/imap4.py	(working copy)
+@@ -4543,19 +4543,33 @@
+         return s[1:-1]
+     return s
+ 
++def _splitParameters(value):
++    value = value.lower().split(';')
++    before = value.pop(0) if value else None
++    params = []
++    for param in value:
++        param = param.strip()
++        if param:
++            k, v = (x.strip() for x in param.split('=', 1))
++            params.append(k)
++            params.append(unquote(v))
++    if not params:
++        params = None
++    return before, params
++
+ def getBodyStructure(msg, extended=False):
+     # XXX - This does not properly handle multipart messages
+     # BODYSTRUCTURE is obscenely complex and criminally under-documented.
+ 
+-    attrs = {}
++    attrs = None
+     headers = 'content-type', 'content-id', 'content-description', 'content-transfer-encoding'
+     headers = msg.getHeaders(False, *headers)
+     mm = headers.get('content-type')
+     if mm:
+         mm = ''.join(mm.splitlines())
+-        mimetype = mm.split(';')
++        mimetype, attrs = _splitParameters(mm)
+         if mimetype:
+-            type = mimetype[0].split('/', 1)
++            type = mimetype.split('/', 1)
+             if len(type) == 1:
+                 major = type[0]
+                 minor = None
+@@ -4563,7 +4577,6 @@
+                 major, minor = type
+             else:
+                 major = minor = None
+-            attrs = dict([x.strip().lower().split('=', 1) for x in mimetype[1:]])
+         else:
+             major = minor = None
+     else:
+@@ -4571,10 +4584,9 @@
+ 
+ 
+     size = str(msg.getSize())
+-    unquotedAttrs = [(k, unquote(v)) for (k, v) in attrs.iteritems()]
+     result = [
+         major, minor,                       # Main and Sub MIME types
+-        unquotedAttrs,                      # content-type parameter list
++        attrs,                              # content-type parameter list
+         headers.get('content-id'),
+         headers.get('content-description'),
+         headers.get('content-transfer-encoding'),
+@@ -4582,9 +4594,9 @@
+     ]
+ 
+     if major is not None:
+-        if major.lower() == 'text':
++        if major == 'text':
+             result.append(str(getLineCount(msg)))
+-        elif (major.lower(), minor.lower()) == ('message', 'rfc822'):
++        elif (major, minor) == ('message', 'rfc822'):
+             contained = msg.getSubPart(0)
+             result.append(getEnvelope(contained))
+             result.append(getBodyStructure(contained, False))
+@@ -4598,38 +4610,28 @@
+         headers = msg.getHeaders(False, *headers)
+         disp = headers.get('content-disposition')
+ 
+-        # XXX - I dunno if this is really right
+         if disp:
+-            disp = disp.split('; ')
+-            if len(disp) == 1:
+-                disp = (disp[0].lower(), None)
+-            elif len(disp) > 1:
+-                disp = (disp[0].lower(), [x.split('=') for x in disp[1:]])
++            disp = _splitParameters(disp)
+ 
+         result.append(headers.get('content-md5'))
+         result.append(disp)
+         result.append(headers.get('content-language'))
+     else:
+-        result = [result]
++        result = []
+         try:
+             i = 0
+             while True:
+                 submsg = msg.getSubPart(i)
+-                result.append(getBodyStructure(submsg))
++                result.append(getBodyStructure(submsg, extended))
+                 i += 1
+         except IndexError:
+             result.append(minor)
+-            result.append(attrs.items())
++            result.append(attrs)
+ 
+-            # XXX - I dunno if this is really right
+             headers = msg.getHeaders(False, 'content-disposition', 'content-language')
+             disp = headers.get('content-disposition')
+             if disp:
+-                disp = disp.split('; ')
+-                if len(disp) == 1:
+-                    disp = (disp[0].lower(), None)
+-                elif len(disp) > 1:
+-                    disp = (disp[0].lower(), [x.split('=') for x in disp[1:]])
++                disp = _splitParameters(disp)
+ 
+             result.append(disp)
+             result.append(headers.get('content-language'))

@@ -1,0 +1,493 @@
+Index: _pollingfile.py
+===================================================================
+--- _pollingfile.py	(revision 18401)
++++ _pollingfile.py	(working copy)
+@@ -6,6 +6,7 @@
+ 
+ """
+ 
++import sys
+ from zope.interface import implements
+ 
+ from twisted.internet.interfaces import IConsumer, IPushProducer
+@@ -13,7 +14,8 @@
+ MIN_TIMEOUT = 0.000000001
+ MAX_TIMEOUT = 0.1
+ 
+-class _PollableResource:
++
++class _PollableResource(object):
+     active = True
+ 
+     def activate(self):
+@@ -22,7 +24,8 @@
+     def deactivate(self):
+         self.active = False
+ 
+-class _PollingTimer:
++
++class _PollingTimer(object):
+     # Everything is private here because it is really an implementation detail.
+ 
+     def __init__(self, reactor):
+@@ -91,51 +94,30 @@
+ # If we ever (let's hope not) need the above functionality on UNIX, this could
+ # be factored into a different module.
+ 
+-import win32pipe
+ import win32file
+ import win32api
+ import pywintypes
+ 
+-class _PollableReadPipe(_PollableResource):
+ 
++class _PollableReader(_PollableResource):
++
+     implements(IPushProducer)
+ 
+-    def __init__(self, pipe, receivedCallback, lostCallback):
+-        # security attributes for pipes
+-        self.pipe = pipe
++    def __init__(self, handle, receivedCallback, lostCallback):
++        self.handle = handle
+         self.receivedCallback = receivedCallback
+         self.lostCallback = lostCallback
+ 
+     def checkWork(self):
+-        finished = 0
+-        fullDataRead = []
++        raise NotImplementedError()
+ 
+-        while 1:
+-            try:
+-                buffer, bytesToRead, result = win32pipe.PeekNamedPipe(self.pipe, 1)
+-                # finished = (result == -1)
+-                if not bytesToRead:
+-                    break
+-                hr, data = win32file.ReadFile(self.pipe, bytesToRead, None)
+-                fullDataRead.append(data)
+-            except win32api.error:
+-                finished = 1
+-                break
+-
+-        dataBuf = ''.join(fullDataRead)
+-        if dataBuf:
+-            self.receivedCallback(dataBuf)
+-        if finished:
+-            self.cleanup()
+-        return len(dataBuf)
+-
+     def cleanup(self):
+         self.deactivate()
+         self.lostCallback()
+ 
+     def close(self):
+         try:
+-            win32api.CloseHandle(self.pipe)
++            win32api.CloseHandle(self.handle)
+         except pywintypes.error:
+             # You can't close std handles...?
+             pass
+@@ -152,26 +134,18 @@
+ 
+ FULL_BUFFER_SIZE = 64 * 1024
+ 
+-class _PollableWritePipe(_PollableResource):
++class _PollableWriter(_PollableResource):
+ 
+     implements(IConsumer)
+ 
+-    def __init__(self, writePipe, lostCallback):
++    def __init__(self, handle, lostCallback):
+         self.disconnecting = False
+         self.producer = None
+         self.producerPaused = 0
+         self.streamingProducer = 0
+         self.outQueue = []
+-        self.writePipe = writePipe
++        self.handle = handle
+         self.lostCallback = lostCallback
+-        try:
+-            win32pipe.SetNamedPipeHandleState(writePipe,
+-                                              win32pipe.PIPE_NOWAIT,
+-                                              None,
+-                                              None)
+-        except pywintypes.error:
+-            # Maybe it's an invalid handle.  Who knows.
+-            pass
+ 
+     def close(self):
+         self.disconnecting = True
+@@ -219,7 +193,7 @@
+     def writeConnectionLost(self):
+         self.deactivate()
+         try:
+-            win32api.CloseHandle(self.writePipe)
++            win32api.CloseHandle(self.handle)
+         except pywintypes.error:
+             # OMG what
+             pass
+@@ -236,13 +210,66 @@
+             self.bufferFull()
+ 
+     def checkWork(self):
++        raise NotImplementedError()
++
++
++
++#
++# Pipe support (XXX this should go in _dumbwin32proc.py)
++# 
++import win32pipe
++
++
++class _PollableReadPipe(_PollableReader):
++    def __init__(self, pipe, receivedCallback, lostCallback):
++        _PollableReader.__init__(self, pipe, receivedCallback, lostCallback)
++        # security attributes for pipes
++
++    def checkWork(self):
++        finished = 0
++        fullDataRead = []
++
++        while 1:
++            try:
++                buffer, bytesToRead, result = win32pipe.PeekNamedPipe(self.handle, 1)
++                # finished = (result == -1)
++                if not bytesToRead:
++                    break
++                hr, data = win32file.ReadFile(self.handle, bytesToRead, None)
++                fullDataRead.append(data)
++            except win32api.error:
++                finished = 1
++                break
++
++        dataBuf = ''.join(fullDataRead)
++        if dataBuf:
++            self.receivedCallback(dataBuf)
++        if finished:
++            self.cleanup()
++        return len(dataBuf)
++
++
++class _PollableWritePipe(_PollableWriter):
++    def __init__(self, writePipe, lostCallback):
++        _PollableWriter.__init__(self, writePipe, lostCallback)
++
++        try:
++            win32pipe.SetNamedPipeHandleState(writePipe,
++                                              win32pipe.PIPE_NOWAIT,
++                                              None,
++                                              None)
++        except pywintypes.error:
++            # Maybe it's an invalid handle.  Who knows.
++            pass
++
++    def checkWork(self):
+         numBytesWritten = 0
+         if not self.outQueue:
+             if self.disconnecting:
+                 self.writeConnectionLost()
+                 return 0
+             try:
+-                win32file.WriteFile(self.writePipe, '', None)
++                win32file.WriteFile(self.handle, '', None)
+             except pywintypes.error:
+                 self.writeConnectionLost()
+                 return numBytesWritten
+@@ -250,7 +277,7 @@
+             data = self.outQueue.pop(0)
+             errCode = 0
+             try:
+-                errCode, nBytesWritten = win32file.WriteFile(self.writePipe,
++                errCode, nBytesWritten = win32file.WriteFile(self.handle,
+                                                              data, None)
+             except win32api.error:
+                 self.writeConnectionLost()
+@@ -268,3 +295,223 @@
+         return numBytesWritten
+ 
+ 
++
++#
++# Console support (XXX this should go in _conio.py)
++#
++# Only base support provided.
++#
++import win32console
++
++
++ENABLE_NORMAL_MODE = win32console.ENABLE_ECHO_INPUT | win32console.ENABLE_LINE_INPUT
++ENABLE_WINDOW_INPUT = win32console.ENABLE_WINDOW_INPUT
++
++
++class _PollableReadConsole(_PollableReader):
++    def __init__(self, conIn, conOut, receivedCallback, lostCallback):
++        _PollableReader.__init__(self, conIn, receivedCallback, lostCallback)
++        self.cp = "cp%d" % win32console.GetConsoleCP()
++        self.buf = []
++        
++        # We need this for echoing
++        self._stdout = conOut
++
++        defaultMode = conIn.GetConsoleMode()
++        conIn.SetConsoleMode(defaultMode | ENABLE_WINDOW_INPUT)
++        self._windowChangeCallback = None
++        
++        self.checkWork = self._checkWork
++
++    def enableRawMode(self, enabled=True):
++        """Enable raw mode.
++        """
++
++        mode = self.handle.GetConsoleMode()
++        if enabled:
++            # Flush buffer
++            dataBuf = ''.join(self.buf)
++            self.buf = []
++
++            if dataBuf:
++                self.receivedCallback(dataBuf)
++
++            self.checkWork = self._checkWork_raw
++
++            # Set mode on the system console, too
++            # XXX check me (this seems not to work)
++            self.handle.SetConsoleMode(mode & ~ENABLE_NORMAL_MODE)
++        else:
++            self.checkWork = self._checkWork
++            
++            # Set mode on the system console, too
++            self.handle.SetConsoleMode(mode | ENABLE_NORMAL_MODE)
++
++    def setWindowChandeCallback(self, callback):
++        """callback is called when the console window buffer is
++        changed.
++
++        Note: WINDOW_BUFFER_SIZE_EVENT is only raised when changing
++              the window *buffer* size from the console menu
++        """
++        
++        self._windowChangeCallback = callback
++
++            
++    def _checkWork(self):
++        try:
++            info = self._stdout.GetConsoleScreenBufferInfo()
++        except pywintypes.error:
++            # stdout handle has been closed
++            self.cleanup()
++            return 0
++            
++        rowSize = info["MaximumWindowSize"].X 
++
++        # How much data we read
++        workUnits = 0
++        
++        # Initialize the current cursor position
++        if not self.buf:
++            self.pos = info["CursorPosition"]
++            
++        while 1:
++            n = self.handle.GetNumberOfConsoleInputEvents()
++            if n == 0:
++                break
++                
++            records = self.handle.ReadConsoleInput(n)
++                
++            # Process input
++            for record in records:
++                if record.EventType == win32console.WINDOW_BUFFER_SIZE_EVENT:
++                    rowSize = record.Size.X
++                    if self._windowChangeCallback:
++                        self._windowChangeCallback()
++                if record.EventType != win32console.KEY_EVENT \
++                        or not record.KeyDown:
++                    continue
++
++                char = record.Char
++                n = record.RepeatCount
++                if char == '\b':
++                    pos = self._stdout.GetConsoleScreenBufferInfo()["CursorPosition"]
++                    
++                    # Move the cursor
++                    x = pos.X - n
++                    if x >= 0:
++                        pos.X = x
++                    # XXX assuming |x| < rowSize (I'm lazy)
++                    elif pos.Y > self.pos.Y:
++                        pos.X = rowSize - 1
++                        pos.Y -= 1
++
++                    self._stdout.SetConsoleCursorPosition(pos)
++                    self._stdout.WriteConsoleOutputCharacter(' ' * n, pos)
++                    
++                    self.buf = self.buf[:-n]
++                    continue
++                elif char == '\0':
++                    vCode = record.VirtualKeyCode
++                    # XXX TODO handle keyboard navigation
++                    continue
++                elif char == '\r':
++                    char = '\r\n' * n # XXX check me
++
++                    self.buf.append(char)
++                    self._stdout.WriteConsole(char) # do echo
++                    
++                    dataBuf = ''.join(self.buf)
++                    self.buf = []
++                    self.pos = info["CursorPosition"]
++
++                    self.receivedCallback(dataBuf)
++                    return len(dataBuf)
++
++                char = char * n
++                data = char.encode(self.cp)
++                self._stdout.WriteConsole(data) # do echo
++                
++                self.buf.append(data)
++                workUnits += n
++
++        return workUnits
++
++    def _checkWork_raw(self):
++        # local buffer
++        buf = []
++
++        while 1: # XXX is this loop really needed?
++            n = self.handle.GetNumberOfConsoleInputEvents()
++            if n == 0:
++                break
++                
++            records = self.handle.ReadConsoleInput(n)
++                
++            # Process input
++            for record in records:
++                if record.EventType == win32console.WINDOW_BUFFER_SIZE_EVENT:
++                    if self._windowChangeCallback:
++                        self._windowChangeCallback()
++                if record.EventType != win32console.KEY_EVENT \
++                        or not record.KeyDown:
++                    continue
++
++                char = record.Char
++                n = record.RepeatCount
++                if char == '\0':
++                    continue
++                elif char == '\r':
++                    char = '\r\n' * n # XXX check me
++
++                char = char * n
++                data = char.encode(self.cp)
++                
++                buf.append(data)
++
++
++        dataBuf = ''.join(buf)
++        if dataBuf:
++            self.receivedCallback(dataBuf)
++
++        return len(dataBuf)
++
++
++class _PollableWriteConsole(_PollableWriter):
++    def __init__(self, con, lostCallback):
++        _PollableWriter.__init__(self, con, lostCallback)
++
++        self.cp = "cp%d" % win32console.GetConsoleOutputCP()
++
++
++    def checkWork(self):
++        numBytesWritten = 0
++        if not self.outQueue:
++            if self.disconnecting:
++                self.writeConnectionLost()
++                return 0
++            try:
++                self.handle.WriteConsole('')
++            except pywintypes.error:
++                self.writeConnectionLost()
++                return numBytesWritten
++        while self.outQueue:
++            data = self.outQueue.pop(0)
++            errCode = 0
++            try:
++                # XXX check if this can block
++                nBytesWritten = self.handle.WriteConsole(data)
++            except win32console.error:
++                self.writeConnectionLost()
++                break
++            else:
++                # assert not errCode, "wtf an error code???"
++                numBytesWritten += nBytesWritten
++                if len(data) > nBytesWritten:
++                    self.outQueue.insert(0, data[nBytesWritten:])
++                    break
++        else:
++            resumed = self.bufferEmpty()
++            if not resumed and self.disconnecting:
++                self.writeConnectionLost()
++        return numBytesWritten
+Index: _win32stdio.py
+===================================================================
+--- _win32stdio.py	(revision 18401)
++++ _win32stdio.py	(working copy)
+@@ -1,15 +1,18 @@
+ # -*- test-case-name: twisted.test.test_process.ProcessTestCase.testStdio -*-
+ 
+ import win32api
++import win32console
+ import os, msvcrt
+ 
+ from zope.interface import implements
+ 
+ from twisted.internet.interfaces import IHalfCloseableProtocol, ITransport, IAddress
+ from twisted.internet.interfaces import IConsumer, IPushProducer
++from twisted.internet import main
+ 
+-from twisted.internet import _pollingfile, main
++import _pollingfile
+ 
++
+ class Win32PipeAddress(object):
+     implements(IAddress)
+ 
+@@ -35,16 +38,27 @@
+ 
+         _pollingfile._PollingTimer.__init__(self, reactor)
+         self.proto = proto
++        
++        # Check if we are connected to a console
++        if os.isatty(0):
++            hstdin = win32console.GetStdHandle(win32console.STD_INPUT_HANDLE)
++            hstdout = win32console.GetStdHandle(win32console.STD_OUTPUT_HANDLE)
+ 
+-        hstdin = win32api.GetStdHandle(win32api.STD_INPUT_HANDLE)
+-        hstdout = win32api.GetStdHandle(win32api.STD_OUTPUT_HANDLE)
++            self.stdin = _pollingfile._PollableReadConsole(
++                hstdin, hstdout, self.dataReceived, self.readConnectionLost)
+ 
+-        self.stdin = _pollingfile._PollableReadPipe(
+-            hstdin, self.dataReceived, self.readConnectionLost)
++            self.stdout = _pollingfile._PollableWriteConsole(
++                hstdout, self.writeConnectionLost)
++        else:
++            hstdin = win32api.GetStdHandle(win32api.STD_INPUT_HANDLE)
++            hstdout = win32api.GetStdHandle(win32api.STD_OUTPUT_HANDLE)
+ 
+-        self.stdout = _pollingfile._PollableWritePipe(
+-            hstdout, self.writeConnectionLost)
++            self.stdin = _pollingfile._PollableReadPipe(
++                hstdin, self.dataReceived, self.readConnectionLost)
+ 
++            self.stdout = _pollingfile._PollableWritePipe(
++                hstdout, self.writeConnectionLost)
++            
+         self._addPollableResource(self.stdin)
+         self._addPollableResource(self.stdout)
+ 
+@@ -113,4 +127,3 @@
+ 
+     def resumeProducing(self):
+         self.stdin.resumeProducing()
+-

@@ -1,0 +1,249 @@
+Index: twisted/test/test_unix.py
+===================================================================
+--- twisted/test/test_unix.py	(revision 18049)
++++ twisted/test/test_unix.py	(working copy)
+@@ -299,7 +299,24 @@
+ 
+         return defer.maybeDeferred(p.stopListening).addCallback(stoppedListening)
+ 
++class UNIXAddressTestCase(PortCleanerUpper):
++    def testConnect(self):
++        """Test that UNIXAddress.connect returns an IConnector"""
++        socketPath = self.mktemp()
++        listeningPort = reactor.listenUNIX(socketPath, Factory(self, socketPath))
++        self.ports.append(listeningPort)
++        addr = address.UNIXAddress(socketPath)
++        conn = addr.connect(reactor, TestClientFactory(self, socketPath))
++        self.assertTrue(interfaces.IConnector.providedBy(conn))
+ 
++    def testListen(self):
++        """Test that UNIXAddress.listen returns an IListeningPort"""
++        socketPath = self.mktemp()
++        addr = address.UNIXAddress(socketPath)
++        listeningPort = addr.listen(reactor, Factory(self, socketPath))
++        self.ports.append(listeningPort)
++        self.assertTrue(interfaces.IListeningPort.providedBy(listeningPort))
++
+ if not interfaces.IReactorUNIX(reactor, None):
+     UnixSocketTestCase.skip = "This reactor does not support UNIX domain sockets"
+ if not interfaces.IReactorUNIXDatagram(reactor, None):
+Index: twisted/test/test_tcp.py
+===================================================================
+--- twisted/test/test_tcp.py	(revision 18049)
++++ twisted/test/test_tcp.py	(working copy)
+@@ -15,7 +15,8 @@
+ from twisted.internet import protocol, reactor, defer, interfaces
+ from twisted.internet import error
+ from twisted.internet.address import IPv4Address
+-from twisted.internet.interfaces import IHalfCloseableProtocol
++from twisted.internet.interfaces import (IConnector, IHalfCloseableProtocol, 
++                                         IListeningPort)
+ from twisted.protocols import policies
+ 
+ 
+@@ -1142,7 +1143,27 @@
+         d.addCallback(lambda _: log.flushErrors(RuntimeError))
+         return d
+ 
++class IPv4AddressTestCase(PortCleanerUpper):
++    def testConnect(self):
++        """Test that IPv4Address.connect returns an IConnector"""
++        factory = ClosingFactory()
++        listeningPort = reactor.listenTCP(0, factory)
++        self.ports.append(listeningPort)
++        factory.port = listeningPort
++        portNo = listeningPort.getHost().port
++        addr = IPv4Address("TCP", "127.0.0.1", portNo)
++        conn = addr.connect(reactor, MyClientFactory())
++        self.assertTrue(IConnector.providedBy(conn))
+ 
++    def testListen(self):
++        """Test that IPv4Address.listen returns an IListeningPort"""
++        factory = ClosingFactory()
++        addr = IPv4Address("TCP", "0.0.0.0", 0)
++        listeningPort = addr.listen(reactor, factory)
++        self.ports.append(listeningPort)
++        factory.port = listeningPort
++        self.assertTrue(IListeningPort.providedBy(listeningPort))
++
+ try:
+     import resource
+ except ImportError:
+Index: twisted/test/test_sslverify.py
+===================================================================
+--- twisted/test/test_sslverify.py	(revision 18049)
++++ twisted/test/test_sslverify.py	(working copy)
+@@ -7,7 +7,7 @@
+ from OpenSSL.crypto import TYPE_RSA
+ 
+ from twisted.trial import unittest
+-from twisted.internet import protocol, defer, reactor
++from twisted.internet import address, protocol, defer, reactor, ssl
+ from twisted.python import log
+ 
+ from twisted.internet import _sslverify as sslverify
+@@ -425,3 +425,61 @@
+             sslverify.Certificate.peerFromTransport(
+                 _ActualSSLTransport()).serialNumber(),
+             12346)
++
++class IPv4AddressTestCase(unittest.TestCase):
++    serverPort = clientConn = None
++    onServerLost = onClientLost = None
++
++    def setUpClass(self):
++        self.sKey, self.sCert = makeCertificate(
++            O="Server Test Certificate",
++            CN="server")
++        self.cKey, self.cCert = makeCertificate(
++            O="Client Test Certificate",
++            CN="client")
++
++    def tearDown(self):
++        if self.serverPort is not None:
++            self.serverPort.stopListening()
++        if self.clientConn is not None:
++            self.clientConn.disconnect()
++
++        L = []
++        if self.onServerLost is not None:
++            L.append(self.onServerLost)
++        if self.onClientLost is not None:
++            L.append(self.onClientLost)
++
++        return defer.DeferredList(L, consumeErrors=True)
++
++    def testIAddressConnectAndListen(self):
++        """Test that passing an SSL context factory to IPv4Address results in an
++        SSL connection. Based on OpenSSLOptions.loopback and 
++        OpenSSLOptions.testAllowedAnonymousClientConnection
++        """
++        self.onServerLost = defer.Deferred()
++        self.onClientLost = defer.Deferred()
++        onData = defer.Deferred()
++
++        serverCertOpts = sslverify.OpenSSLCertificateOptions(privateKey=self.sKey, certificate=self.sCert, requireCertificate=False)
++        clientCertOpts = sslverify.OpenSSLCertificateOptions(requireCertificate=False)
++
++        serverFactory = protocol.ServerFactory()
++        serverFactory.protocol = DataCallbackProtocol
++        serverFactory.onLost = self.onServerLost
++        serverFactory.onData = onData
++
++        clientFactory = protocol.ClientFactory()
++        clientFactory.protocol = WritingProtocol
++        clientFactory.onLost = self.onClientLost
++
++        serverAddr = address.IPv4Address("TCP", "127.0.0.1", 0, serverCertOpts)
++        self.serverPort = serverAddr.listen(reactor, serverFactory)
++        clientAddr = address.IPv4Address("TCP", "127.0.0.1", self.serverPort.getHost().port, clientCertOpts)
++        self.clientConn = clientAddr.connect(reactor, clientFactory)
++        
++        self.assertTrue(isinstance(self.serverPort, ssl.Port))
++        self.assertTrue(isinstance(self.clientConn, ssl.Connector))
++        
++        return onData.addCallback(
++            lambda result: self.assertEquals(result, WritingProtocol.byte))
+Index: twisted/internet/interfaces.py
+===================================================================
+--- twisted/internet/interfaces.py	(revision 18049)
++++ twisted/internet/interfaces.py	(working copy)
+@@ -19,7 +19,23 @@
+     Default implementations are in L{twisted.internet.address}.
+     """
+ 
+-
++    def connect(reactor, factory, timeout=30):
++        """Attempt to connect to my address
++        
++        @param reactor: The reactor instance providing one or more of:
++                        L{IReactorTCP}, L{IReactorUNIX}, L{IReactorUDP}
++        @param factory: A protocol factory providing L{IProtocolFactory}
++        @return: An object which provides L{IConnector}.
++        """
++        
++    def listen(reactor, factory):
++        """Attempt to listen at my address
++        
++        @param reactor: The reactor instance providing one or more of:
++                        L{IReactorTCP}, L{IReactorUNIX}, L{IReactorUDP}
++        @param factory: A protocol factory providing L{IProtocolFactory}
++        @return: An object which provides L{IListeningPort}.
++        """        
+ ### Reactor Interfaces
+ 
+ class IConnector(Interface):
+Index: twisted/internet/address.py
+===================================================================
+--- twisted/internet/address.py	(revision 18049)
++++ twisted/internet/address.py	(working copy)
+@@ -8,6 +8,8 @@
+ from zope.interface import implements
+ from twisted.internet.interfaces import IAddress
+ 
++class _NO_BACKLOG_GIVEN: 
++    pass
+ 
+ class IPv4Address(object):
+     """
+@@ -27,13 +29,32 @@
+ 
+     implements(IAddress)
+     
+-    def __init__(self, type, host, port, _bwHack = None):
++    def __init__(self, type, host, port, sslContextFactory=None, _bwHack = None):
+         assert type in ('TCP', 'UDP')
+         self.type = type
+         self.host = host
+         self.port = port
++        self.sslContextFactory = sslContextFactory
+         self._bwHack = _bwHack
+ 
++    def connect(self, reactor, factory, timeout=30):
++        if self.sslContextFactory:
++            return reactor.connectSSL(self.host, self.port, factory, 
++                                      self.sslContextFactory, timeout)
++        else:
++            return reactor.connectTCP(self.host, self.port, factory, timeout)
++
++    def listen(self, reactor, factory, backlog=_NO_BACKLOG_GIVEN):
++        kwargs = {}
++        if backlog is not _NO_BACKLOG_GIVEN:
++            kwargs["backlog"] = backlog
++        if self.sslContextFactory:
++            return reactor.listenSSL(self.port, factory, self.sslContextFactory, 
++                                     interface=self.host, **kwargs)
++        else:
++            return reactor.listenTCP(self.port, 
++                                     factory, interface=self.host, **kwargs)
++
+     def __getitem__(self, index):
+         warnings.warn("IPv4Address.__getitem__ is deprecated.  Use attributes instead.",
+                       category=DeprecationWarning, stacklevel=2)
+@@ -70,7 +91,16 @@
+     def __init__(self, name, _bwHack='UNIX'):
+         self.name = name
+         self._bwHack = _bwHack
+-    
++
++    def connect(self, reactor, factory, timeout=30):
++        return reactor.connectUNIX(self.name, factory, timeout)
++
++    def listen(self, reactor, factory, backlog=_NO_BACKLOG_GIVEN):
++        kwargs = {}
++        if backlog is not _NO_BACKLOG_GIVEN:
++            kwargs["backlog"] = backlog
++        return reactor.listenUNIX(self.name, factory, **kwargs)
++
+     def __getitem__(self, index):
+         warnings.warn("UNIXAddress.__getitem__ is deprecated.  Use attributes instead.",
+                       category=DeprecationWarning, stacklevel=2)
+@@ -92,7 +122,7 @@
+         return False
+ 
+     def __str__(self):
+-        return 'UNIXSocket(%r)' % (self.name,)
++        return 'UNIXAddress(%r)' % (self.name,)
+ 
+ 
+ # These are for buildFactory backwards compatability due to

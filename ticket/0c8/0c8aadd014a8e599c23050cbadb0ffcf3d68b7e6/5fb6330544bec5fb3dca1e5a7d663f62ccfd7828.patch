@@ -1,0 +1,1240 @@
+diff --git a/twisted/web/http.py b/twisted/web/http.py
+index 2203cd3..5180397 100644
+--- a/twisted/web/http.py
++++ b/twisted/web/http.py
+@@ -587,24 +587,17 @@ class Request:
+     _forceSSL = 0
+     _disconnected = False
+ 
+-    def __init__(self, channel, queued):
++    def __init__(self, channel):
+         """
+         @param channel: the channel we're connected to.
+-        @param queued: are we in the request queue, or can we start writing to
+-            the transport?
+         """
+         self.notifications = []
+         self.channel = channel
+-        self.queued = queued
+         self.requestHeaders = Headers()
+         self.received_cookies = {}
+         self.responseHeaders = Headers()
+         self.cookies = [] # outgoing cookies
+-
+-        if queued:
+-            self.transport = StringTransport()
+-        else:
+-            self.transport = self.channel.transport
++        self.transport = self.channel.transport
+ 
+ 
+     def _cleanup(self):
+@@ -616,45 +609,19 @@ class Request:
+             self.unregisterProducer()
+         self.channel.requestDone(self)
+         del self.channel
+-        try:
+-            self.content.close()
+-        except OSError:
+-            # win32 suckiness, no idea why it does this
+-            pass
+-        del self.content
++        if self.content is not None:
++            try:
++                self.content.close()
++            except OSError:
++                # win32 suckiness, no idea why it does this
++                pass
++            del self.content
+         for d in self.notifications:
+             d.callback(None)
+         self.notifications = []
+ 
+     # methods for channel - end users should not use these
+ 
+-    def noLongerQueued(self):
+-        """
+-        Notify the object that it is no longer queued.
+-
+-        We start writing whatever data we have to the transport, etc.
+-
+-        This method is not intended for users.
+-        """
+-        if not self.queued:
+-            raise RuntimeError("noLongerQueued() got called unnecessarily.")
+-
+-        self.queued = 0
+-
+-        # set transport to real one and send any buffer data
+-        data = self.transport.getvalue()
+-        self.transport = self.channel.transport
+-        if data:
+-            self.transport.write(data)
+-
+-        # if we have producer, register it with transport
+-        if (self.producer is not None) and not self.finished:
+-            self.transport.registerProducer(self.producer, self.streamingProducer)
+-
+-        # if we're finished, clean up
+-        if self.finished:
+-            self._cleanup()
+-
+     def gotLength(self, length):
+         """
+         Called when HTTP channel got length of content in this request.
+@@ -807,18 +774,13 @@ class Request:
+         self.streamingProducer = streaming
+         self.producer = producer
+ 
+-        if self.queued:
+-            if streaming:
+-                producer.pauseProducing()
+-        else:
+-            self.transport.registerProducer(producer, streaming)
++        self.transport.registerProducer(producer, streaming)
+ 
+     def unregisterProducer(self):
+         """
+         Unregister the producer.
+         """
+-        if not self.queued:
+-            self.transport.unregisterProducer()
++        self.transport.unregisterProducer()
+         self.producer = None
+ 
+ 
+@@ -887,8 +849,7 @@ class Request:
+             self.channel.factory.log(self)
+ 
+         self.finished = 1
+-        if not self.queued:
+-            self._cleanup()
++        self._cleanup()
+ 
+ 
+     def write(self, data):
+@@ -1264,11 +1225,12 @@ class Request:
+         """
+         if self._forceSSL:
+             return True
+-        transport = getattr(getattr(self, 'channel', None), 'transport', None)
++        transport = getattr(self, 'transport', None)
+         if interfaces.ISSLTransport(transport, None) is not None:
+             return True
+         return False
+ 
++
+     def _authorize(self):
+         # Authorization, (mostly) per the RFC
+         try:
+@@ -1626,6 +1588,8 @@ class HTTPChannel(basic.LineReceiver, policies.TimeoutMixin):
+     def __init__(self):
+         # the request queue
+         self.requests = []
++        self._handlingRequest = False
++        self._dataBuffer = []
+         self._transferDecoder = None
+ 
+ 
+@@ -1659,7 +1623,7 @@ class HTTPChannel(basic.LineReceiver, policies.TimeoutMixin):
+                 return
+ 
+             # create a new Request object
+-            request = self.requestFactory(self, len(self.requests))
++            request = self.requestFactory(self)
+             self.requests.append(request)
+ 
+             self.__first_line = 0
+@@ -1706,7 +1670,8 @@ class HTTPChannel(basic.LineReceiver, policies.TimeoutMixin):
+ 
+     def _finishRequestBody(self, data):
+         self.allContentReceived()
+-        self.setLineMode(data)
++        self._dataBuffer.append(data)
++        #self.setLineMode(data)
+ 
+ 
+     def headerReceived(self, line):
+@@ -1777,12 +1742,28 @@ class HTTPChannel(basic.LineReceiver, policies.TimeoutMixin):
+         if self.timeOut:
+             self._savedTimeOut = self.setTimeout(None)
+ 
++        # Pause the transport if we can. If we can't that's ok, we'll buffer.
++        try:
++            self.transport.pauseProducing()
++            print "production paused"
++        except AttributeError:
++            pass
++
++        self._handlingRequest = True
++
+         req = self.requests[-1]
+         req.requestReceived(command, path, version)
+ 
+ 
+     def rawDataReceived(self, data):
+         self.resetTimeout()
++
++        # If we're currently handling a request, buffer this data. We shouldn't
++        # have received it (we've paused the transport), but let's be cautious.
++        if self._handlingRequest:
++            self._dataBuffer.append(data)
++            return
++
+         try:
+             self._transferDecoder.dataReceived(data)
+         except _MalformedChunkedDataError:
+@@ -1854,19 +1835,29 @@ class HTTPChannel(basic.LineReceiver, policies.TimeoutMixin):
+         del self.requests[0]
+ 
+         if self.persistent:
+-            # notify next request it can start writing
+-            if self.requests:
+-                self.requests[0].noLongerQueued()
+-            else:
+-                if self._savedTimeOut:
+-                    self.setTimeout(self._savedTimeOut)
++            self._handlingRequest = False
++            # Get the transport to keep writing.
++            try:
++                self.transport.resumeProducing()
++            except AttributeError:
++                pass
++
++            if self._savedTimeOut:
++                self.setTimeout(self._savedTimeOut)
++
++            # Receive our buffered data, if any.
++            data = b''.join(self._dataBuffer)
++            self._dataBuffer = []
++            self.setLineMode(data)
+         else:
+             self.transport.loseConnection()
+ 
++
+     def timeoutConnection(self):
+         log.msg("Timing out client: %s" % str(self.transport.getPeer()))
+         policies.TimeoutMixin.timeoutConnection(self)
+ 
++
+     def connectionLost(self, reason):
+         self.setTimeout(None)
+         for request in self.requests:
+diff --git a/twisted/web/proxy.py b/twisted/web/proxy.py
+index 9f88a2e..c318387 100644
+--- a/twisted/web/proxy.py
++++ b/twisted/web/proxy.py
+@@ -134,8 +134,8 @@ class ProxyRequest(Request):
+     protocols = {b'http': ProxyClientFactory}
+     ports = {b'http': 80}
+ 
+-    def __init__(self, channel, queued, reactor=reactor):
+-        Request.__init__(self, channel, queued)
++    def __init__(self, channel, reactor=reactor):
++        Request.__init__(self, channel)
+         self.reactor = reactor
+ 
+ 
+@@ -195,8 +195,8 @@ class ReverseProxyRequest(Request):
+ 
+     proxyClientFactoryClass = ProxyClientFactory
+ 
+-    def __init__(self, channel, queued, reactor=reactor):
+-        Request.__init__(self, channel, queued)
++    def __init__(self, channel, reactor=reactor):
++        Request.__init__(self, channel)
+         self.reactor = reactor
+ 
+ 
+diff --git a/twisted/web/server.py b/twisted/web/server.py
+index 3431dc8..a9ab407 100644
+--- a/twisted/web/server.py
++++ b/twisted/web/server.py
+@@ -620,7 +620,7 @@ class Site(http.HTTPFactory):
+     A web site: manage log, sessions, and resources.
+ 
+     @ivar counter: increment value used for generating unique sessions ID.
+-    @ivar requestFactory: A factory which is called with (channel, queued)
++    @ivar requestFactory: A factory which is called with (channel)
+         and creates L{Request} instances. Default to L{Request}.
+     @ivar displayTracebacks: if set, Twisted internal errors are displayed on
+         rendered pages. Default to C{True}.
+diff --git a/twisted/web/test/test_http.py b/twisted/web/test/test_http.py
+index 7691077..e1dcd8d 100644
+--- a/twisted/web/test/test_http.py
++++ b/twisted/web/test/test_http.py
+@@ -394,7 +394,7 @@ def _prequest(**headers):
+     """
+     Make a request with the given request headers for the persistence tests.
+     """
+-    request = http.Request(DummyChannel(), False)
++    request = http.Request(DummyChannel())
+     for headerName, v in headers.items():
+         request.requestHeaders.setRawHeaders(networkString(headerName), v)
+     return request
+@@ -1497,7 +1497,7 @@ class RequestTests(unittest.TestCase, ResponseTestMixin):
+         This is used to test that the C{headers}/C{responseHeaders} and
+         C{received_headers}/C{requestHeaders} pairs interact properly.
+         """
+-        req = http.Request(DummyChannel(), False)
++        req = http.Request(DummyChannel())
+         getattr(req, newName).setRawHeaders(b"test", [b"lemur"])
+         self.assertEqual(getattr(req, oldName)[b"test"], b"lemur")
+         setattr(req, oldName, {b"foo": b"bar"})
+@@ -1513,7 +1513,7 @@ class RequestTests(unittest.TestCase, ResponseTestMixin):
+         L{http.Request.getHeader} returns the value of the named request
+         header.
+         """
+-        req = http.Request(DummyChannel(), False)
++        req = http.Request(DummyChannel())
+         req.requestHeaders.setRawHeaders(b"test", [b"lemur"])
+         self.assertEqual(req.getHeader(b"test"), b"lemur")
+ 
+@@ -1523,7 +1523,7 @@ class RequestTests(unittest.TestCase, ResponseTestMixin):
+         When there are multiple values for a single request header,
+         L{http.Request.getHeader} returns the last value.
+         """
+-        req = http.Request(DummyChannel(), False)
++        req = http.Request(DummyChannel())
+         req.requestHeaders.setRawHeaders(b"test", [b"lemur", b"panda"])
+         self.assertEqual(req.getHeader(b"test"), b"panda")
+ 
+@@ -1533,7 +1533,7 @@ class RequestTests(unittest.TestCase, ResponseTestMixin):
+         L{http.Request.getHeader} returns C{None} when asked for the value of a
+         request header which is not present.
+         """
+-        req = http.Request(DummyChannel(), False)
++        req = http.Request(DummyChannel())
+         self.assertEqual(req.getHeader(b"test"), None)
+ 
+ 
+@@ -1542,7 +1542,7 @@ class RequestTests(unittest.TestCase, ResponseTestMixin):
+         L{http.Request.getAllheaders} returns a C{dict} mapping all request
+         header names to their corresponding values.
+         """
+-        req = http.Request(DummyChannel(), False)
++        req = http.Request(DummyChannel())
+         req.requestHeaders.setRawHeaders(b"test", [b"lemur"])
+         self.assertEqual(req.getAllHeaders(), {b"test": b"lemur"})
+ 
+@@ -1552,7 +1552,7 @@ class RequestTests(unittest.TestCase, ResponseTestMixin):
+         L{http.Request.getAllHeaders} returns an empty C{dict} if there are no
+         request headers.
+         """
+-        req = http.Request(DummyChannel(), False)
++        req = http.Request(DummyChannel())
+         self.assertEqual(req.getAllHeaders(), {})
+ 
+ 
+@@ -1561,7 +1561,7 @@ class RequestTests(unittest.TestCase, ResponseTestMixin):
+         When there are multiple values for a single request header,
+         L{http.Request.getAllHeaders} returns only the last value.
+         """
+-        req = http.Request(DummyChannel(), False)
++        req = http.Request(DummyChannel())
+         req.requestHeaders.setRawHeaders(b"test", [b"lemur", b"panda"])
+         self.assertEqual(req.getAllHeaders(), {b"test": b"panda"})
+ 
+@@ -1572,7 +1572,7 @@ class RequestTests(unittest.TestCase, ResponseTestMixin):
+         used as the response status.
+         """
+         channel = DummyChannel()
+-        req = http.Request(channel, False)
++        req = http.Request(channel)
+         req.setResponseCode(201)
+         req.write(b'')
+         self.assertEqual(
+@@ -1586,7 +1586,7 @@ class RequestTests(unittest.TestCase, ResponseTestMixin):
+         causes them to be used as the response status.
+         """
+         channel = DummyChannel()
+-        req = http.Request(channel, False)
++        req = http.Request(channel)
+         req.setResponseCode(202, b"happily accepted")
+         req.write(b'')
+         self.assertEqual(
+@@ -1600,7 +1600,7 @@ class RequestTests(unittest.TestCase, ResponseTestMixin):
+         parameter and raises L{TypeError} if passed anything else.
+         """
+         channel = DummyChannel()
+-        req = http.Request(channel, False)
++        req = http.Request(channel)
+         self.assertRaises(TypeError, req.setResponseCode,
+                           202, u"not happily accepted")
+ 
+@@ -1610,7 +1610,7 @@ class RequestTests(unittest.TestCase, ResponseTestMixin):
+         L{http.Request.setResponseCode} accepts C{int} for the code parameter
+         and raises L{TypeError} if passed anything else.
+         """
+-        req = http.Request(DummyChannel(), False)
++        req = http.Request(DummyChannel())
+         req.setResponseCode(1)
+         self.assertRaises(TypeError, req.setResponseCode, "1")
+ 
+@@ -1620,7 +1620,7 @@ class RequestTests(unittest.TestCase, ResponseTestMixin):
+         L{http.Request.setResponseCode} accepts C{long} for the code
+         parameter.
+         """
+-        req = http.Request(DummyChannel(), False)
++        req = http.Request(DummyChannel())
+         req.setResponseCode(long(1))
+     if _PY3:
+         test_setResponseCodeAcceptsLongIntegers.skip = (
+@@ -1632,7 +1632,7 @@ class RequestTests(unittest.TestCase, ResponseTestMixin):
+         L{http.Request.setHost} sets the value of the host request header.
+         The port should not be added because it is the default.
+         """
+-        req = http.Request(DummyChannel(), False)
++        req = http.Request(DummyChannel())
+         req.setHost(b"example.com", 80)
+         self.assertEqual(
+             req.requestHeaders.getRawHeaders(b"host"), [b"example.com"])
+@@ -1645,7 +1645,7 @@ class RequestTests(unittest.TestCase, ResponseTestMixin):
+         """
+         d = DummyChannel()
+         d.transport = DummyChannel.SSL()
+-        req = http.Request(d, False)
++        req = http.Request(d)
+         req.setHost(b"example.com", 443)
+         self.assertEqual(
+             req.requestHeaders.getRawHeaders(b"host"), [b"example.com"])
+@@ -1656,7 +1656,7 @@ class RequestTests(unittest.TestCase, ResponseTestMixin):
+         L{http.Request.setHost} sets the value of the host request header.
+         The port should be added because it is not the default.
+         """
+-        req = http.Request(DummyChannel(), False)
++        req = http.Request(DummyChannel())
+         req.setHost(b"example.com", 81)
+         self.assertEqual(
+             req.requestHeaders.getRawHeaders(b"host"), [b"example.com:81"])
+@@ -1669,7 +1669,7 @@ class RequestTests(unittest.TestCase, ResponseTestMixin):
+         """
+         d = DummyChannel()
+         d.transport = DummyChannel.SSL()
+-        req = http.Request(d, False)
++        req = http.Request(d)
+         req.setHost(b"example.com", 81)
+         self.assertEqual(
+             req.requestHeaders.getRawHeaders(b"host"), [b"example.com:81"])
+@@ -1679,7 +1679,7 @@ class RequestTests(unittest.TestCase, ResponseTestMixin):
+         """
+         L{http.Request.setHeader} sets the value of the given response header.
+         """
+-        req = http.Request(DummyChannel(), False)
++        req = http.Request(DummyChannel())
+         req.setHeader(b"test", b"lemur")
+         self.assertEqual(req.responseHeaders.getRawHeaders(b"test"), [b"lemur"])
+ 
+@@ -1690,7 +1690,7 @@ class RequestTests(unittest.TestCase, ResponseTestMixin):
+         that the cookie value is equal to C{expectedCookieValue}.
+         """
+         channel = DummyChannel()
+-        req = http.Request(channel, False)
++        req = http.Request(channel)
+         req.addCookie(*args, **kwargs)
+         self.assertEqual(req.cookies[0], expectedCookieValue)
+ 
+@@ -1784,7 +1784,7 @@ class RequestTests(unittest.TestCase, ResponseTestMixin):
+         For an HTTP 1.0 request, L{http.Request.write} sends an HTTP 1.0
+         Response-Line and whatever response headers are set.
+         """
+-        req = http.Request(DummyChannel(), False)
++        req = http.Request(DummyChannel())
+         trans = StringTransport()
+ 
+         req.transport = trans
+@@ -1806,7 +1806,7 @@ class RequestTests(unittest.TestCase, ResponseTestMixin):
+         L{http.Request.write} casts non-bytes header value to bytes
+         transparently.
+         """
+-        req = http.Request(DummyChannel(), False)
++        req = http.Request(DummyChannel())
+         trans = StringTransport()
+ 
+         req.transport = trans
+@@ -1838,7 +1838,7 @@ class RequestTests(unittest.TestCase, ResponseTestMixin):
+         Response-Line, whatever response headers are set, and uses chunked
+         encoding for the response body.
+         """
+-        req = http.Request(DummyChannel(), False)
++        req = http.Request(DummyChannel())
+         trans = StringTransport()
+ 
+         req.transport = trans
+@@ -1863,7 +1863,7 @@ class RequestTests(unittest.TestCase, ResponseTestMixin):
+         L{http.Request.write} sends an HTTP Response-Line, whatever response
+         headers are set, and a last-modified header with that time.
+         """
+-        req = http.Request(DummyChannel(), False)
++        req = http.Request(DummyChannel())
+         trans = StringTransport()
+ 
+         req.transport = trans
+@@ -1886,7 +1886,7 @@ class RequestTests(unittest.TestCase, ResponseTestMixin):
+         """
+         L{http.Request.received_cookies} defaults to an empty L{dict}.
+         """
+-        req = http.Request(DummyChannel(), False)
++        req = http.Request(DummyChannel())
+         self.assertEqual(req.received_cookies, {})
+ 
+ 
+@@ -1895,7 +1895,7 @@ class RequestTests(unittest.TestCase, ResponseTestMixin):
+         L{http.Request.parseCookies} extracts cookies from C{requestHeaders}
+         and adds them to C{received_cookies}.
+         """
+-        req = http.Request(DummyChannel(), False)
++        req = http.Request(DummyChannel())
+         req.requestHeaders.setRawHeaders(
+             b"cookie", [b'test="lemur"; test2="panda"'])
+         req.parseCookies()
+@@ -1908,7 +1908,7 @@ class RequestTests(unittest.TestCase, ResponseTestMixin):
+         L{http.Request.parseCookies} can extract cookies from multiple Cookie
+         headers.
+         """
+-        req = http.Request(DummyChannel(), False)
++        req = http.Request(DummyChannel())
+         req.requestHeaders.setRawHeaders(
+             b"cookie", [b'test="lemur"', b'test2="panda"'])
+         req.parseCookies()
+@@ -1921,7 +1921,7 @@ class RequestTests(unittest.TestCase, ResponseTestMixin):
+         L{http.Request.parseCookies} can be called on a request without a
+         cookie header.
+         """
+-        req = http.Request(DummyChannel(), False)
++        req = http.Request(DummyChannel())
+         req.parseCookies()
+         self.assertEqual(req.received_cookies, {})
+ 
+@@ -1931,7 +1931,7 @@ class RequestTests(unittest.TestCase, ResponseTestMixin):
+         L{http.Request.parseCookies} can be called on a request with an
+         empty cookie header.
+         """
+-        req = http.Request(DummyChannel(), False)
++        req = http.Request(DummyChannel())
+         req.requestHeaders.setRawHeaders(
+             b"cookie", [])
+         req.parseCookies()
+@@ -1943,7 +1943,7 @@ class RequestTests(unittest.TestCase, ResponseTestMixin):
+         L{http.Request.parseCookies} ignores cookies which don't have a
+         value.
+         """
+-        req = http.Request(DummyChannel(), False)
++        req = http.Request(DummyChannel())
+         req.requestHeaders.setRawHeaders(
+             b"cookie", [b'foo; bar; baz;'])
+         req.parseCookies()
+@@ -1955,7 +1955,7 @@ class RequestTests(unittest.TestCase, ResponseTestMixin):
+         """
+         L{http.Request.parseCookies} parses cookies with an empty value.
+         """
+-        req = http.Request(DummyChannel(), False)
++        req = http.Request(DummyChannel())
+         req.requestHeaders.setRawHeaders(
+             b"cookie", [b'foo='])
+         req.parseCookies()
+@@ -1968,7 +1968,7 @@ class RequestTests(unittest.TestCase, ResponseTestMixin):
+         L{http.Request.parseCookies} leaves trailing whitespace in the
+         cookie value.
+         """
+-        req = http.Request(DummyChannel(), False)
++        req = http.Request(DummyChannel())
+         req.requestHeaders.setRawHeaders(
+             b"cookie", [b'foo=bar '])
+         req.parseCookies()
+@@ -1981,7 +1981,7 @@ class RequestTests(unittest.TestCase, ResponseTestMixin):
+         L{http.Request.parseCookies} strips leading whitespace in the
+         cookie key.
+         """
+-        req = http.Request(DummyChannel(), False)
++        req = http.Request(DummyChannel())
+         req.requestHeaders.setRawHeaders(
+             b"cookie", [b' foo=bar'])
+         req.parseCookies()
+@@ -1994,7 +1994,7 @@ class RequestTests(unittest.TestCase, ResponseTestMixin):
+         L{http.Request.parseCookies} parses valid cookies set before or
+         after malformed cookies.
+         """
+-        req = http.Request(DummyChannel(), False)
++        req = http.Request(DummyChannel())
+         req.requestHeaders.setRawHeaders(
+             b"cookie", [b'12345; test="lemur"; 12345; test2="panda"; 12345'])
+         req.parseCookies()
+@@ -2007,7 +2007,7 @@ class RequestTests(unittest.TestCase, ResponseTestMixin):
+         L{http.Request.connectionLost} closes L{Request.content} and drops the
+         reference to the L{HTTPChannel} to assist with garbage collection.
+         """
+-        req = http.Request(DummyChannel(), False)
++        req = http.Request(DummyChannel())
+ 
+         # Cause Request.content to be created at all.
+         req.gotLength(10)
+@@ -2029,80 +2029,19 @@ class RequestTests(unittest.TestCase, ResponseTestMixin):
+         Calling L{Request.registerProducer} when a producer is already
+         registered raises ValueError.
+         """
+-        req = http.Request(DummyChannel(), False)
++        req = http.Request(DummyChannel())
+         req.registerProducer(DummyProducer(), True)
+         self.assertRaises(
+             ValueError, req.registerProducer, DummyProducer(), True)
+ 
+ 
+-    def test_registerProducerWhenQueuedPausesPushProducer(self):
+-        """
+-        Calling L{Request.registerProducer} with an IPushProducer when the
+-        request is queued pauses the producer.
+-        """
+-        req = http.Request(DummyChannel(), True)
+-        producer = DummyProducer()
+-        req.registerProducer(producer, True)
+-        self.assertEqual(['pause'], producer.events)
+-
+-
+-    def test_registerProducerWhenQueuedDoesntPausePullProducer(self):
+-        """
+-        Calling L{Request.registerProducer} with an IPullProducer when the
+-        request is queued does not pause the producer, because it doesn't make
+-        sense to pause a pull producer.
+-        """
+-        req = http.Request(DummyChannel(), True)
+-        producer = DummyProducer()
+-        req.registerProducer(producer, False)
+-        self.assertEqual([], producer.events)
+-
+-
+-    def test_registerProducerWhenQueuedDoesntRegisterPushProducer(self):
+-        """
+-        Calling L{Request.registerProducer} with an IPushProducer when the
+-        request is queued does not register the producer on the request's
+-        transport.
+-        """
+-        self.assertIdentical(
+-            None, getattr(http.StringTransport, 'registerProducer', None),
+-            "StringTransport cannot implement registerProducer for this test "
+-            "to be valid.")
+-        req = http.Request(DummyChannel(), True)
+-        producer = DummyProducer()
+-        req.registerProducer(producer, True)
+-        # This is a roundabout assertion: http.StringTransport doesn't
+-        # implement registerProducer, so Request.registerProducer can't have
+-        # tried to call registerProducer on the transport.
+-        self.assertIsInstance(req.transport, http.StringTransport)
+-
+-
+-    def test_registerProducerWhenQueuedDoesntRegisterPullProducer(self):
+-        """
+-        Calling L{Request.registerProducer} with an IPullProducer when the
+-        request is queued does not register the producer on the request's
+-        transport.
+-        """
+-        self.assertIdentical(
+-            None, getattr(http.StringTransport, 'registerProducer', None),
+-            "StringTransport cannot implement registerProducer for this test "
+-            "to be valid.")
+-        req = http.Request(DummyChannel(), True)
+-        producer = DummyProducer()
+-        req.registerProducer(producer, False)
+-        # This is a roundabout assertion: http.StringTransport doesn't
+-        # implement registerProducer, so Request.registerProducer can't have
+-        # tried to call registerProducer on the transport.
+-        self.assertIsInstance(req.transport, http.StringTransport)
+-
+-
+     def test_registerProducerWhenNotQueuedRegistersPushProducer(self):
+         """
+         Calling L{Request.registerProducer} with an IPushProducer when the
+         request is not queued registers the producer as a push producer on the
+         request's transport.
+         """
+-        req = http.Request(DummyChannel(), False)
++        req = http.Request(DummyChannel())
+         producer = DummyProducer()
+         req.registerProducer(producer, True)
+         self.assertEqual([(producer, True)], req.transport.producers)
+@@ -2114,7 +2053,7 @@ class RequestTests(unittest.TestCase, ResponseTestMixin):
+         request is not queued registers the producer as a pull producer on the
+         request's transport.
+         """
+-        req = http.Request(DummyChannel(), False)
++        req = http.Request(DummyChannel())
+         producer = DummyProducer()
+         req.registerProducer(producer, False)
+         self.assertEqual([(producer, False)], req.transport.producers)
+@@ -2126,7 +2065,7 @@ class RequestTests(unittest.TestCase, ResponseTestMixin):
+         and cleans up per-request state.
+         """
+         d = DummyChannel()
+-        request = http.Request(d, True)
++        request = http.Request(d)
+         finished = request.notifyFinish()
+         request.connectionLost(Failure(ConnectionLost("Connection done")))
+         self.assertIdentical(request.channel, None)
+@@ -2137,7 +2076,7 @@ class RequestTests(unittest.TestCase, ResponseTestMixin):
+         """
+         L{Request.finish} triggers all finish notification Deferreds.
+         """
+-        request = http.Request(DummyChannel(), False)
++        request = http.Request(DummyChannel())
+         finished = request.notifyFinish()
+         # Force the request to have a non-None content attribute.  This is
+         # probably a bug in Request.
+@@ -2151,7 +2090,7 @@ class RequestTests(unittest.TestCase, ResponseTestMixin):
+         Calling L{Request.write} after L{Request.finish} has been called results
+         in a L{RuntimeError} being raised.
+         """
+-        request = http.Request(DummyChannel(), False)
++        request = http.Request(DummyChannel())
+         finished = request.notifyFinish()
+         # Force the request to have a non-None content attribute.  This is
+         # probably a bug in Request.
+@@ -2168,7 +2107,7 @@ class RequestTests(unittest.TestCase, ResponseTestMixin):
+         called results in a L{RuntimeError} being raised.
+         """
+         channel = DummyChannel()
+-        req = http.Request(channel, False)
++        req = http.Request(channel)
+         req.connectionLost(Failure(ConnectionLost("The end.")))
+         self.assertRaises(RuntimeError, req.finish)
+ 
+@@ -2179,7 +2118,7 @@ class RequestTests(unittest.TestCase, ResponseTestMixin):
+         dummy-place holder values when used on a L{Request} which has not yet
+         been initialized.
+         """
+-        request = http.Request(DummyChannel(), False)
++        request = http.Request(DummyChannel())
+         self.assertEqual(
+             repr(request),
+             '<Request at 0x%x method=(no method yet) uri=(no uri yet) '
+@@ -2194,7 +2133,7 @@ class RequestTests(unittest.TestCase, ResponseTestMixin):
+ 
+           <Request at ADDRESS method=METHOD uri=URI clientproto=PROTOCOL>
+        """
+-        request = http.Request(DummyChannel(), False)
++        request = http.Request(DummyChannel())
+         request.clientproto = b'HTTP/1.0'
+         request.method = b'GET'
+         request.uri = b'/foo/bar'
+@@ -2212,7 +2151,7 @@ class RequestTests(unittest.TestCase, ResponseTestMixin):
+         class Otherwise(http.Request):
+             pass
+ 
+-        request = Otherwise(DummyChannel(), False)
++        request = Otherwise(DummyChannel())
+         self.assertEqual(
+             repr(request),
+             '<Otherwise at 0x%x method=(no method yet) uri=(no uri yet) '
+@@ -2224,7 +2163,7 @@ class RequestTests(unittest.TestCase, ResponseTestMixin):
+         L{Request.unregisterProducer} unregisters a non-queued non-streaming
+         producer from the request and the request's transport.
+         """
+-        req = http.Request(DummyChannel(), False)
++        req = http.Request(DummyChannel())
+         req.transport = StringTransport()
+         req.registerProducer(DummyProducer(), False)
+         req.unregisterProducer()
+@@ -2236,45 +2175,13 @@ class RequestTests(unittest.TestCase, ResponseTestMixin):
+         L{Request.unregisterProducer} unregisters a non-queued streaming
+         producer from the request and the request's transport.
+         """
+-        req = http.Request(DummyChannel(), False)
++        req = http.Request(DummyChannel())
+         req.transport = StringTransport()
+         req.registerProducer(DummyProducer(), True)
+         req.unregisterProducer()
+         self.assertEqual((None, None), (req.producer, req.transport.producer))
+ 
+ 
+-    def test_unregisterQueuedNonStreamingProducer(self):
+-        """
+-        L{Request.unregisterProducer} unregisters a queued non-streaming
+-        producer from the request but not from the transport.
+-        """
+-        existing = DummyProducer()
+-        channel = DummyChannel()
+-        transport = StringTransport()
+-        channel.transport = transport
+-        transport.registerProducer(existing, True)
+-        req = http.Request(channel, True)
+-        req.registerProducer(DummyProducer(), False)
+-        req.unregisterProducer()
+-        self.assertEqual((None, existing), (req.producer, transport.producer))
+-
+-
+-    def test_unregisterQueuedStreamingProducer(self):
+-        """
+-        L{Request.unregisterProducer} unregisters a queued streaming producer
+-        from the request but not from the transport.
+-        """
+-        existing = DummyProducer()
+-        channel = DummyChannel()
+-        transport = StringTransport()
+-        channel.transport = transport
+-        transport.registerProducer(existing, True)
+-        req = http.Request(channel, True)
+-        req.registerProducer(DummyProducer(), True)
+-        req.unregisterProducer()
+-        self.assertEqual((None, existing), (req.producer, transport.producer))
+-
+-
+     def test_finishProducesLog(self):
+         """
+         L{http.Request.finish} will call the channel's factory to produce a log
+@@ -2491,46 +2398,6 @@ class Expect100ContinueServerTests(unittest.TestCase, ResponseTestMixin):
+               b"'''\n3\nabc'''\n")])
+ 
+ 
+-    def test_expect100ContinueWithPipelining(self):
+-        """
+-        If a HTTP/1.1 client sends a 'Expect: 100-continue' header, followed
+-        by another pipelined request, the 100 response does not interfere with
+-        the response to the second request.
+-        """
+-        transport = StringTransport()
+-        channel = http.HTTPChannel()
+-        channel.requestFactory = DummyHTTPHandler
+-        channel.makeConnection(transport)
+-        channel.dataReceived(
+-            b"GET / HTTP/1.1\r\n"
+-            b"Host: www.example.com\r\n"
+-            b"Expect: 100-continue\r\n"
+-            b"Content-Length: 3\r\n"
+-            b"\r\nabc"
+-            b"POST /foo HTTP/1.1\r\n"
+-            b"Host: www.example.com\r\n"
+-            b"Content-Length: 4\r\n"
+-            b"\r\ndefg")
+-        response = transport.value()
+-        self.assertTrue(
+-            response.startswith(b"HTTP/1.1 100 Continue\r\n\r\n"))
+-        response = response[len(b"HTTP/1.1 100 Continue\r\n\r\n"):]
+-        self.assertResponseEquals(
+-            response,
+-            [(b"HTTP/1.1 200 OK",
+-              b"Command: GET",
+-              b"Content-Length: 13",
+-              b"Version: HTTP/1.1",
+-              b"Request: /",
+-              b"'''\n3\nabc'''\n"),
+-             (b"HTTP/1.1 200 OK",
+-              b"Command: POST",
+-              b"Content-Length: 14",
+-              b"Version: HTTP/1.1",
+-              b"Request: /foo",
+-              b"'''\n4\ndefg'''\n")])
+-
+-
+ 
+ def sub(keys, d):
+     """
+@@ -2560,7 +2427,7 @@ class DeprecatedRequestAttributesTests(unittest.TestCase):
+         in application code.
+         """
+         channel = DummyChannel()
+-        request = http.Request(channel, True)
++        request = http.Request(channel)
+         request.gotLength(123)
+         request.requestReceived(b"GET", b"/", b"HTTP/1.1")
+         expected = channel.transport.getPeer().host
+diff --git a/twisted/web/test/test_proxy.py b/twisted/web/test/test_proxy.py
+index 68a99c7..770a2c6 100644
+--- a/twisted/web/test/test_proxy.py
++++ b/twisted/web/test/test_proxy.py
+@@ -438,7 +438,7 @@ class ProxyRequestTests(TestCase):
+         transport = StringTransportWithDisconnection()
+         channel = DummyChannel(transport)
+         reactor = MemoryReactor()
+-        request = ProxyRequest(channel, False, reactor)
++        request = ProxyRequest(channel, reactor)
+         request.gotLength(len(data))
+         request.handleContentChunk(data)
+         request.requestReceived(method, b'http://example.com' + uri,
+@@ -497,7 +497,7 @@ class ProxyRequestTests(TestCase):
+         transport = StringTransportWithDisconnection()
+         channel = DummyChannel(transport)
+         reactor = MemoryReactor()
+-        request = ProxyRequest(channel, False, reactor)
++        request = ProxyRequest(channel, reactor)
+         request.gotLength(0)
+         request.requestReceived(b'GET', b'http://example.com:1234/foo/bar',
+                                 b'HTTP/1.0')
+@@ -535,7 +535,7 @@ class ReverseProxyRequestTests(TestCase):
+         transport = StringTransportWithDisconnection()
+         channel = DummyChannel(transport)
+         reactor = MemoryReactor()
+-        request = ReverseProxyRequest(channel, False, reactor)
++        request = ReverseProxyRequest(channel, reactor)
+         request.factory = DummyFactory(u"example.com", 1234)
+         request.gotLength(0)
+         request.requestReceived(b'GET', b'/foo/bar', b'HTTP/1.0')
+diff --git a/twisted/web/test/test_util.py b/twisted/web/test/test_util.py
+index 7f30f16..14cff22 100644
+--- a/twisted/web/test/test_util.py
++++ b/twisted/web/test/test_util.py
+@@ -37,7 +37,7 @@ class RedirectToTests(TestCase):
+         its request, and set the response code to C{FOUND}, so the browser will
+         be redirected.
+         """
+-        request = Request(DummyChannel(), True)
++        request = Request(DummyChannel())
+         request.method = b'GET'
+         targetURL = b"http://target.example.com/4321"
+         redirectTo(targetURL, request)
+@@ -53,7 +53,7 @@ class RedirectToTests(TestCase):
+         """
+         L{redirectTo} will raise TypeError if unicode object is passed in URL
+         """
+-        request = Request(DummyChannel(), True)
++        request = Request(DummyChannel())
+         request.method = b'GET'
+         targetURL = u'http://target.example.com/4321'
+         self.assertRaises(TypeError, redirectTo, targetURL, request)
+diff --git a/twisted/web/test/test_web.py b/twisted/web/test/test_web.py
+index 23eb86d..5660fcb 100644
+--- a/twisted/web/test/test_web.py
++++ b/twisted/web/test/test_web.py
+@@ -450,21 +450,21 @@ class RequestTests(unittest.TestCase):
+         L{server.Request} instances provide L{iweb.IRequest}.
+         """
+         self.assertTrue(
+-            verifyObject(iweb.IRequest, server.Request(DummyChannel(), True)))
++            verifyObject(iweb.IRequest, server.Request(DummyChannel())))
+ 
+ 
+     def testChildLink(self):
+-        request = server.Request(DummyChannel(), 1)
++        request = server.Request(DummyChannel())
+         request.gotLength(0)
+         request.requestReceived(b'GET', b'/foo/bar', b'HTTP/1.0')
+         self.assertEqual(request.childLink(b'baz'), b'bar/baz')
+-        request = server.Request(DummyChannel(), 1)
++        request = server.Request(DummyChannel())
+         request.gotLength(0)
+         request.requestReceived(b'GET', b'/foo/bar/', b'HTTP/1.0')
+         self.assertEqual(request.childLink(b'baz'), b'baz')
+ 
+     def testPrePathURLSimple(self):
+-        request = server.Request(DummyChannel(), 1)
++        request = server.Request(DummyChannel())
+         request.gotLength(0)
+         request.requestReceived(b'GET', b'/foo/bar', b'HTTP/1.0')
+         request.setHost(b'example.com', 80)
+@@ -473,7 +473,7 @@ class RequestTests(unittest.TestCase):
+     def testPrePathURLNonDefault(self):
+         d = DummyChannel()
+         d.transport.port = 81
+-        request = server.Request(d, 1)
++        request = server.Request(d)
+         request.setHost(b'example.com', 81)
+         request.gotLength(0)
+         request.requestReceived(b'GET', b'/foo/bar', b'HTTP/1.0')
+@@ -482,7 +482,7 @@ class RequestTests(unittest.TestCase):
+     def testPrePathURLSSLPort(self):
+         d = DummyChannel()
+         d.transport.port = 443
+-        request = server.Request(d, 1)
++        request = server.Request(d)
+         request.setHost(b'example.com', 443)
+         request.gotLength(0)
+         request.requestReceived(b'GET', b'/foo/bar', b'HTTP/1.0')
+@@ -492,7 +492,7 @@ class RequestTests(unittest.TestCase):
+         d = DummyChannel()
+         d.transport = DummyChannel.SSL()
+         d.transport.port = 443
+-        request = server.Request(d, 1)
++        request = server.Request(d)
+         request.setHost(b'example.com', 443)
+         request.gotLength(0)
+         request.requestReceived(b'GET', b'/foo/bar', b'HTTP/1.0')
+@@ -502,7 +502,7 @@ class RequestTests(unittest.TestCase):
+         d = DummyChannel()
+         d.transport = DummyChannel.SSL()
+         d.transport.port = 80
+-        request = server.Request(d, 1)
++        request = server.Request(d)
+         request.setHost(b'example.com', 80)
+         request.gotLength(0)
+         request.requestReceived(b'GET', b'/foo/bar', b'HTTP/1.0')
+@@ -512,7 +512,7 @@ class RequestTests(unittest.TestCase):
+         d = DummyChannel()
+         d.transport = DummyChannel.SSL()
+         d.transport.port = 81
+-        request = server.Request(d, 1)
++        request = server.Request(d)
+         request.setHost(b'example.com', 81)
+         request.gotLength(0)
+         request.requestReceived(b'GET', b'/foo/bar', b'HTTP/1.0')
+@@ -521,7 +521,7 @@ class RequestTests(unittest.TestCase):
+     def testPrePathURLSetSSLHost(self):
+         d = DummyChannel()
+         d.transport.port = 81
+-        request = server.Request(d, 1)
++        request = server.Request(d)
+         request.setHost(b'foo.com', 81, 1)
+         request.gotLength(0)
+         request.requestReceived(b'GET', b'/foo/bar', b'HTTP/1.0')
+@@ -534,7 +534,7 @@ class RequestTests(unittest.TestCase):
+         preserve the original meaning.
+         """
+         d = DummyChannel()
+-        request = server.Request(d, 1)
++        request = server.Request(d)
+         request.setHost(b'example.com', 80)
+         request.gotLength(0)
+         request.requestReceived(b'GET', b'/foo%2Fbar', b'HTTP/1.0')
+@@ -548,14 +548,16 @@ class RequestTests(unittest.TestCase):
+         message.
+         """
+         d = DummyChannel()
+-        request = server.Request(d, 1)
++        request = server.Request(d)
+         request.site = server.Site(resource.Resource())
+         request.site.displayTracebacks = False
+         fail = failure.Failure(Exception("Oh no!"))
+         request.processingFailed(fail)
+ 
+-        self.assertNotIn(b"Oh no!", request.transport.getvalue())
+-        self.assertIn(b"Processing Failed", request.transport.getvalue())
++        self.assertNotIn(b"Oh no!", request.transport.written.getvalue())
++        self.assertIn(
++            b"Processing Failed", request.transport.written.getvalue()
++        )
+ 
+         # Since we didn't "handle" the exception, flush it to prevent a test
+         # failure
+@@ -568,13 +570,13 @@ class RequestTests(unittest.TestCase):
+         to C{True} writes out the failure.
+         """
+         d = DummyChannel()
+-        request = server.Request(d, 1)
++        request = server.Request(d)
+         request.site = server.Site(resource.Resource())
+         request.site.displayTracebacks = True
+         fail = failure.Failure(Exception("Oh no!"))
+         request.processingFailed(fail)
+ 
+-        self.assertIn(b"Oh no!", request.transport.getvalue())
++        self.assertIn(b"Oh no!", request.transport.written.getvalue())
+ 
+         # Since we didn't "handle" the exception, flush it to prevent a test
+         # failure
+@@ -588,13 +590,13 @@ class RequestTests(unittest.TestCase):
+         entities.
+         """
+         d = DummyChannel()
+-        request = server.Request(d, 1)
++        request = server.Request(d)
+         request.site = server.Site(resource.Resource())
+         request.site.displayTracebacks = True
+         fail = failure.Failure(Exception(u"\u2603"))
+         request.processingFailed(fail)
+ 
+-        self.assertIn(b"&#9731;", request.transport.getvalue())
++        self.assertIn(b"&#9731;", request.transport.written.getvalue())
+ 
+         # Since we didn't "handle" the exception, flush it to prevent a test
+         # failure
+@@ -622,7 +624,7 @@ class GzipEncoderTests(unittest.TestCase):
+         instance of L{server._GzipEncoder} which implements
+         L{iweb._IRequestEncoder}.
+         """
+-        request = server.Request(self.channel, False)
++        request = server.Request(self.channel)
+         request.gotLength(0)
+         request.requestHeaders.setRawHeaders(b"Accept-Encoding",
+                                              [b"gzip,deflate"])
+@@ -638,7 +640,7 @@ class GzipEncoderTests(unittest.TestCase):
+         If the client request passes a I{Accept-Encoding} header which mentions
+         gzip, L{server._GzipEncoder} automatically compresses the data.
+         """
+-        request = server.Request(self.channel, False)
++        request = server.Request(self.channel)
+         request.gotLength(0)
+         request.requestHeaders.setRawHeaders(b"Accept-Encoding",
+                                              [b"gzip,deflate"])
+@@ -656,7 +658,7 @@ class GzipEncoderTests(unittest.TestCase):
+         L{server.GzipEncoderFactory} doesn't return a L{server._GzipEncoder} if
+         the I{Accept-Encoding} header doesn't mention gzip support.
+         """
+-        request = server.Request(self.channel, False)
++        request = server.Request(self.channel)
+         request.gotLength(0)
+         request.requestHeaders.setRawHeaders(b"Accept-Encoding",
+                                              [b"foo,bar"])
+@@ -674,7 +676,7 @@ class GzipEncoderTests(unittest.TestCase):
+         L{server.GzipEncoderFactory} reads them properly to detect if gzip is
+         supported.
+         """
+-        request = server.Request(self.channel, False)
++        request = server.Request(self.channel)
+         request.gotLength(0)
+         request.requestHeaders.setRawHeaders(b"Accept-Encoding",
+                                              [b"deflate", b"gzip"])
+@@ -692,7 +694,7 @@ class GzipEncoderTests(unittest.TestCase):
+         If the content is already encoded and the I{Content-Encoding} header is
+         set, L{server.GzipEncoderFactory} properly appends gzip to it.
+         """
+-        request = server.Request(self.channel, False)
++        request = server.Request(self.channel)
+         request.gotLength(0)
+         request.requestHeaders.setRawHeaders(b"Accept-Encoding",
+                                              [b"deflate", b"gzip"])
+@@ -713,7 +715,7 @@ class GzipEncoderTests(unittest.TestCase):
+         L{server.GzipEncoderFactory} normalizes it and appends gzip to the
+         field value.
+         """
+-        request = server.Request(self.channel, False)
++        request = server.Request(self.channel)
+         request.gotLength(0)
+         request.requestHeaders.setRawHeaders(b"Accept-Encoding",
+                                              [b"deflate", b"gzip"])
+@@ -752,7 +754,7 @@ class RememberURLTests(unittest.TestCase):
+         rr.putChild(b'bar', resource.Resource())
+         chan = self.createServer(r)
+         for url in [b'/foo/', b'/foo/bar', b'/foo/bar/baz', b'/foo/bar/']:
+-            request = server.Request(chan, 1)
++            request = server.Request(chan)
+             request.setHost(b'example.com', 81)
+             request.gotLength(0)
+             request.requestReceived(b'GET', url, b'HTTP/1.0')
+@@ -764,7 +766,7 @@ class RememberURLTests(unittest.TestCase):
+         rr.putChild(b'bar', resource.Resource())
+         chan = self.createServer(rr)
+         for url in [b'/', b'/bar', b'/bar/baz', b'/bar/']:
+-            request = server.Request(chan, 1)
++            request = server.Request(chan)
+             request.setHost(b'example.com', 81)
+             request.gotLength(0)
+             request.requestReceived(b'GET', url, b'HTTP/1.0')
+@@ -815,7 +817,7 @@ class NewRenderTests(unittest.TestCase):
+             resource = NewRenderResource()
+         d.site.resource.putChild(b'newrender', resource)
+         d.transport.port = 81
+-        request = server.Request(d, 1)
++        request = server.Request(d)
+         request.setHost(b'example.com', 81)
+         request.gotLength(0)
+         return request
+@@ -823,11 +825,15 @@ class NewRenderTests(unittest.TestCase):
+     def testGoodMethods(self):
+         req = self._getReq()
+         req.requestReceived(b'GET', b'/newrender', b'HTTP/1.0')
+-        self.assertEqual(req.transport.getvalue().splitlines()[-1], b'hi hi')
++        self.assertEqual(
++            req.transport.written.getvalue().splitlines()[-1], b'hi hi'
++        )
+ 
+         req = self._getReq()
+         req.requestReceived(b'HEH', b'/newrender', b'HTTP/1.0')
+-        self.assertEqual(req.transport.getvalue().splitlines()[-1], b'ho ho')
++        self.assertEqual(
++            req.transport.written.getvalue().splitlines()[-1], b'ho ho'
++        )
+ 
+     def testBadMethods(self):
+         req = self._getReq()
+@@ -855,7 +861,7 @@ class NewRenderTests(unittest.TestCase):
+         req = self._getReq()
+         req.requestReceived(b'HEAD', b'/newrender', b'HTTP/1.0')
+         self.assertEqual(req.code, 200)
+-        self.assertEqual(-1, req.transport.getvalue().find(b'hi hi'))
++        self.assertEqual(-1, req.transport.written.getvalue().find(b'hi hi'))
+ 
+ 
+     def test_unsupportedHead(self):
+@@ -866,7 +872,7 @@ class NewRenderTests(unittest.TestCase):
+         resource = HeadlessResource()
+         req = self._getReq(resource)
+         req.requestReceived(b"HEAD", b"/newrender", b"HTTP/1.0")
+-        headers, body = req.transport.getvalue().split(b'\r\n\r\n')
++        headers, body = req.transport.written.getvalue().split(b'\r\n\r\n')
+         self.assertEqual(req.code, 200)
+         self.assertEqual(body, b'')
+ 
+@@ -887,7 +893,7 @@ class NewRenderTests(unittest.TestCase):
+ 
+         request.requestReceived(b"GET", b"/newrender", b"HTTP/1.0")
+ 
+-        headers, body = request.transport.getvalue().split(b'\r\n\r\n')
++        headers, body = request.transport.written.getvalue().split(b'\r\n\r\n')
+         self.assertEqual(request.code, 500)
+         expected = [
+             '',
+@@ -940,7 +946,7 @@ class AllowedMethodsTests(unittest.TestCase):
+         d = DummyChannel()
+         d.site.resource.putChild(b'gettableresource', GettableResource())
+         d.transport.port = 81
+-        request = server.Request(d, 1)
++        request = server.Request(d)
+         request.setHost(b'example.com', 81)
+         request.gotLength(0)
+         return request
+@@ -988,7 +994,7 @@ class AllowedMethodsTests(unittest.TestCase):
+         req.requestReceived(b'POST', b'/gettableresource?'
+                             b'value=<script>bad', b'HTTP/1.0')
+         self.assertEqual(req.code, 405)
+-        renderedPage = req.transport.getvalue()
++        renderedPage = req.transport.written.getvalue()
+         self.assertNotIn(b"<script>bad", renderedPage)
+         self.assertIn(b'&lt;script&gt;bad', renderedPage)
+ 
+@@ -1003,7 +1009,7 @@ class AllowedMethodsTests(unittest.TestCase):
+         req = self._getReq()
+         req.requestReceived(b'<style>bad', b'/gettableresource', b'HTTP/1.0')
+         self.assertEqual(req.code, 501)
+-        renderedPage = req.transport.getvalue()
++        renderedPage = req.transport.written.getvalue()
+         self.assertNotIn(b"<style>bad", renderedPage)
+         self.assertIn(b'&lt;style&gt;bad', renderedPage)
+ 
+diff --git a/twisted/web/test/test_webclient.py b/twisted/web/test/test_webclient.py
+index bd3f37c..c5996cc 100644
+--- a/twisted/web/test/test_webclient.py
++++ b/twisted/web/test/test_webclient.py
+@@ -727,13 +727,13 @@ class WebClientTests(unittest.TestCase):
+         # Verify the behavior if no bytes are ever written.
+         first = client.downloadPage(
+             self.getURL("wait"),
+-            self.mktemp(), timeout=0.01)
++            self.mktemp(), timeout=0.1)
+ 
+         # Verify the behavior if some bytes are written but then the request
+         # never completes.
+         second = client.downloadPage(
+             self.getURL("write-then-wait"),
+-            self.mktemp(), timeout=0.01)
++            self.mktemp(), timeout=0.1)
+ 
+         return defer.gatherResults([
+             self.assertFailure(first, defer.TimeoutError),
+diff --git a/twisted/web/test/test_wsgi.py b/twisted/web/test/test_wsgi.py
+index 46af048..16499c1 100644
+--- a/twisted/web/test/test_wsgi.py
++++ b/twisted/web/test/test_wsgi.py
+@@ -99,7 +99,7 @@ class WSGIResourceTests(TestCase):
+         self.assertRaises(
+             RuntimeError,
+             self.resource.getChildWithDefault,
+-            b"foo", Request(DummyChannel(), False))
++            b"foo", Request(DummyChannel()))
+         self.assertRaises(
+             RuntimeError,
+             self.resource.putChild,
+@@ -168,7 +168,7 @@ class WSGITestsMixin:
+ 
+         channel = channelFactory()
+         channel.site = Site(root)
+-        request = requestFactory(channel, False)
++        request = requestFactory(channel)
+         for k, v in headers:
+             request.requestHeaders.addRawHeader(
+                 _toByteString(k), _toByteString(v))
+@@ -270,7 +270,7 @@ class WSGITestsMixin:
+                 return Request.requestReceived(
+                     self, command=command, path=path, version=version)
+ 
+-        request = CannedRequest(channel, queued=False)
++        request = CannedRequest(channel)
+         request.gotLength(0)  # Initialize buffer for request body.
+ 
+         return request, result

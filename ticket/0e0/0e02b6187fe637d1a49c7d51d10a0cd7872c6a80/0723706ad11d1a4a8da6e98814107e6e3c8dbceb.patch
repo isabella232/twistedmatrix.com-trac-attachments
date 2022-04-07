@@ -1,0 +1,240 @@
+Index: twisted/names/dns.py
+===================================================================
+--- twisted/names/dns.py	(revision 45104)
++++ twisted/names/dns.py	(working copy)
+@@ -14,7 +14,7 @@
+ __all__ = [
+     'IEncodable', 'IRecord',
+ 
+-    'A', 'A6', 'AAAA', 'AFSDB', 'CNAME', 'DNAME', 'HINFO',
++    'A', 'A6', 'AAAA', 'AFSDB', 'CNAME', 'DNAME', 'DS', 'HINFO',
+     'MAILA', 'MAILB', 'MB', 'MD', 'MF', 'MG', 'MINFO', 'MR', 'MX',
+     'NAPTR', 'NS', 'NULL', 'OPT', 'PTR', 'RP', 'SOA', 'SPF', 'SRV', 'TXT',
+     'WKS',
+@@ -26,10 +26,11 @@
+     'EFORMAT', 'ENAME', 'ENOTIMP', 'EREFUSED', 'ESERVER', 'EBADVERSION',
+ 
+     'Record_A', 'Record_A6', 'Record_AAAA', 'Record_AFSDB', 'Record_CNAME',
+-    'Record_DNAME', 'Record_HINFO', 'Record_MB', 'Record_MD', 'Record_MF',
+-    'Record_MG', 'Record_MINFO', 'Record_MR', 'Record_MX', 'Record_NAPTR',
+-    'Record_NS', 'Record_NULL', 'Record_PTR', 'Record_RP', 'Record_SOA',
+-    'Record_SPF', 'Record_SRV', 'Record_TXT', 'Record_WKS', 'UnknownRecord',
++    'Record_DNAME', 'Record_DS', 'Record_HINFO', 'Record_MB', 'Record_MD',
++    'Record_MF', 'Record_MG', 'Record_MINFO', 'Record_MR', 'Record_MX',
++    'Record_NAPTR', 'Record_NS', 'Record_NULL', 'Record_PTR', 'Record_RP',
++    'Record_SOA', 'Record_SPF', 'Record_SRV', 'Record_TXT', 'Record_WKS',
++    'UnknownRecord',
+ 
+     'QUERY_CLASSES', 'QUERY_TYPES', 'REV_CLASSES', 'REV_TYPES', 'EXT_QUERIES',
+ 
+@@ -110,7 +111,6 @@
+ 
+ 
+ PORT = 53
+-
+ (A, NS, MD, MF, CNAME, SOA, MB, MG, MR, NULL, WKS, PTR, HINFO, MINFO, MX, TXT,
+  RP, AFSDB) = range(1, 19)
+ AAAA = 28
+@@ -119,6 +119,7 @@
+ A6 = 38
+ DNAME = 39
+ OPT = 41
++DS = 43
+ SPF = 99
+ 
+ QUERY_TYPES = {
+@@ -149,6 +150,7 @@
+     A6: 'A6',
+     DNAME: 'DNAME',
+     OPT: 'OPT',
++    DS: 'OPT',
+     SPF: 'SPF'
+ }
+ 
+@@ -187,12 +189,26 @@
+ OP_NOTIFY = 4 # RFC 1996
+ OP_UPDATE = 5 # RFC 2136
+ 
++# DNSSEC Algorithm Numbers
++# http://iana.org/assignments/dns-sec-alg-numbers/dns-sec-alg-numbers.xhtml
++ALG_RSAMD5, ALG_DH, ALG_DSA = range(3)
++(ALG_RSASHA1, ALG_DSANSEC3SHA1, ALG_RSASHA1NSEC3SHA1, ALG_RSASHA256) = (
++range(5, 9))
++ALG_RSASHA512 = 10
++ALG_ECCGOST, ALG_ECDSAP256SHA256, ALG_ECDSAP384SHA384 = range(12, 15)
+ 
++ALG_1, ALG_2, ALG_3 = range(3)
++ALG_5, ALG_6, ALG_7, ALG_8  = range(5, 9)
++ALG_10 = 10
++ALG_12, ALG_13, ALG_14 = range(12, 15)
++
++
+ # Response Codes
+ OK, EFORMAT, ESERVER, ENAME, ENOTIMP, EREFUSED = range(6)
+ # https://tools.ietf.org/html/rfc6891#section-9
+ EBADVERSION = 16
+ 
++
+ class IRecord(Interface):
+     """
+     An single entry in a zone of authority.
+@@ -1035,7 +1051,6 @@
+     fancybasename = 'PTR'
+ 
+ 
+-
+ class Record_DNAME(SimpleRecord):
+     """
+     A non-terminal DNS name redirection.
+@@ -1051,7 +1066,50 @@
+     fancybasename = 'DNAME'
+ 
+ 
++@implementer(IEncodable, IRecord)
++class Record_DS(tputil.FancyEqMixin, tputil.FancyStrMixin):
++    """
++    A delegation signer record
+ 
++    This record type is used verify the public key used for DNSSEC. 
++    @see: U{http://tools.ietf.org/html/rfc4034#section-5}
++    @type keyTag: C{int}
++    @ivar keyTag: Key tag of corresponding DNSKEY record
++    @type algorithm: C{int}
++    @ivar algorithm: Algorithm defined by IANA at U{http://www.iana.org/assignments/dns-sec-alg-numbers/dns-sec-alg-numbers.xhtml}
++    @type digestType: C{int}
++    @ivar digestType: Digest Type defined by IANA at U{http://www.iana.org/assignments/ds-rr-types/ds-rr-types.xhtml}
++    @type digest: C{str}
++    @ivar digest: Digest of the corresponding DNSKEY record
++
++    """
++    TYPE = DS
++    fancybasename = 'DS'
++    compareAttributes = ('keyTag', 'algorithm', 'digestType', 'digest', 'ttl')
++    showAttributes = ('keyTag', 'algorithm', 'digestType', 'ttl')
++
++    def __init__(self, keyTag=0, algorithm=0, digestType=0, digest=b'', ttl=None):
++        self.keyTag = int(keyTag)
++        self.algorithm = int(algorithm)
++        self.digestType = int(digestType)
++        self.digest = Charstr(digest)
++        self.ttl = str2time(ttl)
++
++    def encode(self, strio, compDict = None):
++        strio.write(struct.pack('!HBB', self.keyTag, self.algorithm, self.digestType))
++        self.digest.encode(strio, None)
++
++    def decode(self, strio, length = None):
++        r = struct.unpack('!HBB', readPrecisely(strio, struct.calcsize('!HBB')))
++        self.keyTag, self.algorithm, self.digestType = r
++        self.digest = Charstr()
++        self.digest.decode(strio)
++
++    def __hash__(self):
++        return hash((
++            self.keyTag, self.algorithm, self.digestType, self.digest))
++
++
+ @implementer(IEncodable, IRecord)
+ class Record_A(tputil.FancyEqMixin):
+     """
+@@ -1911,6 +1969,8 @@
+ 
+ 
+ 
++
++
+ def _responseFromMessage(responseConstructor, message, **kwargs):
+     """
+     Generate a L{Message} like instance suitable for use as the response to
+Index: twisted/names/test/test_dns.py
+===================================================================
+--- twisted/names/test/test_dns.py	(revision 45104)
++++ twisted/names/test/test_dns.py	(working copy)
+@@ -30,7 +30,8 @@
+     dns.Record_DNAME, dns.Record_A, dns.Record_SOA, dns.Record_NULL,
+     dns.Record_WKS, dns.Record_SRV, dns.Record_AFSDB, dns.Record_RP,
+     dns.Record_HINFO, dns.Record_MINFO, dns.Record_MX, dns.Record_TXT,
+-    dns.Record_AAAA, dns.Record_A6, dns.Record_NAPTR, dns.UnknownRecord,
++    dns.Record_AAAA, dns.Record_A6, dns.Record_NAPTR, dns.Record_DS, 
++    dns.UnknownRecord,
+     ]
+ 
+ 
+@@ -569,7 +570,15 @@
+         L{dns.Record_TXT} instance.
+         """
+         self._recordRoundtripTest(dns.Record_TXT(b'foo', b'bar'))
++    
+ 
++    def test_DS(self):
++        """
++        The byte stream written by L{dns.Record_DS.encode} can be used by
++        L{dns.Record_DS.decode} to reconstruct the state of the original
++        L{dns.Record_DS} instance.
++        """
++        self._recordRoundtripTest(dns.Record_DS(10001, 8, 1, b'foobar'))
+ 
+ 
+ MESSAGE_AUTHENTIC_DATA_BYTES = (
+@@ -1422,6 +1431,16 @@
+             "<DNAME name=example.com ttl=4321>")
+ 
+ 
++    def test_ds(self):
++        """
++        The repr of a L{dns.Record_DS} instance includes the keytag, 
++        algorithm, digest type, and the TTL of the record
++        """
++        self.assertEqual(
++            repr(dns.Record_DS(1, 2, 3, b'4', 4321)),
++            "<DS keyTag=1 algorithm=2 digestType=3 ttl=4321>")
++
++
+     def test_a(self):
+         """
+         The repr of a L{dns.Record_A} instance includes the dotted-quad
+@@ -1760,6 +1779,43 @@
+         self._simpleEqualityTest(dns.Record_DNAME)
+ 
+ 
++    def test_ds(self):
++        """
++        Two L{dns.Record_DS} instances compare equal if and only if they have
++        the same keytag, algorithm, digest type, digest, and TTL.
++        """
++        # vary the ttl
++        self._equalityTest(
++            dns.Record_DS(60485, 5, 2, b'D4B7D520E7BB5F0F67674A0CCEB1E3E0614B93C4F9E99B8383F6A1E4469DA50A5', 1),
++            dns.Record_DS(60485, 5, 2, b'D4B7D520E7BB5F0F67674A0CCEB1E3E0614B93C4F9E99B8383F6A1E4469DA50A5', 1),
++            dns.Record_DS(60485, 5, 2, b'D4B7D520E7BB5F0F67674A0CCEB1E3E0614B93C4F9E99B8383F6A1E4469DA50A5', 2),
++            )
++        # vary the digest
++        self._equalityTest(
++            dns.Record_DS(60485, 5, 2, b'D4B7D520E7BB5F0F67674A0CCEB1E3E0614B93C4F9E99B8383F6A1E4469DA50A5', 1),
++            dns.Record_DS(60485, 5, 2, b'D4B7D520E7BB5F0F67674A0CCEB1E3E0614B93C4F9E99B8383F6A1E4469DA50A5', 1),
++            dns.Record_DS(60485, 5, 2, b'D4B7D520E7BB5F0F67674A0CCEB1E300614B93C4F9E99B8383F6A1E4469DA50A5', 1),
++            )
++        # vary the digest type
++        self._equalityTest(
++            dns.Record_DS(60485, 5, 2, b'D4B7D520E7BB5F0F67674A0CCEB1E3E0614B93C4F9E99B8383F6A1E4469DA50A5', 1),
++            dns.Record_DS(60485, 5, 2, b'D4B7D520E7BB5F0F67674A0CCEB1E3E0614B93C4F9E99B8383F6A1E4469DA50A5', 1),
++            dns.Record_DS(60485, 5, 1, b'D4B7D520E7BB5F0F67674A0CCEB1E3E0614B93C4F9E99B8383F6A1E4469DA50A5', 1),
++            )
++        # vary the alogrithm
++        self._equalityTest(
++            dns.Record_DS(60485, 5, 2, b'D4B7D520E7BB5F0F67674A0CCEB1E3E0614B93C4F9E99B8383F6A1E4469DA50A5', 1),
++            dns.Record_DS(60485, 5, 2, b'D4B7D520E7BB5F0F67674A0CCEB1E3E0614B93C4F9E99B8383F6A1E4469DA50A5', 1),
++            dns.Record_DS(60485, 8, 2, b'D4B7D520E7BB5F0F67674A0CCEB1E3E0614B93C4F9E99B8383F6A1E4469DA50A5', 1),
++            )
++        # vary the key tag
++        self._equalityTest(
++            dns.Record_DS(60485, 5, 2, b'D4B7D520E7BB5F0F67674A0CCEB1E3E0614B93C4F9E99B8383F6A1E4469DA50A5', 1),
++            dns.Record_DS(60485, 5, 2, b'D4B7D520E7BB5F0F67674A0CCEB1E3E0614B93C4F9E99B8383F6A1E4469DA50A5', 1),
++            dns.Record_DS(60484, 5, 2, b'D4B7D520E7BB5F0F67674A0CCEB1E3E0614B93C4F9E99B8383F6A1E4469DA50A5', 1),
++            )
++
++
+     def test_a(self):
+         """
+         Two L{dns.Record_A} instances compare equal if and only if they have
+

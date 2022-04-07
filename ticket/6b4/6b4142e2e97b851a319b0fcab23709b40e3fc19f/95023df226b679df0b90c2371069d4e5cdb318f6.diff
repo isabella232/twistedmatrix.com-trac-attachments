@@ -1,0 +1,78 @@
+Index: twisted/enterprise/adbapi.py
+===================================================================
+--- twisted/enterprise/adbapi.py	(revision 17970)
++++ twisted/enterprise/adbapi.py	(working copy)
+@@ -130,6 +130,7 @@
+     openfun = None # A function to call on new connections
+     reconnect = False # reconnect when connections fail
+     good_sql = 'select 1' # a query which should always succeed
++    retryOnLost = False
+ 
+     running = False # true when the pool is operating
+ 
+@@ -376,7 +377,21 @@
+             conn.commit()
+             return result
+         except:
+-            conn.rollback()
++            try:
++                conn.rollback()
++            except ConnectionLost:
++                if self.retryOnLost:
++                    conn = Connection(self)
++                    trans = Transaction(self, conn)
++                    try:
++                        result = interaction(trans, *args, **kw)
++                        trans.close()
++                        conn.commit()
++                        return result
++                    except:
++                        conn.rollback()
++                        raise
++                raise
+             raise
+ 
+     def _runQuery(self, trans, *args, **kw):
+Index: twisted/test/test_adbapi.py
+===================================================================
+--- twisted/test/test_adbapi.py	(revision 17970)
++++ twisted/test/test_adbapi.py	(working copy)
+@@ -301,6 +301,30 @@
+         return d
+ 
+ 
++class RetryTestBase(ReconnectTestBase):
++    """Test the asynchronous DB-API code with retry: on ConnectionLost queries are
++    retrie ONE time.
++    """
++
++    def setUp(self):
++        if self.good_sql is None:
++            raise unittest.SkipTest('no good sql for reconnect test')
++        self.startDB()
++        self.dbpool = self.makePool(cp_max=1, cp_reconnect=True,
++                                    cp_good_sql=self.good_sql)
++        self.dbpool.retryOnLost = True
++        self.dbpool.start()
++        return self.dbpool.runOperation(simple_table_schema)
++
++    def _testPool_3(self, res):
++        sql = "select count(1) from simple"
++        d = self.dbpool.runQuery(sql)
++        def _check(row):
++            self.failUnless(int(row[0][0]) == 0, "Table not empty")
++        d.addCallback(_check)
++        return d
++
++
+ class DBTestConnector:
+     """A class which knows how to test for the presence of
+     and establish a connection to a relational database.
+@@ -551,3 +575,7 @@
+ # GadflyReconnectTestCase SQLiteReconnectTestCase PyPgSQLReconnectTestCase
+ # PsycopgReconnectTestCase MySQLReconnectTestCase FirebirdReconnectTestCase
+ makeSQLTests(ReconnectTestBase, 'ReconnectTestCase', globals())
++
++# GadflyRetryTestCase SQLiteRetryTestCase PyPgSQLRetryTestCase
++# PsycopgRetryTestCase MySQLRetryTestCase FirebirdRetryTestCase
++makeSQLTests(RetryTestBase, 'RetryTestBase', globals())

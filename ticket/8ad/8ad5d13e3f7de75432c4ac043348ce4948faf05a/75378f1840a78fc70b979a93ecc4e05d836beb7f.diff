@@ -1,0 +1,101 @@
+Index: twisted/internet/test/test_process.py
+===================================================================
+--- twisted/internet/test/test_process.py	(revision 30364)
++++ twisted/internet/test/test_process.py	(working copy)
+@@ -249,9 +249,7 @@
+ 
+     def test_openFileDescriptors(self):
+         """
+-        A spawned process has only stdin, stdout and stderr open
+-        (file descriptor 3 is also reported as open, because of the call to
+-        'os.listdir()').
++        A spawned process has at least stdin, stdout and stderr open.
+         """
+         from twisted.python.runtime import platformType
+         if platformType != "posix":
+@@ -263,11 +261,13 @@
+             "import sys",
+             "sys.path.insert(0, '%s')" % (top.path,),
+             "from twisted.internet import process",
+-            "sys.stdout.write(str(process._listOpenFDs()))",
++            "sys.stdout.write(' '.join([ str(fd) for fd in process._listOpenFDs() ]))",
+             "sys.stdout.flush()")
+ 
+         def checkOutput(output):
+-            self.assertEquals('[0, 1, 2, 3]', output)
++            self.assertTrue(0 in output)
++            self.assertTrue(1 in output)
++            self.assertTrue(2 in output)
+ 
+         reactor = self.buildReactor()
+ 
+@@ -280,7 +280,7 @@
+ 
+             def processEnded(self, reason):
+                 try:
+-                    checkOutput("".join(self.output))
++                    checkOutput(map(int, "".join(self.output).split()))
+                 finally:
+                     reactor.stop()
+ 
+Index: twisted/internet/process.py
+===================================================================
+--- twisted/internet/process.py	(revision 30364)
++++ twisted/internet/process.py	(working copy)
+@@ -467,36 +467,35 @@
+                                           self.pid, self.status)
+ 
+ 
++_open_fd_poll = None
++_open_fd_max = 0
+ 
+ def _listOpenFDs():
+     """
+-    Return an iterable of potentially open file descriptors.
+-
+-    This function returns an iterable over the contents of /dev/fd or
+-    /proc/<pid>/fd, if they're available on the platform. If they're not, the
+-    returned value is the range [0, maxfds], where 'maxfds' is at least 256.
++    Return a list of currently opened file descriptors.
+     """
+-    dname = "/dev/fd"
++    global _open_fd_poll
++    global _open_fd_max
++
+     try:
+-        return [int(fd) for fd in os.listdir(dname)]
++        import resource
++        maxfds = resource.getrlimit(resource.RLIMIT_NOFILE)[0]
++        # OS-X reports 9223372036854775808. That's a lot of fds
++        # to close
++        if maxfds > 1024:
++            maxfds = 1024
+     except:
+-        dname = "/proc/%d/fd" % (os.getpid(),)
+-        try:
+-            return [int(fd) for fd in os.listdir(dname)]
+-        except:
+-            try:
+-                import resource
+-                maxfds = resource.getrlimit(resource.RLIMIT_NOFILE)[1] + 1
+-                # OS-X reports 9223372036854775808. That's a lot of fds
+-                # to close
+-                if maxfds > 1024:
+-                    maxfds = 1024
+-            except:
+-                maxfds = 256
+-            return xrange(maxfds)
++        maxfds = 256
+ 
++    if _open_fd_max != maxfds:
++        _open_fd_max = maxfds
++        _open_fd_poll = select.poll()
++        for fd in xrange(maxfds):
++            _open_fd_poll.register(fd)
+ 
++    return [ fd for (fd, r) in _open_fd_poll.poll(0) if r != select.POLLNVAL ]
+ 
++
+ class Process(_BaseProcess):
+     """
+     An operating-system Process.

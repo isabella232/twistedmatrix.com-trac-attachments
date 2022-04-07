@@ -1,0 +1,281 @@
+=== modified file 'twisted/plugins/twisted_trial.py'
+--- twisted/plugins/twisted_trial.py	2006-03-12 19:59:12 +0000
++++ twisted/plugins/twisted_trial.py	2009-09-06 10:27:01 +0000
+@@ -51,3 +51,9 @@
+                    shortOpt=None,
+                    klass="TimingTextReporter")
+ 
++Subunit = _Reporter("Subunit Reporter",
++                    "twisted.trial.reporter",
++                    description="subunit output",
++                    longOpt="subunit",
++                    shortOpt=None,
++                    klass="SubunitReporter")
+
+=== modified file 'twisted/trial/reporter.py'
+--- twisted/trial/reporter.py	2008-11-02 13:59:21 +0000
++++ twisted/trial/reporter.py	2009-09-06 10:41:39 +0000
+@@ -20,6 +20,10 @@
+ from twisted.python.util import untilConcludes
+ from twisted.trial import itrial, util
+ 
++try:
++    from subunit import TestProtocolClient
++except ImportError:
++    TestProtocolClient = None
+ from zope.interface import implements
+ 
+ pyunit = __import__('unittest')
+@@ -886,6 +890,51 @@
+ 
+ 
+ 
++if TestProtocolClient is not None:
++    class SubunitReporter(TestProtocolClient):
++        """
++        Reports test output via Subunit.
++        """
++        implements(itrial.IReporter)
++
++
++        def __init__(self, stream=sys.stdout, tbformat='default',
++            realtime=False, publisher=None):
++            super(SubunitReporter, self).__init__(stream)
++
++
++        def addError(self, test, err):
++            return super(SubunitReporter, self).addError(test,
++                 util._exc_info_or_Failure_to_exc_info(err))
++
++
++        def addFailure(self, test, err):
++            return super(SubunitReporter, self).addFailure(test,
++                 util._exc_info_or_Failure_to_exc_info(err))
++
++
++        def addExpectedFailure(self, test, failure, todo):
++            """
++            Not implemented in some subunit versions.
++            """
++            failure = util._exc_info_or_Failure_to_exc_info(failure)
++            upcall = getattr(TestProtocolClient, 'addExpectedFailure', None)
++            if upcall is None:
++                self.addSuccess(test)
++            else:
++                upcall(self, test, failure)
++
++
++        def addUnexpectedSuccess(self, test, todo):
++            # Not represented in pyunit/subunit.
++            self.addSuccess(test)
++
++else:
++    def __inform_missing():raise Exception("Subunit not available.")
++    SubunitReporter = lambda:__inform_missing()
++
++
++
+ class TreeReporter(Reporter):
+     """
+     Print out the tests in the form a tree.
+
+=== modified file 'twisted/trial/test/test_reporter.py'
+--- twisted/trial/test/test_reporter.py	2008-11-02 13:59:21 +0000
++++ twisted/trial/test/test_reporter.py	2009-09-06 10:41:39 +0000
+@@ -812,7 +812,8 @@
+         self.assertEqual([], self.result._getPreludeSegments('foo'))
+ 
+ 
+-class TestReporter(unittest.TestCase):
++
++class TestReporterInterface(unittest.TestCase):
+     resultFactory = reporter.Reporter
+ 
+     def setUp(self):
+@@ -821,16 +822,105 @@
+         self.stream = StringIO.StringIO()
+         self.publisher = log.LogPublisher()
+         self.result = self.resultFactory(self.stream, publisher=self.publisher)
++
++
++    def test_startStop(self):
++        """
++        Test start and stop.
++        """
++        self.result.startTest(self.test)
++        self.result.stopTest(self.test)
++
++
++    def test_addUnexpectedSuccess(self):
++        """
++        Test addUnexpectedSuccess.
++        """
++        self.result.startTest(self.test)
++        self.result.addUnexpectedSuccess(self.test, "todo")
++        self.result.stopTest(self.test)
++
++
++    def test_addSuccess(self):
++        """
++        Test addSuccess.
++        """
++        self.result.startTest(self.test)
++        self.result.addSuccess(self.test)
++        self.result.stopTest(self.test)
++
++
++    def test_addError(self):
++        """
++        Test addError.
++        """
++        self.result.startTest(self.test)
++        try:
++            raise Exception('woo')
++        except Exception:
++            self.result.addError(self.test, self._exc_info())
++        self.result.stopTest(self.test)
++
++
++    def test_addFailure(self):
++        """
++        Test addFailure.
++        """
++        self.result.startTest(self.test)
++        try:
++            raise Exception('woo')
++        except Exception:
++            self.result.addFailure(self.test, self._exc_info())
++        self.result.stopTest(self.test)
++
++
++    def test_addExpectedFailure(self):
++        """
++        Test addExpectedFailure.
++        """
++        self.result.startTest(self.test)
++        try:
++            raise Exception('woo')
++        except Exception:
++            self.result.addExpectedFailure(self.test, self._exc_info(),
++                Todo(""))
++        self.result.stopTest(self.test)
++
++
++    def test_addUnexpectedSuccess(self):
++        """
++        Test addUnexpectedSuccess.
++        """
++        self.result.startTest(self.test)
++        self.result.addUnexpectedSuccess(self.test, Todo(""))
++        self.result.stopTest(self.test)
++
++
++    def test_addSkip(self):
++        """
++        Test addSkip.
++        """
++        self.result.startTest(self.test)
++        self.result.addSkip(self.test, "todo")
++        self.result.stopTest(self.test)
++
++
++
++class TestReporter(TestReporterInterface):
++
++    def setUp(self):
++        TestReporterInterface.setUp(self)
+         self._timer = 0
+         self.result._getTime = self._getTime
+ 
++
+     def _getTime(self):
+         self._timer += 1
+         return self._timer
+ 
++
+     def test_startStop(self):
+-        self.result.startTest(self.test)
+-        self.result.stopTest(self.test)
++        TestReporterInterface.test_startStop(self)
+         self.assertTrue(self.result._lastTime > 0)
+         self.assertEqual(self.result.testsRun, 1)
+         self.assertEqual(self.result.wasSuccessful(), True)
+@@ -848,7 +938,6 @@
+         self.assertEqual(self.stream.getvalue(), 'Hello World!\n')
+ 
+ 
+-
+     def test_printErrorsDeprecated(self):
+         """
+         L{IReporter.printErrors} was deprecated in Twisted 8.0.
+@@ -944,7 +1033,6 @@
+                 filename, lineno, category.split('.')[-1], message))
+ 
+ 
+-
+     def test_duplicateWarningSuppressed(self):
+         """
+         A warning emitted twice within a single test is only written to the
+@@ -1019,6 +1107,12 @@
+         self.assertEqual(stream.getvalue(), "Hello")
+ 
+ 
++
++class TestSubunitReporter(TestReporterInterface):
++    resultFactory = reporter.SubunitReporter
++
++
++
+ class TestTimingReporter(TestReporter):
+     resultFactory = reporter.TimingTextReporter
+ 
+
+=== modified file 'twisted/trial/unittest.py'
+--- twisted/trial/unittest.py	2009-03-31 14:42:10 +0000
++++ twisted/trial/unittest.py	2009-09-06 10:41:39 +0000
+@@ -1418,6 +1418,7 @@
+     """A feature of twisted.trial was used that pyunit cannot support."""
+ 
+ 
++
+ class PyUnitResultAdapter(object):
+     """
+     Wrap a C{TestResult} from the standard library's C{unittest} so that it
+@@ -1433,10 +1434,7 @@
+         self.original = original
+ 
+     def _exc_info(self, err):
+-        if isinstance(err, failure.Failure):
+-            # Unwrap the Failure into a exc_info tuple.
+-            err = (err.type, err.value, err.getTracebackObject())
+-        return err
++        return util._exc_info_or_Failure_to_exc_info(err)
+ 
+     def startTest(self, method):
+         self.original.startTest(method)
+
+=== modified file 'twisted/trial/util.py'
+--- twisted/trial/util.py	2009-05-06 12:38:45 +0000
++++ twisted/trial/util.py	2009-09-06 10:41:39 +0000
+@@ -209,6 +209,14 @@
+         return selectableStrings
+ 
+ 
++def _exc_info_or_Failure_to_exc_info(err):
++    """Coerce a Failure to an _exc_info, if err is a Failure."""
++    if isinstance(err, Failure):
++        # Unwrap the Failure into a exc_info tuple.
++        err = (err.type, err.value, err.getTracebackObject())
++    return err
++
++
+ def suppress(action='ignore', **kwarg):
+     """
+     Sets up the .suppress tuple properly, pass options to this method as you
+@@ -360,4 +368,4 @@
+ 
+ 
+ __all__ = ['FailureError', 'DirtyReactorWarning', 'DirtyReactorError',
+-           'PendingTimedCallsError', 'runSequentially']
++           'PendingTimedCallsError', 'runSequentially', '_exc_info_or_Failure_to_exc_info']
+

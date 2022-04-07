@@ -1,0 +1,150 @@
+Index: python/filepath.py
+===================================================================
+--- python/filepath.py	(revision 22990)
++++ python/filepath.py	(working copy)
+@@ -578,18 +578,52 @@
+ 
+     _chunkSize = 2 ** 2 ** 2 ** 2
+ 
+-    def copyTo(self, destination):
++    def copyTo(self, destination, followLinks=True):
++        """
++        Copies self to destination.  
++
++        If self is a directory, it copies its children (but not itself) 
++        recursively to destination - if destination does not exist as a 
++        directory, it creates it.  If destination is a file, an IOError will 
++        be raised.
++
++        If self is a file, it copies itself to destination.  If destination
++        is a file, it overwrites it.  If destination is a directory, an
++        IOError will be raised.
++
++        If self is a link (and followLinks is False), self will be copied
++        over as a new symlink with the same target as returned by os.readlink.
++        That means that if it is absolute, both the old and new symlink will 
++        link to the same thing.  If it's relative, then perhaps not (and
++        it's also possible that this relative link will be broken).
++
++        File/directory permissions and ownership will NOT be copied over.
++
++        If followLinks is True, symlinks are followed so that they're treated
++        as their targets.  In otherwords, if self is a link, the link's target
++        will be copied.  If destination is a link, self will be copied to the
++        destination's target (the actual destination will be destination's
++        target).  Symlinks under self (if self is a directory) will be
++        followed and its target's children be copied recursively.
++
++        If followLinks is False, symlinks will be copied over as symlinks.
++
++        @param destination: the destination (a FilePath) to which self 
++        should be copied
++        @param followLinks: whether symlinks in self should be treated as links
++        or as their targets
++        """
+         # XXX TODO: *thorough* audit and documentation of the exact desired
+         # semantics of this code.  Right now the behavior of existent
+         # destination symlinks is convenient, and quite possibly correct, but
+         # its security properties need to be explained.
+-        if self.isdir():
++        if self.isdir() and (followLinks or not self.islink()):
+             if not destination.exists():
+                 destination.createDirectory()
+             for child in self.children():
+                 destChild = destination.child(child.basename())
+-                child.copyTo(destChild)
+-        elif self.isfile():
++                child.copyTo(destChild, followLinks)
++        elif self.isfile() and (followLinks or not self.islink()):
+             writefile = destination.open('w')
+             readfile = self.open()
+             while 1:
+@@ -604,6 +638,8 @@
+                     break
+             writefile.close()
+             readfile.close()
++        elif self.islink() and not followLinks:
++            os.symlink(os.readlink(self.path), destination.path)
+         else:
+             # If you see the following message because you want to copy
+             # symlinks, fifos, block devices, character devices, or unix
+@@ -612,7 +648,23 @@
+             raise NotImplementedError(
+                 "Only copying of files and directories supported")
+ 
+-    def moveTo(self, destination):
++    def moveTo(self, destination, followLinks=True):
++        """
++        Move self to destination - basically renaming self to whatever
++        destination is named.  If destination is an already-existing directory,
++        moves all children to destination if destination is empty.  If
++        destination is a non-empty directory, or destination is a file, an
++        OSError will be raised (unless you are moving across filesystems, in
++        which case it will work because moveTo depends upon copyTo).
++
++        If moving between filesystems, self needs to be copied, and everything
++        that applies to copyTo applies to moveTo.
++
++        @param destination: the destination (a FilePath) to which self 
++        should be copied
++        @param followLinks: whether symlinks in self should be treated as links
++        or as their targets (only applicable when moving between filesystems)
++        """
+         try:
+             os.rename(self.path, destination.path)
+             self.restat(False)
+@@ -627,12 +679,12 @@
+ 
+                 # that means it's time to copy trees of directories!
+                 secsib = destination.temporarySibling()
+-                self.copyTo(secsib) # slow
+-                secsib.moveTo(destination) # visible
++                self.copyTo(secsib, followLinks) # slow
++                secsib.moveTo(destination, followLinks) # visible
+ 
+                 # done creating new stuff.  let's clean me up.
+                 mysecsib = self.temporarySibling()
+-                self.moveTo(mysecsib) # visible
++                self.moveTo(mysecsib, followLinks) # visible
+                 mysecsib.remove() # slow
+             else:
+                 raise
+Index: test/test_paths.py
+===================================================================
+--- test/test_paths.py	(revision 22990)
++++ test/test_paths.py	(working copy)
+@@ -398,6 +398,34 @@
+         oldPaths.sort()
+         self.assertEquals(newPaths, oldPaths)
+ 
++    def testCopyToWithSymlink(self):
++        """
++        Verify that copying with followLinks=True copies symlink targets
++        instead of symlinks
++        """
++        os.symlink(self.path.child("sub1").path, self.path.child("link1").path)
++        fp = filepath.FilePath(self.mktemp())
++        self.path.copyTo(fp)
++        self.failIf(fp.child("link1").islink())
++        self.assertEquals([x.basename() for x in fp.child("sub1").children()], 
++                          [x.basename() for x in fp.child("link1").children()])
++
++    def testCopyToWithoutSymlink(self):
++        """
++        Verify that copying with followLinks=False copies symlinks as symlinks
++        """
++        os.symlink("sub1", self.path.child("link1").path)
++        fp = filepath.FilePath(self.mktemp())
++        self.path.copyTo(fp, False)
++        self.failUnless(fp.child("link1").islink())
++        self.assertEquals(os.readlink(self.path.child("link1").path),
++                          os.readlink(fp.child("link1").path))
++
++    if not hasattr(os, "symlink"):
++        text = "Platform does not support symlinks"
++        testCopyToWithSymlink.skip = testCopyToWithoutSymlink = text
++
++
+     def testMoveTo(self):
+         self.assertRaises((OSError, IOError), self.path.moveTo, self.path.child('file1'))
+         oldPaths = list(self.path.walk()) # Record initial state

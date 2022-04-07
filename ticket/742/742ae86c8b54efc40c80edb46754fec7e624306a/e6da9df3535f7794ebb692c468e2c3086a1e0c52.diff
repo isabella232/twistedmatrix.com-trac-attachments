@@ -1,0 +1,129 @@
+Index: twisted/web/server.py
+===================================================================
+--- twisted/web/server.py	(revision 30970)
++++ twisted/web/server.py	(working copy)
+@@ -156,7 +156,7 @@
+             if self.method in (supportedMethods):
+                 # We MUST include an Allow header
+                 # (RFC 2616, 10.4.6 and 14.7)
+-                self.setHeader('Allow', allowedMethods)
++                self.setHeader('Allow', ', '.join(allowedMethods))
+                 s = ('''Your browser approached me (at %(URI)s) with'''
+                      ''' the method "%(method)s".  I only allow'''
+                      ''' the method%(plural)s %(allowed)s here.''' % {
+Index: twisted/web/resource.py
+===================================================================
+--- twisted/web/resource.py	(revision 30970)
++++ twisted/web/resource.py	(working copy)
+@@ -6,6 +6,7 @@
+ Implementation of the lowest-level Resource class.
+ """
+ 
++import re
+ import warnings
+ 
+ from zope.interface import Attribute, implements, Interface
+@@ -206,7 +207,9 @@
+             # This needs to be here until the deprecated subclasses of the
+             # below three error resources in twisted.web.error are removed.
+             from twisted.web.error import UnsupportedMethod
+-            raise UnsupportedMethod(getattr(self, 'allowedMethods', ()))
++            allowedMethods = (getattr(self, 'allowedMethods', 0) or
++                              _computeAllowedMethods(self))
++            raise UnsupportedMethod(allowedMethods)
+         return m(request)
+ 
+ 
+@@ -219,8 +222,22 @@
+         """
+         return self.render_GET(request)
+ 
++def _computeAllowedMethods(resource):
++    """
++    Compute the allowed methods on a C{Resource} based on defined render_FOO
++    methods. Used when raising C{UnsupportedMethod} but C{Resource} does
++    not define C{allowedMethods} attribute.
++    """
++    allowedMethods = []
++    for name in dir(resource):
++        parts = name.split('_')
++        if (len(parts) == 2 and parts[0] == 'render' 
++            and re.match(r'[A-Z]+', parts[1])):
++            allowedMethods.append(parts[1])
++    return allowedMethods
+ 
+ 
++
+ class ErrorPage(Resource):
+     """
+     L{ErrorPage} is a resource which responds with a particular
+Index: twisted/web/test/test_web.py
+===================================================================
+--- twisted/web/test/test_web.py	(revision 30970)
++++ twisted/web/test/test_web.py	(working copy)
+@@ -744,6 +744,65 @@
+ 
+ 
+ 
++class GettableResource(resource.Resource):
++    """
++    Used by AllowedMethodsTest to simulate an allowed method.
++    """
++    def render_GET(self):
++        pass
++
++
++
++class AllowedMethodsTest(unittest.TestCase):
++    """
++    'L{twisted.web.resource._computeAllowedMethods} is provided by a
++    default should the subclass not provide the method.
++    """
++
++
++    def _getReq(self):
++        """
++        Generate a dummy request for use by L{_computeAllowedMethod} tests.
++        """
++        d = DummyChannel()
++        d.site.resource.putChild('gettableresource', GettableResource())
++        d.transport.port = 81
++        request = server.Request(d, 1)
++        request.setHost('example.com', 81)
++        request.gotLength(0)
++        return request
++    
++
++    def test_computeAllowedMethods(self):
++        """
++        _computeAllowedMethods will search through the
++        'gettableresource' for all attributes/methods of the form
++        'render_{method}' ('render_GET', for example) and return a
++        list of the methods. 'HEAD' will always be included from the
++        resource.Resource superclass.
++        """
++        res = GettableResource()
++        allowedMethods = resource._computeAllowedMethods(res)
++        self.assertEquals(set(allowedMethods), set(['GET', 'HEAD'])) 
++
++
++    def test_notAllowed(self):
++        """
++        When an unsupported method is requested, the default
++        '_computeAllowedMethods' method will be called to determine
++        the allowed methods, and the HTTP 405 'Method Not Allowed'
++        status will be returned with the allowed methods will be
++        returned in the 'Allow' header.
++        """
++        req = self._getReq()
++        req.requestReceived('POST', '/gettableresource', 'HTTP/1.0')
++        self.assertEquals(req.code, 405)
++        body = req.transport.getvalue()
++        self.assert_('Allow: GET, HEAD' in req.transport.getvalue() or
++                     'Allow: HEAD, GET' in req.transport.getvalue())
++
++
++
+ class SDResource(resource.Resource):
+     def __init__(self,default):
+         self.default = default

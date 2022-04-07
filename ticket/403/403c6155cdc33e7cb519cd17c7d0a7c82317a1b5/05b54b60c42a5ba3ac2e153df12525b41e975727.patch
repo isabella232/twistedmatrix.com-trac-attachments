@@ -1,0 +1,333 @@
+Index: twisted/test/test_protocols.py
+===================================================================
+--- twisted/test/test_protocols.py	(Revision 28774)
++++ twisted/test/test_protocols.py	(Arbeitskopie)
+@@ -347,9 +347,12 @@
+ 
+ 
+ class TestNetstring(TestMixin, basic.NetstringReceiver):
+-    pass
+ 
++    def stringReceived(self, s):
++        self.received.append(s)
++        self.transport.write(s)
+ 
++
+ class LPTestCaseMixin:
+ 
+     illegalStrings = []
+@@ -387,6 +390,11 @@
+ 
+     protocol = TestNetstring
+ 
++    def setUp(self):
++        self.transport = proto_helpers.StringTransport()
++        self.netstringReceiver = TestNetstring()
++        self.netstringReceiver.makeConnection(self.transport)
++
+     def test_buffer(self):
+         """
+         Test that when strings are received in chunks of different lengths,
+@@ -437,7 +445,73 @@
+             warnings[0]['category'],
+             DeprecationWarning)
+ 
++    def test_receiveEmptyNetstring(self):
++        self.netstringReceiver.dataReceived("0:,")
++        self.assertEquals(self.transport.value(), "")
+ 
++    def test_receiveOneCharacter(self):
++        self.netstringReceiver.dataReceived("1:a,")
++        self.assertEquals(self.transport.value(), "a")
++
++    def test_receiveTwoCharacters(self):
++        self.netstringReceiver.dataReceived("2:ab,")
++        self.assertEquals(self.transport.value(), "ab")
++
++    def test_receiveNestedNetstring(self):
++        self.netstringReceiver.dataReceived("4:1:a,,")
++        self.assertEquals(self.transport.value(), "1:a,")
++
++    def test_moreDataThanSpecified(self):
++        self.netstringReceiver.dataReceived("2:aaa,")
++        self.assertTrue(self.transport.disconnecting)
++
++    def test_moreDataThanSpecifiedBorderCase(self):
++        self.netstringReceiver.dataReceived("0:a,")
++        self.assertTrue(self.transport.disconnecting)
++
++    def test_missingNumber(self):
++        self.netstringReceiver.dataReceived(":aaa,")
++        self.assertTrue(self.transport.disconnecting)
++
++    def test_missingColon(self):
++        self.netstringReceiver.dataReceived("3aaa,")
++        self.assertTrue(self.transport.disconnecting)
++
++    def test_missingNumberAndColon(self):
++        self.netstringReceiver.dataReceived("aaa,")
++        self.assertTrue(self.transport.disconnecting)
++
++    def test_OnlyData(self):
++        self.netstringReceiver.dataReceived("aaa")
++        self.assertTrue(self.transport.disconnecting)
++
++    def test_receiveNetstringPortions_1(self):
++        self.netstringReceiver.dataReceived("4:aa")
++        self.netstringReceiver.dataReceived("aa,")
++        self.assertEquals(self.transport.value(), "aaaa")
++        
++    def test_receiveNetstringPortions_2(self):
++        for part in ["1", "0:01234", "56789", ","]:
++            self.netstringReceiver.dataReceived(part)
++        self.assertEquals(self.transport.value(), "0123456789")
++
++    def test_receiveNetstringPortions_3(self):
++        for part in "2:ab,": # Send one character at a time
++            self.netstringReceiver.dataReceived(part)
++        self.assertEquals(self.transport.value(), "ab")
++
++    def test_receiveTwoNetstrings(self):
++        self.netstringReceiver.dataReceived("1:a,1")
++        self.assertEquals(self.transport.value(), "a")
++        self.netstringReceiver.dataReceived(":a,")
++        self.assertEquals(self.transport.value(), "aa")
++
++    def test_maxReceiveLimit(self):
++        too_long = self.netstringReceiver.MAX_LENGTH + 1
++        self.netstringReceiver.dataReceived("%s:%s" % (too_long, "a" * too_long))
++        self.assertTrue(self.transport.disconnecting)
++
++
+ class IntNTestCaseMixin(LPTestCaseMixin):
+     """
+     TestCase mixin for int-prefixed protocols.
+Index: twisted/protocols/basic.py
+===================================================================
+--- twisted/protocols/basic.py	(Revision 28774)
++++ twisted/protocols/basic.py	(Arbeitskopie)
+@@ -1,5 +1,5 @@
+ # -*- test-case-name: twisted.test.test_protocols -*-
+-# Copyright (c) 2001-2009 Twisted Matrix Laboratories.
++# Copyright (c) 2001-2010 Twisted Matrix Laboratories.
+ # See LICENSE for details.
+ 
+ 
+@@ -20,92 +20,76 @@
+ from twisted.internet import protocol, defer, interfaces, error
+ from twisted.python import log
+ 
+-LENGTH, DATA, COMMA = range(3)
+-NUMBER = re.compile('(\d*)(:?)')
++# See http://cr.yp.to/proto/netstrings.txt for a specification of netstrings.
++# Every netstring starts with digits that specify the length of the data;
++# extra zeros are not allowed. The length specification is separated from
++# the data by a colon (":").
++NETSTRING_LENGTH = re.compile('(\d+)(:)')
++
++# The following pattern describes all valid partial netstring length
++# specifications. It is used to check the netstring validity when the
++# length specification is received in several chunks.
++NETSTRING_LENGTH_PREFIX = re.compile('(\d+)$')
+ DEBUG = 0
+ 
++# Some error information for NetstringParseError instances
++NETSTRING_MISSING_LENGTH = ("The received netstring does not start with a "
++                            "length specification.")
++NETSTRING_OVERFLOW = ("The length specification of the received netstring "
++                      "cannot be represented in Python - it causes an "
++                      "OverflowError!")
++NETSTRING_TOO_LONG = ("The received netstring is longer than the maximum %s "
++                      "specified in MAX_LENGTH")
++NETSTRING_NO_COMMA = "The received netstring is not terminated by a comma."
++
+ class NetstringParseError(ValueError):
+     """The incoming data is not in valid Netstring format."""
+     pass
+ 
+ 
+ class NetstringReceiver(protocol.Protocol):
+-    """This uses djb's Netstrings protocol to break up the input into strings.
++    """This uses djb's Netstrings protocol to break up the input into
++    strings.  See http://cr.yp.to/proto/netstrings.txt for a
++    specification.
+ 
+-    Each string makes a callback to stringReceived, with a single
+-    argument of that string.
++    Each received string triggers a callback to stringReceived, with a
++    single argument of that string.
+ 
+     Security features:
+-        1. Messages are limited in size, useful if you don't want someone
+-           sending you a 500MB netstring (change MAX_LENGTH to the maximum
+-           length you wish to accept).
++        1. Messages are limited in size, useful if you don't want
++           someone sending you a 500MB netstring (change MAX_LENGTH to
++           the maximum length you wish to accept).
+         2. The connection is lost if an illegal message is received.
+     """
+ 
+     MAX_LENGTH = 99999
+     brokenPeer = 0
+-    _readerState = LENGTH
+-    _readerLength = 0
++    parser = None
+ 
+     def stringReceived(self, line):
+         """
+-        Override this.
++        Processes the data portion of a received netstring. Override this.
+         """
+         raise NotImplementedError
+ 
+-    def doData(self):
+-        buffer,self.__data = self.__data[:int(self._readerLength)],self.__data[int(self._readerLength):]
+-        self._readerLength = self._readerLength - len(buffer)
+-        self.__buffer = self.__buffer + buffer
+-        if self._readerLength != 0:
+-            return
+-        self.stringReceived(self.__buffer)
+-        self._readerState = COMMA
++    def dataReceived(self, data):
++        """Translates a netstring into its content and calls ``stringReceived``.
++        """
++        # Initialize parser if necessary
++        if not self.parser:
++            self.parser = self._parseNetstring()
++            self.parser.next()
+ 
+-    def doComma(self):
+-        self._readerState = LENGTH
+-        if self.__data[0] != ',':
+-            if DEBUG:
+-                raise NetstringParseError(repr(self.__data))
+-            else:
+-                raise NetstringParseError
+-        self.__data = self.__data[1:]
+-
+-
+-    def doLength(self):
+-        m = NUMBER.match(self.__data)
+-        if not m.end():
+-            if DEBUG:
+-                raise NetstringParseError(repr(self.__data))
+-            else:
+-                raise NetstringParseError
+-        self.__data = self.__data[m.end():]
+-        if m.group(1):
+-            try:
+-                self._readerLength = self._readerLength * (10**len(m.group(1))) + long(m.group(1))
+-            except OverflowError:
+-                raise NetstringParseError, "netstring too long"
+-            if self._readerLength > self.MAX_LENGTH:
+-                raise NetstringParseError, "netstring too long"
+-        if m.group(2):
+-            self.__buffer = ''
+-            self._readerState = DATA
+-
+-    def dataReceived(self, data):
+-        self.__data = data
++        # Parse received data
+         try:
+-            while self.__data:
+-                if self._readerState == DATA:
+-                    self.doData()
+-                elif self._readerState == COMMA:
+-                    self.doComma()
+-                elif self._readerState == LENGTH:
+-                    self.doLength()
+-                else:
+-                    raise RuntimeError, "mode is not DATA, COMMA or LENGTH"
+-        except NetstringParseError:
++            self.parser.send(data)
++        except NetstringParseError, ex:
+             self.transport.loseConnection()
+             self.brokenPeer = 1
++        except StopIteration:
++            # Reset parser and try again
++            self.parser = None
++            self.dataReceived(data)
+ 
+     def sendString(self, data):
+         """
+@@ -122,7 +106,80 @@
+             data = str(data)
+         self.transport.write('%d:%s,' % (len(data), data))
+ 
++    def _parseNetstring(self):
++        """Incrementally parses data sent by the L{dataReceived} method."""
+ 
++        # When a chunk is received that contains the end of a netstring
++        # and the beginning of one or more other netstrings, remainder
++        # will hold the "rest".
++        remainder = ""
++        while True:
++            chunk =  remainder + (yield)
++
++            # Read length specification
++            lengthSpecification = NETSTRING_LENGTH.match(chunk)
++
++            while not lengthSpecification:
++                self._checkLength(chunk)
++                chunk += (yield)
++                lengthSpecification = NETSTRING_LENGTH.match(chunk)
++
++            endOfNumber = lengthSpecification.end(1)
++            startOfData = lengthSpecification.end(2)
++            expectedLength = self._extractLength(chunk, endOfNumber)
++
++            chunkList = [chunk[startOfData:]] # Strip length specification
++            currentDataLength = len(chunkList[0])
++
++            # Read data and trailing comma
++            while currentDataLength <= expectedLength:
++                chunk = (yield)
++                chunkList.append(chunk)
++                currentDataLength += len(chunk)
++            data, remainder = self._computeDataAndRemainder(chunkList,
++                                                            expectedLength)
++
++            # Process data
++            self.stringReceived(data)
++
++    def _checkLength(self, chunk):
++        partialNumberSpec = NETSTRING_LENGTH_PREFIX.match(chunk)
++        if not partialNumberSpec:
++            raise NetstringParseError(NETSTRING_MISSING_LENGTH)
++        else:
++            try:
++                partialNumber = long(partialNumberSpec.group(1))
++            except OverflowError:
++                raise NetstringParseError(NETSTRING_OVERFLOW)
++            if partialNumber > self.MAX_LENGTH:
++                raise NetstringParseError(NETSTRING_TOO_LONG %
++                                          self.MAX_LENGTH)
++
++    def _extractLength(self, chunk, endOfNumber):
++        try:
++            result = long(chunk[:endOfNumber])
++        except OverflowError:
++            raise NetstringParseError(NETSTRING_OVERFLOW)
++
++        if result > self.MAX_LENGTH:
++            raise NetstringParseError(NETSTRING_TOO_LONG % self.MAX_LENGTH)
++
++        return result
++
++    def _computeDataAndRemainder(self, chunkList, expectedLength):
++        received_string = "".join(chunkList)
++        result = received_string[:expectedLength]
++
++        if len(received_string) > expectedLength + 1:
++            remainder = received_string[expectedLength + 1:]
++        else:
++            remainder = ""
++
++        if received_string[expectedLength] != ",":
++            raise NetstringParseError(NETSTRING_NO_COMMA)
++
++        return result, remainder
++
+ class SafeNetstringReceiver(NetstringReceiver):
+     """This class is deprecated, use NetstringReceiver instead.
+     """

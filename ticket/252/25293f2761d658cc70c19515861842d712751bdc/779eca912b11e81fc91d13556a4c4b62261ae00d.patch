@@ -1,0 +1,124 @@
+Index: internet/defer.py
+===================================================================
+RCS file: /cvs/Twisted/twisted/internet/defer.py,v
+retrieving revision 1.47
+diff -u -r1.47 defer.py
+--- internet/defer.py	24 Jul 2003 07:10:05 -0000	1.47
++++ internet/defer.py	6 Aug 2003 18:02:56 -0000
+@@ -38,6 +38,9 @@
+ class TimeoutError(Exception):
+     pass
+ 
++class CancelledError(Exception):
++    pass
++
+ def logError(err):
+     log.err(err)
+     return err
+@@ -320,13 +323,55 @@
+         L{TimeoutError}.
+         """
+ 
+-        assert not self.timeoutCall, "Don't call setTimeout twice on the same Deferred."
++        import warnings
++
++        warnings.warn("setTimeout is deprecated, please use the "
++                      "`timeout' and `setCanceller' methods.",
++                      DeprecationWarning)
++
++        assert not self.timeoutCall, "Don't call setTimeout or timeout twice on the same Deferred."
+ 
+         from twisted.internet import reactor
+         self.timeoutCall = reactor.callLater(
+             seconds,
+             lambda: self.called or timeoutFunc(self, *args, **kw))
+         return self.timeoutCall
++
++    def timeout(self, seconds):
++        """
++        Set the timeout, in seconds, to wait before cancelling this
++        Deferred. The `cancel' method will be called when the timeout
++        happens.
++        """
++
++        assert not self.timeoutCall, "Don't call setTimeout or timeout twice on the same Deferred."
++
++        from twisted.internet import reactor
++        self.timeoutCall = reactor.callLater(
++            seconds,
++            self.cancel)
++        return self.timeoutCall
++
++    canceller = None
++
++    def setCanceller(self, func, *args, **kwargs):
++        """
++        Set the canceller function for this Deferred. It will be
++        called when the `cancel' method is called, which is usually
++        after a timeout.
++        """
++        self.canceller = (func, args, kwargs)
++
++    def cancel(self):
++        """
++        Cancel this deferred by calling the method registered by
++        `setCanceller' and errbacking.
++        """
++        if self.canceller:
++            f, args, kwargs = self.canceller
++            f(*args, **kwargs)
++        self.errback(failure.Failure(CancelledError("Deferred has been cancelled.")))
++        
+ 
+     armAndErrback = errback
+     armAndCallback = callback
+Index: test/test_defer.py
+===================================================================
+RCS file: /cvs/Twisted/twisted/test/test_defer.py,v
+retrieving revision 1.27
+diff -u -r1.27 test_defer.py
+--- test/test_defer.py	24 Jul 2003 07:10:05 -0000	1.27
++++ test/test_defer.py	6 Aug 2003 18:02:59 -0000
+@@ -160,7 +160,7 @@
+ 
+     def testTimeOut(self):
+         d = defer.Deferred()
+-        d.setTimeout(1.0)
++        d.setTimeout(0.1)
+         l = []
+         d.addErrback(l.append)
+         # Make sure the reactor is shutdown
+@@ -170,6 +170,33 @@
+         reactor.run()
+         self.assertEquals(len(l), 1)
+         self.assertEquals(l[0].type, defer.TimeoutError)
++
++    def testNewTimeOutDefaultCancel(self):
++        d = defer.Deferred()
++        d.timeout(0.1)
++        l = []
++        d.addErrback(l.append)
++        d.addBoth(lambda x: reactor.crash())
++
++        self.assertEquals(l, [])
++        reactor.run()
++        self.assertEquals(len(l), 1)
++        self.assertEquals(l[0].type, defer.CancelledError)
++
++    def testNewTimeOutWithCanceller(self):
++        d = defer.Deferred()
++        d.timeout(0.1)
++        l = []
++        d.addErrback(l.append)
++        d.addBoth(lambda x: reactor.crash())
++
++        d.setCanceller(lambda: l.append("Hi!"))
++
++        self.assertEquals(l, [])
++        reactor.run()
++        self.assertEquals(len(l), 2)
++        self.assertEquals(l[0], "Hi!")
++        self.assertEquals(l[1].type, defer.CancelledError)
+ 
+     def testImmediateSuccess(self):
+         l = []

@@ -1,0 +1,137 @@
+Index: twisted/protocols/basic.py
+===================================================================
+--- twisted/protocols/basic.py	(revision 36006)
++++ twisted/protocols/basic.py	(working copy)
+@@ -534,6 +534,7 @@
+     """
+     line_mode = 1
+     __buffer = b''
++    __busy_receiving = False
+     delimiter = b'\r\n'
+     MAX_LENGTH = 16384
+ 
+@@ -555,31 +556,39 @@
+         Translates bytes into lines, and calls lineReceived (or
+         rawDataReceived, depending on mode.)
+         """
+-        self.__buffer = self.__buffer+data
+-        while self.line_mode and not self.paused:
+-            try:
+-                line, self.__buffer = self.__buffer.split(self.delimiter, 1)
+-            except ValueError:
+-                if len(self.__buffer) > self.MAX_LENGTH:
+-                    line, self.__buffer = self.__buffer, b''
+-                    return self.lineLengthExceeded(line)
+-                break
+-            else:
+-                linelength = len(line)
+-                if linelength > self.MAX_LENGTH:
+-                    exceeded = line + self.__buffer
+-                    self.__buffer = b''
+-                    return self.lineLengthExceeded(exceeded)
+-                why = self.lineReceived(line)
+-                if why or self.transport and self.transport.disconnecting:
+-                    return why
+-        else:
+-            if not self.paused:
+-                data=self.__buffer
+-                self.__buffer = b''
+-                if data:
+-                    return self.rawDataReceived(data)
++        if self.__busy_receiving:
++            self.__buffer += data
++            return
+ 
++        try:
++            self.__busy_receiving = True
++            self.__buffer += data
++            while self.__buffer and not self.paused:
++                if self.line_mode:
++                    try:
++                        line, self.__buffer = self.__buffer.split(self.delimiter, 1)
++                    except ValueError:
++                        if len(self.__buffer) > self.MAX_LENGTH:
++                            line, self.__buffer = self.__buffer, ''
++                            return self.lineLengthExceeded(line)
++                        return
++                    else:
++                        linelength = len(line)
++                        if linelength > self.MAX_LENGTH:
++                            exceeded = line + self.__buffer
++                            self.__buffer = ''
++                            return self.lineLengthExceeded(exceeded)
++                        why = self.lineReceived(line)
++                        if why or self.transport and self.transport.disconnecting:
++                            return why
++                else:
++                    data = self.__buffer
++                    self.__buffer = ''
++                    why = self.rawDataReceived(data)
++                    if why:
++                        return why
++        finally:
++            self.__busy_receiving = False
+ 
+     def setLineMode(self, extra=b''):
+         """
+Index: twisted/protocols/test/test_basic.py
+===================================================================
+--- twisted/protocols/test/test_basic.py	(revision 36006)
++++ twisted/protocols/test/test_basic.py	(working copy)
+@@ -7,6 +7,7 @@
+ 
+ from __future__ import division, absolute_import
+ 
++import sys
+ import struct
+ 
+ from twisted.python.compat import _PY3, iterbytes
+@@ -17,7 +18,26 @@
+ 
+ _PY3NEWSTYLESKIP = "All classes are new style on Python 3."
+ 
++class FlippingLineTester(basic.LineReceiver):
++    """
++    A line receiver that flips between line and raw data modes after one byte.
++    """
+ 
++    delimiter = '\n'
++
++    def lineReceived(self, line):
++        """
++        Set the mode to raw.
++        """
++        self.setRawMode()
++
++    def rawDataReceived(self, data):
++        """
++        Set the mode back to line.
++        """
++        self.setLineMode(data[1:])
++
++
+ class LineTester(basic.LineReceiver):
+     """
+     A line receiver that parses data received and make actions on some tokens.
+@@ -256,6 +276,14 @@
+         self.assertEqual(protocol.rest, b'')
+ 
+ 
++    def test_stackRecursion(self):
++        """
++        Test switching modes many times on the same data.
++        """
++        a = FlippingLineTester()
++        t = proto_helpers.StringIOWithoutClosing()
++        a.makeConnection(protocol.FileWrapper(t))
++        a.dataReceived('x\nx' * sys.getrecursionlimit())
+ 
+ class LineOnlyReceiverTestCase(unittest.SynchronousTestCase):
+     """
+Index: twisted/topfiles/3050.bugfix
+===================================================================
+--- twisted/topfiles/3050.bugfix	(revision 0)
++++ twisted/topfiles/3050.bugfix	(working copy)
+@@ -0,0 +1,2 @@
++twisted.protocols.basic.LineReceiver now does not hit the maximum stack recursion depth when the line and data mode is switched many times.
++twisted.protocols.basic.LineReceiver now does not hit the maximum stack recursion depth when the line and data mode is switched many times.

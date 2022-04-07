@@ -1,0 +1,187 @@
+=== modified file 'twisted/web/server.py'
+--- twisted/web/server.py	2009-09-14 17:25:32 +0000
++++ twisted/web/server.py	2010-09-30 18:10:15 +0000
+@@ -126,58 +126,31 @@
+         except:
+             self.processingFailed(failure.Failure())
+ 
+-
+     def render(self, resrc):
+-        try:
+-            body = resrc.render(self)
+-        except UnsupportedMethod, e:
+-            allowedMethods = e.allowedMethods
+-            if (self.method == "HEAD") and ("GET" in allowedMethods):
+-                # We must support HEAD (RFC 2616, 5.1.1).  If the
+-                # resource doesn't, fake it by giving the resource
+-                # a 'GET' request and then return only the headers,
+-                # not the body.
+-                log.msg("Using GET to fake a HEAD request for %s" %
+-                        (resrc,))
+-                self.method = "GET"
+-                body = resrc.render(self)
+-
+-                if body is NOT_DONE_YET:
+-                    log.msg("Tried to fake a HEAD request for %s, but "
+-                            "it got away from me." % resrc)
+-                    # Oh well, I guess we won't include the content length.
+-                else:
+-                    self.setHeader('content-length', str(len(body)))
+-
+-                self.write('')
+-                self.finish()
+-                return
+-
+-            if self.method in (supportedMethods):
+-                # We MUST include an Allow header
+-                # (RFC 2616, 10.4.6 and 14.7)
+-                self.setHeader('Allow', allowedMethods)
+-                s = ('''Your browser approached me (at %(URI)s) with'''
+-                     ''' the method "%(method)s".  I only allow'''
+-                     ''' the method%(plural)s %(allowed)s here.''' % {
+-                    'URI': self.uri,
+-                    'method': self.method,
+-                    'plural': ((len(allowedMethods) > 1) and 's') or '',
+-                    'allowed': string.join(allowedMethods, ', ')
+-                    })
+-                epage = resource.ErrorPage(http.NOT_ALLOWED,
+-                                           "Method Not Allowed", s)
+-                body = epage.render(self)
+-            else:
+-                epage = resource.ErrorPage(http.NOT_IMPLEMENTED, "Huh?",
+-                                           "I don't know how to treat a"
+-                                           " %s request." % (self.method,))
+-                body = epage.render(self)
+-        # end except UnsupportedMethod
+-
++        """ Render a request.
++            
++            This is called on the leaf resource for
++            a request. Render must return either a string 
++            or a Deferred containing a string as its result.
++            This string will be sent to the browser as the HTML
++            for the request. 
++            Render may also return NOT_DONE_YET; if NOT_DONE_YET
++            is returned then the resource's render method must
++            make any request.write calls and then request.finish.
++            Usually these are done in a deffered callback. This 
++            behaviour will be deprecated in favour of returning
++            a Deferred.
++        """
++        body = defer.maybeDeferred(resrc.render, self)
++        body.addCallbacks(self._cbRender, self._ebRender, 
++                          callbackArgs=(resrc,), errbackArgs=(resrc,))
++        return
++    
++    def _cbRender(self, body, resrc):
++        """ Callback for render; writes the data."""
+         if body == NOT_DONE_YET:
+             return
+-        if type(body) is not types.StringType:
++        if not isinstance(body, str):
+             body = resource.ErrorPage(
+                 http.INTERNAL_SERVER_ERROR,
+                 "Request did not return a string",
+@@ -198,6 +171,60 @@
+             self.setHeader('content-length', str(len(body)))
+             self.write(body)
+         self.finish()
++    
++    def _ebRender(self, fail, resrc):
++        """ Errback for render to handle UnsupportedMethod"""
++        fail.trap(UnsupportedMethod)
++        allowedMethods = fail.value.allowedMethods
++        if (self.method == "HEAD") and ("GET" in allowedMethods): 
++            log.msg("Using GET to fake a HEAD request for %s" % (resrc,))
++            self.method = "GET"
++            
++            body = defer.maybeDeferred(resrc.render, self)
++            body.addCallbacks(self._cbRenderEb, self._ebRenderEb, callbackArgs=(resrc,), errbackArgs=(resrc,))
++            return body
++            
++        if self.method in (supportedMethods):
++            # We MUST include an Allow header
++            # (RFC 2616, 10.4.6 and 14.7)
++            self.setHeader('Allow', allowedMethods)
++            s = ('''Your browser approached me (at %(URI)s) with'''
++                 ''' the method "%(method)s".  I only allow'''
++                 ''' the method%(plural)s %(allowed)s here.''' % {
++                'URI': self.uri,
++                'method': self.method,
++                'plural': ((len(allowedMethods) > 1) and 's') or '',
++                'allowed': string.join(allowedMethods, ', ')
++                })
++            epage = resource.ErrorPage(http.NOT_ALLOWED,
++                                       "Method Not Allowed", s)
++            
++            body = defer.maybeDeferred(epage.render, self)
++            body.addCallback(self._cbRenderEb, resrc)
++            return body
++        else:
++            epage = resource.ErrorPage(http.NOT_IMPLEMENTED, "Huh?",
++                                       "I don't know how to treat a"
++                                       " %s request." % (self.method,))
++        
++        body = defer.maybeDeferred(epage.render,self)
++        body.addCallback(self._cbRender, resrc)
++        return body
++    
++    def _cbRenderEb(self, body, resrc):
++        """ Callback for render's errback; tries to write a fake HEAD request
++            that is created from the GET method.
++        """
++        if body == NOT_DONE_YET:
++            log.msg("Tried to fake a HEAD request for %s, but "
++                            "it got away from me." % resrc)
++            # Oh well, I guess we won't include the content length.
++        else:
++            self.setHeader('content-length', str(len(body)))
++        
++        self.write('')
++        self.finish()
++        return
+ 
+     def processingFailed(self, reason):
+         log.err(reason)
+
+=== modified file 'twisted/web/test/test_web.py'
+--- twisted/web/test/test_web.py	2009-11-22 22:46:12 +0000
++++ twisted/web/test/test_web.py	2010-09-30 18:07:08 +0000
+@@ -861,3 +861,36 @@
+         self.assertEqual(
+             self.site.logFile.read(),
+             '1.2.3.4 - - [25/Oct/2004:12:31:59 +0000] "GET /dummy HTTP/1.0" 123 - "-" "Malicious Web\\" Evil"\n')
++
++class DeferredRenderResource(resource.Resource):
++    """ Leaf resource that returns a Deferred from its render method. """
++    
++    isLeaf = True
++    def render(self, request):
++        d = task.deferLater(reactor, 1, lambda: 'deferred result')
++        d.addCallback(self._cbRender)
++        return d
++    
++    def _cbRender(self, result):
++        return result
++
++
++class DeferredRenderTest(unittest.TestCase):
++    """ Test for handling a resource which returns a Deferred in its render method."""
++    
++    def testDeferredRender(self):
++        """ Test a request that calls a resource which will return a Deferred from its render method."""
++        d = DummyChannel()
++        d.site.resource.putChild('deferrender', DeferredRenderResource())
++        d.transport.port = 81
++        request = server.Request(d, 1)
++        request.setHost('example.com', 81)
++        request.gotLength(0)
++        request.requestReceived('GET', '/deferrender', 'HTTP/1.0')
++        
++        # check that the Deferred returned by render has returned the correct string
++        d = task.deferLater(reactor, 3, self._testDeferredRender, request)
++        return d
++    
++    def _testDeferredRender(self, req):
++        self.assertEquals(req.transport.getvalue().splitlines()[-1], 'deferred result')
+

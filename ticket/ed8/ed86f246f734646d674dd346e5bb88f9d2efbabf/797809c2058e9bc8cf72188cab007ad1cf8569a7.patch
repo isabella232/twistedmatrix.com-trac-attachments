@@ -1,0 +1,159 @@
+Index: /home/wolf/twisted-trunk/twisted/python/reflect.py
+===================================================================
+--- /home/wolf/twisted-trunk/twisted/python/reflect.py	(revision 23536)
++++ /home/wolf/twisted-trunk/twisted/python/reflect.py	(working copy)
+@@ -356,8 +356,23 @@
+     No module was found because none exists.
+     """
+ 
++class InvalidName(ValueError):
++    """
++    The given name is not a dot-separated list of Python objects.
++    """
+ 
++class ModuleNotFound(InvalidName):
++    """
++    The module associated with the given name doesn't exist and it can't be
++    imported.
++    """
+ 
++class ObjectNotFound(InvalidName):
++    """
++    The object associated with the given name doesn't exist and it can't be
++    imported.
++    """
++
+ def _importAndCheckStack(importName):
+     """
+     Import the given name as a module, then walk the stack to determine whether
+@@ -407,25 +422,48 @@
+ 
+     @return: the Python object identified by 'name'.
+ 
+-    @raise ValueError: if the top level dotted name that is passed is not a
+-    valid Python identifier, or the top level dotted name that is passed is not
+-    a valid python module.
++    @raise L{InvalidName}: if the name is not valid (i.e. empty string, names
++    that start/end with '.').
+ 
++    @raise L{ModuleNotFound}: if the name seems a module but it can't be
++    imported.
++
++    @raise L{ObjectNotFound}: if the dot-separated list is not a fully
++    qualified name that can be imported.
++
+     @raise AttributeError: if an attribute of an object along the way cannot be
+     accessed, or a module along the way is not found.
++    """
+ 
+-    @raise ImportError: if any module involved cannot be imported for some
+-    reason.
+-    """
++    if not name:
++        raise InvalidName('Empty module name')
++
++    # if the name starts/ends with a '.' the __import__ will raise an 'Empty
++    # module name' error. This will provide a better error message
++    if name.startswith('.') or name.endswith('.'):
++        raise InvalidName(
++                "Invalid name '%s' (it shouldn't start/end with a '.')" % name)
++
+     names = name.split('.')
+     topLevelPackage = None
+     moduleNames = names[:]
+     while not topLevelPackage:
+-        trialname = '.'.join(moduleNames)
+-        try:
+-            topLevelPackage = _importAndCheckStack(trialname)
+-        except _NoModuleFound:
+-            moduleNames.pop()
++        if moduleNames:
++            trialname = '.'.join(moduleNames)
++            try:
++                topLevelPackage = _importAndCheckStack(trialname)
++            except _NoModuleFound:
++                moduleNames.pop()
++        else:
++            # I wasn't able to load anything in moduleNames
++            if '.' not in name or names[-1] in ('py', 'pyc'):
++                # what I failed to load seems a module
++                raise ModuleNotFound('No module named %s' % name)
++            else:
++                raise ObjectNotFound(
++                    '"%s" is not a valid dot-separated list of Python objects '
++                    '(packages, modules, classes or any other Python object '
++                    'which has attributes)' % name)
+ 
+     obj = topLevelPackage
+     for n in names[1:]:
+Index: /home/wolf/twisted-trunk/twisted/test/test_reflect.py
+===================================================================
+--- /home/wolf/twisted-trunk/twisted/test/test_reflect.py	(revision 23536)
++++ /home/wolf/twisted-trunk/twisted/test/test_reflect.py	(working copy)
+@@ -186,22 +186,52 @@
+     def test_invalidNames(self):
+         """
+         Passing a name which isn't a fully-qualified Python name to L{namedAny}
+-        should result in a L{ValueError}.
++        should result in one of the following exceptions:
++        - L{InvalidName}: the name is not a dot-separated list of Python objects
++        - L{ModuleNotFound}: the module doesn't exist
++        - L{ObjectNotFound}: the object doesn't exist
+         """
+-        # Finally, invalid module names should raise a ValueError
+-        self.assertRaises(
+-            ValueError,
+-            reflect.namedAny, "")
+-        self.assertRaises(
+-            ValueError,
+-            reflect.namedAny, "12345")
+-        self.assertRaises(
+-            ValueError,
+-            reflect.namedAny, "@#$@(#.!@(#!@#")
++
++        err = self.assertRaises(reflect.InvalidName, reflect.namedAny, '')
++        self.assertEquals(str(err), 'Empty module name')
++
++        err = self.assertRaises(reflect.ModuleNotFound, reflect.namedAny,
++                        'nosuchmoduleintheworld.py')
++        self.assertEquals(str(err), 'No module named nosuchmoduleintheworld.py')
++
++        # I'm not sure about what '1234567' really is but it could be a module
++        err = self.assertRaises(reflect.ModuleNotFound, reflect.namedAny,
++                        '1234567')
++        self.assertEquals(str(err), 'No module named 1234567')
++
++        # This is a dot-separated list, but it isn't valid!
++        err = self.assertRaises(reflect.ObjectNotFound, reflect.namedAny,
++                        "@#$@(#.!@(#!@#")
++        self.assertEquals(str(err),
++                        '"@#$@(#.!@(#!@#" is not a valid dot-separated list of '
++                        'Python objects (packages, modules, classes or any '
++                        'other Python object which has attributes)')
++
++        # namedAny is not supposed to handle explicit relavite imports
++        err = self.assertRaises(reflect.InvalidName, reflect.namedAny,
++                        '..twisted')
++        self.assertEquals(str(err),
++                        "Invalid name '..twisted' "
++                        "(it shouldn't start/end with a '.')")
++
++        err = self.assertRaises(reflect.InvalidName, reflect.namedAny,
++                        "I.end.with.a.dot.")
++        self.assertEquals(str(err),
++                        "Invalid name 'I.end.with.a.dot.' "
++                        "(it shouldn't start/end with a '.')")
++
+         # This case is kind of stupid and is mostly a historical accident.
+-        self.assertRaises(
+-            ValueError,
+-            reflect.namedAny, "tcelfer.nohtyp.detsiwt")
++        err = self.assertRaises(reflect.ObjectNotFound, reflect.namedAny,
++                        "tcelfer.nohtyp.detsiwt")
++        self.assertEquals(str(err),
++                        '"tcelfer.nohtyp.detsiwt" is not a valid dot-separated '
++                        'list of Python objects (packages, modules, classes or '
++                        'any other Python object which has attributes)')
+ 
+ 
+ 

@@ -1,0 +1,567 @@
+Index: twisted/words/test/test_irc.py
+===================================================================
+--- twisted/words/test/test_irc.py	(revision 26936)
++++ twisted/words/test/test_irc.py	(working copy)
+@@ -38,6 +38,126 @@
+             self.failUnlessEqual(s, irc.ctcpDequote(irc.ctcpQuote(s)))
+ 
+ 
++
++class Dispatcher(irc.CommandDispatcherMixin):
++    prefix = 'disp'
++
++    def disp_working(self, a, b):
++        return a, b
++
++    def disp_unknown(self, name, a, b):
++        return name, a, b
++
++
++
++class DispatcherTests(unittest.TestCase):
++    def test_dispatch(self):
++        """
++        Dispatching a command invokes the correct handler.
++        """
++        disp = Dispatcher()
++        args = (1, 2)
++        res = disp.dispatch('working', *args)
++        self.assertEqual(res, args)
++
++
++    def test_dispatchUnknown(self):
++        """
++        Dispatching an unknown command invokes the default handler.
++        """
++        disp = Dispatcher()
++        name = 'missing'
++        args = (1, 2)
++        res = disp.dispatch(name, *args)
++        self.assertEqual(res, (name,) + args)
++
++
++    def test_dispatchMissingUnknown(self):
++        """
++        Dispatching an unknown command, when no default handler is present,
++        results in an exception being raised.
++        """
++        disp = Dispatcher()
++        disp.disp_unknown = None
++        self.assertRaises(irc.UnhandledCommand, disp.dispatch, 'bar')
++
++
++
++class ISupportTests(unittest.TestCase):
++    def test_splitParam(self):
++        """
++        Splitting ISUPPORT parameters into key and values. Parameters without
++        a separator should result in the key and a list containing only the
++        empty string.
++        """
++        params = [('FOO',        ('FOO', [''])),
++                  ('BAR=',       ('BAR', [''])),
++                  ('BAZ=1',      ('BAZ', ['1'])),
++                  ('BOB=1,2,3',  ('BOB', ['1', '2', '3']))]
++        for param, expected in params:
++            res = irc.ISupport._splitParam(param)
++            self.assertEqual(res, expected)
++
++
++    def test_splitParamArgs(self):
++        """
++        Splitting ISUPPORT parameter arguments into key and value. Arguments
++        without a separator should result in the key and the empty string.
++        """
++        res = irc.ISupport._splitParamArgs(['A:1', 'B:2', 'C:', 'D'])
++        self.assertEqual(res, (('A', '1'),
++                               ('B', '2'),
++                               ('C', ''),
++                               ('D', '')))
++
++
++    def test_splitParamArgsProcessor(self):
++        """
++        Splitting ISUPPORT parameter arguments with a processor.
++        """
++        res = irc.ISupport._splitParamArgs(['A:1', 'B:2', 'C'],
++                                           irc._intOrDefault)
++        self.assertEqual(res, (('A', 1),
++                               ('B', 2),
++                               ('C', None)))
++
++
++    def test_parsePrefixParam(self):
++        """
++        Parsing the ISUPPORT PREFIX parameter results in the correct mapping.
++        """
++        self.assertEqual(irc.ISupport._parsePrefixParam('hello'), None)
++        self.assertEqual(irc.ISupport._parsePrefixParam('(ov)@+'),
++                         {'o': '@', 'v': '+'})
++
++
++    def test_parse(self):
++        """
++        Parsing ISUPPORT parameters results in the correct mutation of the
++        object, including unknown parameters and unsetting parameters.
++        """
++        isupport = irc.ISupport()
++        isupport.parse(['MODES=4',
++                        'CHANLIMIT=#:20,&:10',
++                        'INVEX',
++                        'EXCEPTS=Z',
++                        'UNKNOWN=A,B,C'])
++
++        self.assertEqual(isupport['MODES'], 4)
++        self.assertEqual(isupport['CHANLIMIT'],
++                        (('#', 20),
++                         ('&', 10)))
++        self.assertEqual(isupport['INVEX'], 'I')
++        self.assertEqual(isupport['EXCEPTS'], 'Z')
++        self.assertEqual(isupport['UNKNOWN'], ('A', 'B', 'C'))
++
++        isupport.parse(['-INVEX'])
++        self.assertNotIn('INVEX', isupport)
++        # Unsetting a previously unset parameter should not be a problem.
++        isupport.parse(['-INVEX'])
++
++
++
+ class IRCClientWithoutLogin(irc.IRCClient):
+     performLogin = 0
+ 
+@@ -80,7 +200,7 @@
+         del self.client
+         del self.transport
+ 
+-class NoticingClient(object, IRCClientWithoutLogin):
++class NoticingClient(IRCClientWithoutLogin, object):
+     methods = {
+         'created': ('when',),
+         'yourHost': ('info',),
+@@ -112,7 +232,7 @@
+ 
+ 
+     def __init__(self, *a, **kw):
+-        object.__init__(self)
++        super(NoticingClient, self).__init__()
+         self.calls = []
+ 
+ 
+@@ -400,7 +520,7 @@
+ 
+     def testBounce(self):
+         msg = "Try server some.host, port 321"
+-        self._serverTestImpl("005", msg, "bounce",
++        self._serverTestImpl("010", msg, "bounce",
+                              info=msg)
+ 
+ 
+Index: twisted/words/protocols/irc.py
+===================================================================
+--- twisted/words/protocols/irc.py	(revision 26936)
++++ twisted/words/protocols/irc.py	(working copy)
+@@ -98,6 +98,78 @@
+         r.extend(str.split('\n'))
+     return r
+ 
++
++
++def _intOrDefault(value, default=None):
++    if value:
++        try:
++            return int(value)
++        except ValueError:
++            pass
++    return default
++
++
++
++class UnhandledCommand(RuntimeError):
++    """
++    A command dispatcher could not locate an appropriate command handler.
++    """
++
++
++
++class CommandDispatcherMixin(object):
++    """
++    Dispatch commands to handlers based on their name.
++
++    Command handler names should be of the form C{prefix_commandName},
++    where C{prefix} is the value specified by L{prefix}, and must
++    accept the parameters as given to L{dispatch}.
++
++    @type prefix: C{str}
++    @ivar prefix: Command handler prefix, used to locate handler attributes
++    """
++    prefix = None
++
++
++    def _dispatch(self, commandName, *args):
++        """
++        Perform actual command dispatch.
++        """
++        def _getMethodName(command):
++            return '%s_%s' % (self.prefix, command)
++
++        def _getMethod(name):
++            return getattr(self, _getMethodName(name), None)
++
++        method = _getMethod(commandName)
++        if method is not None:
++            return method(*args)
++
++        method = _getMethod('unknown')
++        if method is None:
++            raise UnhandledCommand("No handler for %r could be found" % (_getMethodName(commandName),))
++        return method(commandName, *args)
++
++
++    def dispatch(self, commandName, *args):
++        """
++        Dispatch a command to the handler responsible or the default handler.
++
++        If there is no command handler for C{commandName}, L{prefix_unknown} is
++        invoked instead with C{command}, C{*args}. If C{prefix_unknown} is not
++        defined then L{UnhandledCommand} is raised.
++
++        Additional positional arguments are passed on to the handler as
++        positional arguments.
++
++        @type commandName: C{str}
++
++        @return: The return value of the handler
++        """
++        return self._dispatch(commandName, *args)
++
++
++
+ class IRC(protocol.Protocol):
+     """Internet Relay Chat server protocol.
+     """
+@@ -474,6 +546,275 @@
+             self.hostname, RPL_CHANNELMODEIS, user, channel, mode, ' '.join(args)))
+ 
+ 
++
++class ISupport(CommandDispatcherMixin, dict):
++    """
++    Handle ISUPPORT messages.
++
++    C{ISupport} is intended to behave like a dictionary. That having been
++    said, some parameters have been assigned defaults by the (draft)
++    specification, while others have not (or a default makes no sense.)
++
++    Access to ISUPPORT parameters should always be done using the C{get}
++    method and a C{None} result treated as though the parameter was not
++    specified by the server (or unset by the server.) Optionally, consider
++    using C{in} or C{has_key} to check for the existence of flag parameters.
++
++    Information regarding the specifics of ISUPPORT was gleaned from
++    <http://www.irc.org/tech_docs/draft-brocklesby-irc-isupport-03.txt>.
++    """
++    prefix = 'isupport'
++
++    def __init__(self):
++        self.update({
++            'CHANNELLEN': 200,
++            'CHANTYPES': '#&',
++            'MODES': 3,
++            'NICKLEN': 9,
++            'PREFIX': self._parsePrefixParam('(ov)@+')})
++
++
++    def _splitParamArgs(cls, params, valueProcessor=None):
++        """
++        Split ISUPPORT parameter arguments.
++
++        Values can optionally be processed by C{valueProcessor}.
++
++        For example::
++
++            >>> ISupport._splitParamArgs(['A:1', 'B:2'])
++            (('A', '1'), ('B', '2'))
++
++        @type params: C{iterable} of C{str}
++
++        @type valueProcessor: C{callable} taking {str}
++        @param valueProcessor: Callable to process argument values, or C{None}
++            to perform no processing
++
++        @rtype: C{tuple} of C{(str, object)}
++        @return: Sequence of C{(name, processedValue)}
++        """
++        if valueProcessor is None:
++            valueProcessor = lambda x: x
++
++        def _parse():
++            for param in params:
++                if ':' not in param:
++                    param += ':'
++                a, b = param.split(':', 1)
++                yield a, valueProcessor(b)
++        return tuple(_parse())
++    _splitParamArgs = classmethod(_splitParamArgs)
++
++
++    def _splitParam(cls, param):
++        """
++        Split an ISUPPORT parameter.
++
++        @type param: C{str}
++
++        @rtype: C{(str, list)}
++        @return C{(key, arguments)}
++        """
++        if '=' not in param:
++            param += '='
++        key, value = param.split('=', 1)
++        return key, value.split(',')
++    _splitParam = classmethod(_splitParam)
++
++
++    def _parsePrefixParam(cls, prefix):
++        """
++        Parse the ISUPPORT "PREFIX" parameter.
++        """
++        if not prefix:
++            return None
++        if prefix[0] != '(' and ')' not in prefix:
++            return None
++        modes, symbols = prefix.split(')', 1)
++        modes = modes[1:]
++        return dict((mode, symbol) for mode, symbol in zip(modes, symbols))
++    _parsePrefixParam = classmethod(_parsePrefixParam)
++
++
++    def parse(self, params):
++        """
++        Parse ISUPPORT parameters.
++
++        If an unknown parameter is encountered, it is simply added to the
++        dictionary, keyed by its name, as a tuple of the parameters provided.
++
++        @type params: C{iterable} of C{str}
++        @param params: Iterable of ISUPPORT parameters to parse
++        """
++        for param in params:
++            key, value = self._splitParam(param)
++            if key.startswith('-'):
++                self.pop(key[1:], None)
++            else:
++                self[key] = self.dispatch(key, value)
++
++
++    def isupport_unknown(self, command, params):
++        """
++        Unknown ISUPPORT parameter.
++        """
++        return tuple(params)
++
++
++    def isupport_CHANLIMIT(self, params):
++        """
++        The maximum number of each channel type a user may join.
++        """
++        return self._splitParamArgs(params, _intOrDefault)
++
++
++    def isupport_CHANMODES(self, params):
++        """
++        Available channel modes.
++
++        There are 4 categories of channel mode::
++
++            addressModes - Modes that add or remove an address to or from a
++            list, these modes always take a parameter.
++
++            param - Modes that change a setting on a channel, these modes
++            always take a parameter.
++
++            setParam - Modes that change a setting on a channel, these modes
++            only take a parameter when being set.
++
++            noParam - Modes that change a setting on a channel, these modes
++            never take a parameter.
++        """
++        names = ('addressModes', 'param', 'setParam', 'noParam')
++        if len(params) != len(names):
++            # XXX: Perhaps raise an exception or emit a warning.
++            return None
++        return dict(zip(names, params))
++
++
++    def isupport_CHANNELLEN(self, params):
++        """
++        Maximum length of a channel name a client may create.
++        """
++        return _intOrDefault(params[0], self['CHANNELLEN'])
++
++
++    def isupport_CHANTYPES(self, params):
++        """
++        Valid channel prefixes.
++        """
++        return tuple(params[0])
++
++
++    def isupport_EXCEPTS(self, params):
++        """
++        Mode character for "ban exceptions".
++
++        The presence of this parameter indicates that the server supports
++        this functionality.
++        """
++        return params[0] or 'e'
++
++
++    def isupport_IDCHAN(self, params):
++        """
++        Safe channel identifiers.
++
++        The presence of this parameter indicates that the server supports
++        this functionality.
++        """
++        return self._splitParamArgs(params)
++
++
++    def isupport_INVEX(self, params):
++        """
++        Mode character for "invite exceptions".
++
++        The presence of this parameter indicates that the server supports
++        this functionality.
++        """
++        return params[0] or 'I'
++
++
++    def isupport_KICKLEN(self, params):
++        """
++        Maximum length of a kick message a client may provide.
++        """
++        return _intOrDefault(params[0])
++
++
++    def isupport_MAXLIST(self, params):
++        """
++        Maximum number of "list modes" a client may set on a channel at once.
++
++        List modes are identified by the "addressModes" key in CHANMODES.
++        """
++        return self._splitParamArgs(params)
++
++
++    def isupport_MODES(self, params):
++        """
++        Maximum number of modes accepting parameters that may be sent, by a
++        client, in a single MODE command.
++        """
++        return _intOrDefault(params[0])
++
++
++    def isupport_NETWORK(self, params):
++        """
++        IRC network name.
++        """
++        return params[0]
++
++
++    def isupport_NICKLEN(self, params):
++        """
++        Maximum length of a nickname the client may use.
++        """
++        return _intOrDefault(params[0], self['NICKLEN'])
++
++
++    def isupport_PREFIX(self, params):
++        """
++        Mapping of channel modes that clients may have to status flags.
++        """
++        return self._parsePrefixParam(params[0])
++
++
++    def isupport_SAFELIST(self, params):
++        """
++        Flag indicating that a client may request a LIST without being
++        disconnected due to the large amount of data generated.
++        """
++        return True
++
++
++    def isupport_STATUSMSG(self, params):
++        """
++        The server supports sending messages to only to clients on a channel
++        with a specific status.
++        """
++        return params[0]
++
++
++    def isupport_TARGMAX(self, params):
++        """
++        Maximum number of targets allowable for commands that accept multiple
++        targets.
++        """
++        return dict(self._splitParamArgs())
++
++
++    def isupport_TOPICLEN(self, params):
++        """
++        Maximum length of a topic that may be set.
++        """
++        return _intOrDefault(params[0])
++
++
++
+ class IRCClient(basic.LineReceiver):
+     """Internet Relay Chat client protocol, with sprinkles.
+ 
+@@ -576,6 +917,10 @@
+     __pychecker__ = 'unusednames=params,prefix,channel'
+ 
+ 
++    def __init__(self):
++        self.isupported = ISupport()
++
++
+     def _reallySendLine(self, line):
+         return basic.LineReceiver.sendLine(self, lowQuote(line) + '\r')
+ 
+@@ -1364,12 +1709,13 @@
+         self.myInfo(*info)
+ 
+     def irc_RPL_BOUNCE(self, prefix, params):
+-        # 005 is doubly assigned.  Piece of crap dirty trash protocol.
+-        if params[-1] == "are available on this server":
+-            self.isupport(params[1:-1])
+-        else:
+-            self.bounce(params[1])
++        self.bounce(params[1])
+ 
++    def irc_RPL_ISUPPORT(self, prefix, params):
++        args = params[1:-1]
++        self.isupport(args)
++        self.isupported.parse(args)
++
+     def irc_RPL_LUSERCLIENT(self, prefix, params):
+         self.luserClient(params[1])
+ 
+@@ -2289,7 +2635,8 @@
+ RPL_YOURHOST = '002'
+ RPL_CREATED = '003'
+ RPL_MYINFO = '004'
+-RPL_BOUNCE = '005'
++RPL_ISUPPORT = '005'
++RPL_BOUNCE = '010'
+ RPL_USERHOST = '302'
+ RPL_ISON = '303'
+ RPL_AWAY = '301'
+@@ -2430,7 +2777,8 @@
+     "RPL_YOURHOST": '002',
+     "RPL_CREATED": '003',
+     "RPL_MYINFO": '004',
+-    "RPL_BOUNCE": '005',
++    "RPL_ISUPPORT": '005',
++    "RPL_BOUNCE": '010',
+     "RPL_USERHOST": '302',
+     "RPL_ISON": '303',
+     "RPL_AWAY": '301',

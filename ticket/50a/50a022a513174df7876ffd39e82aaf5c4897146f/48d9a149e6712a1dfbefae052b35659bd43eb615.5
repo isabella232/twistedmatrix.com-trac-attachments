@@ -1,0 +1,155 @@
+Index: twisted/web/test/test_xmlrpc.py
+===================================================================
+--- twisted/web/test/test_xmlrpc.py	(revision 28673)
++++ twisted/web/test/test_xmlrpc.py	(working copy)
+@@ -128,6 +128,16 @@
+         xmlrpc._QueryFactory.__init__(self, *args, **kwargs)
+ 
+ 
++class TestQueryFactoryCancel(xmlrpc._QueryFactory):
++    """
++    QueryFactory that saves a reference to the
++    L{twisted.internet.interfaces.IConnector} to test connection lost.
++    """
++
++    def startedConnecting(self, connector):
++        self.connector = connector
++
++
+ class XMLRPCTestCase(unittest.TestCase):
+ 
+     def setUp(self):
+@@ -149,9 +159,17 @@
+         self.factories.append(factory)
+         return factory
+ 
+-    def proxy(self):
++    def proxy(self, factory=None):
++        """
++        Return a new xmlrpc.Proxy for the test site created in
++        setUp(), using the given factory as the queryFactory, or
++        self.queryFactory if no factory is provided.
++        """
+         p = xmlrpc.Proxy("http://127.0.0.1:%d/" % self.port)
+-        p.queryFactory = self.queryFactory
++        if factory is None:
++            p.queryFactory = self.queryFactory
++        else:
++            p.queryFactory = factory
+         return p
+ 
+     def test_results(self):
+@@ -194,6 +212,21 @@
+         d.addCallback(cb)
+         return d
+ 
++    def test_cancel(self):
++        """
++        A deferred from the Proxy can be cancelled, disconnecting
++        the L{twisted.internet.interfaces.IConnector}.
++        """
++        def factory(*args, **kw):
++            factory.f = TestQueryFactoryCancel(*args, **kw)
++            return factory.f
++        d = self.proxy(factory).callRemote('add', 2, 3)
++        self.assertNotEquals(factory.f.connector.state, "disconnected")
++        d.cancel()
++        self.assertEquals(factory.f.connector.state, "disconnected")
++        d = self.assertFailure(d, defer.CancelledError)
++        return d
++
+     def test_errorGet(self):
+         """
+         A classic GET on the xml server should return a NOT_ALLOWED.
+@@ -260,9 +293,12 @@
+     Test with proxy that doesn't add a slash.
+     """
+ 
+-    def proxy(self):
++    def proxy(self, factory=None):
+         p = xmlrpc.Proxy("http://127.0.0.1:%d" % self.port)
+-        p.queryFactory = self.queryFactory
++        if factory is None:
++            p.queryFactory = self.queryFactory
++        else:
++            p.queryFactory = factory
+         return p
+ 
+ 
+Index: twisted/web/xmlrpc.py
+===================================================================
+--- twisted/web/xmlrpc.py	(revision 28673)
++++ twisted/web/xmlrpc.py	(working copy)
+@@ -303,12 +303,42 @@
+     protocol = QueryProtocol
+ 
+     def __init__(self, path, host, method, user=None, password=None,
+-                 allowNone=False, args=()):
++                 allowNone=False, args=(), canceller=None):
++        """
++        @type path: C{str}
++        @param path: The path portion of the URL to which to post
++        method calls.
++
++        @type host: C{str}
++        @param host: The value to use for the Host HTTP header.
++
++        @type method: C{str}
++        @param method: The name of the method to call.
++
++        @type user: C{str} or None
++        @param user: The username with which to authenticate with the server
++        when making calls.
++
++        @type password: C{str} or None
++        @param password: The password with which to authenticate with the
++        server when making calls.
++
++        @type allowNone: C{bool} or None
++        @param allowNone: allow the use of None values in parameters. It's
++        passed to the underlying xmlrpclib implementation. Default to False.
++
++        @type args: C{tuple}
++        @param args: the arguments to pass to the method.
++
++        @type canceller: C{callable} or None
++        @param canceller: a 1-argument callable passed to the deferred
++        as the canceller callback.
++        """
+         self.path, self.host = path, host
+         self.user, self.password = user, password
+         self.payload = payloadTemplate % (method,
+             xmlrpclib.dumps(args, allow_none=allowNone))
+-        self.deferred = defer.Deferred()
++        self.deferred = defer.Deferred(canceller)
+ 
+     def parseResponse(self, contents):
+         if not self.deferred:
+@@ -408,16 +438,23 @@
+             or a failure if the method failed. Generally, the failure type will
+             be L{Fault}, but you can also have an C{IndexError} on some buggy
+             servers giving empty responses.
++
++            If the deferred is cancelled before the request completes, the
++            connection is closed and the deferred will fire with a
++            L{defer.CancelledError}.
+         """
++        def cancel(d):
++            factory.deferred = None
++            connector.disconnect()
+         factory = self.queryFactory(
+             self.path, self.host, method, self.user,
+-            self.password, self.allowNone, args)
++            self.password, self.allowNone, args, cancel)
+         if self.secure:
+             from twisted.internet import ssl
+-            reactor.connectSSL(self.host, self.port or 443,
+-                               factory, ssl.ClientContextFactory())
++            connector = reactor.connectSSL(self.host, self.port or 443,
++                                           factory, ssl.ClientContextFactory())
+         else:
+-            reactor.connectTCP(self.host, self.port or 80, factory)
++            connector = reactor.connectTCP(self.host, self.port or 80, factory)
+         return factory.deferred
+ 
+ 

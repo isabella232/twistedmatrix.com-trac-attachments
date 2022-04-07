@@ -1,0 +1,303 @@
+diff -r b0414c7ecaaf twisted/test/test_libevent.py
+--- a/twisted/test/test_libevent.py	Tue Dec 11 19:01:51 2007 +0100
++++ b/twisted/test/test_libevent.py	Sat Jan 05 00:38:42 2008 +0100
+@@ -5,7 +5,7 @@ Tests for libevent wrapper.
+ Tests for libevent wrapper.
+ """
+ 
+-import socket, errno, sys
++import socket, errno, sys, os, weakref, gc
+ 
+ from twisted.trial import unittest
+ 
+@@ -64,7 +64,7 @@ class EventTestCase(unittest.TestCase):
+         """
+         timerEvents = []
+         timerEvt = libevent.createTimer(lambda *args: timerEvents.append(args))
+-        timerEvt.addToLoop(0.1)
++        timerEvt.addToLoop(0.01)
+         libevent.loop(libevent.EVLOOP_ONCE)
+         self.assertEquals(timerEvents, [(-1, libevent.EV_TIMEOUT, timerEvt)])
+ 
+@@ -80,6 +80,7 @@ class EventTestCase(unittest.TestCase):
+         evt.addToLoop()
+         evt.removeFromLoop()
+         del evt
++        gc.collect()
+         self.assertEquals(sys.getrefcount(cb), org)
+ 
+ 
+@@ -88,7 +89,7 @@ class EventTestCase(unittest.TestCase):
+         Test flag values of a timer object.
+         """
+         timer = libevent.createTimer(lambda *args: None)
+-        timer.addToLoop(1)
++        timer.addToLoop(10)
+         self.assertEquals(timer.pending() & libevent.EV_TIMEOUT, True)
+         timer.removeFromLoop()
+         self.assertEquals(timer.pending() & libevent.EV_TIMEOUT, False)
+@@ -204,7 +205,7 @@ class ConnectedEventTestCase(unittest.Te
+         clientEvt.removeFromLoop()
+         serverEvt.removeFromLoop()
+ 
+-        timerEvt.addToLoop(0.1)
++        timerEvt.addToLoop(0.01)
+         libevent.loop(libevent.EVLOOP_ONCE)
+         self.assertEquals(timerEvents, [(-1, libevent.EV_TIMEOUT, timerEvt)])
+         self.failIf(clientEvents)
+@@ -216,6 +217,69 @@ class EventBaseTestCase(unittest.TestCas
+     """
+     Test L{libevent.EventBase} usage.
+     """
++
++    def setUp(self):
++        """
++        Create a weakvaluedict in order to hold potentially leaked objects,
++        and another dict to hold potentially destroyed objects.
++        """
++        self._leaks = weakref.WeakValueDictionary()
++        self._survivors = {}
++
++    def _watchForLeaks(self, *args):
++        """
++        Watch the given objects for leaks, by creating weakrefs to them.
++        """
++        for obj in args:
++            key = id(obj), repr(obj)
++            self._leaks[key] = obj
++
++    def _watchForSurvival(self, *args):
++        """
++        Watch the given objects for survival, by creating weakrefs to them.
++        """
++        for obj in args:
++            key = id(obj), repr(obj)
++            self._survivors[key] = weakref.ref(obj)
++
++    def _assertLeaks(self):
++        """
++        Assert that all objects watched for leaks have been destroyed.
++        """
++        # Trigger cycle breaking
++        gc.collect()
++        if len(self._leaks):
++            self.fail("%d objects have leaked: %s" % (
++                len(self._leaks),
++                ", ".join([key[1] for key in self._leaks])
++                ))
++
++    def _assertSurvival(self):
++        """
++        Assert that all objects watched for survival have survived.
++        """
++        # Trigger cycle breaking
++        gc.collect()
++        dead = []
++        for (id_, repr_), ref in self._survivors.items():
++            if ref() is None:
++                dead.append(repr_)
++        if dead:
++            self.fail("%d objects should have survived "
++                "but have been destroyed: %s" % (len(dead), ", ".join(dead)))
++
++
++    def _allocateStuff(self):
++        """
++        Allocate some objects so as to try to overwrite dead objects with other
++        stuff. Not guaranteed to work but at least we try :-)
++        """
++        # Reclaim memory, then fill it. We create a lot of plain objects so
++        # that the main allocator is exercised.
++        gc.collect()
++        class _Dummy(object):
++            pass
++        [_Dummy() for i in xrange(10000)]
+ 
+     def test_create(self):
+         """
+@@ -291,12 +355,12 @@ class EventBaseTestCase(unittest.TestCas
+         def eb(fd, events, obj):
+             raise RuntimeError("foo")
+         timer = newEventBase.createTimer(eb)
+-        timer.addToLoop(0.01)
++        timer.addToLoop(0.001)
+ 
+         def cb(fd, events, obj):
+             fireEvents.append((fd, events, obj))
+         timer = newEventBase.createTimer(cb)
+-        timer.addToLoop(0.02)
++        timer.addToLoop(0.002)
+ 
+         self.assertRaises(RuntimeError, newEventBase.dispatch)
+         self.assertEquals(len(fireEvents), 0)
+@@ -305,6 +369,170 @@ class EventBaseTestCase(unittest.TestCas
+         newEventBase.dispatch()
+         self.assertEquals(len(fireEvents), 1)
+ 
++    def test_successfulCallbackReference(self):
++        """
++        Check that successful callbacks aren't leaked.
++        """
++        newEventBase = libevent.EventBase()
++        def cb(fd, events, obj):
++            pass
++        self._watchForLeaks(cb)
++        timer = newEventBase.createTimer(cb)
++        timer.addToLoop(0.002)
++        newEventBase.dispatch()
++
++        del cb, timer
++        self._assertLeaks()
++
++    def test_failedCallbackReference(self):
++        """
++        Check that failed callbacks aren't leaked.
++        """
++        newEventBase = libevent.EventBase()
++        def eb(fd, events, obj):
++            raise RuntimeError("foo")
++        self._watchForLeaks(eb)
++        timer = newEventBase.createTimer(eb)
++        timer.addToLoop(0.002)
++        self.assertRaises(RuntimeError, newEventBase.dispatch)
++
++        del eb, timer
++        self._assertLeaks()
++
++    def test_unfiredCallbackReference(self):
++        """
++        Check that unfired callbacks aren't leaked when the eventBase is
++        destroyed.
++        """
++        newEventBase = libevent.EventBase()
++        def cb(fd, events, obj):
++            pass
++        self._watchForLeaks(cb)
++        timer = newEventBase.createTimer(cb)
++        timer.addToLoop(1)
++
++        del cb, timer, newEventBase
++        self._assertLeaks()
++
++    def test_callbackReference(self):
++        """
++        Check that a simple unregistered callback doesn't leak.
++        """
++        newEventBase = libevent.EventBase()
++        def cb(fd, events, obj):
++            pass
++        timer = newEventBase.createTimer(cb)
++        self._watchForLeaks(cb)
++
++        del cb, timer
++        self._assertLeaks()
++
++    def test_callbackExceptionReference(self):
++        """
++        Check that exceptions propagated from callbacks aren't leaked.
++        """
++        # Custom subclass so that weakref's are possible
++        class _Exception(RuntimeError):
++            pass
++        exc = [None]
++        newEventBase = libevent.EventBase()
++        def eb(fd, events, obj):
++            exc[0] = _Exception("foo")
++            raise exc[0]
++        timer = newEventBase.createTimer(eb)
++        timer.addToLoop(0.002)
++        self.assertRaises(RuntimeError, newEventBase.dispatch)
++        self._watchForLeaks(exc[0])
++
++        del exc[0]
++        self._assertLeaks()
++
++    def test_callbackSurvival(self):
++        """
++        Check that a registered callback survives even when the local reference
++        dies.
++        """
++        newEventBase = libevent.EventBase()
++        def cb(fd, events, obj):
++            pass
++        timer = newEventBase.createTimer(cb)
++        timer.addToLoop(1)
++        self._watchForSurvival(cb)
++
++        del cb, timer
++        self._assertSurvival()
++
++    def test_persistentCallbackSurvival(self):
++        """
++        Check that a persistent callback survives after been fired.
++        """
++        rfd, wfd = os.pipe()
++        newEventBase = libevent.EventBase()
++        def cb(fd, events, obj):
++            newEventBase.loopExit(0)
++        timer = newEventBase.createEvent(rfd,
++            libevent.EV_READ | libevent.EV_PERSIST, cb)
++        timer.addToLoop()
++        os.write(wfd, " ")
++        newEventBase.dispatch()
++        self._watchForSurvival(cb)
++
++        del cb, timer
++        self._assertSurvival()
++
++    def test_persistentFailedCallbackSurvival(self):
++        """
++        Check that a persistent callback survives after raising an exception.
++        """
++        rfd, wfd = os.pipe()
++        newEventBase = libevent.EventBase()
++        def cb(fd, events, obj):
++            newEventBase.loopExit(0)
++            raise RuntimeError("foo")
++        timer = newEventBase.createEvent(rfd,
++            libevent.EV_READ | libevent.EV_PERSIST, cb)
++        timer.addToLoop()
++        os.write(wfd, " ")
++        self.assertRaises(RuntimeError, newEventBase.dispatch)
++        self._watchForSurvival(cb)
++
++        del cb, timer
++        self._assertSurvival()
++
++    def test_persistentCallbackReference(self):
++        """
++        Check that a persistent callback doesn't leak when the eventBase
++        is destroyed.
++        """
++        rfd, wfd = os.pipe()
++        newEventBase = libevent.EventBase()
++        def cb(fd, events, obj):
++            newEventBase.loopExit(0)
++        timer = newEventBase.createEvent(rfd,
++            libevent.EV_READ | libevent.EV_PERSIST, cb)
++        timer.addToLoop()
++        os.write(wfd, " ")
++        newEventBase.dispatch()
++        self._watchForLeaks(cb)
++
++        newEventBase = None
++        del cb, timer
++        self._assertLeaks()
++
++    def test_dispatchedEventRefCount(self):
++        """
++        Check that dispatched event refcounts don't grow.
++        """
++        newEventBase = libevent.EventBase()
++        def cb(fd, events, obj):
++            pass
++        timer = newEventBase.createTimer(cb)
++        orig = sys.getrefcount(timer)
++        timer.addToLoop(0.01)
++        newEventBase.dispatch()
++        # Perhaps some dead cycles involve our object -> break them
++        gc.collect()
++        self.assertEquals(orig, sys.getrefcount(timer))
+ 
+ 
+ if libevent is None:

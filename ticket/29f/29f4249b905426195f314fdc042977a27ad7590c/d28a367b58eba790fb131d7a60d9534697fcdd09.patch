@@ -1,0 +1,197 @@
+=== modified file 'twisted/enterprise/adbapi.py'
+--- twisted/enterprise/adbapi.py	2008-03-23 01:28:30 +0000
++++ twisted/enterprise/adbapi.py	2008-04-06 22:13:11 +0000
+@@ -219,8 +219,8 @@
+             self.running = True
+             
+     def runWithConnection(self, func, *args, **kw):
+-        return self._deferToThread(self._runWithConnection,
+-                                   func, *args, **kw)
++        return threads.deferToThreadpool(self.threadpool, self._runWithConnection,
++                                         func, *args, **kw)
+ 
+     def _runWithConnection(self, func, *args, **kw):
+         conn = Connection(self)
+@@ -257,8 +257,8 @@
+             'interaction(Transaction(...))', or a Failure.
+         """
+ 
+-        return self._deferToThread(self._runInteraction,
+-                                   interaction, *args, **kw)
++        return threads.deferToThreadpool(self.threadpool, self._runInteraction,
++                                         interaction, *args, **kw)
+ 
+     def runQuery(self, *args, **kw):
+         """Execute an SQL query and return the result.
+@@ -401,17 +401,6 @@
+         self.__dict__ = state
+         self.__init__(self.dbapiName, *self.connargs, **self.connkw)
+ 
+-    def _deferToThread(self, f, *args, **kwargs):
+-        """Internal function.
+-
+-        Call f in one of the connection pool's threads.
+-        """
+-
+-        d = defer.Deferred()
+-        self.threadpool.callInThread(threads._putResultInDeferred,
+-                                     d, f, args, kwargs)
+-        return d
+-
+ 
+ 
+ # Common deprecation decorator used for all deprecations.
+
+=== modified file 'twisted/internet/base.py'
+--- twisted/internet/base.py	2008-03-26 17:49:32 +0000
++++ twisted/internet/base.py	2008-04-06 21:37:13 +0000
+@@ -842,6 +842,12 @@
+                 self._initThreadPool()
+             self.threadpool.callInThread(_callable, *args, **kwargs)
+ 
++        def callInThreadWithCallback(self, _callable, on_result, *args, **kwargs):
++            if self.threadpool is None:
++                self._initThreadPool()
++            self.threadpool.callInThreadWithCallback(_callable, on_result,
++                                                     *args, **kwargs)
++
+         def suggestThreadPoolSize(self, size):
+             """
+             See L{twisted.internet.interfaces.IReactorThreads.suggestThreadPoolSize}.
+
+=== modified file 'twisted/internet/threads.py'
+--- twisted/internet/threads.py	2008-03-04 21:36:22 +0000
++++ twisted/internet/threads.py	2008-04-06 22:13:32 +0000
+@@ -15,28 +15,27 @@
+ from twisted.internet import defer
+ 
+ 
+-def _putResultInDeferred(deferred, f, args, kwargs):
+-    """
+-    Run a function and give results to a Deferred.
+-    """
+-    from twisted.internet import reactor
+-    try:
+-        result = f(*args, **kwargs)
+-    except:
+-        f = failure.Failure()
+-        reactor.callFromThread(deferred.errback, f)
+-    else:
+-        reactor.callFromThread(deferred.callback, result)
++def deferToThreadpool(threadpool, f, *args, **kwargs):
++    d = defer.Deferred()
++
++    def on_result(success, result, d=d):
++        from twisted.internet import reactor
++        if success:
++            reactor.callFromThread(d.callback, result)
++        else:
++            reactor.callFromThread(d.errback, result)
++
++    threadpool.callInThreadWithCallback(f, on_result, *args, **kwargs)
++
++    return d
+ 
+ 
+ def deferToThread(f, *args, **kwargs):
+     """
+     Run function in thread and return result as Deferred.
+     """
+-    d = defer.Deferred()
+     from twisted.internet import reactor
+-    reactor.callInThread(_putResultInDeferred, d, f, args, kwargs)
+-    return d
++    return deferToThreadpool(reactor, f, *args, **kwargs)
+ 
+ 
+ def _runMultiple(tupleList):
+
+=== modified file 'twisted/python/threadpool.py'
+--- twisted/python/threadpool.py	2008-03-26 17:49:32 +0000
++++ twisted/python/threadpool.py	2008-04-06 22:02:06 +0000
+@@ -19,7 +19,7 @@
+ 
+ 
+ # Twisted Imports
+-from twisted.python import log, runtime, context, threadable
++from twisted.python import log, runtime, context, threadable, failure
+ 
+ WorkerStop = object()
+ 
+@@ -114,10 +114,13 @@
+         self.callInThread(func, *args, **kw)
+ 
+     def callInThread(self, func, *args, **kw):
++        self.callInThreadWithCallback(func, None, *args, **kw)
++
++    def callInThreadWithCallback(self, func, on_result, *args, **kw):
+         if self.joined:
+             return
+         ctx = context.theContextTracker.currentContext().contexts[-1]
+-        o = (ctx, func, args, kw)
++        o = (ctx, func, args, kw, on_result)
+         self.q.put(o)
+         if self.started:
+             self._startSomeWorkers()
+@@ -156,13 +159,25 @@
+         o = self.q.get()
+         while o is not WorkerStop:
+             self.working.append(ct)
+-            ctx, function, args, kwargs = o
++            ctx, function, args, kwargs, on_result = o
++
+             try:
+-                context.call(ctx, function, *args, **kwargs)
++                result = context.call(ctx, function, *args, **kwargs)
++                success = True
+             except:
+-                context.call(ctx, log.err)
++                result = failure.Failure()
++                success = False
++
+             self.working.remove(ct)
+-            del o, ctx, function, args, kwargs
++
++            if on_result is not None:
++                try:
++                    context.call(ctx, on_result, success, result)
++                except:
++                    context.call(ctx, log.err)
++
++            del o, ctx, function, args, kwargs, on_result, result
++
+             self.waiters.append(ct)
+             o = self.q.get()
+             self.waiters.remove(ct)
+
+=== modified file 'twisted/test/test_threadpool.py'
+--- twisted/test/test_threadpool.py	2008-03-26 17:49:32 +0000
++++ twisted/test/test_threadpool.py	2008-04-06 20:22:14 +0000
+@@ -297,6 +297,26 @@
+             self.failUnless(self.threadpool.workers <= 2)
+ 
+ 
++    def test_singleThread2(self):
++        """
++        Test that the creation of new threads from the thread result callback
++        does not create extra threads.
++        """
++        # Ensure no threads running
++        self.assertEquals(self.threadpool.workers, 0)
++        timeout = self.getTimeout()
++
++        def callback(success, result):
++            self.threadpool.callInThread(self.event.set)
++
++        self.threadpool.callInThreadWithCallback(lambda : None, callback)
++        self.event.wait(timeout)
++        self.event.clear()
++
++        # Ensure there is one thread running
++        self.failUnless(self.threadpool.workers == 1)
++
++
+ 
+ if interfaces.IReactorThreads(reactor, None) is None:
+     for cls in ThreadPoolTestCase, RaceConditionTestCase:
+

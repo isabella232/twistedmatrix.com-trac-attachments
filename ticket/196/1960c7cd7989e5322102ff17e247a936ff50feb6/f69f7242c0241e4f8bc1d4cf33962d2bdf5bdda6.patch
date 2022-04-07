@@ -1,0 +1,132 @@
+Index: names/dns.py
+===================================================================
+--- names/dns.py	(revision 30364)
++++ names/dns.py	(working copy)
+@@ -153,6 +153,9 @@
+ # Response Codes
+ OK, EFORMAT, ESERVER, ENAME, ENOTIMP, EREFUSED = range(6)
+
++# How many answers should each AXFR response message contain
++AXFR_PART_SIZE = 50
++
+ class IRecord(Interface):
+     """
+     An single entry in a zone of authority.
+@@ -1422,7 +1425,7 @@
+
+     @type data: C{list} of C{str}
+     @ivar data: Freeform text which makes up this record.
+-
++
+     @type ttl: C{int}
+     @ivar ttl: The maximum number of seconds which this record should be cached.
+     """
+@@ -1468,10 +1471,10 @@
+     """
+     Structurally, freeform text. Semantically, a policy definition, formatted
+     as defined in U{rfc 4408<http://www.faqs.org/rfcs/rfc4408.html>}.
+-
++
+     @type data: C{list} of C{str}
+     @ivar data: Freeform text which makes up this record.
+-
++
+     @type ttl: C{int}
+     @ivar ttl: The maximum number of seconds which this record should be cached.
+     """
+@@ -1553,7 +1556,56 @@
+                                 len(self.authority), len(self.additional)))
+         strio.write(body)
+
++    def encodeParts(self):
++        # Special case when encoding large AXFR responses.
++        parts = []
+
++        # queries, authority and additional are only encoded once, because
++        # they are the same across all the messages.
++        to_encode = {
++                      'queries': self.queries,
++                      'authority': self.authority,
++                      'additional': self.additional
++                    }
++        encoded = {}
++        for key, value in to_encode.iteritems():
++            strio_tmp = StringIO.StringIO()
++
++            for q in value:
++                q.encode(strio_tmp, compDict = None)
++            encoded[key] = strio_tmp.getvalue()
++
++        answerCount = len(self.answers)
++        # Split answers into multiple parts
++        for i in range(0, answerCount, AXFR_PART_SIZE):
++            strio_part = StringIO.StringIO()
++
++            strio_answers = StringIO.StringIO()
++            answersCurrent = self.answers[i : i + AXFR_PART_SIZE]
++            answersCurrentCount = len(answersCurrent)
++
++            for answer in answersCurrent:
++                answer.encode(strio_answers, compDict = None)
++
++            body = encoded['queries'] + strio_answers.getvalue() + \
++                   encoded['authority'] + encoded['additional']
++            size = len(body) + self.headerSize
++            byte3 = (( ( self.answer & 1 ) << 7 )
++                     | ((self.opCode & 0xf ) << 3 )
++                     | ((self.auth & 1 ) << 2 )
++                     | ((self.trunc & 1 ) << 1 )
++                     | ( self.recDes & 1 ) )
++            byte4 = ( ( (self.recAv & 1 ) << 7 )
++                     | (self.rCode & 0xf ) )
++
++            strio_part.write(struct.pack(self.headerFmt, self.id, byte3, byte4,
++                                    len(self.queries), answersCurrentCount,
++                                    len(self.authority), len(self.additional)))
++            strio_part.write(body)
++            parts.append(strio_part.getvalue())
++
++        return parts
++
+     def decode(self, strio, length=None):
+         self.maxSize = 0
+         header = readPrecisely(strio, self.headerSize)
+@@ -1628,11 +1680,22 @@
+
+
+     def toStr(self):
+-        strio = StringIO.StringIO()
+-        self.encode(strio)
+-        return strio.getvalue()
++        # Special case for AXFR response messages
++        if len(self.queries) > 0:
++            query = self.queries[0]
++        else:
++            query = None
+
++        if query and EXT_QUERIES.get(query.type, 'unknown') == 'AXFR' and \
++           len (self.answers) > AXFR_PART_SIZE:
++            result = self.encodeParts()
++            return result
++        else:
++            strio = StringIO.StringIO()
++            self.encode(strio)
++            return strio.getvalue()
+
++
+     def fromStr(self, str):
+         strio = StringIO.StringIO(str)
+         self.decode(strio)
+@@ -1838,7 +1901,11 @@
+         @type message: L{Message}
+         """
+         s = message.toStr()
+-        self.transport.write(struct.pack('!H', len(s)) + s)
++        if isinstance(s, list):
++            for part in s:
++               self.transport.write(struct.pack('!H', len(part)) + part)
++        else:
++            self.transport.write(struct.pack('!H', len(s)) + s)
+
+     def connectionMade(self):
+         """

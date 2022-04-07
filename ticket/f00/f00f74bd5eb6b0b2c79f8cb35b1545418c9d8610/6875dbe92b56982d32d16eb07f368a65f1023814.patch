@@ -1,0 +1,808 @@
+commit 8e537a20774e40d5e321a4afd5043c0295fb4f52
+Author: Dustin J. Mitchell <dustin@mozilla.com>
+Date:   Mon Apr 13 19:51:04 2015 -0400
+
+    Add tests and py3 compatibility to twisted.web.error
+
+diff --git a/twisted/python/compat.py b/twisted/python/compat.py
+index da759b3..2c55ac8 100644
+--- a/twisted/python/compat.py
++++ b/twisted/python/compat.py
+@@ -11,16 +11,19 @@ features.
+ This is mainly for use of internal Twisted code. We encourage you to use
+ the latest version of Python directly from your code, if possible.
+ 
+ @var unicode: The type of Unicode strings, C{unicode} on Python 2 and C{str}
+     on Python 3.
+ 
+ @var NativeStringIO: An in-memory file-like object that operates on the native
+     string type (bytes in Python 2, unicode in Python 3).
++
++@var urlparse: a URL-parsing module (urlparse on Python 2, urllib.parse on
++    Python 3)
+ """
+ 
+ from __future__ import division
+ 
+ import sys, string, socket, struct
+ 
+ 
+ if sys.version_info < (3, 0):
+@@ -303,16 +306,22 @@ C{__traceback__} attribute being set.
+ 
+ 
+ if _PY3:
+     from io import StringIO as NativeStringIO
+ else:
+     from io import BytesIO as NativeStringIO
+ 
+ 
++if _PY3:
++    import urllib.parse as urlparse
++else:
++    import urlparse
++
++
+ 
+ # Functions for dealing with Python 3's bytes type, which is somewhat
+ # different than Python 2's:
+ if _PY3:
+     def iterbytes(originalBytes):
+         for i in range(len(originalBytes)):
+             yield originalBytes[i:i+1]
+ 
+diff --git a/twisted/python/dist3.py b/twisted/python/dist3.py
+index 8cf49cb..d45cf08 100644
+--- a/twisted/python/dist3.py
++++ b/twisted/python/dist3.py
+@@ -216,16 +216,17 @@ testModules = [
+     "twisted.trial.test.test_deferred",
+     "twisted.trial.test.test_log",
+     "twisted.trial.test.test_pyunitcompat",
+     "twisted.trial.test.test_suppression",
+     "twisted.trial.test.test_testcase",
+     "twisted.trial.test.test_tests",
+     "twisted.trial.test.test_util",
+     "twisted.trial.test.test_warning",
++    "twisted.web.error",
+     # The downloadPage tests weren't ported:
+     "twisted.web.test.test_webclient",
+     "twisted.web.test.test_http",
+     "twisted.web.test.test_http_headers",
+     "twisted.web.test.test_newclient",
+     "twisted.web.test.test_resource",
+     "twisted.web.test.test_web",
+ ]
+@@ -245,30 +246,32 @@ almostModules = [
+     # twisted.python.filepath depends on twisted.python.win32, but on Linux it
+     # only really needs to import:
+     "twisted.python.win32",
+     "twisted.test.reflect_helper_IE",
+     "twisted.test.reflect_helper_VE",
+     "twisted.test.reflect_helper_ZDE",
+     # Required by some of the ported trial tests:
+     "twisted.trial.reporter",
++    # Required by twisted.web.template
++    "twisted.web._element",
++    "twisted.web._flatten",
++    "twisted.web.util",
+     # Agent code and downloadPage aren't ported, test coverage isn't complete:
+     "twisted.web.client",
+-    # twisted.web.resource depends on twisted.web.error, so it is sorta
+-    # ported, but its tests are not yet ported, so it probably doesn't
+-    # completely work.
+-    "twisted.web.error",
+     # Required by twisted.web.server, no actual code here:
+     "twisted.web.iweb",
+     # Required by twisted.web.server for an error handling case:
+     "twisted.web.html",
+     # This module has a lot of missing test coverage.  What tests it has pass,
+     # but it needs a lot more.  It was ported only enough to make the client
+     # work.
+     "twisted.web.http",
+     # GzipEncoder and allowed methods functionality not ported, no doubt
+     # missing lots of test coverage:
+     "twisted.web.server",
++    # Required by twisted.web.error when formatting flattener roots
++    "twisted.web.template",
+ ]
+ 
+ 
+ 
+ modulesToInstall = modules + testModules + almostModules
+diff --git a/twisted/python/urlpath.py b/twisted/python/urlpath.py
+index 1c15f09..a8b75e1 100644
+--- a/twisted/python/urlpath.py
++++ b/twisted/python/urlpath.py
+@@ -1,15 +1,15 @@
+ # -*- test-case-name: twisted.test.test_paths -*-
+ # Copyright (c) Twisted Matrix Laboratories.
+ # See LICENSE for details.
+ 
+ #
+ 
+-import urlparse
++from twisted.python.compat import urlparse
+ import urllib
+ 
+ class URLPath:
+     def __init__(self, scheme='', netloc='localhost', path='',
+                  query='', fragment=''):
+         self.scheme = scheme or 'http'
+         self.netloc = netloc
+         self.path = path or '/'
+diff --git a/twisted/web/_element.py b/twisted/web/_element.py
+index 3c15b3b..84450b9 100644
+--- a/twisted/web/_element.py
++++ b/twisted/web/_element.py
+@@ -1,13 +1,13 @@
+ # -*- test-case-name: twisted.web.test.test_template -*-
+ # Copyright (c) Twisted Matrix Laboratories.
+ # See LICENSE for details.
+ 
+-from zope.interface import implements
++from zope.interface import implementer
+ 
+ from twisted.web.iweb import IRenderable
+ 
+ from twisted.web.error import MissingRenderMethod, UnexposedMethodError
+ from twisted.web.error import MissingTemplateLoader
+ 
+ 
+ class Expose(object):
+@@ -117,16 +117,17 @@ def renderer():
+ 
+         <div>
+             <span>Hello, world.</span>
+         </div>
+     """
+ 
+ 
+ 
++@implementer(IRenderable)
+ class Element(object):
+     """
+     Base for classes which can render part of a page.
+ 
+     An Element is a renderer that can be embedded in a stan document and can
+     hook its template (from the loader) up to render methods.
+ 
+     An Element might be used to encapsulate the rendering of a complex piece of
+@@ -144,17 +145,16 @@ class Element(object):
+     Render methods are invoked with two arguments: first, the
+     L{twisted.web.http.Request} being served and second, the tag object which
+     "invoked" the render method.
+ 
+     @type loader: L{ITemplateLoader} provider
+     @ivar loader: The factory which will be used to load documents to
+         return from C{render}.
+     """
+-    implements(IRenderable)
+     loader = None
+ 
+     def __init__(self, loader=None):
+         if loader is not None:
+             self.loader = loader
+ 
+ 
+     def lookupRenderMethod(self, name):
+diff --git a/twisted/web/_flatten.py b/twisted/web/_flatten.py
+index 98d2b46..a275004 100644
+--- a/twisted/web/_flatten.py
++++ b/twisted/web/_flatten.py
+@@ -2,17 +2,17 @@
+ # Copyright (c) Twisted Matrix Laboratories.
+ # See LICENSE for details.
+ 
+ """
+ Context-free flattener/serializer for rendering Python objects, possibly
+ complex or arbitrarily nested, as strings.
+ """
+ 
+-from cStringIO import StringIO
++from twisted.python.compat import NativeStringIO as StringIO
+ from sys import exc_info
+ from types import GeneratorType
+ from traceback import extract_tb
+ from twisted.internet.defer import Deferred
+ from twisted.web.error import UnfilledSlot, UnsupportedType, FlattenerError
+ 
+ from twisted.web.iweb import IRenderable
+ from twisted.web._stan import (
+@@ -312,28 +312,29 @@ def _flattenTree(request, root):
+     while stack:
+         try:
+             # In Python 2.5, after an exception, a generator's gi_frame is
+             # None.
+             frame = stack[-1].gi_frame
+             element = stack[-1].next()
+         except StopIteration:
+             stack.pop()
+-        except Exception, e:
++        except Exception as e:
+             stack.pop()
+             roots = []
+             for generator in stack:
+                 roots.append(generator.gi_frame.f_locals['root'])
+             roots.append(frame.f_locals['root'])
+             raise FlattenerError(e, roots, extract_tb(exc_info()[2]))
+         else:
+             if type(element) is str:
+                 yield element
+             elif isinstance(element, Deferred):
+-                def cbx((original, toFlatten)):
++                def cbx(originalAndToFlatten):
++                    original, toFlatten = originalAndToFlatten
+                     stack.append(toFlatten)
+                     return original
+                 yield element.addCallback(cbx)
+             else:
+                 stack.append(element)
+ 
+ 
+ def _writeFlattenedData(state, write, result):
+diff --git a/twisted/web/_responses.py b/twisted/web/_responses.py
+index 4766b40..50083fc 100644
+--- a/twisted/web/_responses.py
++++ b/twisted/web/_responses.py
+@@ -107,8 +107,24 @@ RESPONSES = {
+     BAD_GATEWAY: "Bad Gateway",
+     SERVICE_UNAVAILABLE: "Service Unavailable",
+     GATEWAY_TIMEOUT: "Gateway Time-out",
+     HTTP_VERSION_NOT_SUPPORTED: "HTTP Version not supported",
+     INSUFFICIENT_STORAGE_SPACE: "Insufficient Storage Space",
+     NOT_EXTENDED: "Not Extended"
+     }
+ 
++
++def str2response(code):
++    """
++    Returns the response message corresponding to an HTTP code, or None
++    if the code is unknown or unrecognized.
++
++    @type code: L{str}
++    @param code: Refers to an HTTP status code, for example C{http.NOT_FOUND}.
++
++    @return: A string message or none
++    @rtype: L{str}
++    """
++    try:
++        return RESPONSES.get(int(code))
++    except ValueError:
++        return None
+diff --git a/twisted/web/error.py b/twisted/web/error.py
+index beabc90..8ec2f09 100644
+--- a/twisted/web/error.py
++++ b/twisted/web/error.py
+@@ -12,17 +12,18 @@ __all__ = [
+     'Error', 'PageRedirect', 'InfiniteRedirection', 'RenderError',
+     'MissingRenderMethod', 'MissingTemplateLoader', 'UnexposedMethodError',
+     'UnfilledSlot', 'UnsupportedType', 'FlattenerError',
+     'RedirectWithNoLocation',
+     ]
+ 
+ from collections import Sequence
+ 
+-from twisted.web._responses import RESPONSES
++from twisted.web._responses import str2response
++from twisted.python.compat import unicode
+ 
+ 
+ class Error(Exception):
+     """
+     A basic HTTP error.
+ 
+     @type status: C{str}
+     @ivar status: Refers to an HTTP status code, for example C{http.NOT_FOUND}.
+@@ -43,24 +44,17 @@ class Error(Exception):
+             descriptive bytestring that is used instead.
+ 
+         @type message: C{str}
+         @param message: A short error message, for example "NOT FOUND".
+ 
+         @type response: C{bytes}
+         @param response: A complete HTML document for an error page.
+         """
+-        if not message:
+-            try:
+-                message = RESPONSES.get(int(code))
+-            except ValueError:
+-                # If code wasn't a stringified int, can't map the
+-                # status code to a descriptive string so keep message
+-                # unchanged.
+-                pass
++        message = message or str2response(code)
+ 
+         Exception.__init__(self, code, message, response)
+         self.status = code
+         self.message = message
+         self.response = response
+ 
+ 
+     def __str__(self):
+@@ -90,29 +84,19 @@ class PageRedirect(Error):
+         @type response: C{str}
+         @param response: A complete HTML document for an error page.
+ 
+         @type location: C{str}
+         @param location: The location response-header field value. It is an
+             absolute URI used to redirect the receiver to a location other than
+             the Request-URI so the request can be completed.
+         """
+-        if not message:
+-            try:
+-                message = RESPONSES.get(int(code))
+-            except ValueError:
+-                # If code wasn't a stringified int, can't map the
+-                # status code to a descriptive string so keep message
+-                # unchanged.
+-                pass
+-
+-        if location and message:
+-            message = "%s to %s" % (message, location)
+-
+         Error.__init__(self, code, message, response)
++        if self.message and location:
++            self.message = "%s to %s" % (self.message, location)
+         self.location = location
+ 
+ 
+ 
+ class InfiniteRedirection(Error):
+     """
+     HTTP redirection is occurring endlessly.
+ 
+@@ -135,38 +119,32 @@ class InfiniteRedirection(Error):
+         @type response: C{str}
+         @param response: A complete HTML document for an error page.
+ 
+         @type location: C{str}
+         @param location: The location response-header field value. It is an
+             absolute URI used to redirect the receiver to a location other than
+             the Request-URI so the request can be completed.
+         """
+-        if not message:
+-            try:
+-                message = RESPONSES.get(int(code))
+-            except ValueError:
+-                # If code wasn't a stringified int, can't map the
+-                # status code to a descriptive string so keep message
+-                # unchanged.
+-                pass
+-
+-        if location and message:
+-            message = "%s to %s" % (message, location)
+-
+         Error.__init__(self, code, message, response)
++        if self.message and location:
++            self.message = "%s to %s" % (self.message, location)
+         self.location = location
+ 
+ 
+ 
+ class RedirectWithNoLocation(Error):
+     """
+     Exception passed to L{ResponseFailed} if we got a redirect without a
+     C{Location} header field.
+ 
++    @type uri: C{str}
++    @ivar uri: The URI which failed to give a proper location header
++        field.
++
+     @since: 11.1
+     """
+ 
+     def __init__(self, code, message, uri):
+         """
+         Initializes a page redirect exception when no location is given.
+ 
+         @type code: C{str}
+@@ -317,28 +295,32 @@ class FlattenerError(Exception):
+             Typically, L{Tag}s, strings, and other simple Python types.
+ 
+         @return: A string representation of C{obj}.
+         @rtype: L{str}
+         """
+         # There's a circular dependency between this class and 'Tag', although
+         # only for an isinstance() check.
+         from twisted.web.template import Tag
+-        if isinstance(obj, (str, unicode)):
++        try:
++            stringTypes = (bytes, str)
++        except NameError:
++            stringTypes = (str, unicode)
++        if isinstance(obj, stringTypes):
+             # It's somewhat unlikely that there will ever be a str in the roots
+             # list.  However, something like a MemoryError during a str.replace
+             # call (eg, replacing " with &quot;) could possibly cause this.
+             # Likewise, UTF-8 encoding a unicode string to a byte string might
+             # fail like this.
+             if len(obj) > 40:
+-                if isinstance(obj, str):
+-                    prefix = 1
++                if isinstance(obj, unicode):
++                    ellipsis = u'<...>'
+                 else:
+-                    prefix = 2
+-                return repr(obj[:20])[:-1] + '<...>' + repr(obj[-20:])[prefix:]
++                    ellipsis = b'<...>'
++                return repr(obj[:20] + ellipsis + obj[-19:])
+             else:
+                 return repr(obj)
+         elif isinstance(obj, Tag):
+             if obj.filename is None:
+                 return 'Tag <' + obj.tagName + '>'
+             else:
+                 return "File \"%s\", line %d, column %d, in \"%s\"" % (
+                     obj.filename, obj.lineNumber,
+diff --git a/twisted/web/template.py b/twisted/web/template.py
+index 224a192..f14eb9d 100644
+--- a/twisted/web/template.py
++++ b/twisted/web/template.py
+@@ -21,19 +21,19 @@ HTML rendering for twisted.web.
+ 
+ __all__ = [
+     'TEMPLATE_NAMESPACE', 'VALID_HTML_TAG_NAMES', 'Element', 'TagLoader',
+     'XMLString', 'XMLFile', 'renderer', 'flatten', 'flattenString', 'tags',
+     'Comment', 'CDATA', 'Tag', 'slot', 'CharRef', 'renderElement'
+     ]
+ 
+ import warnings
+-from zope.interface import implements
++from zope.interface import implementer
+ 
+-from cStringIO import StringIO
++from twisted.python.compat import NativeStringIO as StringIO
+ from xml.sax import make_parser, handler
+ 
+ from twisted.web._stan import Tag, slot, Comment, CDATA, CharRef
+ from twisted.python.filepath import FilePath
+ 
+ TEMPLATE_NAMESPACE = 'http://twistedmatrix.com/ns/twisted.web.template/0.1'
+ 
+ from twisted.web.iweb import ITemplateLoader
+@@ -348,46 +348,46 @@ def _flatsaxParse(fl):
+     parser.setEntityResolver(s)
+     parser.setProperty(handler.property_lexical_handler, s)
+ 
+     parser.parse(fl)
+ 
+     return s.document
+ 
+ 
++@implementer(ITemplateLoader)
+ class TagLoader(object):
+     """
+     An L{ITemplateLoader} that loads existing L{IRenderable} providers.
+ 
+     @ivar tag: The object which will be loaded.
+     @type tag: An L{IRenderable} provider.
+     """
+-    implements(ITemplateLoader)
+ 
+     def __init__(self, tag):
+         """
+         @param tag: The object which will be loaded.
+         @type tag: An L{IRenderable} provider.
+         """
+         self.tag = tag
+ 
+ 
+     def load(self):
+         return [self.tag]
+ 
+ 
+ 
++@implementer(ITemplateLoader)
+ class XMLString(object):
+     """
+     An L{ITemplateLoader} that loads and parses XML from a string.
+ 
+     @ivar _loadedTemplate: The loaded document.
+     @type _loadedTemplate: a C{list} of Stan objects.
+     """
+-    implements(ITemplateLoader)
+ 
+     def __init__(self, s):
+         """
+         Run the parser on a StringIO copy of the string.
+ 
+         @param s: The string from which to load the XML.
+         @type s: C{str}
+         """
+@@ -400,27 +400,27 @@ class XMLString(object):
+ 
+         @return: the loaded document.
+         @rtype: a C{list} of Stan objects.
+         """
+         return self._loadedTemplate
+ 
+ 
+ 
++@implementer(ITemplateLoader)
+ class XMLFile(object):
+     """
+     An L{ITemplateLoader} that loads and parses XML from a file.
+ 
+     @ivar _loadedTemplate: The loaded document, or C{None}, if not loaded.
+     @type _loadedTemplate: a C{list} of Stan objects, or C{None}.
+ 
+     @ivar _path: The L{FilePath}, file object, or filename that is being
+         loaded from.
+     """
+-    implements(ITemplateLoader)
+ 
+     def __init__(self, path):
+         """
+         Run the parser on a file.
+ 
+         @param path: The file from which to load the XML.
+         @type path: L{FilePath}
+         """
+diff --git a/twisted/web/test/test_error.py b/twisted/web/test/test_error.py
+index 12d625e..4c59c70 100644
+--- a/twisted/web/test/test_error.py
++++ b/twisted/web/test/test_error.py
+@@ -1,17 +1,23 @@
+ # Copyright (c) Twisted Matrix Laboratories.
+ # See LICENSE for details.
+ 
+ """
+ HTTP errors.
+ """
+ 
++import re
++import sys
++import traceback
++
+ from twisted.trial import unittest
++from twisted.python.compat import nativeString
+ from twisted.web import error
++from twisted.web.template import Tag
+ 
+ class ErrorTests(unittest.TestCase):
+     """
+     Tests for how L{Error} attributes are initialized.
+     """
+     def test_noMessageValidStatus(self):
+         """
+         If no C{message} argument is passed to the L{Error} constructor and the
+@@ -144,8 +150,206 @@ class InfiniteRedirectionTests(unittest.TestCase):
+     def test_messageExistsNoLocation(self):
+         """
+         If a C{message} argument is passed to the L{InfiniteRedirection}
+         constructor and no location is provided, C{message} doesn't try to
+         include the empty location.
+         """
+         e = error.InfiniteRedirection("200", "My own message")
+         self.assertEqual(e.message, "My own message")
++
++
++
++class RedirectWithNoLocationTests(unittest.TestCase):
++    """
++    Tests for how L{RedirectWithNoLocation} attributes are initialized.
++    """
++    def test_validMessage(self):
++        """
++        When C{code}, C{message}, and C{uri} are passed to the
++        L{RedirectWithNoLocation} constructor, the C{status}, C{message}, and
++        C{uri} attributes are set, respectively.
++        """
++        e = error.RedirectWithNoLocation("200", "NO LOCATION",
++                                         "https://example.com")
++        self.assertEqual(e.message, "NO LOCATION to https://example.com")
++
++
++class MissingRenderMethodTests(unittest.TestCase):
++    """
++    Tests for how L{MissingRenderMethod} exceptions are initialized and
++    displayed.
++    """
++    def test_constructor(self):
++        """
++        Given C{element} and C{renderName} arguments, the
++        L{MissingRenderMethod} constructor assigns the values to the
++        corresponding attributes.
++        """
++        elt = object()
++        e = error.MissingRenderMethod(elt, 'renderThing')
++        self.assertIdentical(e.element, elt)
++        self.assertIdentical(e.renderName, 'renderThing')
++
++    def test_repr(self):
++        """
++        A L{MissingRenderMethod} is represented using a custom string containing
++        the element's representation and the method name.
++        """
++        elt = object()
++        e = error.MissingRenderMethod(elt, 'renderThing')
++        self.assertEqual(
++            repr(e),
++            "'MissingRenderMethod': %r had no render method named 'renderThing'" % elt)
++
++
++class MissingTemplateLoaderTests(unittest.TestCase):
++    """
++    Tests for how L{MissingTemplateLoader} exceptions are initialized and
++    displayed.
++    """
++    def test_constructor(self):
++        """
++        Given an C{element} argument, the L{MissingTemplateLoader} constructor
++        assigns the value to the corresponding attribute.
++        """
++        elt = object()
++        e = error.MissingTemplateLoader(elt)
++        self.assertIdentical(e.element, elt)
++
++    def test_repr(self):
++        """
++        A L{MissingTemplateLoader} is represented using a custom string containing
++        the element's representation and the method name.
++        """
++        elt = object()
++        e = error.MissingTemplateLoader(elt)
++        self.assertEqual(
++            repr(e),
++            "'MissingTemplateLoader': %r had no loader" % elt)
++
++
++class FlattenerErrorTests(unittest.TestCase):
++    """
++    Tests for how L{FlattenerError} exceptions are initialized and displayed.
++    """
++    def makeFlattenerError(self, roots=[]):
++        try:
++            raise RuntimeError("oh noes")
++        except Exception as e:
++            tb = traceback.extract_tb(sys.exc_info()[2])
++            return error.FlattenerError(e, roots, tb)
++
++    def fakeFormatRoot(self, obj):
++        return 'R(%s)' % obj
++
++    def test_constructor(self):
++        """
++        Given C{exception}, C{roots}, and C{traceback} arguments, the
++        L{FlattenerError} constructor assigns the roots to the C{_roots}
++        attribute.
++        """
++        e = self.makeFlattenerError(roots=['a', 'b'])
++        self.assertEqual(e._roots, ['a', 'b'])
++
++    def test_str(self):
++        """
++        The string form of a L{FlattenerError} is identical to its representation.
++        """
++        e = self.makeFlattenerError()
++        self.assertEqual(str(e), repr(e))
++
++    def test_reprWithRootsAndWithTraceback(self):
++        """
++        The representation of a L{FlattenerError} initialized with roots and a
++        traceback contains a formatted representation of those roots (using
++        C{_formatRoot}) and a formatted traceback.
++        """
++        e = self.makeFlattenerError(['a', 'b'])
++        e._formatRoot = self.fakeFormatRoot
++        self.failUnless(
++            re.match('Exception while flattening:\n'
++                     '  R\(a\)\n'
++                     '  R\(b\)\n'
++                     '  File "[^"]*", line [0-9]*, in makeFlattenerError\n'
++                     '    raise RuntimeError\("oh noes"\)\n'
++                     'RuntimeError: oh noes\n$',
++                     repr(e), re.M | re.S),
++            repr(e))
++
++    def test_reprWithoutRootsAndWithTraceback(self):
++        """
++        The representation of a L{FlattenerError} initialized without roots but
++        with a traceback contains a formatted traceback but no roots.
++        """
++        e = self.makeFlattenerError([])
++        self.failUnless(
++            re.match('Exception while flattening:\n'
++                     '  File "[^"]*", line [0-9]*, in makeFlattenerError\n'
++                     '    raise RuntimeError\("oh noes"\)\n'
++                     'RuntimeError: oh noes\n$',
++                     repr(e), re.M | re.S),
++            repr(e))
++
++    def test_reprWithoutRootsAndWithoutTraceback(self):
++        """
++        The representation of a L{FlattenerError} initialized without roots but
++        with a traceback contains a formatted traceback but no roots.
++        """
++        e = error.FlattenerError(RuntimeError("oh noes"), [], None)
++        self.failUnless(
++            re.match('Exception while flattening:\n'
++                     'RuntimeError: oh noes\n$',
++                     repr(e), re.M | re.S),
++            repr(e))
++
++    def test_formatRootShortNativeString(self):
++        """
++        The C{_formatRoot} method formats a short native string using the
++        built-in repr.
++        """
++        e = self.makeFlattenerError()
++        self.assertEqual(e._formatRoot(nativeString('abcd')), repr('abcd'))
++
++    def test_formatRootLongNativeString(self):
++        """
++        The C{_formatRoot} method formats a short native string using the
++        built-in repr.
++        """
++        e = self.makeFlattenerError()
++        longString = nativeString('abcde-' * 20)
++        self.assertEqual(e._formatRoot(longString),
++                        repr('abcde-abcde-abcde-ab<...>-abcde-abcde-abcde-'))
++
++    def test_formatRootShortByteString(self):
++        """
++        The C{_formatRoot} method formats a short native string using the
++        built-in repr.
++        """
++        e = self.makeFlattenerError()
++        self.assertEqual(e._formatRoot(b'abcd'), repr(b'abcd'))
++
++    def test_formatRootLongByteString(self):
++        """
++        The C{_formatRoot} method formats a short native string using the
++        built-in repr.
++        """
++        e = self.makeFlattenerError()
++        longString = b'abcde-' * 20
++        self.assertEqual(e._formatRoot(longString),
++                        repr(b'abcde-abcde-abcde-ab<...>-abcde-abcde-abcde-'))
++
++    def test_formatRootTagNoFilename(self):
++        """
++        The C{_formatRoot} method formats a C{Tag} with no filename information
++        as 'Tag <tagName>'.
++        """
++        e = self.makeFlattenerError()
++        self.assertEqual(e._formatRoot(Tag('a-tag')), 'Tag <a-tag>')
++
++    def test_formatRootTagWithFilename(self):
++        """
++        The C{_formatRoot} method formats a C{Tag} with filename information
++        using the filename, line, column, and tag information
++        """
++        e = self.makeFlattenerError()
++        t = Tag('a-tag', filename='tpl.py', lineNumber=10, columnNumber=20)
++        self.assertEqual(e._formatRoot(t), 'File "tpl.py", line 10, column 20, in "a-tag"')
+diff --git a/twisted/web/test/test_web__responses.py b/twisted/web/test/test_web__responses.py
+new file mode 100644
+index 0000000..ebd7146
+--- /dev/null
++++ b/twisted/web/test/test_web__responses.py
+@@ -0,0 +1,26 @@
++# Copyright (c) Twisted Matrix Laboratories.
++# See LICENSE for details.
++
++"""
++HTTP responses.
++"""
++
++from twisted.trial import unittest
++from twisted.web._responses import str2response
++
++class Str2ResponseTests(unittest.TestCase):
++    """
++    Tests for L{str2response}.
++    """
++
++    def test_validCode(self):
++        m = str2response("302")
++        self.assertEqual(m, "Found")
++
++    def test_invalidCode(self):
++        m = str2response("987")
++        self.assertEqual(m, None)
++
++    def test_nonintegerCode(self):
++        m = str2response("InvalidCode")
++        self.assertEqual(m, None)

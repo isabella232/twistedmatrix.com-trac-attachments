@@ -1,0 +1,409 @@
+Index: docs/mail/howto/extensions.rst
+===================================================================
+--- docs/mail/howto/extensions.rst	(revision 0)
++++ docs/mail/howto/extensions.rst	(working copy)
+@@ -0,0 +1,81 @@
++Implementing ESMTP Extensions
++=============================
++
++Twisted includes a minimal ESMTP server, :api:`twisted.mail.smtp.ESMTP`, which
++by default offers only ``AUTH`` and ``STARTTLS`` extensions, dependent on
++whether you have specified challengers and a TLS capable transport
++respectively.
++
++If you wish to implement you own extensions, the first thing you will need to
++do is to subclass :api:`twisted.mail.smtp.ESMTP` and override the
++``extensions`` method (note that Twisted uses old-style classes here, so you
++cannot use ``super``).
++
++.. code-block:: python
++
++    from twisted.mail import smtp
++
++    class ExtendedESMTP(smtp.ESMTP):
++
++        def extensions(self):
++            ext = smtp.ESMTP.extensions(self)
++            ext['HELLO'] = None
++            return ext
++
++This will cause the server to announce your extension in response to the
++``EHLO`` command.
++
++To add a new command, implement a ``do_COMMAND`` message
++
++.. code-block:: python
++
++    class ExtendedESMTP(smtp.ESMTP):
++
++        ...
++
++        def do_SAYHELLO(self):
++            self.sendCode(250, 'Hello World!')
++
++If your extension specifies ESMTP options on the ``MAIL FROM:`` command, you
++can find them in a dictionary member variable, ``options``.  Options
++specified on ``MAIL FROM:`` are global and do not necessarily relate to the
++sender.  For example, let’s add a ``NICKNAME`` option that we can use to
++customize the reply from our ``SAYHELLO`` command.
++
++.. code-block:: python
++
++    class ExtendedESMTP(smtp.ESMTP):
++
++        ...
++
++        def do_SAYHELLO(self):
++            name = self.options.get('NICKNAME', 'my anonymous friend')
++            self.sendCode(250, 'Hello %s' % name)
++
++ESMTP also allows for options on the ``RCPT TO:`` command.  Since there can be
++multiple ``RCPT TO:`` commands in a given mailserver dialog, options specified
++on ``RCPT TO:`` are associated with a :api:`twisted.mail.smtp.User` object,
++and can be accessed using the `options` attribute of that object.  For
++instance
++
++.. code-block:: python
++
++    class MyMessage:
++        implements(smtp.IMessage)
++
++        ...
++
++    class MyMessageDelivery:
++        implements(smtp.IMessageDelivery)
++
++        def validateFrom(self, helo, origin):
++            return origin
++
++        def validateTo(self, user):
++            if user.options.get('HAS-WILD-PARTIES', 'no') != 'no':
++                raise SMTPBadRcpt('Cannot send to people who have wild parties')
++            return lambda: MyMessage()
++
++It is also permissible for an ``ESMTP`` subclass to switch to raw mode; you
++might do this if you were trying to implement the ``CHUNKING`` or
++``BINARYMIME`` extensions (see RFC 3030), for instance.
+Index: docs/mail/howto/index.rst
+===================================================================
+--- docs/mail/howto/index.rst	(revision 46345)
++++ docs/mail/howto/index.rst	(working copy)
+@@ -8,3 +8,4 @@
+ 
+ 
+ - :doc:`Sending Mail <sending-mail>`: Sending mail with Twisted
++- :doc:`Implementing ESMTP Extensions <extensions>`: Implementing ESMTP extensions
+Index: twisted/mail/smtp.py
+===================================================================
+--- twisted/mail/smtp.py	(revision 46345)
++++ twisted/mail/smtp.py	(working copy)
+@@ -455,7 +455,24 @@
+     including information on where the message came from
+     """
+ 
+-    def __init__(self, destination, helo, protocol, orig, opts=None):
++    def __init__(self, destination, helo, protocol, orig, options=None):
++        """
++        @type destination: L{Address}
++        @param destination: The destination address.
++
++        @type helo: C{(str, str)}
++        @param helo: The argument to the HELO command and the client's IP
++        address.
++
++        @type protocol: L{SMTP}
++        @param protocol: The SMTP object.
++
++        @type orig: L{Address}
++        @param orig: The sending address.
++
++        @type options: C{dict}
++        @param options: (optional) ESMTP options from the ``RCPT TO:`` command.
++        """
+         host = getattr(protocol, 'host', None)
+         self.dest = Address(destination, host)
+         self.helo = helo
+@@ -464,12 +481,13 @@
+             self.orig = orig
+         else:
+             self.orig = Address(orig, host)
+-        if opts is None:
+-            opts = {}
+-        self.options = opts
++        if options is None:
++            options = {}
++        self.options = options
+ 
+     def __getstate__(self):
+-        """Helper for pickle.
++        """
++        Helper for pickle.
+ 
+         protocol isn't picklabe, but we want User to be, so skip it in
+         the pickle.
+@@ -480,6 +498,21 @@
+                  'orig' : self.orig,
+                  'options': self.options }
+ 
++    
++    def __setstate__(self, state):
++        """
++        Helper for pickle.
++
++        We want to handle the case where we pickle an older User object,
++        which won't have had options, then unpickle it into a newer one.
++        """
++        self.dest = state['dest']
++        self.helo = state['helo']
++        self.protocol = state['protocol']
++        self.orig = state['orig']
++        self.options = state.get('options', {})
++
++        
+     def __str__(self):
+         return str(self.dest)
+ 
+@@ -541,6 +574,9 @@
+         self.delivery = delivery
+         self.deliveryFactory = deliveryFactory
+ 
++        # Holds ESMTP options found on the MAIL FROM: command
++        self.options = {}
++        
+     def timeoutConnection(self):
+         msg = '%s Timeout. Try talking faster next time!' % (self.host,)
+         self.sendCode(421, msg)
+@@ -635,24 +671,29 @@
+                          )\s*(\s(?P<opts>.*))? # Optional WS + ESMTP options
+                          $''',re.I|re.X)
+ 
+-    opt_re = re.compile(r'''^(?P<keyword>[A-Z0-9][-A-Z0-9]*)
+-                             (?:=(?P<value>[^=\ \0-\037]+))?$''',
+-                        re.I|re.X)
+-    space_re = re.compile(r'\s+')
++    # RFC 5321 4.1.2 mail-parameters/rcpt-parameters
++    _optionRE = re.compile(r'''^(?P<keyword>[A-Z0-9][-A-Z0-9]*)
++                               (?:=(?P<value>[^=\ \0-\037]+))?$''',
++                           re.I|re.X)
++    _spaceRE = re.compile(r'\s+')
+ 
+     def _processOptions(self, opts):
+-        """Parse the ESMTP options into a dictionary."""
++        """
++        Parse the ESMTP options into a dictionary.
++
++        @type opts: C{str}
++        @param opts: The mail-parameters or rcpt-parameters in string form.
++
++        @rtype: c{dict}
++        @return: A dictionary containing the options.
++        """
+         options = {}
+ 
+-        for optstr in self.space_re.split(opts):
+-            m = self.opt_re.match(optstr)
++        for optstr in self._spaceRE.split(opts):
++            m = self._optionRE.match(optstr)
+             if not m:
+                 return None
+             value = m.group('value')
+-            if value:
+-                value = value.upper()
+-            else:
+-                value = None
+             options[m.group('keyword').upper()] = value
+             
+         return options
+@@ -669,13 +710,14 @@
+             self.sendCode(501, "Syntax error")
+             return
+ 
++        self.options = {}
+         opts = m.group('opts')
+         if opts:
+             options = self._processOptions(opts)
+             if options is None:
+                 self.sendCode(501, 'Syntax error')
+                 return
+-            self._options = options
++            self.options = options
+         
+         try:
+             addr = Address(m.group('path'), self.host)
+@@ -711,13 +753,12 @@
+             self.sendCode(503, "Must have sender before recipient")
+             return
+ 
+-        options = {}
+-
+         m = self.rcpt_re.match(rest)
+         if not m:
+             self.sendCode(501, "Syntax error")
+             return
+ 
++        options = {}
+         opts = m.group('opts')
+         if opts:
+             options = self._processOptions(opts)
+Index: twisted/mail/test/test_smtp.py
+===================================================================
+--- twisted/mail/test/test_smtp.py	(revision 46345)
++++ twisted/mail/test/test_smtp.py	(working copy)
+@@ -5,6 +5,7 @@
+ Test cases for twisted.mail.smtp module.
+ """
+ import inspect
++import pickle
+ 
+ from zope.interface import implements, directlyProvides
+ 
+@@ -672,9 +673,63 @@
+             self.assertEqual(smtp.quoteaddr(c), e)
+ 
+     def testUser(self):
++        """
++        User should be constructable without options, and should convert
++        to the destination e-mail address.
++        """
+         u = smtp.User('user@host', 'helo.host.name', None, None)
+         self.assertEqual(str(u), 'user@host')
++        self.assertEqual(u.options, {})
++        
+ 
++    def testUserWithOptions(self):
++        """
++        User should remember options.
++        """
++        u = smtp.User('user@host', 'helo.host.name', None, None,
++                      { 'OPTION-1': 'foobar', 'OPTION-2': 'example.com' })
++        self.assertEqual(u.options,
++                         { 'OPTION-1': 'foobar', 'OPTION-2': 'example.com' })
++
++        
++    def testUserPickling(self):
++        """
++        User should be pickleable and when unpickled should be the same.
++        """
++        u = smtp.User('user@host', 'helo.host.name',
++                      'PROTOCOL', 'foo@example.com',
++                      { 'OPTION-1': 'foobar' })
++        pickled_u = pickle.dumps(u)
++        
++        u_dash = pickle.loads(pickled_u)
++
++        self.assertEqual(str(u.dest), str(u_dash.dest))
++        self.assertEqual(u.helo, u_dash.helo)
++        self.assertEqual(u_dash.protocol, None)
++        self.assertEqual(str(u.orig), str(u_dash.orig))
++        self.assertEqual(u.options, u_dash.options)
++
++        
++    def testUserUnpickleFromOldUserPickle(self):
++        """
++        User should be unpickleable from older pickles without options.
++        """
++        old_pickle="(itwisted.mail.smtp\nUser\np0\n(dp2\nS'dest'\np3\n"\
++          "(itwisted.mail.smtp\nAddress\np4\n(dp5\nS'addrstr'\np6\n"\
++          "S'user@host'\np7\nsS'domain'\np8\nS'host'\np9\nsS'local'\n"\
++          "p10\nS'user'\np11\nsbsS'helo'\np12\nS'helo.host.name'\np13\n"\
++          "sS'protocol'\np14\nNsS'orig'\np15\n(itwisted.mail.smtp\n"\
++          "Address\np16\n(dp17\ng6\nS'foo@example.com'\np18\nsg8\n"\
++          "S'example.com'\np19\nsg10\nS'foo'\np20\nsbsb."
++        u_dash = pickle.loads(old_pickle)
++
++        self.assertEqual(str(u_dash.dest), 'user@host')
++        self.assertEqual(u_dash.helo, 'helo.host.name')
++        self.assertEqual(u_dash.protocol, None)
++        self.assertEqual(str(u_dash.orig), 'foo@example.com')
++        self.assertEqual(u_dash.options, {})
++
++        
+     def testXtextEncoding(self):
+         cases = [
+             ('Hello world', 'Hello+20world'),
+@@ -1115,7 +1170,8 @@
+         
+     def testESMTPOptions(self):
+         """
+-        It must be possible to obtain the options passed by the client.
++        It must be possible to obtain the options passed by the client
++        in the MAIL FROM: command.
+         """
+         testcase = self
+         s = smtp.ESMTP()
+@@ -1132,6 +1188,35 @@
+                 return origin
+ 
+             def validateTo(self, user):
++                return lambda: DummyMessage()
++
++        s.delivery = TestDelivery()
++        t = StringTransport()
++        s.makeConnection(t)
++        s.dataReceived('EHLO example.com\r\n'
++                       'MAIL FROM: foo@example.com OPTION=Value '
++                       'OPTION2=Value2 OPTION-3=Value3\r\n'
++                       'RCPT TO: bar@example.com BAR-OPTION=Baz\r\n'
++                       'RCPT TO: blam@example.com BLAM-OPTION=Blat\r\n')
++        s.connectionLost(error.ConnectionDone())
++
++
++    def testESMTPRecipientOptions(self):
++        """
++        It must be possible to obtain the options passed by the client
++        in the RCPT TO: command.
++        """
++        testcase = self
++        s = smtp.ESMTP()
++
++        class TestDelivery(NotImplementedDelivery):
++            """
++            Delivery object which checks the options.
++            """
++            def validateFrom(self, helo, origin):
++                return origin
++
++            def validateTo(self, user):
+                 if str(user) == 'bar@example.com':
+                     testcase.assertEqual(user.options,
+                                          { 'BAR-OPTION': 'Baz' })
+@@ -1139,7 +1224,8 @@
+                     testcase.assertEqual(user.options,
+                                          { 'BLAM-OPTION': 'Blat' })
+                 return lambda: DummyMessage()
+-        
++
++        s.delivery = TestDelivery()
+         t = StringTransport()
+         s.makeConnection(t)
+         s.dataReceived('EHLO example.com\r\n'
+@@ -1181,17 +1267,17 @@
+                 testcase.fail('Line received while in binary mode')
+ 
+             def rawDataReceived(self, data):
+-                to_do = len(data)
+-                if to_do > self.binary_left:
+-                    to_do = self.binary_left
++                todo = len(data)
++                if todo > self.binary_left:
++                    todo = self.binary_left
+ 
+                 # In a real extension we'd do something with the data here
+                 
+-                self.binary_left -= to_do
++                self.binary_left -= todo
+                 if not self.binary_left:
+-                    self.setLineMode(data[to_do:])
++                    self.setLineMode(data[todo:])
+                     self.mode = smtp.COMMAND
+-                    self.sendCode(250, 'Received %d bytes' % self.binary_count)
++                    self.sendCode(250, 'Received %d bytes' % (self.binary_count,))
+ 
+         s = ESMTPBinaryModeTest()
+         t = StringTransport()
+Index: twisted/mail/topfiles/8128.feature
+===================================================================
+--- twisted/mail/topfiles/8128.feature	(revision 0)
++++ twisted/mail/topfiles/8128.feature	(working copy)
+@@ -0,0 +1 @@
++twisted.mail.smtp.ESMTP subclasses can now obtain the ESMTP options from MAIL FROM and RCPT TO commands, and are also able to switch to raw mode so they can implement extensions that need to read bytes rather than lines.

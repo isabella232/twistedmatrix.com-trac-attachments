@@ -1,0 +1,120 @@
+Index: twisted/protocols/amp.py
+===================================================================
+--- twisted/protocols/amp.py	(revision 28155)
++++ twisted/protocols/amp.py	(working copy)
+@@ -954,11 +954,13 @@
+             commands = cls._currentClassCommands[:]
+             cls._currentClassCommands[:] = []
+             cd = attrs['_commandDispatch'] = {}
+-            for base in bases:
+-                cls._grabFromBase(cd, base)
++            subcls = type.__new__(cls, name, bases, attrs)
++            ancestors = list(subcls.__mro__[1:])
++            ancestors.reverse()
++            for ancestor in ancestors:
++                cd.update(getattr(ancestor, '_commandDispatch', {}))
+             for commandClass, responderFunc in commands:
+                 cd[commandClass.commandName] = (commandClass, responderFunc)
+-            subcls = type.__new__(cls, name, bases, attrs)
+             if (bases and (
+                     subcls.lookupFunction != CommandLocator.lookupFunction)):
+                 def locateResponder(self, name):
+@@ -970,12 +972,6 @@
+                 subcls.locateResponder = locateResponder
+             return subcls
+ 
+-        def _grabFromBase(cls, cd, base):
+-            if hasattr(base, "_commandDispatch"):
+-                cd.update(base._commandDispatch)
+-                for subbase in base.__bases__:
+-                    cls._grabFromBase(cd, subbase)
+-        _grabFromBase = classmethod(_grabFromBase)
+ 
+     implements(IResponderLocator)
+ 
+Index: twisted/test/test_amp.py
+===================================================================
+--- twisted/test/test_amp.py	(revision 28155)
++++ twisted/test/test_amp.py	(working copy)
+@@ -600,7 +600,7 @@
+ 
+ class TestLocator(amp.CommandLocator):
+     """
+-    A locator which implements a responder to a 'hello' command.
++    A locator which implements a responder to the 'simple' command.
+     """
+     def __init__(self):
+         self.greetings = []
+@@ -613,6 +613,28 @@
+ 
+ 
+ 
++class OverridingLocator(TestLocator):
++    """
++    A locator which overrides the responder to the 'simple' command.
++    """
++
++    def greetingResponder(self, greeting, cookie):
++        """
++        Return a different cookieplus than L{TestLocator.greetingResponder}.
++        """
++        self.greetings.append((greeting, cookie))
++        return dict(cookieplus=cookie + 4)
++    greetingResponder = SimpleGreeting.responder(greetingResponder)
++
++
++
++class InheritingLocator(OverridingLocator):
++    """
++    This locator should inherit the responder from L{OverridingLocator}.
++    """
++
++
++
+ class OverrideLocatorAMP(amp.AMP):
+     def __init__(self):
+         amp.AMP.__init__(self)
+@@ -653,14 +675,41 @@
+         locateResponder, wrapped in logic to serialize and deserialize its
+         arguments.
+         """
+-        locator = TestLocator()
++        return self._checkSimpleGreeting(TestLocator, 8)
++
++
++    def _checkSimpleGreeting(self, locatorClass, expected):
++        """
++        Check that a locator of type C{locatorClass} finds a responder
++        for command named C{simple} and that the found responder anwsers
++        with the C{expected} result to a C{SimpleGreeting<"ni hao", 5>}
++        command.
++        """
++        locator = locatorClass()
+         responderCallable = locator.locateResponder("simple")
+         result = responderCallable(amp.Box(greeting="ni hao", cookie="5"))
+         def done(values):
+-            self.assertEquals(values, amp.AmpBox(cookieplus='8'))
++            self.assertEquals(values, amp.AmpBox(cookieplus=str(expected)))
+         return result.addCallback(done)
+ 
+ 
++    def test_responderOverriding(self):
++        """
++        L{CommandLocator} subclasses should be able to override the responder
++        method of its base class, by registering their own responder method
++        with L{Command.responder} decorator.
++        """
++        return self._checkSimpleGreeting(OverridingLocator, 9)
++
++
++    def test_responderInheritance(self):
++        """
++        The inheritance of responder methods should follow the standard
++        Python inheritance rules.
++        """
++        return self._checkSimpleGreeting(InheritingLocator, 9)
++
++
+     def test_lookupFunctionDeprecatedOverride(self):
+         """
+         Subclasses which override locateResponder under its old name,

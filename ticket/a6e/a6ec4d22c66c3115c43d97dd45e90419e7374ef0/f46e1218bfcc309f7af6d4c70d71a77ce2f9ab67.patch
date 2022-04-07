@@ -1,0 +1,129 @@
+Index: twisted/mail/smtp.py
+===================================================================
+--- twisted/mail/smtp.py	(revision 38792)
++++ twisted/mail/smtp.py	(working copy)
+@@ -1894,15 +1894,14 @@
+         p.timeout = self.timeout
+         return p
+ 
+-def sendmail(smtphost, from_addr, to_addrs, msg, senderDomainName=None, port=25):
++def _sendmail(_SMTPSenderFactory, smtphost, from_addr, to_addrs, msg,
++              senderDomainName=None, port=25):
+     """Send an email
+ 
+-    This interface is intended to be a direct replacement for
+-    smtplib.SMTP.sendmail() (with the obvious change that
+-    you specify the smtphost as well). Also, ESMTP options
+-    are not accepted, as we don't do ESMTP yet. I reserve the
+-    right to implement the ESMTP options differently.
++    This interface should not be used directly.
++    Use L{twiste.mail.smtp.sendmail} instread.
+ 
++    @param _SMTPSenderFactory: The factory used to send mail.
+     @param smtphost: The host the message should be sent to
+     @param from_addr: The (envelope) address sending this mail.
+     @param to_addrs: A list of addresses to send this mail to.  A string will
+@@ -1934,18 +1933,65 @@
+         # It's not a file
+         msg = StringIO(str(msg))
+ 
+-    d = defer.Deferred()
+-    factory = SMTPSenderFactory(from_addr, to_addrs, msg, d)
++    def cancel(d):
++        """
++        Cancel the L{twisted.mail.smtp.sendmail} call, tell the
++        L{twisted.mail.smtp.SMTPSenderFactory} not to retry and disconnect the
++        connection.
++        """
++        factory.sendFinished = 1
++        connector.disconnect()
++    d = defer.Deferred(cancel)
++    factory = _SMTPSenderFactory(from_addr, to_addrs, msg, d)
+ 
+     if senderDomainName is not None:
+         factory.domain = senderDomainName
+ 
+-    reactor.connectTCP(smtphost, port, factory)
++    connector = reactor.connectTCP(smtphost, port, factory)
+ 
+     return d
+ 
++def sendmail(smtphost, from_addr, to_addrs, msg, senderDomainName=None, port=25):
++    """Send an email
+ 
++    This interface is intended to be a direct replacement for
++    smtplib.SMTP.sendmail() (with the obvious change that
++    you specify the smtphost as well). Also, ESMTP options
++    are not accepted, as we don't do ESMTP yet. I reserve the
++    right to implement the ESMTP options differently.
+ 
++    @param smtphost: The host the message should be sent to
++    @param from_addr: The (envelope) address sending this mail.
++    @param to_addrs: A list of addresses to send this mail to.  A string will
++        be treated as a list of one address
++    @param msg: The message, including headers, either as a file or a string.
++        File-like objects need to support read() and close(). Lines must be
++        delimited by '\\n'. If you pass something that doesn't look like a
++        file, we try to convert it to a string (so you should be able to
++        pass an email.Message directly, but doing the conversion with
++        email.Generator manually will give you more control over the
++        process).
++
++    @param senderDomainName: Name by which to identify.  If None, try
++    to pick something sane (but this depends on external configuration
++    and may not succeed).
++
++    @param port: Remote port to which to connect.
++
++    @rtype: L{Deferred}
++    @returns: A L{Deferred}, its callback will be called if a message is sent
++        to ANY address, the errback if no message is sent.
++
++        The callback will be called with a tuple (numOk, addresses) where numOk
++        is the number of successful recipient addresses and addresses is a list
++        of tuples (address, code, resp) giving the response to the RCPT command
++        for each address.
++    """
++    return _sendmail(SMTPSenderFactory, smtphost, from_addr, to_addr, msg,
++                     senderDomainName, port)
++
++
++
+ ##
+ ## Yerg.  Codecs!
+ ##
+Index: twisted/mail/test/test_smtp.py
+===================================================================
+--- twisted/mail/test/test_smtp.py	(revision 38792)
++++ twisted/mail/test/test_smtp.py	(working copy)
+@@ -1649,3 +1649,30 @@
+             warningsShown[0]['message'],
+             "tlsMode attribute of twisted.mail.smtp.ESMTPClient "
+             "is deprecated since Twisted 13.0")
++
++
++
++class SendmailTestCase(unittest.TestCase):
++    """
++    Tests for the L{twisted.mail.smtp.sendmail}.
++    """
++    def test_cancel(self):
++        """
++        A deferred returned by the L{twisted.mail.smtp.sendmail} can be
++        cancelled, telling the L{twisted.mail.smtp.SMTPSenderFactory} not to
++        retry and disconnecting the L{twisted.internet.interfaces.IConnector}.
++        """
++        class MockSMTPSenderFactory(smtp.SMTPSenderFactory):
++            def startedConnecting(self, connector):
++                self.connector = connector
++        def factory(*args, **kw):
++            factory.f = MockSMTPSenderFactory(*args, **kw)
++            return factory.f
++        d = smtp._sendmail(factory, "127.0.0.1",
++                           "source@address", "recipient@address", "message")
++        self.assertEqual(factory.f.connector.state, "connecting")
++        d.cancel()
++        self.assertEqual(factory.f.sendFinished, 1)
++        self.assertEqual(factory.f.connector.state, "disconnected")
++        d = self.assertFailure(d, defer.CancelledError)
++        return d

@@ -1,0 +1,132 @@
+--- /home/jeff/hack/py/Twisted/sandbox/exarkun/tls/record.py	2003-12-08 10:58:14.000000000 +0800
++++ record.py	2004-01-05 22:04:00.000000000 +0800
+@@ -1,6 +1,6 @@
+ # -*- test-case-name: twisted.test.test_record -*-
+ 
+-import types, math, struct, itertools
++import types, math, struct 
+ 
+ class Integer:
+     def __init__(self, bits, signed=False):
+@@ -17,6 +17,9 @@
+             return self.bits == other.bits and self.signed == other.signed
+         return False
+ 
++    def __len__(self):
++	return ( self.bits + self.signed ) >> 3
++
+     def __repr__(self):
+         return '<%ssigned %d bit integer>' % (self.signed and 'un' or '', self.signed + self.bits)
+ 
+@@ -31,6 +34,22 @@
+     def range(self, value):
+         return 2 ** self.bits > value
+ 
++class FixedString:
++    def __init__(self, length):
++	self.length = length
++
++    def __repr__(self):
++	return '<%d byte fixed string>' % (self.length)
++
++    def __len__(self):
++	return self.length
++
++    def __hash__(self):
++        return hash(self.length)
++
++    def __eq__(self, other):
++	return self.length == other.length
++
+ class Int255String:
+     pass
+ 
+@@ -86,7 +105,7 @@
+ 
+     for (n, fmt) in ((32, 'I'), (16, 'H'), (8, 'B')):
+         while offset >= n:
+-            result.append(struct.pack('>' + fmt, accum & (2 ** n - 1)))
++            result.append(struct.pack(Record.endianess + fmt, accum & (2 ** n - 1)))
+             offset -= n
+             accum >>= n
+ 
+@@ -98,7 +117,12 @@
+ def callattr(self, name):
+     return lambda value: getattr(self, name)(value)
+ 
+-class Record:
++class Record(object):
++
++    BIG_ENDIAN = '>'
++    LITTLE_ENDIAN = '<'
++    endianess = BIG_ENDIAN
++
+     FORMAT_SPECIFIERS = {
+         Integer(8, False): 'B',
+         Integer(8, True): 'b',
+@@ -120,13 +144,25 @@
+     def encode(self):
+         result = []
+         subbytes = []
+-        for (attr, t) in self.__encode__():
++	lastoff = 0
++	lastlen = 0
++        for (attr, t, adr) in self.__encode__():
+             if t in self.FORMAT_SPECIFIERS:
+                 processEncode(result, subbytes)
+                 subbytes = []
+ 
+                 fmt = self.FORMAT_SPECIFIERS[t]
+-                result.append(struct.pack('>' + fmt, getattr(self, attr)))
++		try:
++		    result.append(struct.pack(self.endianess + fmt, getattr(self, attr)))
++		except AttributeError:
++		    if (adr - lastoff) > lastlen:
++			for _ in range(adr - lastoff - lastlen):
++			    result.append("0")
++		    for _ in range(len(t)):
++			result.append("0")
++		    lastoff = adr
++		    lastlen = len(t)
++
+             elif isinstance(t, (types.ClassType, types.TypeType)) and issubclass(t, Record):
+                 processEncode(result, subbytes)
+                 subbytes = []
+@@ -138,22 +174,32 @@
+                 raise NotImplementedError((t, attr))
+         if subbytes:
+             processEncode(result, subbytes)
++
++	while not len(result) == len(self):
++	    result.append("0")
+         return ''.join(result)
+ 
+ 
+-    def decode(cls, bytes):
+-        i = cls()
++    def decode(cls, bytes, *args, **kwargs):
++        i = cls(*args, **kwargs)
+         offset = 0
++	eaten = 0
+         subbytes = []
+-        for (attrspec, t) in i.__decode__():
++        for (attrspec, t, adr) in i.__decode__():
+             if isinstance(attrspec, str):
+                 attrspec = setattr(i, attrspec)
+             if t in cls.FORMAT_SPECIFIERS:
+                 if offset:
+                     raise ValueError("Non-byte-aligned values in format")
+                 fmt = cls.FORMAT_SPECIFIERS[t]
+-                size = struct.calcsize('>' + fmt)
+-                attrspec(struct.unpack('>' + fmt, bytes[:size])[0])
++                size = struct.calcsize(cls.endianess + fmt)
++		if eaten <= adr:
++		    bytes = bytes[(adr - eaten):]
++		    eaten += (adr - eaten)
++		else:
++		    raise RuntimeError("Slow down cowboy!")
++                attrspec(struct.unpack(cls.endianess + fmt, bytes[:size])[0])
++		eaten += size
+                 bytes = bytes[size:]
+             elif isinstance(t, (types.ClassType, types.TypeType)) and issubclass(t, Record):
+                 o, bytes = t.decode(bytes)

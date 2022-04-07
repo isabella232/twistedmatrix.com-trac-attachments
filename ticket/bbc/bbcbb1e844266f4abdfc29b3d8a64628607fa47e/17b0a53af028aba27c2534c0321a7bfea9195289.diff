@@ -1,0 +1,149 @@
+Index: adbapi.py
+===================================================================
+RCS file: /cvs/Twisted/twisted/enterprise/adbapi.py,v
+retrieving revision 1.55
+diff -r1.55 adbapi.py
+27d26
+< 
+93c92
+< 
+---
+>         self.transLock = {} # transaction semaphores, keyed on transaction 
+100c99
+< 
+---
+>         self.noconnpool = threadpool.ThreadPool(self.min, self.max)
+110d108
+< 
+113a112
+>             self.noconnpool.start()
+179a179,245
+>     def startTransaction(self):
+>         """Open a new database Transaction.
+> 
+>         @return: a Deferred which will fire the Transaction or a Failure.
+> 
+>         Since this connection will be in use until the Transaction is
+>         completed, the thread that we call the function in gets blocked
+>         until then.  The Semaphore it is waiting on is stored in
+>         the self.transLock dictionary. 
+>         """        
+> 
+>         d = defer.Deferred()
+> 
+>         def _startTransaction():
+>             from twisted.internet import reactor
+>             from threading import Semaphore
+>             
+>             # blocks until a transaction is opened 
+>             t = Transaction(self, self.connect())
+> 
+>             # call back the Deferred with the Transaction
+>             reactor.callInThread(d.callback, t)
+> 
+>             # make a semaphore that will be signaled when the
+>             # transaction is complete (making this thread available
+>             # again)            
+>             lck = Semaphore(0)
+>             self.transLock[t] = lck 
+> 
+>             # now this thread waits until the transaction is completed
+>             # lck will be signaled by commitTransaction or
+>             # rollbackTransaction.  when acquire() returns, the thread
+>             # is available for other DB uses. 
+>             lck.acquire()
+>             
+>         self.threadpool.callInThread(_startTransaction)
+>         return d
+> 
+>     def runQueryInTransaction(self, trans, *args, **kw):
+>         """Execute an SQL query in the specified Transaction and return the result.
+> 
+>         This function is similar to runQuery but uses a previously created
+>         Transaction and does not commit or rollback the connection upon
+>         completion.
+>         """
+>         
+>         return self._deferToNoconn(self._runQueryInTransaction, trans, *args, **kw)
+> 
+>     def runOperationInTransaction(self, trans, *args, **kw):
+>         """Execute an SQL query in the specified Transaction and return None.
+> 
+>         This function is similar to runOperation but uses a previously created
+>         Transaction and does not commit or rollback the connection upon
+>         completion.
+>         """
+>         return self._deferToNoconn(self._runOperationInTransaction, trans, *args, **kw)
+> 
+>     def commitTransaction(self, trans):
+>         """Commit the transaction to the database."""
+>         
+>         return self._deferToNoconn(self._commitTransaction, trans)
+> 
+>     def rollbackTransaction(self, trans):
+>         """Exit the transaction without committing."""
+> 
+>         return self._deferToNoconn(self._rollbackTransaction, trans)
+> 
+206c272,273
+<         """Return a database connection when one becomes available. This method blocks and should be run in a thread from the internal threadpool.
+---
+>         """Return a database connection when one becomes available.
+>         This method blocks and should be run in a thread from the internal threadpool.
+223a291,330
+> 
+>     def _runQueryInTransaction(self, trans, *args, **kwargs):
+>         trans.reopen()
+>         try:
+>             apply(trans.execute, args, kwargs)
+>             if(trans.rowcount != 0):
+>                 result = trans.fetchall()
+>             else:
+>                 result = []
+>             return result
+>         except:
+>             log.msg('Exception in SQL query.')
+>             log.deferr()
+>             raise
+>         
+>     def _runOperationInTransaction(self, trans, *args, **kwargs):
+>         trans.reopen()
+>         try:
+>             apply(trans.execute, args, kwargs)
+>         except:
+>             log.msg('Exception in SQL operation.')
+>             print trans, args
+>             
+>             log.deferr()
+>             raise
+> 
+>     def _commitTransaction(self, trans):
+>         conn = trans._connection
+>         conn.commit()
+>         lck = self.transLock[trans]
+>         del self.transLock[trans]
+>         lck.release()
+>         
+>     def _rollbackTransaction(self, trans):
+>         conn = trans._connection
+>         conn.rollback()
+>         lck = self.transLock[trans]
+>         del self.transLock[trans]
+>         lck.release()
+>                 
+239c346
+<         curs = conn.cursor()
+---
+>         curs = conn.cursor()        
+284a392,402
+>                                      d, f, args, kwargs)
+>         return d
+> 
+>     def _deferToNoconn(self, f, *args, **kwargs):
+>         """Internal function.
+> 
+>         Call f in a connectionless thread (used by run*InTransaction)
+>         """
+> 
+>         d = defer.Deferred()
+>         self.noconnpool.callInThread(threads._putResultInDeferred,

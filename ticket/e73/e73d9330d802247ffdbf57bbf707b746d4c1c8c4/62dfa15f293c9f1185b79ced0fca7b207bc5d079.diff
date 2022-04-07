@@ -1,0 +1,131 @@
+=== modified file 'twisted/web2/channel/http.py'
+--- twisted/web2/channel/http.py	2007-01-01 23:41:33 +0000
++++ twisted/web2/channel/http.py	2008-03-20 16:59:47 +0000
+@@ -55,7 +55,7 @@
+     inHeaders = None
+     partialHeader = ''
+     connHeaders = None
+-    finishedReading = False
++    finishedReading = True
+ 
+     channel = None
+ 
+@@ -371,6 +371,7 @@
+ 
+ 
+     def gotInitialLine(self, initialLine):
++        self.finishedReading = False
+         parts = initialLine.split()
+         
+         # Parse the initial request line
+
+=== modified file 'twisted/web2/client/http.py'
+--- twisted/web2/client/http.py	2007-10-19 08:16:52 +0000
++++ twisted/web2/client/http.py	2008-03-20 15:56:06 +0000
+@@ -9,6 +9,7 @@
+ from zope.interface import implements
+ 
+ from twisted.internet.defer import Deferred
++from twisted.internet import error
+ from twisted.protocols.basic import LineReceiver
+ from twisted.protocols.policies import TimeoutMixin
+ 
+@@ -168,6 +169,7 @@
+         self._error(reason)
+ 
+     def gotInitialLine(self, initialLine):
++        self.finishedReading = False
+         parts = initialLine.split(' ', 2)
+ 
+         # Parse the initial request line
+@@ -350,7 +352,7 @@
+         if not persist:
+             # Tell all requests but first to abort.
+             for request in self.inRequests[1:]:
+-                request.connectionLost(None)
++                request.connectionLost(error.ConnectionDone())
+             del self.inRequests[1:]
+ 
+     def connectionLost(self, reason):
+
+=== modified file 'twisted/web2/test/test_client.py'
+--- twisted/web2/test/test_client.py	2007-10-19 08:16:52 +0000
++++ twisted/web2/test/test_client.py	2008-03-20 16:53:23 +0000
+@@ -5,7 +5,7 @@
+ Tests for HTTP client.
+ """
+ 
+-from twisted.internet import protocol, defer
++from twisted.internet import protocol, defer, error
+ 
+ from twisted.web2.client import http
+ from twisted.web2 import http_headers
+@@ -61,8 +61,10 @@
+     def assertReceived(self, cxn, expectedStatus, expectedHeaders,
+                        expectedContent=None):
+         self.iterate(cxn)
+-
+-        headers, content = cxn.server.data.split('\r\n\r\n', 1)
++    
++        data = cxn.server.data
++        cxn.server.data = ''
++        headers, content = data.split('\r\n\r\n', 1)
+         status, headers = headers.split('\r\n', 1)
+         headers = headers.split('\r\n')
+ 
+@@ -188,6 +190,54 @@
+ 
+         return d
+ 
++    def test_abortPipelining(self):
++        """
++        Ensure that pending requests are aborted if the server closes the
++        connection.
++        """
++
++        cxn = self.connect(inputTimeOut=None)
++        deferreds = []
++        
++        req1 = http.ClientRequest('GET', '/', None, None)
++        d1 = cxn.client.submitRequest(req1, closeAfter=False).addCallback(
++            self.checkResponse, 200, [], 0, None)
++        deferreds.append(d1)
++
++        self.assertReceived(cxn, 'GET / HTTP/1.1',
++                            ['Connection: Keep-Alive'])
++
++        self.writeLines(cxn, ('HTTP/1.1 200 OK',
++                              'Content-Length: 0',
++                              'Connection: Keep-Alive',
++                              '\r\n'))
++        
++        # pipeline two requests, after the first one the server closes the
++        # connection
++        req2 = http.ClientRequest('GET', '/', None, None)
++        d2 = cxn.client.submitRequest(req2, closeAfter=False).addCallback(
++            self.checkResponse, 200, [], 0, None)
++        deferreds.append(d2)
++        
++        self.assertReceived(cxn, 'GET / HTTP/1.1',
++                            ['Connection: Keep-Alive'])
++
++        req3 = http.ClientRequest('GET', '/', None, None)
++        d3 = cxn.client.submitRequest(req3, closeAfter=False)
++        self.failUnlessFailure(d3, error.ConnectionDone)
++        deferreds.append(d3)
++
++        self.assertReceived(cxn, 'GET / HTTP/1.1',
++                            ['Connection: Keep-Alive'])
++       
++        # close the connection, the client should cancel req3
++        self.writeLines(cxn, ('HTTP/1.1 200 OK',
++                              'Content-Length: 0',
++                              'Connection: close',
++                              '\r\n'))
++
++        return defer.DeferredList(deferreds)
++
+     def test_userHeaders(self):
+         """
+         Make sure that headers get through in both directions.
+

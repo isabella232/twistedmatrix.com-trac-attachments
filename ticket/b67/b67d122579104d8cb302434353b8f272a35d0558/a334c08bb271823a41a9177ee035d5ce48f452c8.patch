@@ -1,0 +1,355 @@
+diff --git doc/core/howto/trial.xhtml doc/core/howto/trial.xhtml
+index 189f2d2..e6ecfba 100644
+--- doc/core/howto/trial.xhtml
++++ doc/core/howto/trial.xhtml
+@@ -623,6 +623,29 @@ changes nothing to our class.</p>
+ 
+ <a href="listings/trial/calculus/client_3.py" class="py-listing">client_3.py</a>
+ 
++<h2>Dropping into a debugger</h2>
++
++<p>In the course of writing and running your tests, it is often helpful to
++employ the use of a debugger. This can be particularly helpful in tracking down
++where the source of a troublesome bug is in your code. Python's standard library
++includes a debugger in the form of the
++<a href="http://docs.python.org/library/pdb.html">pdb</a> module.
++Running your tests with <code class="python">pdb</code> is as simple as invoking
++twisted with the <code class="shell">--debug</code> option, which will start
++<code class="python">pdb</code> at the beginning of the execution of your test
++suite.</p>
++
++<p>Trial also provides a <code class="shell">--debugger</code> option which can
++run your test suite using another debugger instead. To specify a debugger other
++than <code class="python">pdb</code>, pass in the fully-qualified name of an
++object that provides the same interface as <code class="python">pdb</code>.
++Most third-party debuggers tend to implement an interface similar to
++<code class="python">pdb</code>, or at least provide a wrapper object that
++does. For example, invoking trial with the line
++<code class="shell">trial --debug --debugger pudb</code> will open the
++<a href="http://pypi.python.org/pypi/pudb">PuDB</a> debugger instead, provided
++it is properly installed.</p>
++
+ <h2>Code coverage</h2>
+ 
+ <p>Code coverage is one of the aspects of software testing that shows how much
+diff --git doc/core/man/trial.1 doc/core/man/trial.1
+index f4f0787..009c25d 100644
+--- doc/core/man/trial.1
++++ doc/core/man/trial.1
+@@ -63,9 +63,9 @@ Set the number of process workers to run. It conflicts with the debug and
+ profile options.
+ .TP
+ \fB-b\fR, \fB--debug\fR
+-Run the tests in the Python debugger. Also does post-mortem
+-debugging on exceptions. Will load `.pdbrc' from current directory if
+-it exists.
++Run the tests in a debugger. If that debugger is 'pdb' (which is the default if
++unspecified), a `.pdbrc' will be loaded from the current directory if it
++exists. Also does post-mortem debugging on exceptions.
+ .TP
+ \fB-B\fR, \fB--debug-stacktraces\fR
+ Report Deferred creation and callback stack traces.
+@@ -90,6 +90,11 @@ Note that this functionality uses Python's sys.settrace() function, so tests
+ that call sys.settrace() themselves are likely to break trial's coverage
+ functionality.
+ .TP
++\fB--debugger\fR
++Specifies the debugger to use when the --debug option is passed. The argument
++should be the fully qualified name of an object that implements the same
++interface as the standard library's `pdb'.
++.TP
+ \fB--disablegc\fR
+ Disable the garbage collector for the duration of the test run. As each test is
+ run, trial saves the TestResult objects, which means that Python's garbage
+diff --git twisted/scripts/trial.py twisted/scripts/trial.py
+index 8c44d64..f317841 100644
+--- twisted/scripts/trial.py
++++ twisted/scripts/trial.py
+@@ -4,7 +4,7 @@
+ # See LICENSE for details.
+ 
+ 
+-import sys, os, random, gc, time, warnings
++import sys, os, random, gc, pdb, time, warnings
+ 
+ from twisted.internet import defer
+ from twisted.application import app
+@@ -309,8 +309,9 @@ class Options(_BasicOptions, usage.Options, app.ReactorSelectionMixin):
+     """
+ 
+     optFlags = [
+-                ["debug", "b", "Run tests in the Python debugger. Will load "
+-                 "'.pdbrc' from current directory if it exists."],
++                ["debug", "b", "Run tests in a debugger. If that debugger is "
++                 "pdb, will load '.pdbrc' from current directory if it exists."
++                ],
+                 ["debug-stacktraces", "B", "Report Deferred creation and "
+                  "callback stack traces"],
+                 ["nopm", None, "don't automatically jump into debugger for "
+@@ -321,6 +322,8 @@ class Options(_BasicOptions, usage.Options, app.ReactorSelectionMixin):
+                 ]
+ 
+     optParameters = [
++        ["debugger", None, "pdb", "the fully qualified name of a debugger to "
++         "use if --debug is passed"],
+         ["logfile", "l", "test.log", "log file name"],
+         ["jobs", "j", None, "Number of local workers to run"]
+         ]
+@@ -413,6 +416,38 @@ def _getLoader(config):
+     return loader
+ 
+ 
++def _wrappedPdb():
++    """
++    Wrap an instance of C{pdb.Pdb} with readline support and load any .rcs.
++
++    """
++
++    dbg = pdb.Pdb()
++    try:
++        import readline
++    except ImportError:
++        print "readline module not available"
++        sys.exc_clear()
++    for path in ('.pdbrc', 'pdbrc'):
++        if os.path.exists(path):
++            try:
++                rcFile = file(path, 'r')
++            except IOError:
++                sys.exc_clear()
++            else:
++                dbg.rcLines.extend(rcFile.readlines())
++    return dbg
++
++
++class _DebuggerNotFound(Exception):
++    """
++    A debugger import failed.
++
++    Used to allow translating these errors into usage error messages.
++
++    """
++
++
+ 
+ def _makeRunner(config):
+     """
+@@ -440,6 +475,17 @@ def _makeRunner(config):
+     else:
+         if config['debug']:
+             args['mode'] = runner.TrialRunner.DEBUG
++            debugger = config['debugger']
++
++            if debugger != 'pdb':
++                try:
++                    args['debugger'] = reflect.namedAny(debugger)
++                except reflect.ModuleNotFound:
++                    raise _DebuggerNotFound(
++                        '%r debugger could not be found.' % (debugger,))
++            else:
++                args['debugger'] = _wrappedPdb()
++
+         args['profile'] = config['profile']
+         args['forceGarbageCollection'] = config['force-gc']
+ 
+@@ -456,7 +502,12 @@ def run():
+     except usage.error, ue:
+         raise SystemExit, "%s: %s" % (sys.argv[0], ue)
+     _initialDebugSetup(config)
+-    trialRunner = _makeRunner(config)
++
++    try:
++        trialRunner = _makeRunner(config)
++    except _DebuggerNotFound as e:
++        raise SystemExit('%s: %s' % (sys.argv[0], str(e)))
++
+     suite = _getSuite(config)
+     if config['until-failure']:
+         test_result = trialRunner.runUntilFailure(suite)
+@@ -468,4 +519,3 @@ def run():
+         results.write_results(show_missing=1, summary=False,
+                               coverdir=config.coverdir().path)
+     sys.exit(not test_result.wasSuccessful())
+-
+diff --git twisted/topfiles/5794.feature twisted/topfiles/5794.feature
+new file mode 100644
+index 0000000..313898c
+--- /dev/null
++++ twisted/topfiles/5794.feature
+@@ -0,0 +1 @@
++trial now supports specifying a debugger other than pdb with the --debugger command line flag.
+diff --git twisted/trial/runner.py twisted/trial/runner.py
+index 50966ed..358dc03 100644
+--- twisted/trial/runner.py
++++ twisted/trial/runner.py
+@@ -705,24 +705,6 @@ class TrialRunner(object):
+     DEBUG = 'debug'
+     DRY_RUN = 'dry-run'
+ 
+-    def _getDebugger(self):
+-        dbg = pdb.Pdb()
+-        try:
+-            import readline
+-        except ImportError:
+-            print "readline module not available"
+-            sys.exc_clear()
+-        for path in ('.pdbrc', 'pdbrc'):
+-            if os.path.exists(path):
+-                try:
+-                    rcFile = file(path, 'r')
+-                except IOError:
+-                    sys.exc_clear()
+-                else:
+-                    dbg.rcLines.extend(rcFile.readlines())
+-        return dbg
+-
+-
+     def _setUpTestdir(self):
+         self._tearDownLogFile()
+         currentDir = os.getcwd()
+@@ -754,7 +736,8 @@ class TrialRunner(object):
+                  realTimeErrors=False,
+                  uncleanWarnings=False,
+                  workingDirectory=None,
+-                 forceGarbageCollection=False):
++                 forceGarbageCollection=False,
++                 debugger=None):
+         self.reporterFactory = reporterFactory
+         self.logfile = logfile
+         self.mode = mode
+@@ -767,6 +750,7 @@ class TrialRunner(object):
+         self._logFileObserver = None
+         self._logFileObject = None
+         self._forceGarbageCollection = forceGarbageCollection
++        self.debugger = debugger
+         if profile:
+             self.run = util.profiled(self.run, 'profile.data')
+ 
+@@ -814,9 +798,7 @@ class TrialRunner(object):
+                 result.stopTest(single)
+         else:
+             if self.mode == self.DEBUG:
+-                # open question - should this be self.debug() instead.
+-                debugger = self._getDebugger()
+-                run = lambda: debugger.runcall(suite.run, result)
++                run = lambda: self.debugger.runcall(suite.run, result)
+             else:
+                 run = lambda: suite.run(result)
+ 
+diff --git twisted/trial/test/test_runner.py twisted/trial/test/test_runner.py
+index 56f16de..b077c8e 100644
+--- twisted/trial/test/test_runner.py
++++ twisted/trial/test/test_runner.py
+@@ -5,7 +5,7 @@
+ # Author: Robert Collins
+ 
+ 
+-import StringIO, os, sys
++import StringIO, os, pdb, sys
+ from zope.interface import implements
+ from zope.interface.verify import verifyObject
+ 
+@@ -488,21 +488,68 @@ class TestRunner(unittest.SynchronousTestCase):
+         self.assertEqual(self.standardReport, result._calls)
+ 
+ 
++    def runSampleSuite(self, my_runner):
++        loader = runner.TestLoader()
++        suite = loader.loadByName('twisted.trial.test.sample', True)
++        return my_runner.run(suite)
++
++
+     def test_runner_debug(self):
+         self.parseOptions(['--reporter', 'capturing',
+                            '--debug', 'twisted.trial.test.sample'])
+         my_runner = self.getRunner()
+-        debugger = CapturingDebugger()
+-        def get_debugger():
+-            return debugger
+-        my_runner._getDebugger = get_debugger
+-        loader = runner.TestLoader()
+-        suite = loader.loadByName('twisted.trial.test.sample', True)
+-        result = my_runner.run(suite)
++        debugger = my_runner.debugger = CapturingDebugger()
++        result = self.runSampleSuite(my_runner)
+         self.assertEqual(self.standardReport, result._calls)
+         self.assertEqual(['runcall'], debugger._calls)
+ 
+ 
++    def test_runner_debugger_defaults_to_pdb(self):
++        self.parseOptions(['--debug', 'twisted.trial.test.sample'])
++
++        self.runcall_called = False
++        def runcall(pdb, suite, result):
++            self.runcall_called = True
++        self.patch(pdb.Pdb, "runcall", runcall)
++
++        self.runSampleSuite(self.getRunner())
++
++        self.assertTrue(self.runcall_called)
++
++    def test_runner_debugger_with_explicitly_passed_pdb(self):
++        self.parseOptions([
++            '--reporter', 'capturing',
++            '--debugger', 'pdb',
++            '--debug', 'twisted.trial.test.sample',
++        ])
++
++        self.runcall_called = False
++        def runcall(pdb, suite, result):
++            self.runcall_called = True
++        self.patch(pdb.Pdb, "runcall", runcall)
++
++        self.runSampleSuite(self.getRunner())
++
++        self.assertTrue(self.runcall_called)
++
++
++    cdebugger = CapturingDebugger()
++
++
++    def test_runner_debugger(self):
++        self.parseOptions([
++            '--reporter', 'capturing',
++            '--debugger',
++            'twisted.trial.test.test_runner.TestRunner.cdebugger',
++            '--debug',
++            'twisted.trial.test.sample',
++        ])
++        my_runner = self.getRunner()
++        result = self.runSampleSuite(my_runner)
++        self.assertEqual(self.standardReport, result._calls)
++        self.assertEqual(['runcall'], my_runner.debugger._calls)
++
++
+ 
+ class RemoveSafelyTests(unittest.SynchronousTestCase):
+     """
+diff --git twisted/trial/test/test_script.py twisted/trial/test/test_script.py
+index 11dad70..0203ee1 100644
+--- twisted/trial/test/test_script.py
++++ twisted/trial/test/test_script.py
+@@ -549,3 +549,23 @@ class MakeRunnerTestCase(unittest.TestCase):
+         runner = trial._makeRunner(options)
+         self.assertIsInstance(runner, TrialRunner)
+         self.assertEqual(TrialRunner.DRY_RUN, runner.mode)
++
++
++
++class TestRun(unittest.TestCase):
++    """
++    Tests for the L{run} function.
++
++    """
++
++    def test_debugger_not_found(self):
++        def _makeRunner(*args, **kwargs):
++            raise trial._DebuggerNotFound('foo')
++        self.patch(trial, "_makeRunner", _makeRunner)
++
++        try:
++            trial.run()
++        except SystemExit as e:
++            self.assertIn("foo", str(e))
++        else:
++            self.fail("Should have exited due to non-existent debugger!")

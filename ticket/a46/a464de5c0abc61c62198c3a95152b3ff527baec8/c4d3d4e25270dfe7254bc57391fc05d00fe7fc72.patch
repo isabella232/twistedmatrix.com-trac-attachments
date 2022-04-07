@@ -1,0 +1,506 @@
+Index: http.py
+===================================================================
+--- http.py	(revision 21264)
++++ http.py	(working copy)
+@@ -1,13 +1,11 @@
+-from zope.interface import implements
+-
+-from twisted.internet import defer, protocol
++from twisted.internet import defer, protocol, reactor
+ from twisted.protocols import basic, policies
+ from twisted.web2 import stream as stream_mod, http, http_headers, responsecode
+ from twisted.web2.channel import http as httpchan
+ from twisted.web2.channel.http import PERSIST_NO_PIPELINE, PERSIST_PIPELINE
+-from twisted.web2.client import interfaces
+ 
+-#from twisted.python.util import tracer
++def myid(o):
++    return id(o) % 1024
+ 
+ class ProtocolError(Exception):
+     pass
+@@ -49,8 +47,13 @@
+         else:
+             self.stream = None
+ 
+-
+ class HTTPClientChannelRequest(httpchan.HTTPParser):
++    """A requestor.
++    This handles submitting a ClientRequest and handling its response.
++    The Protocol (aka the channel) handles which piece of data
++    goes to which requestor. Once a requestor has finished its
++    response, it notifies the channel to move on to the next response.
++    """
+     parseCloseAsEnd = True
+     outgoing_version = "HTTP/1.1"
+     chunkedOut = False
+@@ -58,14 +61,25 @@
+     
+     closeAfter = False
+     
+-    def __init__(self, channel, request, closeAfter):
++    def __init__(self, channel, request, closeAfter=False):
++        """
++        @param channel: The HTTP protocol for this connection
++        @type channel: C{HTTPClientProtocol}
++        
++        @param request: The request we are seeking a response to
++        @type request: C{ClientRequest}
++
++        @param closeAfter: Whether we should close after sending this request
++        @type closeAfter: C{bool}
++        """
++
+         httpchan.HTTPParser.__init__(self, channel)
+         self.request = request
+         self.closeAfter = closeAfter
+         self.transport = self.channel.transport
+-        self.responseDefer = defer.Deferred()
+         
+     def submit(self):
++        "Submit a request, i.e. start writing it (reliably) to the server."
+         l = []
+         request = self.request
+         if request.method == "HEAD":
+@@ -97,17 +111,11 @@
+         self.transport.writeSequence(l)
+         
+         d = stream_mod.StreamProducer(request.stream).beginProducing(self)
++        # When finished writing, call self._finish:
+         d.addCallback(self._finish).addErrback(self._error)
+ 
+-    def registerProducer(self, producer, streaming):
+-        """Register a producer.
+-        """
+-        self.transport.registerProducer(producer, streaming)
+-
+-    def unregisterProducer(self):
+-        self.transport.unregisterProducer()
+-        
+     def write(self, data):
++        "Write some data to the server. Possibly will chunk this data."
+         if not data:
+             return
+         elif self.chunkedOut:
+@@ -126,18 +134,16 @@
+         del self.transport
+ 
+     def _error(self, err):
++        print "ERROR!",err
+         self.abortParse()
+-        self.responseDefer.errback(err)
+ 
+     def _abortWithError(self, errcode, text):
+         self.abortParse()
+-        self.responseDefer.errback(ProtocolError(text))
+ 
+-    def connectionLost(self, reason):
+-        ### FIXME!
+-        pass
+-    
+     def gotInitialLine(self, initialLine):
++        """The initial line from the server, i.e. HTTP/1.1 200 OK
++        The rest of the lines are handled by the parent class
++        """
+         parts = initialLine.split(' ', 2)
+         
+         # Parse the initial request line
+@@ -163,190 +169,270 @@
+             return
+ 
+     ## FIXME: Actually creates Response, function is badly named!
++    ## FIXME: parent class needs to be patched for this.
+     def createRequest(self):
+         self.stream = stream_mod.ProducerStream(self.length)
+         self.response = http.Response(self.code, self.inHeaders, self.stream)
+         self.stream.registerProducer(self, True)
+         
+-        del self.inHeaders
++    ## FIXME: Actually processes Response, function is badly named!
++    ## FIXME: parent class needs to be patched for this.
++    def processRequest(self): pass
+ 
+-    ## FIXME: Actually processes Response, function is badly named!
+-    def processRequest(self):
+-        self.responseDefer.callback(self.response)
+-        
+     def handleContentChunk(self, data):
+         self.stream.write(data)
+ 
+     def handleContentComplete(self):
+         self.stream.finish()
+ 
++class HTTPClientProtocol(basic.LineReceiver, policies.TimeoutMixin, object):
++    """A HTTP 1.1 Client with request pipelining support.
++    This implements one "channel" on persistent connections.
++    HTTPClientChannelRequest implements each request/response.
+ 
+-class EmptyHTTPClientManager(object):
+-    """A dummy HTTPClientManager.  It doesn't do any client management, and is 
+-    meant to be used only when creating an HTTPClientProtocol directly.
++    http://www.w3.org/Protocols/rfc2616/rfc2616.html
+     """
+-
+-    implements(interfaces.IHTTPClientManager)
+-
+-    def clientBusy(self, proto):
+-        pass
+     
+-    def clientIdle(self, proto):
+-        pass
+-
+-    def clientPipelining(self, proto):
+-        pass
+-    
+-    def clientGone(self, proto):
+-        pass
+-    
+-
+-class HTTPClientProtocol(basic.LineReceiver, policies.TimeoutMixin, object):
+-    """A HTTP 1.1 Client with request pipelining support."""
+-    
+-    chanRequest = None
++    channel = HTTPClientChannelRequest 
+     maxHeaderLength = 10240
+-    firstLine = 1
+-    readPersistent = PERSIST_NO_PIPELINE
++    firstLine = True
++    readPersistent=PERSIST_NO_PIPELINE
+     
+     # inputTimeOut should be pending whenever a complete request has
+     # been written but the complete response has not yet been
+     # received, and be reset every time data is received.
+     inputTimeOut = 60 * 4
+ 
+-    def __init__(self, manager=None):
++    def __init__(self):
+         """
+-        @param manager: The object this client reports it state to.
+-        @type manager: L{interfaces.IHTTPClientManager}
++        @param readPersistent: Whether to read persistently, and whether to pipeline (send multiple requests before a response)
++        @type readPersistent: C{int}
+         """
++        self.pipeline = []
++#        print "Init %d" % myid(self)
+ 
+-        self.outRequest = None
+-        self.inRequests = []
+-        if manager is None:
+-            manager = EmptyHTTPClientManager()
+-        self.manager = manager
++    # These functions field the data to the proper requestor
++    # The spec says:
++    #     A client that supports persistent connections MAY "pipeline" its
++    #    requests (i.e., send multiple requests without waiting for each
++    #    response). A server MUST send its responses to those requests in
++    #    the same order that the requests were received.
++    # So we can assume the responses will arrive in order, and that order
++    # can only be guaranteed if the responses arrive on the same connection
++    # so we can assume the responses will arrive on the same connection
++    # as their request. Requests on different connections may have responses
++    # out of the order the requests are sent, and that is a Good Thing.
+ 
++    def lineLengthExceeded(self, line, wasFirst=False):
++        code = wasFirst and responsecode.REQUEST_URI_TOO_LONG or responsecode.BAD_REQUEST
++        self._abortWithError(code, "Header too long: %s %d" % (line[:100],len(line)))
++
+     def lineReceived(self, line):
+-        if not self.inRequests:
+-            # server sending random unrequested data.
++        if len(line) > self.maxHeaderLength:
++            self.lineLengthExceeded(line)
+             self.transport.loseConnection()
+             return
+-
+-        # If not currently writing this request, set timeout
+-        if self.inRequests[0] is not self.outRequest:
+-            self.setTimeout(self.inputTimeOut)
+-            
+         if self.firstLine:
+-            self.firstLine = 0
+-            self.inRequests[0].gotInitialLine(line)
++            self.firstLine = False
++            self.curRequest().gotInitialLine(line)
+         else:
+-            self.inRequests[0].lineReceived(line)
++            self.curRequest().lineReceived(line)
+ 
+     def rawDataReceived(self, data):
+-        if not self.inRequests:
++        if not self.curRequest():
+             print "Extra raw data!"
+             # server sending random unrequested data.
+             self.transport.loseConnection()
+             return
+         
+-        # If not currently writing this request, set timeout
+-        if self.inRequests[0] is not self.outRequest:
+-            self.setTimeout(self.inputTimeOut)
+-            
+-        self.inRequests[0].rawDataReceived(data)
+-        
+-    def submitRequest(self, request, closeAfter=True):
+-        """
+-        @param request: The request to send to a remote server.
+-        @type request: L{ClientRequest}
++        self.curRequest().rawDataReceived(data)
++    
++    def connectionMade(self):
++        print myid(self),"connected"
++        self.sendAnother()
+ 
+-        @param closeAfter: If True the 'Connection: close' header will be sent,
+-            otherwise 'Connection: keep-alive'
+-        @type closeAfter: C{bool}
++    def sendAnother(self,closeAfter=False):
++        if not self.factory.requests:
++            if not self.pipeline:
++                self.noMoreRequests()
++            return
+ 
+-        @rtype: L{twisted.internet.defer.Deferred}
+-        @return: A Deferred which will be called back with the
+-            L{twisted.web2.http.Response} from the server.
+-        """
++        if self.pipeline and not self.readPersistent:
++            raise ProtocolError("Cannot send multiple requests on a non-persistent connection!")
+ 
+-        # Assert we're in a valid state to submit more
+-        assert self.outRequest is None
+-        assert ((self.readPersistent is PERSIST_NO_PIPELINE and not self.inRequests)
+-                or self.readPersistent is PERSIST_PIPELINE)
++        request = self.channel(self,self.factory.requests.pop(0),closeAfter)
++        print "%d Sending %d %s" % (myid(self),myid(request),request.request.uri)
++        self.pipeline.append(request)
++#        print "Cur %d" % myid(self.curRequest())
++        request.submit()
++
++    def curRequest(self):
++        if not self.pipeline: 
++            print "Pipeline",self.pipeline
++            raise ProtocolError("No current request")
++        if self.pipeline: return self.pipeline[0]
++
++    def noMoreRequests(self):
++        print myid(self),"No more to send"
++        self.transport.loseConnection()
++        self.factory.channelDone(self)
+         
+-        self.manager.clientBusy(self)
+-        if closeAfter:
+-            self.readPersistent = False
+-        
+-        self.outRequest = chanRequest = HTTPClientChannelRequest(self, request, closeAfter)
+-        self.inRequests.append(chanRequest)
+-        
+-        chanRequest.submit()
+-        return chanRequest.responseDefer
+-
+     def requestWriteFinished(self, request):
+-        assert request is self.outRequest
+-        
+-        self.outRequest = None
+-        # Tell the manager if more requests can be submitted.
++        "Send another if more requests can be submitted."
++        print "Done sending",myid(self),myid(request)
+         self.setTimeout(self.inputTimeOut)
+         if self.readPersistent is PERSIST_PIPELINE:
+-            self.manager.clientPipelining(self)
++            # Give it a bit of time for other channels to pick up
++            reactor.callLater(0.1,self.sendAnother)
+ 
+     def requestReadFinished(self, request):
+-        assert self.inRequests[0] is request
++        print myid(self),"Finished",myid(request),myid(self.curRequest())
++        assert self.curRequest() is request, "%s %d != %d" % (myid(self),myid(self.curRequest()),myid(request))
+         
+-        del self.inRequests[0]
+         self.firstLine = True
+-        
+-        if not self.inRequests:
+-            if self.readPersistent:
+-                self.setTimeout(None)
+-                self.manager.clientIdle(self)
+-            else:
+-#                 print "No more requests, closing"
+-                self.transport.loseConnection()
++    
++        print myid(self),"Throwing away",myid(self.curRequest())
++        self.pipeline.pop(0)
++    
++        if self.readPersistent:
++            print "anodder?"
++            self.setTimeout(None)
++            self.sendAnother()
++        else:
++            # No more requests, closing
++            self.noMoreRequests()
+ 
+-    def setReadPersistent(self, persist):
+-        self.readPersistent = persist
+-        if not persist:
+-            # Tell all requests but first to abort.
+-            for request in self.inRequests[1:]:
+-                request.connectionLost(None)
+-            del self.inRequests[1:]
+-    
++    def setReadPersistent(self,rp):
++        self.readPersistent = rp
++
+     def connectionLost(self, reason):
+         self.readPersistent = False
+         self.setTimeout(None)
+-        self.manager.clientGone(self)
+-        # Tell all requests to abort.
+-        for request in self.inRequests:
+-            if request is not None:
+-                request.connectionLost(reason)
+-    
+-    #isLastRequest = tracer(isLastRequest)
+-    #lineReceived = tracer(lineReceived)
+-    #rawDataReceived = tracer(rawDataReceived)
+-    #connectionLost = tracer(connectionLost)
+-    #requestReadFinished = tracer(requestReadFinished)
+-    #requestWriteFinished = tracer(requestWriteFinished)
+-    #submitRequest = tracer(submitRequest)
+-    
++        if self.pipeline:
++            # oops, some requests left unfinished
++            leftover = (ror.request for ror in self.pipeline)
++            self.factory.requests.extend(leftover)
+ 
+-def testConn(host):
+-    from twisted.internet import reactor
+-    d = protocol.ClientCreator(reactor, HTTPClientProtocol).connectTCP(host, 80)
+-    def gotResp(resp, num):
++class HTTPClientFactory(protocol.ReconnectingClientFactory):
++    numPipes = 4 # How many pipes are we lining?
++    def __init__(self,requests=[]):
++        self.pipes = set()
++        self.requests = list(requests)
++    def addRequest(self,request):
++        self.requests.append(request)
++    def connect(self,host,port,reactor):
++        for i in range(self.numPipes):
++            reactor.connectTCP(host,port,self)
++    def buildProtocol(self,addr):
++        proto = protocol.ReconnectingClientFactory.buildProtocol(self,addr)
++        self.pipes.add(proto)
++        return proto
++    def channelDone(self, requestor):
++        if not self.requests:
++            # We're winding down here
++            self.stopTrying()
++            self.pipes.discard(requestor)
++        else:
++            # Try this again...
++            self.retry(connector)
++
++#####################################################################
++# To test stuff out, we make a little test server with some interesting
++# resources on it. Since twisted.web2's server has pipelining and 
++# persistence, we can fully exercise the use of this client class.
++# A subprocess runs the server via twistd, while the main process
++# connects to it. Change thePort to something unprivileged and 
++# unused.
++
++thePort = 10080
++
++class TestRequestor(HTTPClientChannelRequest):
++    def processRequest(self):
++        num = id(self) % 1024 # whatever
+         def print_(n):
+             print "DATA %s: %r" % (num, n)
+         def printdone(n):
+-            print "DONE %s" % num
+-        print "GOT RESPONSE %s: %s" % (num, resp)
+-        stream_mod.readStream(resp.stream, print_).addCallback(printdone)
+-    def sendReqs(proto):
+-        proto.submitRequest(ClientRequest("GET", "/", {'Host':host}, None)).addCallback(gotResp, 1)
+-        proto.submitRequest(ClientRequest("GET", "/foo", {'Host':host}, None)).addCallback(gotResp, 2)
+-    d.addCallback(sendReqs)
+-    del d
++            print "DONE %s %s" % (num,self.request.uri)
++        print "GOT RESPONSE %s: %s" % (num, self.code)
++        return stream_mod.readStream(self.stream, print_).addCallback(printdone)
++        
++class TestProtocol(HTTPClientProtocol): 
++    channel = TestRequestor
++
++class TestFactory(HTTPClientFactory):
++    protocol = TestProtocol
++    numPipes = 3
++    def channelDone(self, requestor):
++        HTTPClientFactory.channelDone(self,requestor)
++        if not len(self.pipes):
++            # We're done
++            reactor.stop()
++
++def testConn(host):
++    from twisted.internet import reactor
++    requests = (
++        ClientRequest("GET", "/", {'Host':host}, None),
++        ClientRequest("GET", "/evil", {'Host':host}, None),
++        ClientRequest("GET", "/evil", {'Host':host}, None),
++        ClientRequest("GET", "/evil", {'Host':host}, None),
++        ClientRequest("GET", "/foo/", {'Host':host}, None),
++    )
++
++    factory = TestFactory(requests)
++    factory.connect(host,thePort,reactor)
++    print "Client ready"
+     reactor.run()
+ 
++from twisted.web2 import server, http, resource, channel
++import os,signal
++import sys,subprocess,time,random
++
++def testSrv():
++    class Child(resource.Resource):
++        addSlash = True
++        def render(self, ctx):
++            return http.Response(stream="Do what you want cause a pirate is free")
++
++    class EvilChild(resource.Resource):
++        addSlash = False
++        def render(self, ctx):
++            s=stream_mod.ProducerStream()
++            s.write("Evil\r\n")
++            s.write("Evil\r\n")
++            self.evilrender(s,4)
++            return http.Response(stream=s)
++        def evilrender(self,s,count):
++            if count <= 0:
++                s.finish()
++            else:
++                s.write("Child\r\n")
++                reactor.callLater(random.randrange(1,3),self.evilrender,s,count-1)
++
++
++    class Toplevel(resource.Resource):
++        child_foo = Child()
++        child_evil = EvilChild()
++        addSlash = True
++        def render(self, ctx):
++            return http.Response(stream="Hello synx!")
++
++    site = server.Site(Toplevel())
++
++    print "Starting server"
++    return site
++
++if __name__=='__builtin__': 
++    site = testSrv()
++    # Standard twisted application Boilerplate
++    from twisted.application import service, strports
++    application = service.Application("demoserver")
++    # Isn't strports obsolete YET?
++    s = strports.service('tcp:%d' % thePort, channel.HTTPFactory(site))
++    s.setServiceParent(application)
++    
++elif __name__=='__main__':
++    pid = subprocess.Popen(['twistd','-noy',sys.argv[0]])
++    time.sleep(1)
++    testConn('localhost')
++    os.kill(pid.pid,signal.SIGTERM)
++    pid.wait()

@@ -1,0 +1,106 @@
+diff --git twisted/web/http.py twisted/web/http.py
+index b8294bd..af8e69e 100644
+--- twisted/web/http.py
++++ twisted/web/http.py
+@@ -1295,6 +1295,16 @@ class PotentialDataLoss(Exception):
+ 
+ 
+ 
++class _MalformedChunkedDataError(Exception):
++    """
++    C{_ChunkedTranferDecoder} raises L{_MalformedChunkedDataError} from its 
++    C{dataRecieved} method when it encounters malformed data. This exception
++    indicates a client-side error. If this exception is raised, the connection
++    should be dropped with a 400 error.
++    """
++
++
++
+ class _IdentityTransferDecoder(object):
+     """
+     Protocol for accumulating bytes up to a specified length.  This handles the
+@@ -1419,7 +1429,10 @@ class _ChunkedTransferDecoder(object):
+         if '\r\n' in data:
+             line, rest = data.split('\r\n', 1)
+             parts = line.split(';')
+-            self.length = int(parts[0], 16)
++            try:
++                self.length = int(parts[0], 16)
++            except ValueError:
++                raise _MalformedChunkedDataError("Chunk-size must be an integer.")
+             if self.length == 0:
+                 self.state = 'TRAILER'
+             else:
+@@ -1495,6 +1508,11 @@ class HTTPChannel(basic.LineReceiver, policies.TimeoutMixin):
+         Transfer-Encoding.
+     """
+ 
++    # This is the first class outside of the core to handle user input. The 
++    # puck stops here for HTTP related errors. If this class doesn't handle, 
++    # e.g., a malformed request, then the core will be getting a failure and
++    # dumping it in the logs.
++
+     maxHeaders = 500 # max number of headers allowed per request
+ 
+     length = 0
+@@ -1631,7 +1649,11 @@ class HTTPChannel(basic.LineReceiver, policies.TimeoutMixin):
+ 
+     def rawDataReceived(self, data):
+         self.resetTimeout()
+-        self._transferDecoder.dataReceived(data)
++        try:
++            self._transferDecoder.dataReceived(data)
++        except _MalformedChunkedDataError:
++            self.transport.write("HTTP/1.1 400 Bad Request\r\n\r\n")
++            self.transport.loseConnection()
+ 
+ 
+     def allHeadersReceived(self):
+diff --git twisted/web/test/test_http.py twisted/web/test/test_http.py
+index 04078da..42b387a 100644
+--- twisted/web/test/test_http.py
++++ twisted/web/test/test_http.py
+@@ -892,6 +892,36 @@ Hello,
+ 
+         self.runRequest(httpRequest, MyRequest)
+ 
++    def test_malformed_chunkedEncoding(self):
++        """
++        If a request uses the I{chunked} transfer encoding, the request body is
++        decoded accordingly before it is made available on the request. If the
++        request is malformed, we should get a 400 error.
++        """
++        # See test_chunkedEncoding for the correct form of this request.
++        httpRequest = '''\
++GET / HTTP/1.0
++Content-Type: text/plain
++Transfer-Encoding: chunked
++
++MALFORMED_LINE_THIS_SHOULD_BE_'6'
++Hello,
++14
++ spam,eggs spam spam
++0
++
++'''
++        testcase = self
++        didRequest = list()
++        class MyRequest(http.Request):
++            def process(self):
++                # This request should fail, so this should never be called.
++                didRequest.append(True)
++        channel = self.runRequest(httpRequest, MyRequest, success=False)
++        self.assertFalse(didRequest)
++        self.assertEqual(
++            channel.transport.value(),
++            "HTTP/1.1 400 Bad Request\r\n\r\n")
+ 
+ 
+ class QueryArgumentsTestCase(unittest.TestCase):
+diff --git twisted/web/topfiles/6030.bugfix twisted/web/topfiles/6030.bugfix
+new file mode 100644
+index 0000000..a56e38a
+--- /dev/null
++++ twisted/web/topfiles/6030.bugfix
+@@ -0,0 +1 @@
++twisted.web.http.HTTPChannel now drops connections and issues a 400 error upon receipt of a chunk-encoding encoded request with a bad chunk-length field. (#6030)

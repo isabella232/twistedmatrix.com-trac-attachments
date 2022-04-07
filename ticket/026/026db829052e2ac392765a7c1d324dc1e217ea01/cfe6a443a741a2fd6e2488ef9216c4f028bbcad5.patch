@@ -1,0 +1,236 @@
+Index: internet/_dumbwin32proc.py
+===================================================================
+--- internet/_dumbwin32proc.py	(revision 23159)
++++ internet/_dumbwin32proc.py	(working copy)
+@@ -46,12 +46,8 @@
+         if win32event.WaitForSingleObject(self.proc.hProcess, 0) != win32event.WAIT_OBJECT_0:
+             return 0
+         exitCode = win32process.GetExitCodeProcess(self.proc.hProcess)
+-        if exitCode == 0:
+-            err = error.ProcessDone(exitCode)
+-        else:
+-            err = error.ProcessTerminated(exitCode)
+         self.deactivate()
+-        self.proc.protocol.processEnded(failure.Failure(err))
++        self.proc.processEnded(exitCode)
+         return 0
+ 
+ 
+@@ -118,6 +114,7 @@
+     implements(IProcessTransport, IConsumer, IProducer)
+ 
+     buffer = ''
++    pid = None
+ 
+     def __init__(self, reactor, protocol, command, args, environment, path):
+         _pollingfile._PollingTimer.__init__(self, reactor)
+@@ -145,19 +142,19 @@
+         StartupInfo.dwFlags = win32process.STARTF_USESTDHANDLES
+ 
+         # Create new handles whose inheritance property is false
+-        pid = win32api.GetCurrentProcess()
++        currentPid = win32api.GetCurrentProcess()
+ 
+-        tmp = win32api.DuplicateHandle(pid, self.hStdoutR, pid, 0, 0,
++        tmp = win32api.DuplicateHandle(currentPid, self.hStdoutR, currentPid, 0, 0,
+                                        win32con.DUPLICATE_SAME_ACCESS)
+         win32file.CloseHandle(self.hStdoutR)
+         self.hStdoutR = tmp
+ 
+-        tmp = win32api.DuplicateHandle(pid, self.hStderrR, pid, 0, 0,
++        tmp = win32api.DuplicateHandle(currentPid, self.hStderrR, currentPid, 0, 0,
+                                        win32con.DUPLICATE_SAME_ACCESS)
+         win32file.CloseHandle(self.hStderrR)
+         self.hStderrR = tmp
+ 
+-        tmp = win32api.DuplicateHandle(pid, self.hStdinW, pid, 0, 0,
++        tmp = win32api.DuplicateHandle(currentPid, self.hStdinW, currentPid, 0, 0,
+                                        win32con.DUPLICATE_SAME_ACCESS)
+         win32file.CloseHandle(self.hStdinW)
+         self.hStdinW = tmp
+@@ -172,7 +169,7 @@
+         cmdline = quoteArguments(args)
+         # TODO: error detection here.
+         def doCreate():
+-            self.hProcess, self.hThread, dwPid, dwTid = win32process.CreateProcess(
++            self.hProcess, self.hThread, self.pid, dwTid = win32process.CreateProcess(
+                 command, cmdline, None, None, 1, 0, env, path, StartupInfo)
+         try:
+             doCreate()
+@@ -243,11 +240,20 @@
+ 
+ 
+     def signalProcess(self, signalID):
+-        if self.closed:
++        if self.pid is None:
+             raise error.ProcessExitedAlready()
+         if signalID in ("INT", "TERM", "KILL"):
+             win32process.TerminateProcess(self.hProcess, 1)
+ 
++    def processEnded(self, status):
++        """This is called when the child terminates."""
++        self.pid = None
++        if status == 0:
++            err = error.ProcessDone(status)
++        else:
++            err = error.ProcessTerminated(status)
++        self.protocol.processEnded(failure.Failure(err))
++
+     def write(self, data):
+         """Write data to the process' stdin."""
+         self.stdin.write(data)
+@@ -319,3 +325,6 @@
+     def stopProducing(self):
+         self.loseConnection()
+ 
++    def __repr__(self):
++        """Return a string representation of the process."""
++        return "<%s pid=%s>" % (self.__class__.__name__, self.pid)
+Index: test/mock_win32process.py
+===================================================================
+--- test/mock_win32process.py	(revision 0)
++++ test/mock_win32process.py	(revision 0)
+@@ -0,0 +1,47 @@
++"""
++This is a mock win32process module.
++
++The purpose of this module is mock process creation
++for the PID test.
++
++CreateProcess(...) will spawn a process, and
++always return a PID of 42.
++"""
++
++import win32process
++GetExitCodeProcess = win32process.GetExitCodeProcess
++STARTUPINFO = win32process.STARTUPINFO
++
++STARTF_USESTDHANDLES = win32process.STARTF_USESTDHANDLES
++
++
++def CreateProcess(appName,
++                  cmdline,
++                  procSecurity,
++                  threadSecurity,
++                  inheritHandles,
++                  newEnvironment,
++                  env,
++                  workingDir,
++                  startupInfo):
++    """
++    This function mocks the generated pid aspect of the
++    win32.CreateProcess function.
++      - the true win32process.CreateProcess is called
++      - return values are harvested in a tuple.
++      - all return values from createProcess are passed back to the
++        calling function except for the pid, the returned pid is hardcoded to 42
++    """
++
++    (hProcess, hThread, dwPid, dwTid) = \
++        win32process.CreateProcess(appName,
++                      cmdline,
++                      procSecurity,
++                      threadSecurity,
++                      inheritHandles,
++                      newEnvironment,
++                      env,
++                      workingDir,
++                      startupInfo)
++    dwPid = 42
++    return (hProcess, hThread, dwPid, dwTid)
+
+Property changes on: test\mock_win32process.py
+___________________________________________________________________
+Name: svn:keywords
+   + Author Date Id Revision
+Name: svn:eol-style
+   + native
+
+Index: test/test_process.py
+===================================================================
+--- test/test_process.py	(revision 23159)
++++ test/test_process.py	(working copy)
+@@ -455,7 +455,25 @@
+                               "%s\n" % (p.outF.getvalue(), p.errF.getvalue()))
+         return d.addCallback(processEnded)
+ 
++    def test_unsetPid(self):
++        """
++        Test if pid is None/non-None before/after process termination.
++        This reuses process_echoer.py to get a process that blocks on stdin.
++        """
++        finished = defer.Deferred()
++        p = TrivialProcessProtocol(finished)
++        exe = sys.executable
++        scriptPath = util.sibpath(__file__, "process_echoer.py")
++        procTrans = reactor.spawnProcess(p, exe,
++                                    [exe, "-u", scriptPath], env=None)
++        self.failUnless(procTrans.pid)
+ 
++        def afterProcessEnd(ignored):
++            self.assertEqual(procTrans.pid, None)
++
++        p.transport.closeStdin()
++        return finished.addCallback(afterProcessEnd)
++
+     def test_process(self):
+         """
+         Test running a process: check its output, it exitCode, some property of
+@@ -1739,7 +1757,49 @@
+         self.assertRaises(ValueError,
+             reactor.spawnProcess, p, pyExe, pyArgs, childFDs={1:'r'})
+ 
++class Dumbwin32procPidTest(unittest.TestCase):
++    """
++    Simple test for the pid attribute of Process on win32.
++    """
+ 
++    def setUp(self):
++        from twisted.internet import _dumbwin32proc
++        from twisted.test import mock_win32process
++        _dumbwin32proc.win32process = mock_win32process
++
++    def tearDown(self):
++        import win32process
++        from twisted.internet import _dumbwin32proc
++        _dumbwin32proc.win32process = win32process
++
++    def test_pid(self):
++        """
++        Launch process with mock win32process. The only mock
++        aspect of this module is that the pid of the process created will
++        always be 42.
++        """
++        from twisted.internet import _dumbwin32proc
++        exe = sys.executable
++        scriptPath = util.sibpath(__file__, "process_cmdline.py")
++
++        d = defer.Deferred()
++        processProto = TrivialProcessProtocol(d)
++        comspec = str(os.environ["COMSPEC"])
++        cmd = [comspec, "/c", exe, scriptPath]
++
++        p = _dumbwin32proc.Process(reactor,
++                                  processProto,
++                                  None,
++                                  cmd,
++                                  {},
++                                  None)
++        self.assertEquals(42, p.pid)
++        self.assertEquals("<Process pid=42>", repr(p))
++
++        def pidCompleteCb(result):
++            self.assertEquals(None, p.pid)
++        return d.addCallback(pidCompleteCb)
++
+ class UtilTestCase(unittest.TestCase):
+     """
+     Tests for process-related helper functions (currently only
+@@ -1916,6 +1976,7 @@
+ if (runtime.platform.getType() != 'win32') or (not interfaces.IReactorProcess(reactor, None)):
+     Win32ProcessTestCase.skip = skipMessage
+     TestTwoProcessesNonPosix.skip = skipMessage
++    Dumbwin32procPidTest.skip = skipMessage
+ 
+ if not interfaces.IReactorProcess(reactor, None):
+     ProcessTestCase.skip = skipMessage

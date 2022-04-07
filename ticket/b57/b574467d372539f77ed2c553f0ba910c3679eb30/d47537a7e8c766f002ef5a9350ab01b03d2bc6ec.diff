@@ -1,0 +1,319 @@
+Index: twisted/words/test/test_irc.py
+===================================================================
+--- twisted/words/test/test_irc.py	(revision 26936)
++++ twisted/words/test/test_irc.py	(working copy)
+@@ -15,6 +15,69 @@
+ from twisted.test.proto_helpers import StringTransport, StringIOWithoutClosing
+ 
+ 
++
++class PrefixTests(unittest.TestCase):
++    def test_unknownPrefix(self):
++        """
++        Unknown prefixes have the C{prefix} attribute set, while others remain
++        C{None}, specificallly C{nickname}.
++        """
++        prefix = 'server.host.name'
++        p = irc.Prefix(prefix)
++        self.assertEqual(p.prefix, prefix)
++        self.assertIdentical(p.nickname, None)
++
++        prefix = 'nick!user'
++        p = irc.Prefix(prefix)
++        self.assertEqual(p.prefix, prefix)
++        self.assertIdentical(p.nickname, None)
++        self.assertIdentical(p.realname, None)
++
++
++    def test_weirdUserPrefix(self):
++        """
++        Apparently C{nick@host} is a valid specifier, meaning C{realname}
++        is C{None}.
++        """
++        prefix = 'nick@host'
++        p = irc.Prefix(prefix)
++        self.assertEqual(p.prefix, prefix)
++        self.assertEqual(p.nickname, 'nick')
++        self.assertIdentical(p.realname, None)
++        self.assertEqual(p.host, 'host')
++
++
++    def test_userPrefix(self):
++        """
++        User prefixes are correctly parsed into C{nickname}, C{realname} and
++        C{host} fields.
++        """
++        prefix = 'nick!user@host'
++        p = irc.Prefix(prefix)
++        self.assertEqual(p.prefix, prefix)
++        self.assertEqual(p.nickname, 'nick')
++        self.assertEqual(p.realname, 'user')
++        self.assertEqual(p.host, 'host')
++
++
++    def test_emptyPrefix(self):
++        """
++        Empty prefixes are invalid.
++        """
++        self.assertRaises(ValueError, irc.Prefix, '')
++
++
++    def test_nickOrPrefix(self):
++        """
++        The helper function C{_nickOrPrefix} correctly chooses a nickname over
++        a prefix.
++        """
++        self.assertEqual('foo', irc._nickOrPrefix('foo'))
++        self.assertEqual('bar', irc._nickOrPrefix('bar@foo'))
++        self.assertEqual('bar', irc._nickOrPrefix('bar!quux@foo'))
++
++
++
+ stringSubjects = [
+     "Hello, this is a nice string with no complications.",
+     "xargs%(NUL)smight%(NUL)slike%(NUL)sthis" % {'NUL': irc.NUL },
+Index: twisted/words/protocols/irc.py
+===================================================================
+--- twisted/words/protocols/irc.py	(revision 26936)
++++ twisted/words/protocols/irc.py	(working copy)
+@@ -51,6 +51,71 @@
+ class IRCPasswordMismatch(Exception):
+     pass
+ 
++
++
++def _nickOrPrefix(prefix):
++    """
++    Parse a prefix and get the nickname, otherwise get the prefix.
++    """
++    p = Prefix(prefix)
++    return p.nickname or p.prefix
++
++
++
++class Prefix(object):
++    """
++    An IRC prefix.
++
++    Prefixes can either be a user prefix, which consists of a nickname,
++    user / real name (which is optional) and host; or, an unknown prefix, such
++    as a nickname or server name.
++
++    In the case of an unknown prefix, only the L{prefix} attribute will be
++    valid, while the rest are set to C{None}.
++
++    A reliable method for determining whether a prefix is a user prefix, is to
++    ensure that L{nickname} is not C{None}.
++
++    @type prefix: C{str}
++    @ivar prefix: Original prefix
++
++    @type nickname: C{str}
++    @ivar nickname: User's nickname
++
++    @type realname: C{str}
++    @ivar realname: User's ident / real name
++
++    @type host: C{str}
++    @ivar host: User's host
++    """
++    def __init__(self, prefix):
++        """
++        Parse a prefix.
++
++        @type prefix: C{str}
++        @param prefix: An IRC prefix
++        """
++        nickname = realname = host = None
++
++        if not prefix:
++            raise ValueError('Prefix is empty')
++
++        if '@' in prefix:
++            nickname, host = prefix.split('@', 1)
++        if nickname is not None and '!' in nickname:
++            nickname, realname = nickname.split('!', 1)
++
++        self.prefix = prefix
++        self.nickname = nickname
++        self.realname = realname
++        self.host = host
++
++
++    def __repr__(self):
++        return '<%s %r>' % (type(self).__name__, self.prefix)
++
++
++
+ def parsemsg(s):
+     """Breaks a message from an IRC server into its prefix, command, and arguments.
+     """
+@@ -1169,7 +1234,7 @@
+         """
+         Called when a user joins a channel.
+         """
+-        nick = string.split(prefix,'!')[0]
++        nick = _nickOrPrefix(prefix)
+         channel = params[-1]
+         if nick == self.nickname:
+             self.joined(channel)
+@@ -1180,7 +1245,7 @@
+         """
+         Called when a user leaves a channel.
+         """
+-        nick = string.split(prefix,'!')[0]
++        nick = _nickOrPrefix(prefix)
+         channel = params[0]
+         if nick == self.nickname:
+             self.left(channel)
+@@ -1191,7 +1256,7 @@
+         """
+         Called when a user has quit.
+         """
+-        nick = string.split(prefix,'!')[0]
++        nick = _nickOrPrefix(prefix)
+         self.userQuit(nick, params[0])
+ 
+ 
+@@ -1283,7 +1348,7 @@
+         """
+         Called when a user changes their nickname.
+         """
+-        nick = string.split(prefix,'!', 1)[0]
++        nick = _nickOrPrefix(prefix)
+         if nick == self.nickname:
+             self.nickChanged(params[0])
+         else:
+@@ -1293,7 +1358,7 @@
+         """
+         Called when a user is kicked from a channel.
+         """
+-        kicker = string.split(prefix,'!')[0]
++        kicker = _nickOrPrefix(prefix)
+         channel = params[0]
+         kicked = params[1]
+         message = params[-1]
+@@ -1307,7 +1372,7 @@
+         """
+         Someone in the channel set the topic.
+         """
+-        user = string.split(prefix, '!')[0]
++        user = _nickOrPrefix(prefix)
+         channel = params[0]
+         newtopic = params[1]
+         self.topicUpdated(user, channel, newtopic)
+@@ -1317,13 +1382,13 @@
+         Called when the topic for a channel is initially reported or when it
+         subsequently changes.
+         """
+-        user = string.split(prefix, '!')[0]
++        user = _nickOrPrefix(prefix)
+         channel = params[1]
+         newtopic = params[2]
+         self.topicUpdated(user, channel, newtopic)
+ 
+     def irc_RPL_NOTOPIC(self, prefix, params):
+-        user = string.split(prefix, '!')[0]
++        user = _nickOrPrefix(prefix)
+         channel = params[1]
+         newtopic = ""
+         self.topicUpdated(user, channel, newtopic)
+@@ -1408,7 +1473,7 @@
+         self.action(user, channel, data)
+ 
+     def ctcpQuery_PING(self, user, channel, data):
+-        nick = string.split(user,"!")[0]
++        nick = _nickOrPrefix(user)
+         self.ctcpMakeReply(nick, [("PING", data)])
+ 
+     def ctcpQuery_FINGER(self, user, channel, data):
+@@ -1423,7 +1488,7 @@
+         else:
+             reply = str(self.fingerReply)
+ 
+-        nick = string.split(user,"!")[0]
++        nick = _nickOrPrefix(user)
+         self.ctcpMakeReply(nick, [('FINGER', reply)])
+ 
+     def ctcpQuery_VERSION(self, user, channel, data):
+@@ -1432,7 +1497,7 @@
+                                % (user, data))
+ 
+         if self.versionName:
+-            nick = string.split(user,"!")[0]
++            nick = _nickOrPrefix(user)
+             self.ctcpMakeReply(nick, [('VERSION', '%s:%s:%s' %
+                                        (self.versionName,
+                                         self.versionNum,
+@@ -1443,7 +1508,7 @@
+             self.quirkyMessage("Why did %s send '%s' with a SOURCE query?"
+                                % (user, data))
+         if self.sourceURL:
+-            nick = string.split(user,"!")[0]
++            nick = _nickOrPrefix(user)
+             # The CTCP document (Zeuge, Rollo, Mesander 1994) says that SOURCE
+             # replies should be responded to with the location of an anonymous
+             # FTP server in host:directory:file format.  I'm taking the liberty
+@@ -1456,7 +1521,7 @@
+             self.quirkyMessage("Why did %s send '%s' with a USERINFO query?"
+                                % (user, data))
+         if self.userinfo:
+-            nick = string.split(user,"!")[0]
++            nick = _nickOrPrefix(user)
+             self.ctcpMakeReply(nick, [('USERINFO', self.userinfo)])
+ 
+     def ctcpQuery_CLIENTINFO(self, user, channel, data):
+@@ -1467,7 +1532,7 @@
+         the usage of that tag.
+         """
+ 
+-        nick = string.split(user,"!")[0]
++        nick = _nickOrPrefix(user)
+         if not data:
+             # XXX: prefixedMethodNames gets methods from my *class*,
+             # but it's entirely possible that this *instance* has more
+@@ -1493,7 +1558,7 @@
+     def ctcpQuery_ERRMSG(self, user, channel, data):
+         # Yeah, this seems strange, but that's what the spec says to do
+         # when faced with an ERRMSG query (not a reply).
+-        nick = string.split(user,"!")[0]
++        nick = _nickOrPrefix(user)
+         self.ctcpMakeReply(nick, [('ERRMSG',
+                                    "%s :No error has occoured." % data)])
+ 
+@@ -1501,7 +1566,7 @@
+         if data is not None:
+             self.quirkyMessage("Why did %s send '%s' with a TIME query?"
+                                % (user, data))
+-        nick = string.split(user,"!")[0]
++        nick = _nickOrPrefix(user)
+         self.ctcpMakeReply(nick,
+                            [('TIME', ':%s' %
+                              time.asctime(time.localtime(time.time())))])
+@@ -1519,7 +1584,7 @@
+             data = data[len(dcctype)+1:]
+             handler(user, channel, data)
+         else:
+-            nick = string.split(user,"!")[0]
++            nick = _nickOrPrefix(user)
+             self.ctcpMakeReply(nick, [('ERRMSG',
+                                        "DCC %s :Unknown DCC type '%s'"
+                                        % (data, dcctype))])
+@@ -1629,7 +1694,7 @@
+     #    raise NotImplementedError
+ 
+     def ctcpUnknownQuery(self, user, channel, tag, data):
+-        nick = string.split(user,"!")[0]
++        nick = _nickOrPrefix(user)
+         self.ctcpMakeReply(nick, [('ERRMSG',
+                                    "%s %s: Unknown query '%s'"
+                                    % (tag, data, tag))])
+@@ -1672,7 +1737,7 @@
+                 self.ctcpUnknownReply(user, channel, m[0], m[1])
+ 
+     def ctcpReply_PING(self, user, channel, data):
+-        nick = user.split('!', 1)[0]
++        nick = _nickOrPrefix(user)
+         if (not self._pings) or (not self._pings.has_key((nick, data))):
+             raise IRCBadMessage,\
+                   "Bogus PING response from %s: %s" % (user, data)

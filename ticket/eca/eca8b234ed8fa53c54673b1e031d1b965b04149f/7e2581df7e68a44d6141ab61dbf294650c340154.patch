@@ -1,0 +1,209 @@
+Index: twisted/python/log.py
+===================================================================
+--- twisted/python/log.py	(revision 32317)
++++ twisted/python/log.py	(working copy)
+@@ -193,8 +193,8 @@
+         occurred.
+     @type _why: C{str}
+     """
+-    if _stuff is None:
+-        _stuff = failure.Failure()
++    if _stuff is None or isinstance(_stuff, Exception):
++        _stuff = failure.Failure(_stuff)
+     if isinstance(_stuff, failure.Failure):
+         if _keepErrors:
+             if _ignoreErrors:
+@@ -210,9 +210,7 @@
+                     _keptErrors.append(_stuff)
+             else:
+                 _keptErrors.append(_stuff)
+-        msg(failure=_stuff, why=_why, isError=1, **kw)
+-    elif isinstance(_stuff, Exception):
+-        msg(failure=failure.Failure(_stuff), why=_why, isError=1, **kw)
++        theLogPublisher.err(_stuff, _why, **kw)
+     else:
+         msg(repr(_stuff), why=_why, isError=1, **kw)
+ 
+@@ -279,28 +277,55 @@
+         actualEventDict.update(kw)
+         actualEventDict['message'] = message
+         actualEventDict['time'] = time.time()
+-        for i in xrange(len(self.observers) - 1, -1, -1):
++        failed = []
++        for observer in reversed(self.observers):
+             try:
+-                self.observers[i](actualEventDict)
++                observer(actualEventDict)
+             except KeyboardInterrupt:
+                 # Don't swallow keyboard interrupt!
+                 raise
+             except UnicodeEncodeError:
+                 raise
+             except:
+-                observer = self.observers[i]
+-                self.observers[i] = lambda event: None
+                 try:
+-                    err(failure.Failure(),
+-                        "Log observer %s failed." % (observer,))
+-                except:
+-                    # Sometimes err() will throw an exception,
+-                    # e.g. RuntimeError due to blowing the stack; if that
+-                    # happens, there's not much we can do...
++                    stuff = failure.Failure()
++                    why = "Log observer %s failed." % (observer,)
++                    publisher = LogPublisher()
++                    for o in self.observers:
++                        if o != observer:
++                            publisher.addObserver(o)
++                    failed.append((publisher, stuff, why))
++                except Exception:
++                    # OOM, stack overflow or an observer with broken __eq__ or
++                    # __str__. Give up.
+                     pass
+-                self.observers[i] = observer
++        for publisher, stuff, why in failed:
++            publisher.err(stuff, why)
+ 
+ 
++    def err(self, _stuff=None, _why=None, **kw):
++        """
++        Write a failure to the log.
++
++        The C{_stuff} and C{_why} parameters use an underscore prefix to lessen
++        the chance of colliding with a keyword argument the application wishes
++        to pass.  It is intended that they be supplied with arguments passed
++        positionally, not by keyword.
++
++        @param _stuff: The failure to log.  If C{_stuff} is C{None} a new
++            L{Failure} will be created from the current exception state.  If
++            C{_stuff} is an C{Exception} instance it will be wrapped in a
++            L{Failure}.
++        @type _stuff: C{NoneType}, C{Exception}, or L{Failure}.
++
++        @param _why: The source of this failure.  This will be logged along
++            with C{_stuff} and should describe the context in which the failure
++            occurred.
++        @type _why: C{str}
++        """
++        self.msg(failure=failure.Failure(_stuff), why=_why, isError=1, **kw)
++
++
+     def showwarning(self, message, category, filename, lineno, file=None,
+                     line=None):
+         """
+Index: twisted/test/test_log.py
+===================================================================
+--- twisted/test/test_log.py	(revision 32317)
++++ twisted/test/test_log.py	(working copy)
+@@ -97,11 +97,7 @@
+             # Send out the event which will break one of the observers.
+             log.msg("Howdy, y'all.")
+ 
+-            # The broken observer should have caused this to be logged.  There
+-            # is a slight bug with LogPublisher - when it logs an error from an
+-            # observer, it uses the global "err", which is not necessarily
+-            # associated with it, but which may be associated with a different
+-            # LogPublisher!  See #3307.
++            # The broken observer should have caused this to be logged.
+             excs = self.flushLoggedErrors(ZeroDivisionError)
+             self.assertEqual(len(excs), 1)
+ 
+@@ -109,9 +105,7 @@
+             self.assertEquals(len(L1), 2)
+             self.assertEquals(len(L2), 2)
+ 
+-            # The order is slightly wrong here.  The first event should be
+-            # delivered to all observers; then, errors should be delivered.
+-            self.assertEquals(L1[1]['message'], ("Howdy, y'all.",))
++            self.assertEquals(L1[0]['message'], ("Howdy, y'all.",))
+             self.assertEquals(L2[0]['message'], ("Howdy, y'all.",))
+ 
+ 
+@@ -231,6 +225,75 @@
+                                        line))
+ 
+ 
++    def test_publisherLocalyReportsBrokenObservers(self):
++        """
++        Log publisher does not use the global L{log.err} when reporting broken
++        observers.
++        """
++        errors = []
++        def logError(eventDict):
++            if eventDict.get("isError"):
++                errors.append(eventDict["failure"].value)
++
++        def fail(eventDict):
++            raise RuntimeError("test_publisherLocalyReportsBrokenObservers")
++
++        publisher = log.LogPublisher()
++        publisher.addObserver(logError)
++        publisher.addObserver(fail)
++
++        publisher.msg("Hello!")
++        self.assertEqual(publisher.observers, [logError, fail])
++        self.assertEqual(len(errors), 1)
++        self.assertIsInstance(errors[0], RuntimeError)
++
++
++    def test_removeObserverDuringMsg(self):
++        """
++        Removing an observer during L{log.msg} call has no ill effects.
++        """
++        publisher = log.LogPublisher()
++
++        def dummyObserver(eventDict):
++            pass
++
++        def evilObserver(eventdict):
++            for i in range(2):
++                publisher.removeObserver(dummyObserver)
++
++        for i in range(2):
++            publisher.addObserver(dummyObserver)
++        publisher.addObserver(evilObserver)
++        publisher.msg("Hello!")
++        self.assertEqual(publisher.observers, [evilObserver])
++
++
++    def test_removeObserverAndRaiseDuringMsg(self):
++        """
++        An observer that removes itself by calling L{log.removeObserver} and
++        then raises an error has no ill effect on L{log.msg}.
++        """
++        errors = []
++        def logError(eventDict):
++            if eventDict.get("isError"):
++                errors.append(eventDict["failure"].value)
++
++
++        def stupidObserver(eventDict):
++            publisher.removeObserver(stupidObserver)
++            raise RuntimeError("test_removeObserverAndRaise")
++
++        publisher = log.LogPublisher()
++        publisher.addObserver(logError)
++        publisher.addObserver(stupidObserver)
++
++        publisher.msg("Hello!")
++        self.assertEqual(publisher.observers, [logError])
++        self.assertEqual(len(errors), 1)
++        self.assertIsInstance(errors[0], RuntimeError)
++
++
++
+ class FakeFile(list):
+     def write(self, bytes):
+         self.append(bytes)
+Index: twisted/topfiles/3307.bugfix
+===================================================================
+--- twisted/topfiles/3307.bugfix	(revision 0)
++++ twisted/topfiles/3307.bugfix	(revision 0)
+@@ -0,0 +1 @@
++LogPublishers don't use the global log publisher for reporting broken observers anymore.
+Index: twisted/topfiles/5194.bugfix
+===================================================================
+--- twisted/topfiles/5194.bugfix	(revision 0)
++++ twisted/topfiles/5194.bugfix	(revision 0)
+@@ -0,0 +1 @@
++twisted.python.log now copes with log observers that are removed during log.msg calls.

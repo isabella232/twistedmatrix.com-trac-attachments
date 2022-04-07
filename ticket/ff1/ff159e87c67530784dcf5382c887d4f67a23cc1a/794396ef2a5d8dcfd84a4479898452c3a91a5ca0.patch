@@ -1,0 +1,214 @@
+Index: twisted/internet/defer.py
+===================================================================
+--- twisted/internet/defer.py	(revision 29941)
++++ twisted/internet/defer.py	(working copy)
+@@ -904,7 +904,7 @@
+ 
+ 
+ 
+-def _inlineCallbacks(result, g, deferred):
++def _inlineCallbacks(result, g, deferred, state):
+     """
+     See L{inlineCallbacks}.
+     """
+@@ -927,7 +927,7 @@
+         except StopIteration:
+             # fell off the end, or "return" statement
+             deferred.callback(None)
+-            return deferred
++            return
+         except _DefGen_Return, e:
+             # returnValue() was called; time to give a result to the original
+             # Deferred.  First though, let's try to identify the potentially
+@@ -967,10 +967,10 @@
+                         appCodeTrace.tb_frame.f_code.co_name),
+                     DeprecationWarning, filename, lineno)
+             deferred.callback(e.value)
+-            return deferred
++            return
+         except:
+             deferred.errback()
+-            return deferred
++            return
+ 
+         if isinstance(result, Deferred):
+             # a deferred was yielded, get the result.
+@@ -979,14 +979,23 @@
+                     waiting[0] = False
+                     waiting[1] = r
+                 else:
+-                    _inlineCallbacks(r, g, deferred)
++                    state[0] = None # we are not waiting for deferred result any more
++                    if state[1]: # if cancelling in progress
++                        # in this case r is normally result of cancel (Failure(CancelledError))
++                        g.close() # stop generator
++                        if isinstance(r, failure.Failure): # cunsume only CancelledError
++                            r.trap(CancelledError)
++                            return None
++                    else:
++                        _inlineCallbacks(r, g, deferred, state)
+ 
+             result.addBoth(gotResult)
+             if waiting[0]:
+                 # Haven't called back yet, set flag so that we get reinvoked
+                 # and return from the loop
+                 waiting[0] = False
+-                return deferred
++                state[0] = result # store deferred result we are waiting for
++                return
+ 
+             result = waiting[1]
+             # Reset waiting to initial values for next loop.  gotResult uses
+@@ -999,6 +1008,27 @@
+             waiting[1] = None
+ 
+ 
++
++def startInlineCallbacks(g, deferred):
++    """
++    See L{inlineCallbacks}.
++    """
++    state = [
++        None, # deferred result we are waiting for or None
++        False, # cancelling flag
++    ]
++
++    # start cancelling process when deferred finished while we waiting for result
++    def finish(result):
++        if state[0] is not None:
++            state[1] = True
++            state[0].cancel()
++            state[0] = None
++        return result
++    deferred.addBoth(finish)
++
++    _inlineCallbacks(None, g, deferred, state)
++
+     return deferred
+ 
+ 
+@@ -1042,9 +1072,14 @@
+                 # will trigger an errback
+                 raise Exception('DESTROY ALL LIFE')
+         thingummy = inlineCallbacks(thingummy)
++
++    You can cancel (or even errback or callback) the L{Deferred} returned from
++    your deferred generator before it errback or callback by generator result.
++    In this case yield throws standard GeneratorExit exception. And if generator is
++    waiting for other deferred it will be cancelled too.
+     """
+     def unwindGenerator(*args, **kwargs):
+-        return _inlineCallbacks(None, f(*args, **kwargs), Deferred())
++        return startInlineCallbacks(f(*args, **kwargs), Deferred())
+     return mergeFunctionMetadata(f, unwindGenerator)
+ 
+ 
+Index: twisted/test/test_defgen.py
+===================================================================
+--- twisted/test/test_defgen.py	(revision 29941)
++++ twisted/test/test_defgen.py	(working copy)
+@@ -179,6 +179,7 @@
+ ## syntax error in Python 2.4 and before.
+ inlineCallbacksTestsSource = '''
+ from twisted.internet.defer import inlineCallbacks, returnValue
++from twisted.python.failure import Failure
+ 
+ class InlineCallbacksTests(BaseDefgenTests, unittest.TestCase):
+     # First provide all the generator impls necessary for BaseDefgenTests
+@@ -238,6 +239,15 @@
+         returnValue(0)
+     _genStackUsage2 = inlineCallbacks(_genStackUsage2)
+ 
++    def _genExpectCancelling(self, result_holder=[None], getChildThing=getThing):
++        try:
++            x = yield getChildThing()
++        except GeneratorExit:
++            result_holder[0] = 'GeneratorExit'
++            raise
++        returnValue(x)
++    _genExpectCancelling = inlineCallbacks(_genExpectCancelling)
++
+     # Tests unique to inlineCallbacks
+ 
+     def testYieldNonDeferrred(self):
+@@ -270,6 +280,80 @@
+ 
+         return _return().addCallback(self.assertEqual, 6)
+ 
++    def testCascadeCancelling(self):
++        """Ensure cascade cancelling."""
++        child_result_holder = ['FAILURE']
++        def getChildThing():
++            d = Deferred()
++            def _eb(result):
++                child_result_holder[0] = 'SUCCESS'
++                return result
++            d.addErrback(_eb)
++            return d
++        d = self._genExpectCancelling(getChildThing=getChildThing)
++        d.addErrback(lambda result: None)
++        d.cancel()
++        self.assertEqual(child_result_holder[0], 'SUCCESS', "no cascade cancelling occurs")
++
++    def testCorrectChildErrbackWhenCascadeCancelling(self):
++        """Ensure child errback with correct value when cascade cancelling."""
++        class MyCancelledError(defer.CancelledError):
++            pass
++        def my_canceller(deferred):
++            deferred.errback(MyCancelledError())
++        child_result_holder = ['FAILURE']
++        def getChildThing():
++            d = Deferred(my_canceller)
++            def _eb(result):
++                if result.check(MyCancelledError):
++                    child_result_holder[0] = 'SUCCESS'
++                return result
++            d.addErrback(_eb)
++            return d
++        d = self._genExpectCancelling(getChildThing=getChildThing)
++        d.addErrback(lambda result: None)
++        d.cancel()
++        self.assertEqual(
++            child_result_holder[0], 'SUCCESS',
++            "child does not errback with correct value"
++        )
++
++    def testNoErroneousBubbledCancelledErrorWhenCascadeCancelling(self):
++        """Ensure no erroneous bubbled CancelledError when cascade cancelling."""
++        class MyError(Exception):
++            pass
++        d = self._genExpectCancelling()
++        def _errback(fail):
++            self.assertTrue(fail.check(MyError), "deferred errback with wrong result")
++        d.addErrback(_errback)
++        d.errback(MyError())
++
++    def testChildErrorNotConsumedWhenCascadeCancelling(self):
++        """Ensure child error not consumed when cascade cancelling."""
++        class MyError(ValueError):
++            pass
++        def my_canceller(deferred):
++            deferred.errback(MyError())
++        def getChildThing():
++            d = Deferred(my_canceller)
++            return d
++        d = self._genExpectCancelling(getChildThing=getChildThing)
++        d.addErrback(lambda result: None)
++        d.cancel()
++        errors = self.flushLoggedErrors(MyError)
++        self.assertEquals(len(errors), 1, "exception consumed")
++        errors[0].trap(MyError)
++
++    def testGeneratorStopsWhenCancelling(self):
++        """Ensure generator stops when cancelling."""
++        result_holder = [None]
++        d = self._genExpectCancelling(result_holder=result_holder)
++        d.addErrback(lambda fail: None)
++        d.cancel()
++        self.assertEqual(
++            result_holder[0], 'GeneratorExit',
++            "generator does not stop with GeneratorExit"
++        )
+ '''
+ 
+ if sys.version_info > (2, 5):

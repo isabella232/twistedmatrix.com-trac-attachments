@@ -1,0 +1,237 @@
+# Bazaar merge directive format 2 (Bazaar 0.90)
+# revision_id: hs@ox.cx-20130120223509-hncc428ohhsp0rwv
+# target_branch: file:///Users/hynek/Projects/Twisted/trunk/
+# testament_sha1: 72dd321d00950e898b1654c7c31421084391a82e
+# timestamp: 2013-01-20 23:36:07 +0100
+# base_revision_id: svn-v4:bbbe8e31-12d6-0310-92fd-\
+#   ac37d47ddeeb:trunk:36805
+# 
+# Begin patch
+=== modified file 'twisted/internet/ssl.py'
+--- twisted/internet/ssl.py	2012-11-06 14:15:38 +0000
++++ twisted/internet/ssl.py	2013-01-20 22:30:48 +0000
+@@ -22,6 +22,8 @@
+ from __future__ import division, absolute_import
+ 
+ # System imports
++import warnings
++
+ from OpenSSL import SSL
+ supported = True
+ 
+@@ -56,7 +58,9 @@
+                  sslmethod=SSL.SSLv23_METHOD, _contextFactory=SSL.Context):
+         """
+         @param privateKeyFileName: Name of a file containing a private key
+-        @param certificateFileName: Name of a file containing a certificate
++        @param certificateFileName: Name of a file containing a certificate. It
++            is possible to supply chain certificates by concatenating them to
++            the file.
+         @param sslmethod: The SSL method to use
+         """
+         self.privateKeyFileName = privateKeyFileName
+@@ -76,7 +80,19 @@
+             # Disallow SSLv2!  It's insecure!  SSLv3 has been around since
+             # 1996.  It's time to move on.
+             ctx.set_options(SSL.OP_NO_SSLv2)
+-            ctx.use_certificate_file(self.certificateFileName)
++
++            if hasattr(self._contextFactory, 'use_certificate_chain_file'):
++                try:
++                    ctx.use_certificate_chain_file(self.certificateFileName)
++                except SSL.Error:
++                    # The retry is necessary since C{use_certificate_file}
++                    # allows more input formats than the chain variant which
++                    # supports only PEM.
++                    ctx.use_certificate_file(self.certificateFileName)
++            else:
++                warnings.warn('Chained certificates are unavailable. Use '
++                              'PyOpenSSL >= 0.10 if you need this feature.')
++                ctx.use_certificate_file(self.certificateFileName)
+             ctx.use_privatekey_file(self.privateKeyFileName)
+             self._context = ctx
+ 
+
+=== modified file 'twisted/test/test_ssl.py'
+--- twisted/test/test_ssl.py	2012-11-06 14:15:38 +0000
++++ twisted/test/test_ssl.py	2013-01-20 22:35:09 +0000
+@@ -623,13 +623,18 @@
+ 
+ 
+ 
+-class FakeContext:
++class OldFakeContext:
+     """
+     L{OpenSSL.SSL.Context} double which can more easily be inspected.
++
++    This simulates PyOpenSSL version < 0.10 which doesn't have
++    C{use_certificate_chain_file} yet.
+     """
+     def __init__(self, method):
+         self._method = method
+         self._options = 0
++        self._use_certificate_file_calledWith = []
++        self._use_privatekey_file_calledWith = []
+ 
+ 
+     def set_options(self, options):
+@@ -637,11 +642,26 @@
+ 
+ 
+     def use_certificate_file(self, fileName):
+-        pass
++        self._use_certificate_file_calledWith.append(fileName)
+ 
+ 
+     def use_privatekey_file(self, fileName):
+-        pass
++        self._use_privatekey_file_calledWith.append(fileName)
++
++
++
++class FakeContext(OldFakeContext):
++    """
++    Adds C{use_certificate_chain_file} to L{OldFakeContext} and introspection
++    thereof.
++    """
++    def __init__(self, method):
++        OldFakeContext.__init__(self, method)
++        self._use_certificate_chain_file_calledWith = []
++
++
++    def use_certificate_chain_file(self, fileName):
++        self._use_certificate_chain_file_calledWith.append(fileName)
+ 
+ 
+ 
+@@ -695,6 +715,52 @@
+             ssl.DefaultOpenSSLContextFactory, self.mktemp(), certPath)
+ 
+ 
++    def test_chainLoaderNotAvailable(self):
++        """
++        PyOpenSSL < 0.10 is still supported but lacks support for chained
++        certificates. Ensure we fall back and warn the user.
++        """
++        ctx = ssl.DefaultOpenSSLContextFactory(
++            certPath, certPath,
++            _contextFactory=OldFakeContext)._context
++        self.assertEqual([certPath], ctx._use_certificate_file_calledWith)
++        warns = self.flushWarnings(
++            offendingFunctions=[ssl.DefaultOpenSSLContextFactory.cacheContext])
++        self.assertEqual(1, len(warns))
++        self.assertTrue(warns[0]['message'].startswith('Chained certificates'))
++
++
++    def test_chainLoaderIsAvailable(self):
++        """
++        Ensure L{SSL.Context.use_certificate_chain_file} is called if
++        available.
++        """
++        self.assertEqual(
++            [certPath], self.context._use_certificate_chain_file_calledWith)
++        self.assertEqual([], self.context._use_certificate_file_calledWith)
++
++
++    def test_certificateIsNotPEMEncoded(self):
++        """
++        Nowadays it's preferable to use
++        L{SSL.Context.use_certificate_chain_file} over
++        L{SSL.Context.use_certificate_file}.  However, the former accepts only
++        PEM encoded certificates while the latter is more general.  Therefore
++        if C{use_certificate_chain_file} fails, it's possible a non-PEM
++        certificate has been supplied and we have to re-try using
++        C{use_certificate_file}.
++        """
++        class FakeContextRaiseOnChain(FakeContext):
++            def use_certificate_chain_file(self, fileName):
++                raise SSL.Error()
++
++        factory = ssl.DefaultOpenSSLContextFactory(
++            certPath, certPath,
++            _contextFactory=FakeContextRaiseOnChain)
++        self.assertEqual(
++            [certPath],
++            factory._context._use_certificate_file_calledWith)
++
+ 
+ class ClientContextFactoryTests(unittest.TestCase):
+     """
+
+=== added file 'twisted/topfiles/6258.feature'
+--- twisted/topfiles/6258.feature	1970-01-01 00:00:00 +0000
++++ twisted/topfiles/6258.feature	2013-01-16 10:50:01 +0000
+@@ -0,0 +1,1 @@
++twisted.internet.ssl.DefaultOpenSSLContextFactory now supports chained certificate files.
+
+# Begin bundle
+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
+D3p71sNUQ/8XckU4UJCSeLZR

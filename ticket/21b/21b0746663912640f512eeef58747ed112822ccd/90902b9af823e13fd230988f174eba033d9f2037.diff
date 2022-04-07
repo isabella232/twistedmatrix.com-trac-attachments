@@ -1,0 +1,217 @@
+diff --git a/twisted/internet/endpoints.py b/twisted/internet/endpoints.py
+index 238c272..b89da3c 100644
+--- a/twisted/internet/endpoints.py
++++ b/twisted/internet/endpoints.py
+@@ -1291,8 +1291,8 @@ def _tokenize(description):
+             _STRING, 'world'
+     """
+     current = ''
+-    ops = ':='
+-    nextOps = {':': ':=', '=': ':'}
++    ops = ':=,'
++    nextOps = {':': ':=', '=': ':', ',': ':'}
+     description = iter(description)
+     for n in description:
+         if n in ops:
+@@ -1313,6 +1313,9 @@ def _parse(description):
+     Convert a description string into a list of positional and keyword
+     parameters, using logic vaguely like what Python does.
+ 
++    If the string contains multiple comma-separated descriptions, the
++    positional and keyword parameters are yielded separately for each one.
++
+     @param description: a string as described by L{serverFromString} or
+         L{clientFromString}.
+ 
+@@ -1334,8 +1337,11 @@ def _parse(description):
+         elif value == ':':
+             add(sofar)
+             sofar = ()
++        elif value == ',':
++            yield args, kw
++            args, kw = [], {}
+     add(sofar)
+-    return args, kw
++    yield args, kw
+ 
+ 
+ # Mappings from description "names" to endpoint constructors.
+@@ -1374,7 +1380,7 @@ def _parseServer(description, factory, default=None):
+ 
+     @return: a 3-tuple of (plugin or name, arguments, keyword arguments)
+     """
+-    args, kw = _parse(description)
++    args, kw = _parse(description).next()
+     if not args or (len(args) == 1 and not kw):
+         deprecationMessage = (
+             "Unqualified strport description passed to 'service'."
+@@ -1518,6 +1524,41 @@ def quoteStringArgument(argument):
+ 
+ 
+ 
++# No configuration parameters for any internal endpoint parsers yet
++_clientConfigurers = {
++    'TCP': None,
++    'SSL': None,
++    'UNIX': None,
++    }
++
++def setClientConfig(descriptions):
++    """
++    Configure client endpoint string parsers from the provided descriptions
++    string.
++
++    @param descriptions: A comma-separated list of strports descriptions.
++    @type descriptions: L{bytes}
++
++    @since: 1X.X
++    """
++    for args, kwargs in _parse(descriptions):
++        aname = args.pop(0)
++        name = aname.upper()
++        for plugin in getPlugins(IStreamClientEndpointStringParserWithReactor):
++            if plugin.prefix.upper() == name:
++                if not hasattr(plugin, "setClientConfig"):
++                    raise ValueError("Endpoint type %r doesn't support client parser configuration" % (aname,))
++                plugin.setClientConfig(**kwargs)
++                break
++        else:
++            if name not in _clientConfigurers:
++                raise ValueError("Unknown endpoint type: %r" % (aname,))
++            if not _clientConfigurers[name]:
++                raise ValueError("Endpoint type %r doesn't support client parser configuration" % (aname,))
++            _clientConfigurers[name](**kwargs)
++
++
++
+ def _parseClientTCP(*args, **kwargs):
+     """
+     Perform any argument value coercion necessary for TCP client parameters.
+@@ -1748,7 +1789,7 @@ def clientFromString(reactor, description):
+ 
+     @since: 10.2
+     """
+-    args, kwargs = _parse(description)
++    args, kwargs = _parse(description).next()
+     aname = args.pop(0)
+     name = aname.upper()
+     for plugin in getPlugins(IStreamClientEndpointStringParserWithReactor):
+diff --git a/twisted/internet/interfaces.py b/twisted/internet/interfaces.py
+index 79ee904..f04b689 100644
+--- a/twisted/internet/interfaces.py
++++ b/twisted/internet/interfaces.py
+@@ -2670,6 +2670,18 @@ class IStreamClientEndpointStringParserWithReactor(Interface):
+     )
+ 
+ 
++    def setClientConfig(**kwargs):
++        """
++        This method is invoked by L{endpoints.setClientConfig}, if the type of
++        endpoint matches the return value from this
++        L{IStreamClientEndpointStringParserWithReactor}'s C{prefix} method.
++
++        @param kwargs: The byte string arguments from the endpoint description
++            passed as keyword arguments.  For example, if the description were
++            C{b"my-type:foo=bar:baz=qux"}, C{kwargs} would be
++            C{dict(foo=b'bar', baz=b'qux')}.
++        """
++
+     def parseStreamClient(reactor, *args, **kwargs):
+         """
+         This method is invoked by L{endpoints.clientFromString}, if the type of
+diff --git a/twisted/internet/test/fakeendpoint.py b/twisted/internet/test/fakeendpoint.py
+index ce8fce1..252a072 100644
+--- a/twisted/internet/test/fakeendpoint.py
++++ b/twisted/internet/test/fakeendpoint.py
+@@ -26,15 +26,19 @@ class PluginBase(object):
+ class FakeClientParser(PluginBase):
+ 
+     def parseStreamClient(self, *a, **kw):
+-        return StreamClient(self, a, kw)
++        return StreamClient(self, a, kw, None)
+ 
+ 
+ 
+ @implementer(IStreamClientEndpointStringParserWithReactor)
+ class FakeClientParserWithReactor(PluginBase):
++    _config = None
++
++    def setClientConfig(self, **kw):
++        FakeClientParserWithReactor._config = kw
+ 
+     def parseStreamClient(self, *a, **kw):
+-        return StreamClient(self, a, kw)
++        return StreamClient(self, a, kw, FakeClientParserWithReactor._config)
+ 
+ 
+ 
+@@ -57,7 +61,10 @@ class EndpointBase(object):
+ 
+ @implementer(IStreamClientEndpoint)
+ class StreamClient(EndpointBase):
+-    pass
++
++    def __init__(self, parser, args, kwargs, config):
++        EndpointBase.__init__(self, parser, args, kwargs)
++        self.config = config
+ 
+ 
+ 
+diff --git a/twisted/internet/test/test_endpoints.py b/twisted/internet/test/test_endpoints.py
+index 41983e2..ad65fc4 100644
+--- a/twisted/internet/test/test_endpoints.py
++++ b/twisted/internet/test/test_endpoints.py
+@@ -2675,6 +2675,53 @@ def addFakePlugin(testCase, dropinSource="fakeendpoint.py"):
+ 
+ 
+ 
++class ClientParserConfigTests(unittest.TestCase):
++    """
++    Tests for L{twisted.internet.endpoints.stripClientString}.
++    """
++
++    def test_clientConfig(self):
++        """
++        L{endpoints.clientFromString} looks up plugins of type
++        L{IStreamClientEndpoint} and constructs endpoints from them.
++        """
++        addFakePlugin(self)
++        endpoints.setClientConfig(b"crfake:foo=bar:spam=eggs")
++        notAReactor = object()
++        clientEndpoint = endpoints.clientFromString(
++            notAReactor, b"crfake:alpha:beta:cee=dee:num=1")
++        self.assertEqual(clientEndpoint.config, dict(foo=b'bar', spam=b'eggs'))
++
++
++    def test_unknownType(self):
++        """
++        L{endpoints.setClientConfig} raises C{ValueError} when given an
++        unknown endpoint type.
++        """
++        value = self.assertRaises(
++            # faster-than-light communication not supported
++            ValueError, endpoints.setClientConfig,
++            b"ftl:andromeda/carcosa/hali/2387")
++        self.assertEqual(
++            str(value),
++            "Unknown endpoint type: 'ftl'")
++
++
++    def test_unconfigurableType(self):
++        """
++        L{endpoints.setClientConfig} raises C{ValueError} when given an
++        unconfigurable endpoint type.
++        """
++        value = self.assertRaises(
++            # no internal parsers support configuration
++            ValueError, endpoints.setClientConfig,
++            b"tcp:example.com:1234")
++        self.assertEqual(
++            str(value),
++            "Endpoint type 'tcp' doesn't support client parser configuration")
++
++
++
+ class ClientStringTests(unittest.TestCase):
+     """
+     Tests for L{twisted.internet.endpoints.clientFromString}.

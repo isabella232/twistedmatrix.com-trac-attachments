@@ -1,0 +1,150 @@
+Index: twisted/internet/_pollingfile.py
+===================================================================
+--- twisted/internet/_pollingfile.py	(revision 38381)
++++ twisted/internet/_pollingfile.py	(working copy)
+@@ -183,11 +183,18 @@
+     def close(self):
+         self.disconnecting = True
+ 
++
+     def bufferFull(self):
+-        if self.producer is not None:
++        """
++        Called when the write buffer is full. Pauses producer if not already
++        paused and the producer is a push producer.
++        """
++        if self.producer is not None and (self.streamingProducer and
++                                        not self.producerPaused):
+             self.producerPaused = 1
+             self.producer.pauseProducing()
+ 
++
+     def bufferEmpty(self):
+         if self.producer is not None and ((not self.streamingProducer) or
+                                           self.producerPaused):
+Index: twisted/internet/test/test_pollingfile.py
+===================================================================
+--- twisted/internet/test/test_pollingfile.py	(revision 38381)
++++ twisted/internet/test/test_pollingfile.py	(working copy)
+@@ -4,17 +4,110 @@
+ """
+ Tests for L{twisted.internet._pollingfile}.
+ """
++import os
+ 
+ from twisted.python.runtime import platform
+ from twisted.trial.unittest import TestCase
++from twisted.protocols import basic
++from twisted.internet.test.reactormixins import ReactorBuilder
+ 
++
++
+ if platform.isWindows():
++    import win32pipe
++    import win32security
++
+     from twisted.internet import _pollingfile
++
++    from twisted.internet._pollingfile import _PollingTimer
++    _skipNotWindows = None
+ else:
+-    _pollingfile = None
++    _skipNotWindows = "Test will run only on Windows."
++    _PollingTimer = object
++ 
+ 
++ 
++class PipeRunner(_PollingTimer):
++    """
++    Builds, initializes and runs a pair of read/write pipes.
++    """
++    def __init__(self, pipeSize, doneReadCB, doneWriteCB, receivedCB, reactor):
++        _PollingTimer.__init__(self, reactor)
++        sAttrs = win32security.SECURITY_ATTRIBUTES()
++        sAttrs.bInheritHandle = 1
++        hRead, hWrite = win32pipe.CreatePipe(sAttrs, pipeSize)
++        self.reader = _pollingfile._PollableReadPipe(hRead, receivedCB, doneReadCB)
++        self.writer = _pollingfile._PollableWritePipe(hWrite, doneWriteCB)
++        self._addPollableResource(self.reader)
++        self._addPollableResource(self.writer)
+ 
+ 
++
++class TestPollablePipes(ReactorBuilder):
++    """
++    Tests for L{_pollingfile._PollableWritePipe} and
++    L{_pollingfile._PollableReadPipe}.
++    """
++    def setUp(self):
++        self._oldBufferSize = _pollingfile.FULL_BUFFER_SIZE
++
++
++    def tearDown(self):
++        _pollingfile.FULL_BUFFER_SIZE = self._oldBufferSize
++
++
++    def test_pullProducerErroneousPauseProducingCalls(self):
++        """
++        Test write pipe as a consumer using a pull producer.
++
++        The data received at the other end of the pipe is checked and counted
++        as are the number of producer pause/resume/stop calls.
++
++        When calling registerProducer() with a pull-producer, the streaming
++        parameter is False. The consumer should *not* be calling the producers
++        pauseProducing() method when it's buffer fills as that method is not
++        normally present, causing an error, and is redundant.
++
++        See Ticket #2835: pauseProducing() called erroneously.
++        """
++        pipeSize = 4096     # avoid Ticket #5365 issues
++        _pollingfile.FULL_BUFFER_SIZE = 1024
++        testMessage = '0' * 1024
++
++        class TestProtocol(basic.LineReceiver):
++            def lineReceived(self, line):
++                self.testResponse = line
++                transport.writer.close()
++
++        class TestPullProducer(object):
++            pauseCount = 0
++            def resumeProducing(self):
++                transport.writer.write(testMessage+"\r\n")
++
++            def pauseProducing(self):
++                """
++                This method is not part of IPullProducer, but is erroneously
++                called by _pollingfile.bufferFull().
++                """
++                self.pauseCount += 1
++
++            def stopProducing(self):
++                pass
++
++        reactor = self.buildReactor()
++        r, w = lambda: reactor.stop(), lambda: None 
++        protocol, producer = TestProtocol(), TestPullProducer()
++        transport = PipeRunner(pipeSize, r, w, protocol.dataReceived, reactor)
++        transport.writer.registerProducer(producer, False)
++        producer.resumeProducing()
++        self.runReactor(reactor)
++        self.assertEqual(testMessage, protocol.testResponse)
++        self.assertEqual(0, producer.pauseCount)
++
++
++globals().update(TestPollablePipes.makeTestCaseClasses())
++
++
+ class TestPollableWritePipe(TestCase):
+     """
+     Tests for L{_pollingfile._PollableWritePipe}.
+@@ -41,6 +134,7 @@
+ 
+ 
+ 
++if _skipNotWindows:
++    TestPollablePipes.skip = skipMessage
++    TestPollableWritePipeUnicode.skip = skipMessage
+ 
+-if _pollingfile is None:
+-    TestPollableWritePipe.skip = "Test will run only on Windows."

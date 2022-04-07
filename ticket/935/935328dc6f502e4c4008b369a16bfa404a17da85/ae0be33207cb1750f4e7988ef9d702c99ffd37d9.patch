@@ -1,0 +1,960 @@
+Index: doc/names/examples/edns_server.tac.py
+===================================================================
+--- doc/names/examples/edns_server.tac.py	(revision 0)
++++ doc/names/examples/edns_server.tac.py	(working copy)
+@@ -0,0 +1,67 @@
++# Copyright (c) Twisted Matrix Laboratories.
++# See LICENSE for details.
++
++"""
++A DNS server which replies NXDOMAIN to all queries.
++
++Usage: twistd -noy doc/names/examples/edns_auth_server.tac.py
++
++This server uses the protocol hacks from edns.py
++
++The important thing is that because messages are decoded using
++EDNSMessage rather than dns.Message, OPT records are extracted from
++the additional section of EDNS query messages during decoding.
++
++This is one way of fixing #6645.
++
++Additionally we force ednsVersion=None so that the server doesn't
++respond with any OPT records.
++Although RFC6891-7 suggests that the correct response should be FORMERR.
++ * https://tools.ietf.org/html/rfc6891#section-7
++
++Ultimately, DNSServerFactory will need modifying or replacing so that
++it can dynamically respond using the correct EDNS settings and RCODE
++based on the client request.
++
++EDNSMessage will also need to be made aware of RRSets so that it can
++correctly limit the size of (or truncate) responses based on the
++chosen maxSize.
++ * https://twistedmatrix.com/trac/wiki/EDNS0#Selectivetruncate
++"""
++
++from functools import partial
++
++from twisted.application.internet import TCPServer, UDPServer
++from twisted.application.service import Application, MultiService
++
++from twisted.names import edns, server
++
++
++
++PORT = 10053
++EDNS_VERSION = None
++
++
++def makeService():
++    masterService = MultiService()
++
++    factory = server.DNSServerFactory(
++        authorities=[],
++        caches=[],
++        clients=[])
++
++    factory.protocol = partial(edns.EDNSStreamProtocol, ednsVersion=EDNS_VERSION)
++    proto = edns.EDNSDatagramProtocol(ednsVersion=EDNS_VERSION, controller=factory)
++
++    UDPServer(PORT, proto).setServiceParent(masterService)
++    TCPServer(PORT, factory).setServiceParent(masterService)
++
++    return masterService
++
++
++
++application = Application("An EDNS aware noop DNS server")
++
++
++
++makeService().setServiceParent(application)
+Index: doc/names/examples/test_edns_compliance.py
+===================================================================
+--- doc/names/examples/test_edns_compliance.py	(revision 0)
++++ doc/names/examples/test_edns_compliance.py	(working copy)
+@@ -0,0 +1,251 @@
++# Copyright (c) Twisted Matrix Laboratories.
++# See LICENSE for details.
++
++"""
++An example trial test module which demonstrates how the low level
++L{dns._OPTHeader} class can be used for testing DNS servers for
++compliance with DNS RFCs.
++
++This example should be run using trial eg
++
++ trial doc/names/examples/test_edns_compliance.py
++
++ OR
++
++ TARGET=127.0.0.1 trial doc/names/examples/test_edns_compliance.py
++"""
++
++import os
++
++from twisted.internet import reactor
++from twisted.names import dns
++from twisted.trial import unittest
++
++
++
++class DNSMessageManglingProtocol(dns.DNSDatagramProtocol):
++    """
++    A L{dns.DNSDatagramProtocol} subclass with hooks for mangling a
++    L{dns.Message} before it is sent.
++    """
++
++    def __init__(self, *args, **kwargs):
++        """
++        @param mangler: A callable which will be passed a message
++            argument and must return a message which will then be
++            encoded and sent.
++        @type mangler: L{callable}
++
++        @see: L{dns.DNSDatagramProtocol.__init__} for inherited
++            arguments.
++        """
++        self.mangler = kwargs.pop('mangler')
++        dns.DNSDatagramProtocol.__init__(self, *args, **kwargs)
++
++
++    def writeMessage(self, message, address):
++        """
++        Send a message holding DNS queries.
++
++        @type message: L{dns.Message}
++        """
++        message = self.mangler(message)
++        return dns.DNSDatagramProtocol.writeMessage(self, message, address)
++
++
++
++def serversUnderTest(default):
++    """
++    Return a list of server information tuples found in the
++    environment or C{default} if none are found.
++
++    @param default: A default list of servers to be tested if none
++        were found among the environment variables.
++    @type default: L{list} of 3-L{tuple}.
++
++    @return: L{list} of L{tuple} containing target server info
++        (host, port, description)
++    """
++    targetServer = os.environ.get('TARGET')
++    if targetServer is not None:
++        parts = targetServer.split(',', 2)
++        if len(parts) == 2:
++            parts.append(parts[0])
++        if len(parts) == 1:
++            parts.extend([53, parts[0]])
++        parts[1] = int(parts[1])
++        return [tuple(parts)]
++    else:
++        return default
++
++
++
++# Default servers to be tested
++SERVERS = [
++    # GoogleDNS public recursive resolver
++    ('8.8.8.8', 53, 'GoogleRecursiveDns'),
++
++    # OpenDNS public recursive resolver
++    ('208.67.222.222', 53, 'OpenDNS'),
++
++    # Twisted 13.1 Authoritative DNS (ns1.twistedmatrix.com)
++    ('66.35.39.66', 53, 'TwistedAuthoritativeDns'),
++
++    # Bind 9.9.3-S1-P1 (as reported by version.bind CH TXT) (ams.sns-pb.isc.org)
++    ('199.6.1.30', 53, 'Bind9.9'),
++
++    # Power DNS (as reported by version.bind CH TXT) (dns-us1.powerdns.net)
++    ('46.165.192.30', 53, 'PowerDNS'),
++
++    # NSD 4.0.0b5 (as reported by version.bind CH TXT) (open.nlnetlabs.nl)
++    ('213.154.224.1', 53, 'NSD4'),
++
++    # DJBDNS (uz5dz39x8xk8wyq3dzn7vpt670qmvzx0zd9zg4ldwldkv6kx9ft090.ns.yp.to.)
++    ('131.155.71.143', 53, 'DJBDNS')
++]
++
++
++
++class DNSComplianceTestBuilder(object):
++    """
++    Build a dictionary of L{unittest.TestCase} classes each of which
++    runs a group of tests against a particular server.
++    """
++    @classmethod
++    def makeTestCaseClasses(cls):
++        """
++        Create a L{unittest.TestCase} subclass which mixes in C{cls}
++        for each server and return a dict mapping their names to them.
++        """
++        classes = {}
++        for host, port, description in serversUnderTest(SERVERS):
++            name = (cls.__name__ + "." + description).replace(".", "_")
++            class testcase(cls, unittest.TestCase):
++                __module__ = cls.__module__
++                server = (host, port)
++            testcase.__name__ = name
++            classes[testcase.__name__] = testcase
++        return classes
++
++
++
++def hasAdditionalOptRecord(message):
++    """
++    Test a message for an L{dns._OPTHeader} instance among its
++    additional records.
++    """
++    for r in message.additional:
++        if r.type == dns.OPT:
++            return True
++    return False
++
++
++
++class RFC6891Tests(DNSComplianceTestBuilder):
++    """
++    Tests for compliance with RFC6891.
++
++    https://tools.ietf.org/html/rfc6891#section-6.1.1
++    """
++    def connectProtocol(self, proto):
++        """
++        Connect C{proto} to a listening UDP port and add a cleanup to
++        stop the port when the current test finishes.
++
++        @param proto: A L{twisted.internet.protocols.DatagramProtocol}
++            instance.
++        """
++        port = reactor.listenUDP(0, proto)
++        self.addCleanup(port.stopListening)
++
++
++    def test_611_ednsResponseToEdnsRequest(self):
++        """
++        If an OPT record is present in a received request, compliant
++        responders MUST include an OPT record in their respective
++        responses.
++
++        https://tools.ietf.org/html/rfc6891#section-6.1.1
++        """
++
++        def addOptRecord(message):
++            message.additional.append(dns._OPTHeader(version=1))
++            return message
++
++        proto = DNSMessageManglingProtocol(
++            controller=None, mangler=addOptRecord)
++        self.connectProtocol(proto)
++
++        d = proto.query(self.server, [dns.Query('.', dns.NS, dns.IN)])
++
++        def checkForOpt(message):
++            self.assertTrue(
++                hasAdditionalOptRecord(message),
++                'Message did not contain an OPT record '
++                + 'in its additional section. '
++                + 'rCode: %s, ' % (message.rCode,)
++                + 'answers: %s, ' % (message.answers,)
++                + 'authority: %s, ' % (message.authority,)
++                + 'additional: %s ' % (message.additional,))
++        d.addCallback(checkForOpt)
++
++        return d
++
++
++    def test_611_formErrOnMultipleOptRecords(self):
++        """
++        When an OPT RR is included within any DNS message, it MUST be
++        the only OPT RR in that message.  If a query message with more
++        than one OPT RR is received, a FORMERR (RCODE=1) MUST be
++        returned.
++
++        https://tools.ietf.org/html/rfc6891#section-6.1.1
++        """
++        def addMultipleOptRecord(message):
++            message.additional.extend([dns._OPTHeader(), dns._OPTHeader()])
++            return message
++
++        proto = DNSMessageManglingProtocol(
++            controller=None, mangler=addMultipleOptRecord)
++        self.connectProtocol(proto)
++
++        d = proto.query(self.server, [dns.Query('.', dns.NS, dns.IN)])
++
++        d.addCallback(
++            lambda message: self.assertEqual(message.rCode, dns.EFORMAT))
++
++        return d
++
++
++    def test_7_nonEdnsResponseToNonEdnsRequest(self):
++        """
++        Lack of presence of an OPT record in a request MUST be taken as an
++        indication that the requestor does not implement any part of this
++        specification and that the responder MUST NOT include an OPT record
++        in its response.
++
++        https://tools.ietf.org/html/rfc6891#section-7
++        """
++
++        proto = dns.DNSDatagramProtocol(controller=None)
++        self.connectProtocol(proto)
++
++        d = proto.query(self.server, [dns.Query('.', dns.NS, dns.IN)])
++
++        def checkForOpt(message):
++            self.assertFalse(
++                hasAdditionalOptRecord(message),
++                'Message contained an OPT record '
++                + 'in its additional section. '
++                + 'rCode: %s, ' % (message.rCode,)
++                + 'answers: %s, ' % (message.answers,)
++                + 'authority: %s, ' % (message.authority,)
++                + 'additional: %s ' % (message.additional,))
++        d.addCallback(checkForOpt)
++
++        return d
++
++
++
++globals().update(
++    RFC6891Tests.makeTestCaseClasses())
+Index: doc/names/examples/txdig.py
+===================================================================
+--- doc/names/examples/txdig.py	(revision 0)
++++ doc/names/examples/txdig.py	(working copy)
+@@ -0,0 +1,202 @@
++# Copyright (c) Twisted Matrix Laboratories.
++# See LICENSE for details.
++
++"""
++A flexible tool for interrogating DNS name servers.
++
++Example usage:
++ txdig -s 8.8.8.8 example.com NS
++
++This is a usecase for an API with the convenience of client.Resolver
++while allowing fine control of the DNS query message.
++
++I use client.Resolver.queryUDP and queryTCP instead of IResolver
++methods because I want to choose the transport protocol and because
++these functions return a message instance instead of just the record
++sections.
++
++This example relies on _EDNSMessage, which I've temporarily copied
++from ticket:5675 into twisted.names.edns.
++
++I've also hacked together some supporting classes in that module which
++demonstrate how _EDNSMessage can be integrated with the existing
++protocol and factory classes with some subclasses. More comments in
++edns.py.
++"""
++
++from functools import partial
++import re
++import sys
++
++from twisted.internet import task
++from twisted.names import dns
++from twisted.names.edns import EDNSResolver
++from twisted.python import usage
++
++
++
++ALL_QUERY_TYPES = dict(dns.QUERY_TYPES.items() + dns.EXT_QUERIES.items())
++
++
++
++class Options(usage.Options):
++    """
++    Options based on dig.
++    """
++
++    synopsis = 'Usage: txdig [OPTIONS] DOMAIN_NAME QUERY_TYPE'
++
++    optFlags = [
++        ["tcp", None, "Use TCP when querying name servers."],
++        ["noedns", None, "Disable EDNS."],
++        ["dnssec", None, ("Requests DNSSEC records be sent "
++                          "by setting the DNSSEC OK bit (DO) "
++                          "in the OPT record in the additional section "
++                          "of the query.")],
++    ]
++
++    optParameters = [
++            ["server", "s", '127.0.0.1',
++             "The name or IP address of the name server to query.", str],
++
++            ["port", "p", 53,
++             "The port number of the name server to query.", int],
++
++            ["timeout", "t", 5,
++             "The timeout for a query in seconds.", float],
++
++            ["tries", "T", 3,
++             "The number of times to try UDP queries to server.", int],
++
++            ["edns", None, 0,
++             "Specify the EDNS version to query with.", int],
++
++            ["bufsize", None, 4096,
++             "Set the UDP message buffer size advertised using EDNS0.", int],
++        ]
++
++
++    def parseArgs(self, queryName='', queryType='ALL_RECORDS'):
++        self['queryName'] = queryName
++        try:
++            self['queryType'] = dns.REV_TYPES[queryType]
++        except KeyError:
++            raise usage.UsageError(
++                'Unrecognised QUERY_TYPE %r. ' % (queryType,)
++                + 'Must be one of %r' % (sorted(dns.REV_TYPES.keys()),))
++
++
++    def postOptions(self):
++        if self['noedns']:
++            self['edns'] = None
++
++
++
++def parseOptions():
++    """
++    Parse command line options and print the full usage message to
++    stderr if there are errors.
++    """
++    options = Options()
++    try:
++        options.parseOptions()
++    except usage.UsageError as errortext:
++        sys.stderr.write(str(options) + '\n')
++        sys.stderr.write('ERROR: %s\n' % (errortext,))
++        raise SystemExit(1)
++    return options
++
++
++
++def formatRecord(record):
++    """
++    Format a record and its payload to match the dig long form.
++    """
++    line = []
++
++    if isinstance(record, dns.Query):
++        line.append(';')
++
++    line.append(record.name.name.ljust(25))
++
++    if isinstance(record, dns.RRHeader):
++        line.append(str(record.ttl).ljust(6))
++
++    line.append(
++        dns.QUERY_CLASSES.get(
++            record.cls, '(%s)' % (record.cls,)).ljust(5))
++
++    line.append(
++        ALL_QUERY_TYPES.get(
++            record.type, '(%s)' % (record.type,)).ljust(5))
++
++    if isinstance(record, dns.RRHeader):
++        payload = str(record.payload)
++        # Remove the <RECORD_NAME and > from the payload str
++        line.append(payload[payload.find(' '):-1])
++
++    # Remove the ttl from the payload, its already printed from the RRHeader.
++    line = re.sub('\s+ttl=\d+', '', ' '.join(line))
++
++    return line
++
++
++
++def printMessage(message):
++    """
++    Print the sections of a message in dig long form.
++    """
++    sections = ("queries", "answers", "authority", "additional")
++    print ";; flags:",
++    for a in message.showAttributes:
++        if a in sections:
++            continue
++        print '%s: %s,' % (a, getattr(message, a)),
++    print
++
++    for section in sections:
++        records = getattr(message, section)
++        print ";;", section.upper(), "SECTION:", len(records)
++        for r in records:
++            print formatRecord(r)
++        print
++
++    print ";; MSG SIZE recvd:", len(message.toStr())
++
++    return message
++
++
++
++def dig(reactor, queryName='', queryType=dns.ALL_RECORDS, queryClass=dns.IN,
++        edns=0, bufsize=4096, dnssec=False,
++        tcp=False, timeout=5, tries=3,
++        server='127.0.0.1', port=53, **kwargs):
++    """
++    Query a DNS server.
++    """
++    r = EDNSResolver(servers=[(server, port)],
++                     reactor=reactor,
++                     ednsVersion=edns,
++                     maxSize=bufsize,
++                     dnssecOK=dnssec)
++
++    if tcp:
++        queryMethod = partial(r.queryTCP, timeout=timeout)
++    else:
++        queryMethod = partial(r.queryUDP, timeout=(timeout,) * tries)
++
++    d = queryMethod(queries=[dns.Query(queryName, queryType, queryClass)])
++
++    d.addCallback(printMessage)
++
++    return d
++
++
++
++def main(reactor):
++    return dig(reactor, **parseOptions())
++
++
++
++if __name__ == "__main__":
++    task.react(main)
+Index: twisted/names/edns.py
+===================================================================
+--- twisted/names/edns.py	(revision 0)
++++ twisted/names/edns.py	(working copy)
+@@ -0,0 +1,420 @@
++# Copyright (c) Twisted Matrix Laboratories.
++# See LICENSE for details.
++
++"""
++_EDNSMessage copied from #5675.
++
++Plus subclasses of dns.DNSDatagramProtocol, dns.DNSProtocol and
++client.Resolver which integrate EDNSMessage.
++"""
++
++from twisted.internet import error
++from twisted.names import client, dns
++from twisted.names.dns import EFORMAT, Message, OPT, _OPTHeader, OP_QUERY
++from twisted.python import util as tputil
++
++
++
++class EDNSDatagramProtocol(dns.DNSDatagramProtocol):
++    """
++    This hack is necessary because dns.DNSDatagramProtocol is
++    hardcoded to use dns.Message for building outbound query datagrams
++    and for decoding incoming datagrams.
++
++    It would be easier to integrate new EDNS components if DNS
++    protocols had a convenient way of specifying an alternative
++    message factory.
++    """
++    def __init__(self, *args, **kwargs):
++        """
++        This seems ugly too. If I could provide a messageFactory
++        function, these EDNSMessage arguments needn't be passed
++        explicitly to the DNS protocols. Instead just pass
++        partial(EDNSMessage, ednsVersion=x, maxSize=y).
++        """
++        self.ednsVersion = kwargs.pop('ednsVersion', 0)
++        self.maxSize = kwargs.pop('maxSize', 4096)
++        self.dnssecOK = kwargs.pop('dnssecOK', False)
++
++        dns.DNSDatagramProtocol.__init__(self, *args, **kwargs)
++
++
++    def writeMessage(self, message, address):
++        """
++        Again, this is a hack, but it demonstrates the usefulness of
++        _EDNSMessage.fromMessage for wrapping dns.Message.
++
++        It might be convenient if I could provide EDNS specific
++        keyword arguments to fromMessage - ednsVersion, maxSize, etc.
++        """
++        message = _EDNSMessage.fromMessage(message)
++
++        message.ednsVersion = self.ednsVersion
++        message.maxSize = self.maxSize
++        message.dnssecOK = self.dnssecOK
++
++        return dns.DNSDatagramProtocol.writeMessage(self, message, address)
++
++
++    def _query(self, *args, **kwargs):
++        d = dns.DNSDatagramProtocol._query(self, *args, **kwargs)
++
++        return d.addCallback(_EDNSMessage.fromMessage)
++
++
++
++class EDNSStreamProtocol(dns.DNSProtocol):
++    """
++    See comments for EDNSDatagramProtocol.
++
++    It's a shame we have to duplicate the same hacks for the TCP DNS
++    protocol.
++
++    If DNSDatagramProtocol used connected UDP instead, there would be
++    less difference between the UDP and TCP protocols eg writeMessage
++    would have a consistent signature and maybe this duplication
++    wouldn't be necessary.
++    """
++    def __init__(self, *args, **kwargs):
++        self.ednsVersion = kwargs.pop('ednsVersion', 0)
++        self.maxSize = kwargs.pop('maxSize', 4096)
++        self.dnssecOK = kwargs.pop('dnssecOK', False)
++
++        dns.DNSProtocol.__init__(self, *args, **kwargs)
++
++
++    def writeMessage(self, message):
++        message = _EDNSMessage.fromMessage(message)
++        message.ednsVersion = self.controller.ednsVersion
++        message.maxSize = self.controller.maxSize
++        message.dnssecOK = self.controller.dnssecOK
++
++        return dns.DNSProtocol.writeMessage(self, message)
++
++
++    def _query(self, *args, **kwargs):
++        d = dns.DNSProtocol._query(self, *args, **kwargs)
++        d.addCallback(_EDNSMessage.fromMessage)
++        return d
++
++
++
++class EDNSClientFactory(client.DNSClientFactory):
++    def buildProtocol(self, addr):
++        p = EDNSStreamProtocol(controller=self.controller)
++        p.factory = self
++        return p
++
++
++
++class EDNSResolver(client.Resolver):
++    """
++    client.Resolver is hardcoded to use dns.DNSDatagramProtcol and
++    dns.DNSProtocol (via client.DNSClientFactory).
++
++    It would be nice if I could specify dnsDatagramProtocolFactory and
++    dnsStreamProtocolFactory as arguments to client.Resolver.
++
++    Also need to consider whether client.Resolver is a suitable place
++    to do EDNS buffer size detection.
++
++    The IResolver methods of client.Resolver currently respond to
++    truncated UDP messages by issuing a follow up TCP query.
++
++    In addition they could respond to timeouts by re-issue a UDP query
++    with a smaller advertised EDNS buffersize.
++
++    See
++     * https://tools.ietf.org/html/rfc6891#section-6.2.2
++     * https://www.dns-oarc.net/oarc/services/replysizetest
++    """
++    def __init__(self, *args, **kwargs):
++        self.ednsVersion = kwargs.pop('ednsVersion', 0)
++        self.maxSize = kwargs.pop('maxSize', 4096)
++        self.dnssecOK = kwargs.pop('dnssecOK', False)
++
++        client.Resolver.__init__(self, *args, **kwargs)
++
++        self.factory = EDNSClientFactory(self, self.timeout)
++
++
++    def _connectedProtocol(self):
++        proto = EDNSDatagramProtocol(
++            ednsVersion=self.ednsVersion,
++            maxSize=self.maxSize,
++            dnssecOK=self.dnssecOK,
++            controller=self,
++            reactor=self._reactor)
++
++        while True:
++            try:
++                self._reactor.listenUDP(dns.randomSource(), proto)
++            except error.CannotListenError:
++                pass
++            else:
++                return proto
++
++
++
++class _EDNSMessage(tputil.FancyStrMixin, tputil.FancyEqMixin, object):
++    """
++    An C{EDNS} message.
++
++    Designed for compatibility with L{Message} but with a narrower
++    public interface.
++
++    Most importantly, L{_EDNSMessage.fromStr} will interpret and
++    remove OPT records that are present in the additional records
++    section.
++
++    The OPT records are used to populate certain EDNS specific
++    attributes.
++
++    L{_EDNSMessage.toStr} will add suitable OPT records to the
++    additional section to represent the extended EDNS information.
++
++    @see: U{https://tools.ietf.org/html/rfc6891}
++
++    @ivar id: A 16 bit identifier assigned by the program that
++        generates any kind of query.  This identifier is copied the
++        corresponding reply and can be used by the requester to match
++        up replies to outstanding queries.
++
++    @ivar answer: A one bit field that specifies whether this message
++        is a query (0), or a response (1).
++
++    @ivar opCode: A four bit field that specifies kind of query in
++        this message.  This value is set by the originator of a query
++        and copied into the response.  The values are:
++                0               a standard query (QUERY)
++                1               an inverse query (IQUERY)
++                2               a server status request (STATUS)
++                3-15            reserved for future use
++
++    @ivar auth: Authoritative Answer - this bit is valid in responses,
++        and specifies that the responding name server is an authority
++        for the domain name in question section.
++
++    @ivar trunc: TrunCation - specifies that this message was
++        truncated due to length greater than that permitted on the
++        transmission channel.
++
++    @ivar recDes: Recursion Desired - this bit may be set in a query
++        and is copied into the response.  If RD is set, it directs the
++        name server to pursue the query recursively.  Recursive query
++        support is optional.
++
++    @ivar recAv: Recursion Available - this be is set or cleared in a
++        response, and denotes whether recursive query support is
++        available in the name server.
++
++    @ivar rCode: Response code - this 4 bit field is set as part of
++        responses.  The values have the following interpretation:
++                0               No error condition
++
++                1               Format error - The name server was
++                                unable to interpret the query.
++                2               Server failure - The name server was
++                                unable to process this query due to a
++                                problem with the name server.
++
++                3               Name Error - Meaningful only for
++                                responses from an authoritative name
++                                server, this code signifies that the
++                                domain name referenced in the query does
++                                not exist.
++
++                4               Not Implemented - The name server does
++                                not support the requested kind of query.
++
++                5               Refused - The name server refuses to
++                                perform the specified operation for
++                                policy reasons.  For example, a name
++                                server may not wish to provide the
++                                information to the particular requester,
++                                or a name server may not wish to perform
++                                a particular operation (e.g., zone
++                                transfer) for particular data.
++
++    @ivar ednsVersion: Indicates the EDNS implementation level. Set to
++        C{None} to prevent any EDNS attributes and options being added
++        to the encoded byte string.
++
++    @ivar queries: A L{list} of L{Query} instances.
++
++    @ivar answers: A L{list} of L{RRHeader} instances.
++
++    @ivar authority: A L{list} of L{RRHeader} instances.
++
++    @ivar additional: A L{list} of L{RRHeader} instances.
++    """
++
++    showAttributes = (
++        'id', 'answer', 'opCode', 'auth', 'trunc',
++        'recDes', 'recAv', 'rCode', 'ednsVersion', 'dnssecOK',
++        'maxSize',
++        'queries', 'answers', 'authority', 'additional')
++
++    compareAttributes = showAttributes
++
++    def __init__(self, id=0, answer=0,
++                 opCode=OP_QUERY, auth=0,
++                 trunc=0, recDes=0,
++                 recAv=0, rCode=0, ednsVersion=0, dnssecOK=False, maxSize=512,
++                 queries=None, answers=None, authority=None, additional=None):
++        """
++        All arguments are stored as attributes with the same names.
++
++        @see: L{_EDNSMessage} for an explanation of the meaning of
++            each attribute.
++
++        @type id: C{int}
++        @type answer: C{int}
++        @type opCode: C{int}
++        @type auth: C{int}
++        @type trunc: C{int}
++        @type recDes: C{int}
++        @type recAv: C{int}
++        @type rCode: C{int}
++        @type ednsVersion: C{int} or C{None}
++        @type queries: C{list} of L{Query}
++        @type answers: C{list} of L{RRHeader}
++        @type authority: C{list} of L{RRHeader}
++        @type additional: C{list} of L{RRHeader}
++        """
++        self.id = id
++        self.answer = answer
++        self.opCode = opCode
++
++        # XXX: AA bit can be determined by checking for an
++        # authoritative answer record whose name matches the query
++        # name - perhaps in a higher level EDNSResponse class?
++        self.auth = auth
++
++        # XXX: TC bit can be determined during encoding based on EDNS max
++        # packet size.
++        self.trunc = trunc
++
++        self.recDes = recDes
++        self.recAv = recAv
++        self.rCode = rCode
++        self.ednsVersion = ednsVersion
++        self.dnssecOK = dnssecOK
++        self.maxSize = maxSize
++
++        self.queries = queries or []
++        self.answers = answers or []
++        self.authority = authority or []
++        self.additional = additional or []
++
++        self._decodingErrors = []
++
++
++    def toStr(self):
++        """
++        Encode to wire format.
++
++        If C{ednsVersion} is not None, an L{_OPTHeader} instance
++        containing all the I{EDNS} specific attributes and options
++        will be appended to the list of C{additional} records and this
++        will be encoded into the byte string as an C{OPT} record byte
++        string.
++
++        @return: A L{bytes} string.
++        """
++        m = Message(
++            id=self.id,
++            answer=self.answer,
++            opCode=self.opCode,
++            auth=self.auth,
++            trunc=self.trunc,
++            recDes=self.recDes,
++            recAv=self.recAv,
++            rCode=self.rCode,
++            maxSize=self.maxSize)
++
++        m.queries = list(self.queries)
++        m.answers = list(self.answers)
++        m.authority = list(self.authority)
++        m.additional = list(self.additional)
++
++        if self.ednsVersion is not None:
++            o = _OPTHeader(version=self.ednsVersion,
++                           udpPayloadSize=self.maxSize,
++                           dnssecOK=self.dnssecOK)
++            m.additional.append(o)
++
++        return m.toStr()
++
++
++    @classmethod
++    def fromMessage(cls, message):
++        """
++        Construct and return a new L(_EDNSMessage} whose attributes
++        and records are derived from the attributes and records of
++        C{message} (a L{Message} instance)
++
++        If present, an I{OPT} record will be extracted from the
++        C{additional} section and its attributes and options will be
++        used to set the EDNS specific attributes C{extendedRCODE},
++        c{ednsVersion}, c{dnssecOK}, c{ednsOptions}.
++
++        The C{extendedRCODE} will be combined with C{message.rCode}
++        and assigned to C{self.rCode}.
++
++        If multiple I{OPT} records are found, this is considered an
++        error and no EDNS specific attributes will be
++        set. Additionally, an L{EFORMAT} error will be appended to
++        C{_decodingErrors}.
++        """
++        additional = []
++        optRecords = []
++        for r in message.additional:
++            if r.type == OPT:
++                optRecords.append(_OPTHeader.fromRRHeader(r))
++            else:
++                additional.append(r)
++
++        newMessage = cls(
++            id=message.id,
++            answer=message.answer,
++            opCode=message.opCode,
++            auth=message.auth,
++            trunc=message.trunc,
++            recDes=message.recDes,
++            recAv=message.recAv,
++            rCode=message.rCode,
++            # Default to None, it will be updated later when the OPT
++            # records are parsed.
++            ednsVersion=None,
++            queries=list(message.queries),
++            answers=list(message.answers),
++            authority=list(message.authority),
++            additional=additional,
++            )
++
++        if optRecords:
++            if len(optRecords) > 1:
++                newMessage._decodingErrors.append(EFORMAT)
++            else:
++                opt = optRecords[0]
++                newMessage.ednsVersion = opt.version
++                newMessage.maxSize = opt.udpPayloadSize
++                newMessage.dnssecOK = opt.dnssecOK
++
++        return newMessage
++
++
++    def fromStr(self, bytes):
++        """
++        Decode from wire format, saving flags, values and records to
++        this L{_EDNSMessage} instance in place.
++
++        @type bytes: L{bytes}
++        @param bytes: The full byte string to be decoded.
++        """
++        m = Message()
++        m.fromStr(bytes)
++
++        ednsMessage = self.fromMessage(m)
++        self.__dict__ = ednsMessage.__dict__

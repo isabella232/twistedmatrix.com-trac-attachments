@@ -1,0 +1,125 @@
+diff --git a/twisted/scripts/_twistd_unix.py b/twisted/scripts/_twistd_unix.py
+index 97bf6f9..8e36194 100644
+--- a/twisted/scripts/_twistd_unix.py
++++ b/twisted/scripts/_twistd_unix.py
+@@ -3,6 +3,7 @@
+ # See LICENSE for details.
+ 
+ import os, errno, sys
++import syslog as pysyslog # The standard library module
+ 
+ from twisted.python import log, syslog, logfile
+ from twisted.python.util import switchUID, uidFromString, gidFromString
+@@ -30,6 +31,12 @@ class ServerOptions(app.ServerOptions):
+     optParameters = [
+                      ['prefix', None,'twisted',
+                       "use the given prefix when syslogging"],
++                     ['syslogOptions', None, syslog.DEFAULT_OPTIONS,
++                      "Bitwise-OR of options passed to syslog.openlog()"],
++                     ['syslogFacility', None, syslog.DEFAULT_FACILITY,
++                      "Messages will be sent to the given syslog facility. "
++                      "Use symbolic names like LOG_LOCAL0.",
++                      syslog.facilityFromString],
+                      ['pidfile','','twistd.pid',
+                       "Name of the pidfile"],
+                      ['chroot', None, None,
+@@ -98,6 +105,16 @@ class UnixAppLogger(app.AppLogger):
+         syslog messages.
+     @type _syslogPrefix: C{str}
+ 
++    @ivar _syslogOptions: If C{syslog} is C{True}, the options flags to use
++        with syslog.openlog().
++    @type _syslogOptions: C{int}
++
++    @ivar _syslogFacility: If C{syslog} is C{True}, messages will be sent to
++        the given syslog facility (C{LOG_USER}, C{LOG_LOCAL0}, etc.
++        - L{twisted.python.syslog.facilityFromString} can produce the required
++        value).
++    @type _syslogFacility: C{int}
++
+     @ivar _nodaemon: A flag indicating the process will not be daemonizing.
+     @type _nodaemon: C{bool}
+     """
+@@ -106,6 +123,10 @@ class UnixAppLogger(app.AppLogger):
+         app.AppLogger.__init__(self, options)
+         self._syslog = options.get("syslog", False)
+         self._syslogPrefix = options.get("prefix", "")
++        self._syslogOptions = options.get("syslogOptions",
++                syslog.DEFAULT_OPTIONS)
++        self._syslogFacility = options.get("syslogFacility",
++                syslog.DEFAULT_FACILITY)
+         self._nodaemon = options.get("nodaemon", False)
+ 
+ 
+@@ -121,7 +142,8 @@ class UnixAppLogger(app.AppLogger):
+         @return: An object suitable to be passed to C{log.addObserver}.
+         """
+         if self._syslog:
+-            return syslog.SyslogObserver(self._syslogPrefix).emit
++            return syslog.SyslogObserver(self._syslogPrefix,
++                    self._syslogOptions, self._syslogFacility).emit
+ 
+         if self._logfilename == '-':
+             if not self._nodaemon:
+diff --git a/twisted/test/test_twistd.py b/twisted/test/test_twistd.py
+index 4608192..8da735a 100644
+--- a/twisted/test/test_twistd.py
++++ b/twisted/test/test_twistd.py
+@@ -1020,9 +1020,56 @@ class UnixAppLoggerTestCase(unittest.TestCase):
+         observer = logger._getLogObserver()
+         self.assertEquals(syslogModule.prefix, "test-prefix")
+ 
++    def test_getLogObserverSyslogParameters(self):
++        """
++        Test that all combinations of syslog parameters work.
++        """
++        class fakesyslog(object):
++            def openlog(self, prefix, options, facility):
++                self.prefix = prefix
++                self.options = options
++                self.facility = facility
++        syslogModule = fakesyslog()
++        self.patch(syslog, "syslog", syslogModule)
++
++        # Passing nothing
++        logger = UnixAppLogger({"syslog": True})
++        observer = logger._getLogObserver()
++        self.assertEquals(syslogModule.prefix, "")
++        self.assertEquals(syslogModule.options, 0)
++        self.assertEquals(syslogModule.facility, 8) # LOG_USER
++
++        # Passing prefix
++        logger = UnixAppLogger({"syslog": True, "prefix": "test-prefix"})
++        observer = logger._getLogObserver()
++        self.assertEquals(syslogModule.prefix, "test-prefix")
++        self.assertEquals(syslogModule.options, 0)
++        self.assertEquals(syslogModule.facility, 8) # LOG_USER
++
++        # Passing options
++        logger = UnixAppLogger({
++                "syslog": True,
++                "syslogOptions": 3,
++            })
++        observer = logger._getLogObserver()
++        self.assertEquals(syslogModule.prefix, "")
++        self.assertEquals(syslogModule.options, 3)
++        self.assertEquals(syslogModule.facility, 8) # LOG_USER
++
++        # Passing a facility
++        logger = UnixAppLogger({
++                "syslog": True,
++                "syslogFacility": 128, # LOG_LOCAL0
++            })
++        observer = logger._getLogObserver()
++        self.assertEquals(syslogModule.prefix, "")
++        self.assertEquals(syslogModule.options, 0)
++        self.assertEquals(syslogModule.facility, 128)
++
++
+     if syslog is None:
+         test_getLogObserverSyslog.skip = "Syslog not available"
+-
++        test_getLogObserverSyslogParameters.skip = "Syslog not available"
+ 
+ 
+ if UnixAppLogger is None:

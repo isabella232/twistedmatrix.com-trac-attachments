@@ -1,0 +1,275 @@
+Index: twisted/scripts/trial.py
+===================================================================
+--- twisted/scripts/trial.py	(revision 22134)
++++ twisted/scripts/trial.py	(working copy)
+@@ -321,8 +321,6 @@
+         randomer.seed(config['random'])
+         loader.sorter = lambda x : randomer.random()
+         print 'Running tests shuffled with seed %d\n' % config['random']
+-    if config['force-gc']:
+-        loader.forceGarbageCollection = True
+     if not config['until-failure']:
+         loader.suiteFactory = runner.DestructiveTestSuite
+     return loader
+@@ -341,7 +339,8 @@
+                               tracebackFormat=config['tbformat'],
+                               realTimeErrors=config['rterrors'],
+                               uncleanWarnings=config['unclean-warnings'],
+-                              workingDirectory=config['temp-directory'])
++                              workingDirectory=config['temp-directory'],
++                              forceGarbageCollection=config['force-gc'])
+ 
+ 
+ def run():
+Index: twisted/trial/test/test_tests.py
+===================================================================
+--- twisted/trial/test/test_tests.py	(revision 22134)
++++ twisted/trial/test/test_tests.py	(working copy)
+@@ -613,7 +613,7 @@
+         test gc.collect is called before and after each test.
+         """
+         test = TestGarbageCollection.BasicTest('test_foo')
+-        test.forceGarbageCollection = True
++        test = unittest._ForceGarbageCollectionDecorator(test)
+         result = reporter.TestResult()
+         test.run(result)
+         self.failUnlessEqual(
+@@ -624,11 +624,11 @@
+         """
+         test gc.collect is called after tearDownClass.
+         """
+-        tests = [TestGarbageCollection.ClassTest('test_1'),
+-                 TestGarbageCollection.ClassTest('test_2')]
+-        for t in tests:
+-            t.forceGarbageCollection = True
+-        test = runner.TestSuite(tests)
++        test = unittest.TestSuite(
++            [TestGarbageCollection.ClassTest('test_1'),
++             TestGarbageCollection.ClassTest('test_2')])
++        test = unittest.decorate(
++            test, unittest._ForceGarbageCollectionDecorator)
+         result = reporter.TestResult()
+         test.run(result)
+         # check that collect gets called after individual tests, and
+@@ -646,8 +646,8 @@
+         from twisted.trial.test import weird
+         # test_unhandledDeferred creates a cycle. we need explicit control of gc
+         gc.disable()
+-        self.test1 = weird.TestBleeding('test_unhandledDeferred')
+-        self.test1.forceGarbageCollection = True
++        self.test1 = unittest._ForceGarbageCollectionDecorator(
++            weird.TestBleeding('test_unhandledDeferred'))
+ 
+     def test_isReported(self):
+         """
+Index: twisted/trial/test/test_script.py
+===================================================================
+--- twisted/trial/test/test_script.py	(revision 22134)
++++ twisted/trial/test/test_script.py	(working copy)
+@@ -16,29 +16,6 @@
+ 
+ 
+ 
+-class TestGarbageCollect(unittest.TestCase):
+-    def setUp(self):
+-        self.config = trial.Options()
+-
+-    def test_forcedGc(self):
+-        """
+-        Passing the '--force-gc' option to the trial script should set the
+-        appropriate flag in the test loader.
+-        """
+-        self.config['force-gc'] = True
+-        loader = trial._getLoader(self.config)
+-        self.assertEqual(True, loader.forceGarbageCollection)
+-
+-    def test_unforcedGc(self):
+-        """
+-        The test loader should only enable forced garbage collection if the
+-        option is passed to the trial script.
+-        """
+-        loader = trial._getLoader(self.config)
+-        self.assertEqual(False, loader.forceGarbageCollection)
+-
+-
+-
+ class TestSuiteUsed(unittest.TestCase):
+     """
+     Check the category of tests suite used by the loader.
+Index: twisted/trial/test/test_loader.py
+===================================================================
+--- twisted/trial/test/test_loader.py	(revision 22134)
++++ twisted/trial/test/test_loader.py	(working copy)
+@@ -191,51 +191,6 @@
+                              [test._testMethodName for test in suite._tests])
+ 
+ 
+-    def test_loadWithoutForcedGarbageCollection(self):
+-        """
+-        Tests loaded by default should not be set to force garbage collection.
+-        This test checks 'loadMethod'.
+-        """
+-        import sample
+-        test = self.loader.loadMethod(sample.FooTest.test_foo)
+-        self.assertEqual(test.forceGarbageCollection, False)
+-
+-    def test_loadWithForcedGarbageCollection(self):
+-        """
+-        If the loader is set to force garbage collection, any tests it loads
+-        should also be set to force garbage collection. This test checks
+-        'loadMethod'.
+-        """
+-        import sample
+-        self.loader.forceGarbageCollection = True
+-        test = self.loader.loadMethod(sample.FooTest.test_foo)
+-        self.assertEqual(test.forceGarbageCollection, True)
+-
+-
+-    def test_loadWithoutForcedGarbageCollectionClass(self):
+-        """
+-        Tests loaded by default should not be set to force garbage collection.
+-        This test checks 'loadClass'.
+-        """
+-        import sample
+-        suite = self.loader.loadClass(sample.FooTest)
+-        for test in unittest._iterateTests(suite):
+-            self.assertEqual(test.forceGarbageCollection, False)
+-
+-
+-    def test_loadWithForcedGarbageCollectionClass(self):
+-        """
+-        If the loader is set to force garbage collection, any tests it loads
+-        should also be set to force garbage collection. This test checks
+-        'loadClass'.
+-        """
+-        import sample
+-        self.loader.forceGarbageCollection = True
+-        suite = self.loader.loadClass(sample.FooTest)
+-        for test in unittest._iterateTests(suite):
+-            self.assertEqual(test.forceGarbageCollection, True)
+-
+-
+     def test_loadNonClass(self):
+         import sample
+         self.failUnlessRaises(TypeError, self.loader.loadClass, sample)
+Index: twisted/trial/runner.py
+===================================================================
+--- twisted/trial/runner.py	(revision 22134)
++++ twisted/trial/runner.py	(working copy)
+@@ -411,7 +411,6 @@
+         self.suiteFactory = TestSuite
+         self.sorter = name
+         self._importErrors = []
+-        self.forceGarbageCollection = False
+ 
+     def sort(self, xs):
+         """
+@@ -507,9 +506,7 @@
+         return self._makeCase(method.im_class, method.__name__)
+ 
+     def _makeCase(self, klass, methodName):
+-        test = klass(methodName)
+-        test.forceGarbageCollection = self.forceGarbageCollection
+-        return test
++        return klass(methodName)
+ 
+     def loadPackage(self, package, recurse=False):
+         """
+@@ -716,7 +713,8 @@
+                  tracebackFormat='default',
+                  realTimeErrors=False,
+                  uncleanWarnings=False,
+-                 workingDirectory=None):
++                 workingDirectory=None,
++                 forceGarbageCollection=False):
+         self.reporterFactory = reporterFactory
+         self.logfile = logfile
+         self.mode = mode
+@@ -729,6 +727,7 @@
+         self._logFileObserver = None
+         self._logFileObject = None
+         self._logWarnings = False
++        self.forceGarbageCollection = forceGarbageCollection
+         if profile:
+             self.run = util.profiled(self.run, 'profile.data')
+ 
+@@ -769,10 +768,13 @@
+         Run the test or suite and return a result object.
+         """
+         result = self._makeResult()
++        test = unittest.decorate(test, ITestCase)
++        if self.forceGarbageCollection:
++            test = unittest.decorate(
++                test, unittest._ForceGarbageCollectionDecorator)
+         # decorate the suite with reactor cleanup and log starting
+         # This should move out of the runner and be presumed to be
+         # present
+-        test = unittest.decorate(test, ITestCase)
+         suite = TrialSuite([test])
+         startTime = time.time()
+         if self.mode == self.DRY_RUN:
+Index: twisted/trial/unittest.py
+===================================================================
+--- twisted/trial/unittest.py	(revision 22134)
++++ twisted/trial/unittest.py	(working copy)
+@@ -509,10 +509,6 @@
+     rather than an exception. All of the assertion methods raise this if the
+     assertion fails.
+ 
+-    @ivar forceGarbageCollection: If set to True, C{gc.collect()} will be
+-    called before and after the test. Otherwise, garbage collection will
+-    happen in whatever way Python sees fit.
+-
+     @ivar skip: C{None} or a string explaining why this test is to be
+     skipped. If defined, the test will not be run. Instead, it will be
+     reported to the result object as 'skipped' (if the C{TestResult} supports
+@@ -557,7 +553,6 @@
+                 self._initInstances()
+             self.__class__._instances.add(self)
+         self._passed = False
+-        self.forceGarbageCollection = False
+         self._cleanups = []
+ 
+     def _initInstances(cls):
+@@ -736,8 +731,6 @@
+ 
+     def _cleanUp(self, result):
+         try:
+-            if self.forceGarbageCollection:
+-                gc.collect()
+             clean = util._Janitor(self, result).postCaseCleanup()
+             if not clean:
+                 self._passed = False
+@@ -908,8 +901,6 @@
+             self.__class__._instancesRun.add(self)
+         self._deprecateReactor(reactor)
+         try:
+-            if self.forceGarbageCollection:
+-                gc.collect()
+             if first:
+                 d = self.deferSetUpClass(result)
+             else:
+@@ -1290,6 +1281,23 @@
+ 
+ 
+ 
++class _ForceGarbageCollectionDecorator(TestDecorator):
++    """
++    Forces garbage collection to be run before and after the test. Any errors
++    raised during collection are added as errors.
++    """
++
++    def run(self, result):
++        gc.collect()
++        TestDecorator.run(self, result)
++        self.original._installObserver()
++        gc.collect()
++        for error in self.original._observer.getErrors():
++            result.addError(self, error)
++        self.original.flushLoggedErrors()
++        self.original._removeObserver()
++
++
+ components.registerAdapter(
+     _PyUnitTestCaseAdapter, pyunit.TestCase, itrial.ITestCase)
+ 

@@ -1,0 +1,74 @@
+diff --git twisted/web/http.py twisted/web/http.py
+index 77d878b..696ddaa 100644
+--- twisted/web/http.py
++++ twisted/web/http.py
+@@ -1495,6 +1495,11 @@ class HTTPChannel(basic.LineReceiver, policies.TimeoutMixin):
+         Transfer-Encoding.
+     """
+ 
++    # This is the first class outside of the core to handle user input. The 
++    # puck stops here for HTTP related errors. If this class doesn't handle, 
++    # e.g., a malformed request, then the core will be getting a failure and
++    # dumping it in the logs.
++
+     maxHeaders = 500 # max number of headers allowed per request
+ 
+     length = 0
+@@ -1625,7 +1630,11 @@ class HTTPChannel(basic.LineReceiver, policies.TimeoutMixin):
+ 
+     def rawDataReceived(self, data):
+         self.resetTimeout()
+-        self._transferDecoder.dataReceived(data)
++        try:
++            self._transferDecoder.dataReceived(data)
++        except ValueError:
++            self.transport.write("HTTP/1.1 400 Bad Request\r\n\r\n")
++            self.transport.loseConnection()
+ 
+ 
+     def allHeadersReceived(self):
+diff --git twisted/web/test/test_http.py twisted/web/test/test_http.py
+index 959acfa..403ec65 100644
+--- twisted/web/test/test_http.py
++++ twisted/web/test/test_http.py
+@@ -878,6 +878,40 @@ Hello,
+ 
+         self.runRequest(httpRequest, MyRequest)
+ 
++    def test_malformed_chunkedEncoding(self):
++        """
++        If a request uses the I{chunked} transfer encoding, the request body is
++        decoded accordingly before it is made available on the request. If the
++        request is malformed, we should get a 400 error.
++        """
++        # See test_chunkedEncoding for the correct form of this request.
++        httpRequest = '''\
++GET / HTTP/1.0
++Content-Type: text/plain
++Transfer-Encoding: chunked
++
++MALFORMED_LINE_THIS_SHOULD_BE_'6'
++Hello,
++14
++ spam,eggs spam spam
++0
++
++'''
++        testcase = self
++        didRequest = False
++        class MyRequest(http.Request):
++            def process(self):
++                # This request should fail, so this should never be called.
++                testcase.didRequest = True
++
++        try:
++            channel = self.runRequest(httpRequest, MyRequest, success=False)
++        except ValueError:
++            self.fail()
++        self.assertFalse(didRequest)
++        self.assertEqual(
++            channel.transport.value(),
++            "HTTP/1.1 400 Bad Request\r\n\r\n")
+ 
+ 
+ class QueryArgumentsTestCase(unittest.TestCase):

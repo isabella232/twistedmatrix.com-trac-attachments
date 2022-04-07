@@ -1,0 +1,106 @@
+diff --git a/twisted/conch/endpoints.py b/twisted/conch/endpoints.py
+index 353ef7f..0d0b992 100644
+--- a/twisted/conch/endpoints.py
++++ b/twisted/conch/endpoints.py
+@@ -248,6 +248,9 @@ class _ConnectionReady(SSHConnection):
+     L{_ConnectionReady} is an L{SSHConnection} (an SSH service) which only
+     propagates the I{serviceStarted} event to a L{Deferred} to be handled
+     elsewhere.
++
++    @ivar userauth: The L{_UserAuth} that was used to authenticate this
++        L{SSHConnection}.
+     """
+     def __init__(self, ready):
+         """
+@@ -256,6 +259,7 @@ class _ConnectionReady(SSHConnection):
+         """
+         SSHConnection.__init__(self)
+         self._ready = ready
++        self.userauth = None
+ 
+ 
+     def serviceStarted(self):
+@@ -427,6 +431,7 @@ class _CommandTransport(SSHClientTransport):
+         command = _ConnectionReady(self.connectionReady)
+ 
+         userauth = _UserAuth(self.creator.username, command)
++        command.userauth = userauth
+         userauth.password = self.creator.password
+         if self.creator.keys:
+             userauth.keys = list(self.creator.keys)
+@@ -785,6 +790,9 @@ class _NewConnectionHelper(object):
+         @param immediate: Whether to close connection immediately.
+         @type immediate: L{bool}.
+         """
++        if connection.userauth:
++            if connection.userauth.agent:
++                connection.userauth.agent.transport.loseConnection()
+         if immediate:
+             # We're assuming the underlying connection is a ITCPTransport,
+             # which is what the current implementation is restricted to:
+diff --git a/twisted/conch/test/test_endpoints.py b/twisted/conch/test/test_endpoints.py
+index 52c0b66..38316ad 100644
+--- a/twisted/conch/test/test_endpoints.py
++++ b/twisted/conch/test/test_endpoints.py
+@@ -28,12 +28,13 @@ from twisted.internet.error import ProcessTerminated, ConnectingCancelledError
+ from twisted.cred.portal import Portal
+ from twisted.cred.checkers import InMemoryUsernamePasswordDatabaseDontUse
+ 
++from twisted.conch.client.agent import SSHAgentClient
+ from twisted.conch.interfaces import IConchUser
+ from twisted.conch.error import ConchError, UserRejectedKey, HostKeyChanged
+ 
+ if requireModule('Crypto.Cipher.AES') and requireModule('pyasn1.type'):
+     from twisted.conch.ssh.factory import SSHFactory
+-    from twisted.conch.ssh.userauth import SSHUserAuthServer
++    from twisted.conch.ssh.userauth import SSHUserAuthServer, SSHUserAuthClient
+     from twisted.conch.ssh.connection import SSHConnection
+     from twisted.conch.ssh.keys import Key
+     from twisted.conch.ssh.channel import SSHChannel
+@@ -48,7 +49,7 @@ if requireModule('Crypto.Cipher.AES') and requireModule('pyasn1.type'):
+     from twisted.conch.endpoints import (
+         _ISSHConnectionCreator, AuthenticationFailed, SSHCommandAddress,
+         SSHCommandClientEndpoint, _ReadFile, _NewConnectionHelper,
+-        _ExistingConnectionHelper)
++        _ExistingConnectionHelper, _ConnectionReady)
+ 
+     from twisted.conch.ssh.transport import SSHClientTransport
+ else:
+@@ -1440,12 +1441,11 @@ class NewConnectionHelperTests(TestCase):
+         """
+         helper = _NewConnectionHelper(
+             None, None, None, None, None, None, None, None, None, None)
+-        connection = SSHConnection()
++        connection = _ConnectionReady(None)
+         connection.transport = StringTransport()
+         helper.cleanupConnection(connection, False)
+         self.assertTrue(connection.transport.disconnecting)
+ 
+-
+     def test_cleanupConnectionImmediately(self):
+         """
+         L{_NewConnectionHelper.cleanupConnection} closes the transport with
+@@ -1461,8 +1461,22 @@ class NewConnectionHelperTests(TestCase):
+ 
+         helper = _NewConnectionHelper(
+             None, None, None, None, None, None, None, None, None, None)
+-        connection = SSHConnection()
++        connection = _ConnectionReady(None)
+         connection.transport = SSHClientTransport()
+         connection.transport.transport = Abortable()
+         helper.cleanupConnection(connection, True)
+         self.assertTrue(connection.transport.transport.aborted)
++
++    def test_cleanupConnectionAgentConnection(self):
++        """
++        L{_NewConnectionHelper.cleanupConnection} closes the agent transport.
++        """
++        helper = _NewConnectionHelper(
++            None, None, None, None, None, None, None, None, None, None)
++        connection = _ConnectionReady(None)
++        connection.userauth = SSHUserAuthClient(None, None)
++        connection.userauth.agent = SSHAgentClient()
++        connection.userauth.agent.transport = StringTransport()
++        connection.transport = StringTransport()
++        helper.cleanupConnection(connection, False)
++        self.assertTrue(connection.userauth.agent.transport.disconnecting)

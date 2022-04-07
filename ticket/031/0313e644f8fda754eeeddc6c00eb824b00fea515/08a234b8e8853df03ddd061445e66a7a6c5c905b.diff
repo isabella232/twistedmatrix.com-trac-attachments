@@ -1,0 +1,643 @@
+Index: doc/core/howto/tutorial/components.xhtml
+===================================================================
+--- doc/core/howto/tutorial/components.xhtml	(revision 24967)
++++ doc/core/howto/tutorial/components.xhtml	(working copy)
+@@ -38,28 +38,225 @@
+ interfaces provides the same flexibility inheritance gives: future
+ subclasses can override the adapters.</p>
+ 
++<h2>Interfaces and Adapters</h2>
++
++<p>Zope is described as "an open source application server for building content 
++management systems, intranets, portals, and custom applications," but for our 
++purposes we're only going to be interested one particular part of Zope: 
++zope.interfaces.</p>
++
++<p>If interfaces are completely new to you, you might want to read the 
++<a href="../components.xhtml">Components HOWTO</a> before going any further. 
++In this case, instead of dealing with virtual hairdryers, we're going to be 
++manipulating <code>FingerService</code>.</p>
++
++<p>For now, our <code>FingerService</code> will have two functions, 
++<code>getUser</code> and <code>getUsers</code>.  As such, the corresponding 
++interface for this service will look like this:</p>
++
++<pre class="python">
++class IFingerService(Interface):
++
++    def getUser(user):
++        """Return a deferred returning a string"""
++
++    def getUsers():
++        """Return a deferred returning a list of strings"""
++</pre>
++
++<p>(We are of course using the standard convention of a name that 
++starts with a capital "I" for the name of the interface.</p>
++
++<p>We indicate that <code>FingerService</code> implements this interface by 
++inserting this line into the <code>FingerService</code> definition:</p>
++
++<pre class="python">
++    implements(IFingerService)
++</pre>
++
++<p>This time, instead of putting functions like <code>getFingerFactory</code> 
++and <code>getIRCBot</code> into <code>FingerService</code>, we're going to 
++use <code base="API" class="twisted.python">components</code> to create 
++adpaters that will take the functions in <code>FingerService</code> and 
++return factories that will implement specific interfaces.</p>
++
++<p>Let's start with <code>FingerFactory</code>. We'll define an interface with</p>
++<pre class="python">
++class IFingerFactory(Interface):
++    def getUser(user):
++        """Return a deferred returning a string"""
++</pre>
++
++<p>Now we'll define an adapter, <code>FingerFactoryFromService</code>.  As it
++is for an adapter, this definition implicitly takes <code>FingerService</code> 
++as an argument (<code>service</code>) and returns a factory that implements 
++<code>IFingerFactory</code>:</p>
++
++<pre class="python">
++class FingerFactoryFromService(protocol.ServerFactory):
++
++    implements(IFingerFactory)
++
++    protocol = FingerProtocol
++
++        def __init__(self, service):
++            self.service = service
++
++        def getUser(self, user):
++            return self.service.getUser(user)
++</pre>
++
++<p>Finally, in order for the program to use this adapter, we'll have to 
++register it in the main function:</p>
++
++<pre class="python">
++components.registerAdapter(FingerFactoryFromService,
++                           IFingerService,
++                           IFingerFactory)
++</pre>
++
++<p>Recall that in the last version of the program, we started 
++<code>FingerFactory</code> with the line</p>
++
++<pre class="python">
++internet.TCPServer(79, f.getFingerFactory() 
++                   ).setServiceParent(serviceCollection)
++</pre>
++
++<p>where <code>f</code> was an instance of <code>FingerService</code>. With 
++this new adapter, we will instead use</p>
++
++<pre class="python">
++internet.TCPServer(79, IFingerFactory(f)
++                   ).setServiceParent(serviceCollection)
++</pre>
++
++<p>When the <code>IFingerFactory</code> interface is called with an instance of 
++<code>FingerService</code>, the interface will look into the adapter registry,
++find the adapter for <code>FingerService</code> we registered, and 
++consequently return an instance of <code>FingerFactoryFromService</code>.</p>
++
++<p>We can now create other interfaces and adapters to generate factories that 
++we used to have to implement directly in <code>FingerService</code>.  For 
++instance, for IRC, we can use</p>
++
++<pre class="python">
++class IIRCClientFactory(Interface):
++
++    def getUser(user):
++        """Return a deferred returning a string"""
++
++class IRCClientFactoryFromService(protocol.ClientFactory):
++
++    implements(IIRCClientFactory)
++
++    protocol = IRCReplyBot
++    nickname = None
++
++    def __init__(self, service):
++        self.service = service
++
++    def getUser(self, user):
++        return self.service.getUser(user)
++
++components.registerAdapter(IRCClientFactoryFromService,
++                           IFingerService,
++                           IIRCClientFactory)
++...
++i = IIRCClientFactory(f)
++i.nickname = 'fingerbot'
++internet.TCPClient('irc.freenode.org', 6667, i  
++                   ).setServiceParent(serviceCollection)
++</pre>
++
++<p>As with <code>FingerFactoryFromService</code>, we can keep using the same 
++protocol (<code>IRCReplyBot</code>) we defined in the last version of the 
++code.</p>
++
++<p>For the web, recall that our factory is actually a 
++<code base="API" class="twisted.web.resource">Resource</code>.  Accordingly, 
++we'll use the existing 
++<code base="API" class="twisted.web.resource">IResource</code> interface with 
++the adapter:</p>
++
++<pre class="python">
++class HTTPFactoryFromService(resource.Resource):
++
++    implements(resource.IResource)
++
++    def __init__(self, service):
++        resource.Resource.__init__(self)
++        self.service = service
++        self.putChild('RPC2', UserStatusXR(self.service))
++
++    def render_GET(self, request):
++        d = self.service.getUsers()
++        def formatUsers(users):
++            l = ['&lt;li&gt;&lt;a href="%s"&gt;%s&lt;/a&gt;&lt;/li&gt;' % (user, user)
++                 for user in users]
++            return '&lt;ul&gt;'+''.join(l)+'&lt;/ul&gt;'
++        d.addCallback(formatUsers)
++        d.addCallback(request.write)
++        d.addCallback(lambda _: request.finish())
++        return server.NOT_DONE_YET
++
++    def getChild(self, path, request):
++        if path=="":
++            return HTTPFactoryFromService(self.service)
++        else:
++            return UserStatus(path, self.service)
++
++components.registerAdapter(HTTPFactoryFromService,
++                           IFingerService,
++                           resource.IResource)
++...
++internet.TCPServer(8000, server.Site(resource.IResource(f))
++                   ).setServiceParent(serviceCollection)
++</pre>
++
++<p>Put it all together, and here's the result:</p>
++
+ <a href="listings/finger/finger19.tac" class="py-listing">finger19.tac</a>
+ 
+ <h2>Advantages of Latest Version</h2>
+ 
++<p>Despite the extra complexity, using adapters and interfaces has provided 
++several advantages here:
+ <ul>
+-<li>Readable -- each class is short</li>
+-<li>Maintainable -- each class knows only about interfaces</li>
++<li>Readabiliy &mdash; each class is short</li>
++<li>Maintainability &mdash; each class knows only about interfaces</li>
+ <li>Dependencies between code parts are minimized</li>
+-<li>Example: writing a new IFingerService is easy</li>
+ </ul>
++
++<p>And perhaps most significantly, the code is easy to extend.  Remember the 
++old <code>FingerSetterFactory</code> we used to have?  We can construct a new 
++<em>backend</em> &mdash; a new version of <code>FingerService</code> &mdash; 
++that contains this functionality, without having to worry about breaking the 
++functionality of the rest of the components.</p>
++
+ <a href="listings/finger/finger19a_changes.py" class="py-listing">finger19a_changes.py</a>
+-<p>
+-Full source code here: <a class="py-listing" href="listings/finger/finger19a.tac">finger19a.tac</a>
+-</p>
+ 
++<p>Because this new <code>MemoryFingerService</code> implements 
++<code>IFingerSetterService</code>, when we construct 
++<code>IFingerSetterFactory</code> with the <code>MemoryFingerService</code> named 
++<code>f</code>, a <code>FingerSetterFactoryFromService</code> is constructed 
++with <code>f</code> as an argument, because that's the adapter we registered.  
++Since <code>MemoryFingerService</code> also implements 
++<code>IFingerService</code> and provides <code>getUser</code> and 
++<code>getUsers</code>, we can use it as a complete replacement for the old 
++<code>FingerService</code> we used above.</p>
++
++<p>Here, then, is the full code with the new <code>MemoryFingerService</code> 
++integrated:</p>
++<a class="py-listing" href="listings/finger/finger19a.tac">finger19a.tac</a>
++
+ <h2>Aspect-Oriented Programming</h2>
+ 
+ <p>At last, an example of aspect-oriented programming that isn't about logging
+-or timing. This code is actually useful! Watch how aspect-oriented programming
+-helps you write less code and have fewer dependencies!
++or timing. This code is actually useful! In the next section, we'll see how 
++easy it is to swap in other finger service backends.
+ </p>
+ 
+-
++</p>
+ </body>
+ </html>
+Index: doc/core/howto/tutorial/listings/finger/finger19.tac
+===================================================================
+--- doc/core/howto/tutorial/listings/finger/finger19.tac	(revision 24967)
++++ doc/core/howto/tutorial/listings/finger/finger19.tac	(working copy)
+@@ -8,19 +8,6 @@
+ from zope.interface import Interface, implements
+ import cgi
+ 
+-class IFingerService(Interface):
+-
+-    def getUser(user):
+-        """Return a deferred returning a string"""
+-
+-    def getUsers():
+-        """Return a deferred returning a list of strings"""
+-
+-class IFingerSetterService(Interface):
+-
+-    def setUser(user, status):
+-        """Set the user's status to something"""
+-
+ def catchError(err):
+     return "Internal error in server"
+ 
+@@ -35,15 +22,27 @@
+         d.addCallback(writeValue)
+ 
+ 
++class IRCReplyBot(irc.IRCClient):
++
++    def connectionMade(self):
++        self.nickname = self.factory.nickname
++        irc.IRCClient.connectionMade(self)
++
++    def privmsg(self, user, channel, msg):
++        user = user.split('!')[0]
++        if self.nickname.lower() == channel.lower():
++            d = self.factory.getUser(msg)
++            d.addErrback(catchError)
++            d.addCallback(lambda m: "Status of %s: %s" % (msg, m))
++            d.addCallback(lambda m: self.msg(user, m))
++
++
+ class IFingerFactory(Interface):
+ 
+     def getUser(user):
+         """Return a deferred returning a string"""
+ 
+-    def buildProtocol(addr):
+-        """Return a protocol returning a string"""
+ 
+-
+ class FingerFactoryFromService(protocol.ServerFactory):
+ 
+     implements(IFingerFactory)
+@@ -60,60 +59,7 @@
+                            IFingerService,
+                            IFingerFactory)
+ 
+-class FingerSetterProtocol(basic.LineReceiver):
+ 
+-    def connectionMade(self):
+-        self.lines = []
+-
+-    def lineReceived(self, line):
+-        self.lines.append(line)
+-
+-    def connectionLost(self, reason):
+-        if len(self.lines) == 2:
+-            self.factory.setUser(*self.lines)
+-
+-
+-class IFingerSetterFactory(Interface):
+-
+-    def setUser(user, status):
+-        """Return a deferred returning a string"""
+-
+-    def buildProtocol(addr):
+-        """Return a protocol returning a string"""
+-
+-
+-class FingerSetterFactoryFromService(protocol.ServerFactory):
+-
+-    implements(IFingerSetterFactory)
+-
+-    protocol = FingerSetterProtocol
+-
+-    def __init__(self, service):
+-        self.service = service
+-
+-    def setUser(self, user, status):
+-        self.service.setUser(user, status)
+-
+-
+-components.registerAdapter(FingerSetterFactoryFromService,
+-                           IFingerSetterService,
+-                           IFingerSetterFactory)
+-
+-class IRCReplyBot(irc.IRCClient):
+-
+-    def connectionMade(self):
+-        self.nickname = self.factory.nickname
+-        irc.IRCClient.connectionMade(self)
+-
+-    def privmsg(self, user, channel, msg):
+-        user = user.split('!')[0]
+-        if self.nickname.lower() == channel.lower():
+-            d = self.factory.getUser(msg)
+-            d.addErrback(catchError)
+-            d.addCallback(lambda m: "Status of %s: %s" % (msg, m))
+-            d.addCallback(lambda m: self.msg(user, m))
+-
+-
+ class IIRCClientFactory(Interface):
+ 
+     """
+@@ -123,10 +69,7 @@
+     def getUser(user):
+         """Return a deferred returning a string"""
+ 
+-    def buildProtocol(addr):
+-        """Return a protocol"""
+ 
+-
+ class IRCClientFactoryFromService(protocol.ClientFactory):
+ 
+     implements(IIRCClientFactory)
+@@ -144,7 +87,7 @@
+                            IFingerService,
+                            IIRCClientFactory)
+ 
+-class UserStatusTree(resource.Resource):
++class HTTPFactoryFromService(resource.Resource):
+ 
+     implements(resource.IResource)
+ 
+@@ -166,13 +109,15 @@
+ 
+     def getChild(self, path, request):
+         if path=="":
+-            return UserStatusTree(self.service)
++            return HTTPFactoryFromService(self.service)
+         else:
+             return UserStatus(path, self.service)
+ 
+-components.registerAdapter(UserStatusTree, IFingerService,
++components.registerAdapter(HTTPFactoryFromService,
++                           IFingerService,
+                            resource.IResource)
+ 
++
+ class UserStatus(resource.Resource):
+ 
+     def __init__(self, user, service):
+@@ -200,6 +145,15 @@
+         return self.service.getUser(user)
+ 
+ 
++class IFingerService(Interface):
++
++    def getUser(user):
++        """Return a deferred returning a string"""
++
++    def getUsers():
++        """Return a deferred returning a list of strings"""
++
++
+ class FingerService(service.Service):
+ 
+     implements(IFingerService)
+Index: doc/core/howto/tutorial/listings/finger/finger19a.tac
+===================================================================
+--- doc/core/howto/tutorial/listings/finger/finger19a.tac	(revision 24967)
++++ doc/core/howto/tutorial/listings/finger/finger19a.tac	(working copy)
+@@ -8,19 +8,6 @@
+ from zope.interface import Interface, implements
+ import cgi
+ 
+-class IFingerService(Interface):
+-
+-    def getUser(user):
+-        """Return a deferred returning a string"""
+-
+-    def getUsers():
+-        """Return a deferred returning a list of strings"""
+-
+-class IFingerSetterService(Interface):
+-
+-    def setUser(user, status):
+-        """Set the user's status to something"""
+-
+ def catchError(err):
+     return "Internal error in server"
+ 
+@@ -35,31 +22,6 @@
+         d.addCallback(writeValue)
+ 
+ 
+-class IFingerFactory(Interface):
+-
+-    def getUser(user):
+-        """Return a deferred returning a string"""
+-
+-    def buildProtocol(addr):
+-        """Return a protocol returning a string"""
+-
+-
+-class FingerFactoryFromService(protocol.ServerFactory):
+-
+-    implements(IFingerFactory)
+-
+-    protocol = FingerProtocol
+-
+-    def __init__(self, service):
+-        self.service = service
+-
+-    def getUser(self, user):
+-        return self.service.getUser(user)
+-
+-components.registerAdapter(FingerFactoryFromService,
+-                           IFingerService,
+-                           IFingerFactory)
+-
+ class FingerSetterProtocol(basic.LineReceiver):
+ 
+     def connectionMade(self):
+@@ -69,8 +31,9 @@
+         self.lines.append(line)
+ 
+     def connectionLost(self, reason):
+-        if len(self.lines) == 2:
+-            self.factory.setUser(*self.lines)
++        user = self.lines[0]
++        status = self.lines[1]
++        self.factory.setUser(user, status)
+ 
+ 
+ class IFingerSetterFactory(Interface):
+@@ -78,10 +41,7 @@
+     def setUser(user, status):
+         """Return a deferred returning a string"""
+ 
+-    def buildProtocol(addr):
+-        """Return a protocol returning a string"""
+ 
+-
+ class FingerSetterFactoryFromService(protocol.ServerFactory):
+ 
+     implements(IFingerSetterFactory)
+@@ -95,9 +55,6 @@
+         self.service.setUser(user, status)
+ 
+ 
+-components.registerAdapter(FingerSetterFactoryFromService,
+-                           IFingerSetterService,
+-                           IFingerSetterFactory)
+ 
+ class IRCReplyBot(irc.IRCClient):
+ 
+@@ -114,6 +71,29 @@
+             d.addCallback(lambda m: self.msg(user, m))
+ 
+ 
++class IFingerFactory(Interface):
++
++    def getUser(user):
++        """Return a deferred returning a string"""
++
++
++class FingerFactoryFromService(protocol.ServerFactory):
++
++    implements(IFingerFactory)
++
++    protocol = FingerProtocol
++
++    def __init__(self, service):
++        self.service = service
++
++    def getUser(self, user):
++        return self.service.getUser(user)
++
++components.registerAdapter(FingerFactoryFromService,
++                           IFingerService,
++                           IFingerFactory)
++
++
+ class IIRCClientFactory(Interface):
+ 
+     """
+@@ -123,10 +103,7 @@
+     def getUser(user):
+         """Return a deferred returning a string"""
+ 
+-    def buildProtocol(addr):
+-        """Return a protocol"""
+ 
+-
+ class IRCClientFactoryFromService(protocol.ClientFactory):
+ 
+     implements(IIRCClientFactory)
+@@ -144,7 +121,7 @@
+                            IFingerService,
+                            IIRCClientFactory)
+ 
+-class UserStatusTree(resource.Resource):
++class HTTPFactoryFromService(resource.Resource):
+ 
+     implements(resource.IResource)
+ 
+@@ -166,13 +143,15 @@
+ 
+     def getChild(self, path, request):
+         if path=="":
+-            return UserStatusTree(self.service)
++            return HTTPFactoryFromService(self.service)
+         else:
+             return UserStatus(path, self.service)
+ 
+-components.registerAdapter(UserStatusTree, IFingerService,
++components.registerAdapter(HTTPFactoryFromService,
++                           IFingerService,
+                            resource.IResource)
+ 
++
+ class UserStatus(resource.Resource):
+ 
+     def __init__(self, user, service):
+@@ -199,7 +178,24 @@
+     def xmlrpc_getUser(self, user):
+         return self.service.getUser(user)
+ 
++
++class IFingerService(Interface):
++
++    def getUser(user):
++        """Return a deferred returning a string"""
++
++    def getUsers():
++        """Return a deferred returning a list of strings"""
++
++
++class IFingerSetterService(Interface):
++
++    def setUser(user, status):
++        """Set the user's status to something"""
++
++
+ class MemoryFingerService(service.Service):
++    """Reads and writes the user's status from memory"""
+ 
+     implements([IFingerService, IFingerSetterService])
+ 
+Index: doc/core/howto/tutorial/listings/finger/finger19a_changes.py
+===================================================================
+--- doc/core/howto/tutorial/listings/finger/finger19a_changes.py	(revision 24967)
++++ doc/core/howto/tutorial/listings/finger/finger19a_changes.py	(working copy)
+@@ -1,12 +1,46 @@
++# Extending the FingerService backend
+ 
++class FingerSetterProtocol(basic.LineReceiver):
++
++    def connectionMade(self):
++        self.lines = []
++
++    def lineReceived(self, line):
++        self.lines.append(line)
++
++    def connectionLost(self, reason):
++        user = self.lines[0]
++        status = self.lines[1]
++        self.factory.setUser(user, status)
++
++
++class IFingerSetterFactory(Interface):
++
++    def setUser(user, status):
++        """Return a deferred returning a string"""
++
++
++class FingerSetterFactoryFromService(protocol.ServerFactory):
++
++    implements(IFingerSetterFactory)
++
++    protocol = FingerSetterProtocol
++
++    def __init__(self, service):
++        self.service = service
++
++    def setUser(self, user, status):
++        self.service.setUser(user, status)
++
++
+ class IFingerSetterService(Interface):
+ 
+     def setUser(user, status):
+         """Set the user's status to something"""
+ 
+-# Advantages of latest version
+ 
+ class MemoryFingerService(service.Service):
++    """Reads and writes the user's status from memory"""
+ 
+     implements([IFingerService, IFingerSetterService])
+ 

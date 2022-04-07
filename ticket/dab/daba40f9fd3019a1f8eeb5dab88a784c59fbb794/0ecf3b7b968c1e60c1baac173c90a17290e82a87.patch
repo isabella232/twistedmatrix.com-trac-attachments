@@ -1,0 +1,1316 @@
+Index: twisted/test/test_paths.py
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+--- twisted/test/test_paths.py	(revision 39161)
++++ twisted/test/test_paths.py	(revision )
+@@ -8,6 +8,7 @@
+ from __future__ import division, absolute_import
+ 
+ import os, time, pickle, errno, stat
++import shutil
+ import contextlib
+ from pprint import pformat
+ 
+@@ -20,21 +21,13 @@
+ 
+ from zope.interface.verify import verifyObject
+ 
++if _PY3 and platform.isWindows():
++    import warnings
++    warnings.filterwarnings("once", category=DeprecationWarning,
++                            message="Windows bytes API")
+ 
+-class BytesTestCase(TestCase):
+-    """
+-    Override default method implementations to support byte paths.
+-    """
+-    def mktemp(self):
+-        """
+-        Return a temporary path, encoded as bytes.
+-        """
+-        return TestCase.mktemp(self).encode("utf-8")
+-
+-
+-
+-class AbstractFilePathTestCase(BytesTestCase):
+-
++class AbstractFilePathTestCase(TestCase):
++    # The contents of the files are actually binary, as they are opened "rb"
+     f1content = b"file 1"
+     f2content = b"file 2"
+ 
+@@ -56,33 +49,186 @@
+     def setUp(self):
+         self.now = time.time()
+         cmn = self.cmn = os.path.abspath(self.mktemp())
++
++        if _PY3:
++            _cmnUnicode = cmn
++            _cmnBytes = _cmnUnicode.encode("utf-8")
++        else:
++            _cmnBytes = cmn
++            _cmnUnicode = _cmnBytes.decode("utf-8")
++
++        self.assertIsUnicode(_cmnUnicode)
++        self.assertIsBytes(_cmnBytes)
++
++        self.basePathUnicode = filepath.FilePath(_cmnUnicode)
++        self.basePathBytes = filepath.FilePath(_cmnBytes)
++
+         self.all = [cmn]
+         os.mkdir(cmn)
+-        self.subdir(b"sub1")
+-        f = self.subfile(b"file1")
++        self.subdir("sub1")
++        f = self.subfile("file1")
+         f.write(self.f1content)
+         f.close()
+-        f = self.subfile(b"sub1", b"file2")
++        f = self.subfile("sub1", "file2")
+         f.write(self.f2content)
+         f.close()
+-        self.subdir(b'sub3')
+-        f = self.subfile(b"sub3", b"file3.ext1")
++        self.subdir('sub3')
++        f = self.subfile("sub3", "file3.ext1")
+         f.close()
+-        f = self.subfile(b"sub3", b"file3.ext2")
++        f = self.subfile("sub3", "file3.ext2")
+         f.close()
+-        f = self.subfile(b"sub3", b"file3.ext3")
++        f = self.subfile("sub3", "file3.ext3")
+         f.close()
+         self.path = filepath.FilePath(cmn)
+-        self.root = filepath.FilePath(b"/")
++        self.root = filepath.FilePath("/")
+ 
++        # Detect symlink support on Python 3.x + Windows -
++        # os.symlink is available, but only if you have
++        # administrative privileges.
++        # If you do not have privleges, OSError with errno
++        # set to None is raised.  Unfortunately there's not
++        # a better way to do this detection AFAICT.
++        if os.name == "nt" and hasattr(os, "symlink"):
++            testSymlinkPathname = os.path.join(self.cmn, "___sym1")
++            # Assume we can symlink until proven otherwise by making the syscall
++            self.osCanSymlink = True
++            try:
++                os.symlink(os.path.join(self.cmn, "file1"), testSymlinkPathname)
++            except OSError as err:
++                if err.errno is None:
++                    self.osCanSymlink = False
++                # if we get a non-None errno, it's possible we could
++                # symlink in general, but can't do it on the file we specified.
++                # TODO what's the best way to detect this?
+ 
++        else:
++            self.osCanSymlink = hasattr(os, "symlink")
++
++    def tearDown(self):
++        shutil.rmtree(self.cmn, ignore_errors=True)
++
++    def assertIsUnicode(self, string):
++        """
++        Assert that the input string is a unicode string.
++        """
++        unicodeType = str
++        if not _PY3:
++            unicodeType = unicode
++        self.assertTrue(isinstance(string, unicodeType))
++
++    def assertIsBytes(self, string):
++        """
++        Assert that the input string is a byte string.
++        """
++        self.assertTrue(isinstance(string, bytes))
++
++    def test_unicodeParentIsUnicode(self):
++        self.assertIsUnicode(self.basePathUnicode.parent().path)
++
++    def test_bytesParentIsBytes(self):
++        self.assertIsBytes(self.basePathBytes.parent().path)
++
++    def test_inputStringTypeMatches(self):
++        """
++        Verify that the type of the path attribute on FilePath objects reflects the
++        input type.
++        """
++        path = filepath.FilePath(u"test.txt")
++        self.assertIsUnicode(path.path)
++        self.assertEqual(path.path, os.path.abspath(u"test.txt"))
++
++        path = filepath.FilePath(b"test.txt")
++        self.assertIsBytes(path.path)
++        self.assertEqual(path.path, os.path.abspath(b"test.txt"))
++
++        # Once more, with feeling this time!
++        path = filepath.FilePath(u"test_\u0ca0_\u0ca0.txt")
++        self.assertIsUnicode(path.path)
++        self.assertEqual(path.path, os.path.abspath(u"test_\u0ca0_\u0ca0.txt"))
++
++        # Non-ASCII encoding for good measure
++        path = filepath.FilePath(b"test_\x0c\xa0_\x0c\xa0.txt")
++        self.assertIsBytes(path.path)
++        self.assertEqual(path.path, os.path.abspath(b"test_\x0c\xa0_\x0c\xa0.txt"))
++
++    def test_unicodePathnameListings(self):
++        """
++        Verify that FilePath.listdir returns paths as str/unicode when the FilePath instance
++        is a unicode path, including when some files include non-ASCII code points.
++        """
++        path = self.basePathUnicode.child(u"unicode-test")
++        path.makedirs()
++        unicodePath1 = path.child(u"\u0ca0_\u0ca0.txt")
++        unicodePath2 = path.child(u"98\u00b0.txt")
++        unicodePath1.touch()
++        unicodePath2.touch()
++
++        unicodeListing = path.listdir()
++        self.assertEqual(len(unicodeListing), 2)
++        self.assertIn(u"98\u00b0.txt", unicodeListing)
++        self.assertIn(u"\u0ca0_\u0ca0.txt", unicodeListing)
++
++    def test_bytesPathnameListdir(self):
++        """
++        Verify that FilePath.listdir returns paths as bytes when the FilePath instance
++        is a byte path, including when some files include non-ASCII characters.
++        """
++        path = self.basePathBytes.child(b"bytes-test")
++        path.makedirs()
++        bytesPath1 = path.child(b"\xfe\xff.txt")
++        bytesPath2 = path.child(b"hello\xc0\x80.txt")
++        bytesPath3 = path.child(b"helloworld.txt")
++        bytesPath1.touch()
++        bytesPath2.touch()
++        bytesPath3.touch()
++
++        bytesListing = path.listdir()
++        self.assertEqual(len(bytesListing), 3)
++        self.assertIn(b"\xfe\xff.txt", bytesListing)
++        self.assertIn(b"hello\xc0\x80.txt", bytesListing)
++        self.assertIn(b"helloworld.txt", bytesListing)
++
++    def test_unicodeGlobChildren(self):
++        """
++        Verify that FilePath.globChildren functions correctly when the input
++        is a unicode string.
++        """
++        sub3 = self.basePathUnicode.child(u"sub3")
++        globbedChildren = sub3.globChildren(u"file3*")
++        self.assertEqual(len(globbedChildren), 3)
++        self.assertIn(sub3.child(u"file3.ext1"), globbedChildren)
++        self.assertIn(sub3.child(u"file3.ext2"), globbedChildren)
++        self.assertIn(sub3.child(u"file3.ext3"), globbedChildren)
++
++    def test_bytesGlobChildren(self):
++        """
++        Verify that FilePath.globChildren functions correctly when the input
++        is a byte string.
++        """
++        sub3 = self.basePathBytes.child(b"sub3")
++        globbedChildren = sub3.globChildren(b"file3*")
++        self.assertEqual(len(globbedChildren), 3)
++        self.assertIn(sub3.child(b"file3.ext1"), globbedChildren)
++        self.assertIn(sub3.child(b"file3.ext2"), globbedChildren)
++        self.assertIn(sub3.child(b"file3.ext3"), globbedChildren)
++
++    def test_setContentUnicodeFailure(self):
++        """
++        Verify that setContent fails with TypeError when unicode strings are
++        passed as the content parameter, and that no file was created.
++        """
++        unicodeData = u"asdfjkl;"
++        newPath = self.path.child("unicodeFailure.bin")
++        self.assertRaises(TypeError, newPath.setContent, unicodeData)
++        self.assertFalse(newPath.exists())
++
+     def test_segmentsFromPositive(self):
+         """
+         Verify that the segments between two paths are correctly identified.
+         """
+         self.assertEqual(
+-            self.path.child(b"a").child(b"b").child(b"c").segmentsFrom(self.path),
+-            [b"a", b"b", b"c"])
++            self.path.child("a").child("b").child("c").segmentsFrom(self.path),
++            ["a", "b", "c"])
+ 
+     def test_segmentsFromNegative(self):
+         """
+@@ -90,8 +236,8 @@
+         """
+         self.assertRaises(
+             ValueError,
+-            self.path.child(b"a").child(b"b").child(b"c").segmentsFrom,
+-                self.path.child(b"d").child(b"c").child(b"e"))
++            self.path.child("a").child("b").child("c").segmentsFrom,
++                self.path.child("d").child("c").child("e"))
+ 
+ 
+     def test_walk(self):
+@@ -109,7 +255,7 @@
+         the L{FilePath} in question.
+         """
+         L = []
+-        pathobj = self.path.child(b"a").child(b"b").child(b"c")
++        pathobj = self.path.child("a").child("b").child("c")
+         fullpath = pathobj.path
+         lastpath = fullpath
+         thispath = os.path.dirname(fullpath)
+@@ -125,7 +271,7 @@
+         Verify that a valid subdirectory will show up as a directory, but not as a
+         file, not as a symlink, and be listable.
+         """
+-        sub1 = self.path.child(b'sub1')
++        sub1 = self.path.child('sub1')
+         self.failUnless(sub1.exists(),
+                         "This directory does exist.")
+         self.failUnless(sub1.isdir(),
+@@ -134,15 +280,16 @@
+                         "It's a directory.")
+         self.failUnless(not sub1.islink(),
+                         "It's a directory.")
+-        self.assertEqual(sub1.listdir(),
+-                             [b'file2'])
++        sub1_listing = sub1.listdir()
++        self.assertEqual(sub1_listing,
++                             ['file2'])
+ 
+ 
+     def test_invalidSubdir(self):
+         """
+         Verify that a subdirectory that doesn't exist is reported as such.
+         """
+-        sub2 = self.path.child(b'sub2')
++        sub2 = self.path.child('sub2')
+         self.failIf(sub2.exists(),
+                     "This directory does not exist.")
+ 
+@@ -150,10 +297,10 @@
+         """
+         Make sure that we can read existent non-empty files.
+         """
+-        f1 = self.path.child(b'file1')
++        f1 = self.path.child('file1')
+         with contextlib.closing(f1.open()) as f:
+             self.assertEqual(f.read(), self.f1content)
+-        f2 = self.path.child(b'sub1').child(b'file2')
++        f2 = self.path.child('sub1').child('file2')
+         with contextlib.closing(f2.open()) as f:
+             self.assertEqual(f.read(), self.f2content)
+ 
+@@ -163,8 +310,8 @@
+         C{fp.descendant([a, b, c])} returns the same L{FilePath} as is returned
+         by C{fp.child(a).child(b).child(c)}.
+         """
+-        multiple = self.path.descendant([b'a', b'b', b'c'])
+-        single = self.path.child(b'a').child(b'b').child(b'c')
++        multiple = self.path.descendant(['a', 'b', 'c'])
++        single = self.path.child('a').child('b').child('c')
+         self.assertEqual(multiple, single)
+ 
+ 
+@@ -172,9 +319,9 @@
+         """
+         Verify that path instances are usable as dictionary keys.
+         """
+-        f1 = self.path.child(b'file1')
+-        f1prime = self.path.child(b'file1')
+-        f2 = self.path.child(b'file2')
++        f1 = self.path.child('file1')
++        f1prime = self.path.child('file1')
++        f2 = self.path.child('file2')
+         dictoid = {}
+         dictoid[f1] = 3
+         dictoid[f1prime] = 4
+@@ -192,7 +339,7 @@
+         Verify that path instances are usable as dictionary keys which do not clash
+         with their string counterparts.
+         """
+-        f1 = self.path.child(b'file1')
++        f1 = self.path.child('file1')
+         dictoid = {f1: 'hello'}
+         dictoid[f1.path] = 'goodbye'
+         self.assertEqual(len(dictoid), 2)
+@@ -204,7 +351,7 @@
+         directories.
+         """
+         self.assertRaises(filepath.UnlistableError,
+-                          self.path.child(b'not real').children)
++                          self.path.child('not real').children)
+ 
+     def test_childrenNotDirectoryError(self):
+         """
+@@ -212,7 +359,7 @@
+         a file rather than a directory.
+         """
+         self.assertRaises(filepath.UnlistableError,
+-                          self.path.child(b'file1').children)
++                          self.path.child('file1').children)
+ 
+ 
+     def test_newTimesAreFloats(self):
+@@ -220,7 +367,7 @@
+         Verify that all times returned from the various new time functions are ints
+         (and hopefully therefore 'high precision').
+         """
+-        for p in self.path, self.path.child(b'file1'):
++        for p in self.path, self.path.child('file1'):
+             self.assertEqual(type(p.getAccessTime()), float)
+             self.assertEqual(type(p.getModificationTime()), float)
+             self.assertEqual(type(p.getStatusChangeTime()), float)
+@@ -231,7 +378,7 @@
+         Verify that all times returned from the various time functions are
+         integers, for compatibility.
+         """
+-        for p in self.path, self.path.child(b'file1'):
++        for p in self.path, self.path.child('file1'):
+             self.assertEqual(type(p.getatime()), int)
+             self.assertEqual(type(p.getmtime()), int)
+             self.assertEqual(type(p.getctime()), int)
+@@ -253,21 +400,11 @@
+ 
+ 
+ 
+-class ListingCompatibilityTests(BytesTestCase):
++class ListingCompatibilityTests(TestCase):
+     """
+     These tests verify compatibility with legacy behavior of directory listing.
+     """
+ 
+-    def test_windowsErrorExcept(self):
+-        """
+-        Verify that when a WindowsError is raised from listdir, catching
+-        WindowsError works.
+-        """
+-        fwp = FakeWindowsPath(self.mktemp())
+-        self.assertRaises(filepath.UnlistableError, fwp.children)
+-        self.assertRaises(WindowsError, fwp.children)
+-
+-
+     def test_alwaysCatchOSError(self):
+         """
+         Verify that in the normal case where a directory does not exist, we will
+@@ -422,7 +559,7 @@
+ 
+ 
+ 
+-class PermissionsTestCase(BytesTestCase):
++class PermissionsTestCase(TestCase):
+     """
+     Test Permissions and RWX classes
+     """
+@@ -590,9 +727,9 @@
+         basic modes that should work everywhere (even on Windows).
+         """
+         for mode in (0o555, 0o777):
+-            self.path.child(b"sub1").chmod(mode)
++            self.path.child("sub1").chmod(mode)
+             self.assertEqual(
+-                stat.S_IMODE(os.stat(self.path.child(b"sub1").path).st_mode),
++                stat.S_IMODE(os.stat(self.path.child("sub1").path).st_mode),
+                 mode)
+ 
+ 
+@@ -605,21 +742,25 @@
+         @raise SkipTest: raised if symbolic links are not supported on the
+             host platform.
+         """
+-        if getattr(os, 'symlink', None) is None:
++        if not hasattr(os, "symlink"):
+             raise SkipTest(
+                 "Platform does not support symbolic links.")
++        try:
+-        os.symlink(target, name)
++            os.symlink(target, name)
++        except OSError as exc:
++            if os.name == "nt" and exc.errno is None: # win32 + python 3: see Python issue #9333
++                raise SkipTest("User does not have permission to create symlinks")
+ 
+ 
+     def createLinks(self):
+         """
+         Create several symbolic links to files and directories.
+         """
+-        subdir = self.path.child(b"sub1")
+-        self.symlink(subdir.path, self._mkpath(b"sub1.link"))
+-        self.symlink(subdir.child(b"file2").path, self._mkpath(b"file2.link"))
+-        self.symlink(subdir.child(b"file2").path,
+-                     self._mkpath(b"sub1", b"sub1.file2.link"))
++        subdir = self.path.child("sub1")
++        self.symlink(subdir.path, self._mkpath("sub1.link"))
++        self.symlink(subdir.child("file2").path, self._mkpath("file2.link"))
++        self.symlink(subdir.child("file2").path,
++                     self._mkpath("sub1", "sub1.file2.link"))
+ 
+ 
+     def test_realpathSymlink(self):
+@@ -628,10 +769,10 @@
+         symlink.
+         """
+         self.createLinks()
+-        self.symlink(self.path.child(b"file2.link").path,
+-                     self.path.child(b"link.link").path)
+-        self.assertEqual(self.path.child(b"link.link").realpath(),
+-                          self.path.child(b"sub1").child(b"file2"))
++        self.symlink(self.path.child("file2.link").path,
++                     self.path.child("link.link").path)
++        self.assertEqual(self.path.child("link.link").realpath(),
++                          self.path.child("sub1").child("file2"))
+ 
+ 
+     def test_realpathCyclicalSymlink(self):
+@@ -639,10 +780,10 @@
+         L{FilePath.realpath} raises L{filepath.LinkError} if the path is a
+         symbolic link which is part of a cycle.
+         """
+-        self.symlink(self.path.child(b"link1").path, self.path.child(b"link2").path)
+-        self.symlink(self.path.child(b"link2").path, self.path.child(b"link1").path)
++        self.symlink(self.path.child("link1").path, self.path.child("link2").path)
++        self.symlink(self.path.child("link2").path, self.path.child("link1").path)
+         self.assertRaises(filepath.LinkError,
+-                          self.path.child(b"link2").realpath)
++                          self.path.child("link2").realpath)
+ 
+ 
+     def test_realpathNoSymlink(self):
+@@ -650,8 +791,8 @@
+         L{FilePath.realpath} returns the path itself if the path is not a
+         symbolic link.
+         """
+-        self.assertEqual(self.path.child(b"sub1").realpath(),
+-                          self.path.child(b"sub1"))
++        self.assertEqual(self.path.child("sub1").realpath(),
++                          self.path.child("sub1"))
+ 
+ 
+     def test_walkCyclicalSymlink(self):
+@@ -659,8 +800,8 @@
+         Verify that walking a path with a cyclical symlink raises an error
+         """
+         self.createLinks()
+-        self.symlink(self.path.child(b"sub1").path,
+-                     self.path.child(b"sub1").child(b"sub1.loopylink").path)
++        self.symlink(self.path.child("sub1").path,
++                     self.path.child("sub1").child("sub1.loopylink").path)
+         def iterateOverPath():
+             return [foo.path for foo in self.path.walk()]
+         self.assertRaises(filepath.LinkError, iterateOverPath)
+@@ -674,8 +815,8 @@
+         """
+         self.createLinks()
+         # we create cyclical symlinks
+-        self.symlink(self.path.child(b"sub1").path,
+-                     self.path.child(b"sub1").child(b"sub1.loopylink").path)
++        self.symlink(self.path.child("sub1").path,
++                     self.path.child("sub1").child("sub1.loopylink").path)
+         def noSymLinks(path):
+             return not path.islink()
+         def iterateOverPath():
+@@ -697,12 +838,12 @@
+ 
+     def test_getAndSet(self):
+         content = b'newcontent'
+-        self.path.child(b'new').setContent(content)
+-        newcontent = self.path.child(b'new').getContent()
++        self.path.child('new').setContent(content)
++        newcontent = self.path.child('new').getContent()
+         self.assertEqual(content, newcontent)
+         content = b'content'
+-        self.path.child(b'new').setContent(content, b'.tmp')
+-        newcontent = self.path.child(b'new').getContent()
++        self.path.child('new').setContent(content, '.tmp')
++        newcontent = self.path.child('new').getContent()
+         self.assertEqual(content, newcontent)
+ 
+ 
+@@ -711,7 +852,7 @@
+         If reading from the underlying file raises an exception,
+         L{FilePath.getContent} raises that exception after closing the file.
+         """
+-        fp = ExplodingFilePath(b"")
++        fp = ExplodingFilePath("")
+         self.assertRaises(IOError, fp.getContent)
+         self.assertTrue(fp.fp.closed)
+ 
+@@ -721,7 +862,7 @@
+         If writing to the underlying file raises an exception,
+         L{FilePath.setContent} raises that exception after closing the file.
+         """
+-        fp = ExplodingFilePath(b"")
++        fp = ExplodingFilePath("")
+         self.assertRaises(IOError, fp.setContent, b"blah")
+         self.assertTrue(fp.fp.closed)
+ 
+@@ -753,13 +894,13 @@
+         fp.setContent(b"hello")
+         opened = fp.openedPaths()
+         self.assertEqual(len(opened), 1)
+-        self.assertTrue(opened[0].basename().endswith(b".new"),
++        self.assertTrue(opened[0].basename().endswith(".new"),
+                         "%s does not end with default '.new' extension" % (
+                             opened[0].basename()))
+-        fp.setContent(b"goodbye", b"-something-else")
++        fp.setContent(b"goodbye", "-something-else")
+         opened = fp.openedPaths()
+         self.assertEqual(len(opened), 2)
+-        self.assertTrue(opened[1].basename().endswith(b"-something-else"),
++        self.assertTrue(opened[1].basename().endswith("-something-else"),
+                         "%s does not end with -something-else extension" % (
+                             opened[1].basename()))
+ 
+@@ -770,8 +911,8 @@
+         non-links. Also check that the symbolic link shares the directory
+         property with its target.
+         """
+-        s4 = self.path.child(b"sub4")
+-        s3 = self.path.child(b"sub3")
++        s4 = self.path.child("sub4")
++        s3 = self.path.child("sub3")
+         self.symlink(s3.path, s4.path)
+         self.assertTrue(s4.islink())
+         self.assertFalse(s3.islink())
+@@ -786,12 +927,17 @@
+         directory.
+         """
+         targetLinks = [
+-            (self.path.child(b"sub2"), self.path.child(b"sub2.link")),
+-            (self.path.child(b"sub2").child(b"file3.ext1"),
+-             self.path.child(b"file3.ext1.link"))
++            (self.path.child("sub2"), self.path.child("sub2.link")),
++            (self.path.child("sub2").child("file3.ext1"),
++             self.path.child("file3.ext1.link"))
+             ]
+         for target, link in targetLinks:
++            try:
+-            target.linkTo(link)
++                target.linkTo(link)
++            except OSError as exc:
++                if os.name == "nt" and exc.errno is None: # win32 + python 3: see Python issue #9333
++                    raise SkipTest("User does not have permission to create symlinks")
++
+             self.assertTrue(link.islink(), "This is a link")
+             self.assertEqual(target.isdir(), link.isdir())
+             self.assertEqual(target.isfile(), link.isfile())
+@@ -803,10 +949,10 @@
+             - the target is in a directory that doesn't exist
+             - the target already exists
+         """
+-        self.assertRaises(OSError, self.path.child(b"file1").linkTo,
+-                          self.path.child(b'nosub').child(b'file1'))
+-        self.assertRaises(OSError, self.path.child(b"file1").linkTo,
+-                          self.path.child(b'sub1').child(b'file2'))
++        self.assertRaises(OSError, self.path.child("file1").linkTo,
++                          self.path.child('nosu').child('file1'))
++        self.assertRaises(OSError, self.path.child("file1").linkTo,
++                          self.path.child('sub1').child('file2'))
+ 
+ 
+     if not getattr(os, "symlink", None):
+@@ -817,23 +963,23 @@
+ 
+ 
+     def testMultiExt(self):
+-        f3 = self.path.child(b'sub3').child(b'file3')
+-        exts = b'.foo', b'.bar', b'ext1', b'ext2', b'ext3'
++        f3 = self.path.child('sub3').child('file3')
++        exts = '.foo', '.bar', 'ext1', 'ext2', 'ext3'
+         self.failIf(f3.siblingExtensionSearch(*exts))
+-        f3e = f3.siblingExtension(b".foo")
++        f3e = f3.siblingExtension(".foo")
+         f3e.touch()
+         self.failIf(not f3.siblingExtensionSearch(*exts).exists())
+-        self.failIf(not f3.siblingExtensionSearch(b'*').exists())
++        self.failIf(not f3.siblingExtensionSearch('*').exists())
+         f3e.remove()
+         self.failIf(f3.siblingExtensionSearch(*exts))
+ 
+     def testPreauthChild(self):
+-        fp = filepath.FilePath(b'.')
+-        fp.preauthChild(b'foo/bar')
+-        self.assertRaises(filepath.InsecurePath, fp.child, b'/foo')
++        fp = filepath.FilePath('.')
++        fp.preauthChild('foo/bar')
++        self.assertRaises(filepath.InsecurePath, fp.child, '/foo')
+ 
+     def testStatCache(self):
+-        p = self.path.child(b'stattest')
++        p = self.path.child('stattest')
+         p.touch()
+         self.assertEqual(p.getsize(), 0)
+         self.assertEqual(abs(p.getmtime() - time.time()) // 20, 0)
+@@ -857,13 +1003,13 @@
+         self.assertEqual(self.path.path, newpath.path)
+ 
+     def testInsecureUNIX(self):
+-        self.assertRaises(filepath.InsecurePath, self.path.child, b"..")
+-        self.assertRaises(filepath.InsecurePath, self.path.child, b"/etc")
+-        self.assertRaises(filepath.InsecurePath, self.path.child, b"../..")
++        self.assertRaises(filepath.InsecurePath, self.path.child, "..")
++        self.assertRaises(filepath.InsecurePath, self.path.child, "/etc")
++        self.assertRaises(filepath.InsecurePath, self.path.child, "../..")
+ 
+     def testInsecureWin32(self):
+-        self.assertRaises(filepath.InsecurePath, self.path.child, b"..\\..")
+-        self.assertRaises(filepath.InsecurePath, self.path.child, b"C:randomfile")
++        self.assertRaises(filepath.InsecurePath, self.path.child, "..\\..")
++        self.assertRaises(filepath.InsecurePath, self.path.child, "C:randomfile")
+ 
+     if platform.getType() != 'win32':
+         testInsecureWin32.skip = "Test will run only on Windows."
+@@ -876,8 +1022,8 @@
+         the filesystem.  For obvious reasons, we do not wish to normally permit
+         access to these.
+         """
+-        self.assertRaises(filepath.InsecurePath, self.path.child, b"CON")
+-        self.assertRaises(filepath.InsecurePath, self.path.child, b"C:CON")
++        self.assertRaises(filepath.InsecurePath, self.path.child, "CON")
++        self.assertRaises(filepath.InsecurePath, self.path.child, "C:CON")
+         self.assertRaises(filepath.InsecurePath, self.path.child, r"C:\CON")
+ 
+     if platform.getType() != 'win32':
+@@ -885,27 +1031,27 @@
+ 
+ 
+     def testComparison(self):
+-        self.assertEqual(filepath.FilePath(b'a'),
+-                          filepath.FilePath(b'a'))
+-        self.failUnless(filepath.FilePath(b'z') >
+-                        filepath.FilePath(b'a'))
+-        self.failUnless(filepath.FilePath(b'z') >=
+-                        filepath.FilePath(b'a'))
+-        self.failUnless(filepath.FilePath(b'a') >=
+-                        filepath.FilePath(b'a'))
+-        self.failUnless(filepath.FilePath(b'a') <=
+-                        filepath.FilePath(b'a'))
+-        self.failUnless(filepath.FilePath(b'a') <
+-                        filepath.FilePath(b'z'))
+-        self.failUnless(filepath.FilePath(b'a') <=
+-                        filepath.FilePath(b'z'))
+-        self.failUnless(filepath.FilePath(b'a') !=
+-                        filepath.FilePath(b'z'))
+-        self.failUnless(filepath.FilePath(b'z') !=
+-                        filepath.FilePath(b'a'))
++        self.assertEqual(filepath.FilePath('a'),
++                          filepath.FilePath('a'))
++        self.failUnless(filepath.FilePath('z') >
++                        filepath.FilePath('a'))
++        self.failUnless(filepath.FilePath('z') >=
++                        filepath.FilePath('a'))
++        self.failUnless(filepath.FilePath('a') >=
++                        filepath.FilePath('a'))
++        self.failUnless(filepath.FilePath('a') <=
++                        filepath.FilePath('a'))
++        self.failUnless(filepath.FilePath('a') <
++                        filepath.FilePath('z'))
++        self.failUnless(filepath.FilePath('a') <=
++                        filepath.FilePath('z'))
++        self.failUnless(filepath.FilePath('a') !=
++                        filepath.FilePath('z'))
++        self.failUnless(filepath.FilePath('z') !=
++                        filepath.FilePath('a'))
+ 
+-        self.failIf(filepath.FilePath(b'z') !=
+-                    filepath.FilePath(b'z'))
++        self.failIf(filepath.FilePath('z') !=
++                    filepath.FilePath('z'))
+ 
+ 
+     def test_descendantOnly(self):
+@@ -914,14 +1060,14 @@
+         L{InsecurePath} is raised.
+         """
+         self.assertRaises(
+-            filepath.InsecurePath, self.path.descendant, [b'a', b'..'])
++            filepath.InsecurePath, self.path.descendant, ['a', '..'])
+ 
+ 
+     def testSibling(self):
+-        p = self.path.child(b'sibling_start')
+-        ts = p.sibling(b'sibling_test')
++        p = self.path.child('sibling_start')
++        ts = p.sibling('sibling_test')
+         self.assertEqual(ts.dirname(), p.dirname())
+-        self.assertEqual(ts.basename(), b'sibling_test')
++        self.assertEqual(ts.basename(), 'sibling_test')
+         ts.createDirectory()
+         self.assertIn(ts, self.path.children())
+ 
+@@ -938,7 +1084,7 @@
+         If L{FilePath.temporarySibling} is given an extension argument, it will
+         produce path objects with that extension appended to their names.
+         """
+-        testExtension = b".test-extension"
++        testExtension = ".test-extension"
+         ts = self.path.temporarySibling(testExtension)
+         self.assertTrue(ts.basename().endswith(testExtension),
+                         "%s does not end with %s" % (
+@@ -959,12 +1105,12 @@
+         For a path which is a symbolic link, L{FilePath.remove} just deletes
+         the link, not the target.
+         """
+-        link = self.path.child(b"sub1.link")
++        link = self.path.child("sub1.link")
+         # setUp creates the sub1 child
+-        self.symlink(self.path.child(b"sub1").path, link.path)
++        self.symlink(self.path.child("sub1").path, link.path)
+         link.remove()
+         self.assertFalse(link.exists())
+-        self.assertTrue(self.path.child(b"sub1").exists())
++        self.assertTrue(self.path.child("sub1").exists())
+ 
+ 
+     def test_copyToDirectory(self):
+@@ -989,7 +1135,7 @@
+         source file to read from, the destination file is closed and the
+         exception is raised to the caller of L{FilePath.copyTo}.
+         """
+-        nosuch = self.path.child(b"nothere")
++        nosuch = self.path.child("nothere")
+         # Make it look like something to copy, even though it doesn't exist.
+         # This could happen if the file is deleted between the isfile check and
+         # the file actually being opened.
+@@ -1023,7 +1169,7 @@
+         attempting to copy a directory to a child of itself.
+         """
+         self.assertRaises((OSError, IOError),
+-                          self.path.copyTo, self.path.child(b'file1'))
++                          self.path.copyTo, self.path.child('file1'))
+ 
+ 
+     def test_copyToWithSymlink(self):
+@@ -1031,25 +1177,25 @@
+         Verify that copying with followLinks=True copies symlink targets
+         instead of symlinks
+         """
+-        self.symlink(self.path.child(b"sub1").path,
+-                     self.path.child(b"link1").path)
++        self.symlink(self.path.child("sub1").path,
++                     self.path.child("link1").path)
+         fp = filepath.FilePath(self.mktemp())
+         self.path.copyTo(fp)
+-        self.assertFalse(fp.child(b"link1").islink())
+-        self.assertEqual([x.basename() for x in fp.child(b"sub1").children()],
+-                          [x.basename() for x in fp.child(b"link1").children()])
++        self.assertFalse(fp.child("link1").islink())
++        self.assertEqual([x.basename() for x in fp.child("sub1").children()],
++                          [x.basename() for x in fp.child("link1").children()])
+ 
+ 
+     def test_copyToWithoutSymlink(self):
+         """
+         Verify that copying with followLinks=False copies symlinks as symlinks
+         """
+-        self.symlink(b"sub1", self.path.child(b"link1").path)
++        self.symlink("sub1", self.path.child("link1").path)
+         fp = filepath.FilePath(self.mktemp())
+         self.path.copyTo(fp, followLinks=False)
+-        self.assertTrue(fp.child(b"link1").islink())
+-        self.assertEqual(os.readlink(self.path.child(b"link1").path),
+-                          os.readlink(fp.child(b"link1").path))
++        self.assertTrue(fp.child("link1").islink())
++        self.assertEqual(os.readlink(self.path.child("link1").path),
++                          os.readlink(fp.child("link1").path))
+ 
+ 
+     def test_copyToMissingSource(self):
+@@ -1152,7 +1298,7 @@
+         IOError if you want to move a path into one of its child. It's simply
+         the error raised by the underlying rename system call.
+         """
+-        self.assertRaises((OSError, IOError), self.path.moveTo, self.path.child(b'file1'))
++        self.assertRaises((OSError, IOError), self.path.moveTo, self.path.child('file1'))
+ 
+ 
+     def setUpFaultyRename(self):
+@@ -1198,12 +1344,12 @@
+         actually copy the content of the linked node.
+         """
+         invokedWith = self.setUpFaultyRename()
+-        f2 = self.path.child(b'file2')
+-        f3 = self.path.child(b'file3')
+-        self.symlink(self.path.child(b'file1').path, f2.path)
++        f2 = self.path.child('file2')
++        f3 = self.path.child('file3')
++        self.symlink(self.path.child('file1').path, f2.path)
+         f2.moveTo(f3)
+         self.assertFalse(f3.islink())
+-        self.assertEqual(f3.getContent(), b'file 1')
++        self.assertEqual(f3.getContent(), 'file 1')
+         self.assertTrue(invokedWith)
+ 
+ 
+@@ -1213,9 +1359,9 @@
+         another symlink.
+         """
+         invokedWith = self.setUpFaultyRename()
+-        f2 = self.path.child(b'file2')
+-        f3 = self.path.child(b'file3')
+-        self.symlink(self.path.child(b'file1').path, f2.path)
++        f2 = self.path.child('file2')
++        f3 = self.path.child('file3')
++        self.symlink(self.path.child('file1').path, f2.path)
+         f2.moveTo(f3, followLinks=False)
+         self.assertTrue(f3.islink())
+         self.assertEqual(f3.getContent(), b'file 1')
+@@ -1233,21 +1379,22 @@
+         """
+         path = filepath.FilePath(self.mktemp())
+         f = path.create()
+-        self.failUnless("b" in f.mode)
++        self.failUnless("" in f.mode)
+         f.write(b"\n")
+         f.close()
+-        read = open(path.path, "rb").read()
++        with open(path.path, "rb") as f:
++            read = f.read()
+-        self.assertEqual(read, b"\n")
++            self.assertEqual(read, b"\n")
+ 
+ 
+     def testOpen(self):
+         # Opening a file for reading when it does not already exist is an error
+-        nonexistent = self.path.child(b'nonexistent')
++        nonexistent = self.path.child('nonexistent')
+         e = self.assertRaises(IOError, nonexistent.open)
+         self.assertEqual(e.errno, errno.ENOENT)
+ 
+         # Opening a file for writing when it does not exist is okay
+-        writer = self.path.child(b'writer')
++        writer = self.path.child('writer')
+         f = writer.open('w')
+         f.write(b'abc\ndef')
+         f.close()
+@@ -1267,7 +1414,7 @@
+ 
+         # Put some bytes in a file so we can test that appending does not
+         # destroy them.
+-        appender = self.path.child(b'appender')
++        appender = self.path.child('appender')
+         f = appender.open('w')
+         f.write(b'abc')
+         f.close()
+@@ -1338,7 +1485,7 @@
+ 
+         See http://bugs.python.org/issue7686 for details about the bug.
+         """
+-        writer = self.path.child(b'explicit-binary')
++        writer = self.path.child('explicit-binary')
+         file = writer.open('wb')
+         file.write(b'abc\ndef')
+         file.close()
+@@ -1355,7 +1502,7 @@
+ 
+         See http://bugs.python.org/issue7686 for details about the bug.
+         """
+-        writer = self.path.child(b'multiple-binary')
++        writer = self.path.child('multiple-binary')
+         file = writer.open('wbb')
+         file.write(b'abc\ndef')
+         file.close()
+@@ -1407,10 +1554,10 @@
+         """
+         for mode in (0o777, 0o700):
+             self.path.child(b"sub1").chmod(mode)
+-            self.assertEqual(self.path.child(b"sub1").getPermissions(),
++            self.assertEqual(self.path.child("sub1").getPermissions(),
+                               filepath.Permissions(mode))
+-        self.path.child(b"sub1").chmod(0o764) #sanity check
+-        self.assertEqual(self.path.child(b"sub1").getPermissions().shorthand(),
++        self.path.child("sub1").chmod(0o764) #sanity check
++        self.assertEqual(self.path.child("sub1").getPermissions().shorthand(),
+                           "rwxrw-r--")
+ 
+ 
+@@ -1423,15 +1570,15 @@
+         bit.
+         """
+         # Change permission after test so file can be deleted
+-        self.addCleanup(self.path.child(b"sub1").chmod, 0o777)
++        self.addCleanup(self.path.child("sub1").chmod, 0o777)
+ 
+         for mode in (0o777, 0o555):
+-            self.path.child(b"sub1").chmod(mode)
+-            self.assertEqual(self.path.child(b"sub1").getPermissions(),
++            self.path.child("sub1").chmod(mode)
++            self.assertEqual(self.path.child("sub1").getPermissions(),
+                               filepath.Permissions(mode))
+-        self.path.child(b"sub1").chmod(0o511) #sanity check to make sure that
++        self.path.child("sub1").chmod(0o511) #sanity check to make sure that
+         # user=group=other permissions
+-        self.assertEqual(self.path.child(b"sub1").getPermissions().shorthand(),
++        self.assertEqual(self.path.child("sub1").getPermissions().shorthand(),
+                           "r-xr-xr-x")
+ 
+ 
+@@ -1463,7 +1610,7 @@
+             numbers = int
+         else:
+             numbers = (int, long)
+-        c = self.path.child(b'file1')
++        c = self.path.child('file1')
+         for p in self.path, c:
+             self.assertIsInstance(p.getInodeNumber(), numbers)
+             self.assertIsInstance(p.getDevice(), numbers)
+Index: twisted/python/filepath.py
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+--- twisted/python/filepath.py	(revision 39161)
++++ twisted/python/filepath.py	(revision )
+@@ -30,20 +30,16 @@
+ # things import this module, and it would be good if it could easily be
+ # modified for inclusion in the standard library.  --glyph
+ 
+-from twisted.python.compat import comparable, cmp
++from twisted.python.compat import comparable, cmp, _PY3
+ from twisted.python.runtime import platform
+-
+-from twisted.python.win32 import ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND
+-from twisted.python.win32 import ERROR_INVALID_NAME, ERROR_DIRECTORY, O_BINARY
+ from twisted.python.win32 import WindowsError
+-
+ from twisted.python.util import FancyEqMixin
+ 
+ 
+ _CREATE_FLAGS = (os.O_EXCL |
+                  os.O_CREAT |
+                  os.O_RDWR |
+-                 O_BINARY)
++                 os.O_BINARY)
+ 
+ 
+ def _stub_islink(path):
+@@ -203,8 +199,8 @@
+         """
+         A file path for the directory containing the file at this file path.
+ 
+-        @param name: the name of a sibling of this path. C{name} must be a direct
+-            sibling of this path and may not contain a path separator.
++        @param name: the name of a sibling of this path. C{name} must be a
++            direct sibling of this path and may not contain a path separator.
+ 
+         @return: a sibling file path of this one.
+         """
+@@ -259,7 +255,7 @@
+ 
+ 
+ 
+-def _secureEnoughString():
++def _secureEnoughBytes():
+     """
+     Compute a string usable as a new, temporary filename.
+ 
+@@ -324,45 +320,20 @@
+         """
+         try:
+             subnames = self.listdir()
+-        except WindowsError as winErrObj:
+-            # WindowsError is an OSError subclass, so if not for this clause
+-            # the OSError clause below would be handling these.  Windows error
+-            # codes aren't the same as POSIX error codes, so we need to handle
+-            # them differently.
+ 
+-            # Under Python 2.5 on Windows, WindowsError has a winerror
+-            # attribute and an errno attribute.  The winerror attribute is
+-            # bound to the Windows error code while the errno attribute is
+-            # bound to a translation of that code to a perhaps equivalent POSIX
+-            # error number.
+-
+-            # Under Python 2.4 on Windows, WindowsError only has an errno
+-            # attribute.  It is bound to the Windows error code.
+-
+-            # For simplicity of code and to keep the number of paths through
+-            # this suite minimal, we grab the Windows error code under either
+-            # version.
+-
+-            # Furthermore, attempting to use os.listdir on a non-existent path
+-            # in Python 2.4 will result in a Windows error code of
+-            # ERROR_PATH_NOT_FOUND.  However, in Python 2.5,
+-            # ERROR_FILE_NOT_FOUND results instead. -exarkun
+-            winerror = getattr(winErrObj, 'winerror', winErrObj.errno)
+-            if winerror not in (ERROR_PATH_NOT_FOUND,
+-                                ERROR_FILE_NOT_FOUND,
+-                                ERROR_INVALID_NAME,
+-                                ERROR_DIRECTORY):
+-                raise
+-            raise _WindowsUnlistableError(winErrObj)
+         except OSError as ose:
+-            if ose.errno not in (errno.ENOENT, errno.ENOTDIR):
++            # Fun fact: Python 2.6-3.2 maps Windows ERROR_DIRECTORY (267) to
++            # EINVAL, but 3.3 more "correctly" maps it to ENOTDIR.
++            # Handle EINVAL to catch older Python versions.
++            if ose.errno not in (errno.ENOENT, errno.ENOTDIR, errno.EINVAL):
+                 # Other possible errors here, according to linux manpages:
+                 # EACCES, EMIFLE, ENFILE, ENOMEM.  None of these seem like the
+                 # sort of thing which should be handled normally. -glyph
+                 raise
+             raise UnlistableError(ose)
+-        return map(self.child, subnames)
+ 
++        return [self.child(subname) for subname in subnames]
++
+     def walk(self, descend=None):
+         """
+         Yield myself, then each of my children, and each of those children's
+@@ -456,7 +427,15 @@
+             return segments
+         raise ValueError("%r not parent of %r" % (ancestor, self))
+ 
++    def __eq__(self, other):
++        """
++        Test whether we refer to the same path as twisanother L{FilePath} instance.
+ 
++        @param other: The L{FilePath} instance we are comparing against.
++        @type other: L{FilePath}
++        """
++        return self.path == other.path
++
+     # new in 8.0
+     def __hash__(self):
+         """
+@@ -609,13 +588,16 @@
+     Greater-than-second precision is only available in Windows on Python2.5 and
+     later.
+ 
+-    On both Python 2 and Python 3, paths can only be bytes.
++    On both Python 2 and Python 3, paths can be either bytes or unicode
++    (str on Python 3).  Depending on the string type for which the path
++    was created, all subsequent operations involving strings must use
++    and will return that type.
+ 
+     @type alwaysCreate: L{bool}
+     @ivar alwaysCreate: When opening this file, only succeed if the file does
+         not already exist.
+ 
+-    @type path: L{bytes}
++    @type path: L{str or bytes}
+     @ivar path: The path from which 'downward' traversal is permitted.
+ 
+     @ivar statinfo: The currently cached status information about the file on
+@@ -636,16 +618,38 @@
+     statinfo = None
+     path = None
+ 
+-    sep = slash.encode("ascii")
+-
+     def __init__(self, path, alwaysCreate=False):
+         """
+         Convert a path string to an absolute path if necessary and initialize
+         the L{FilePath} with the result.
+         """
++        # Keep track of whether we are str or bytes internally.
++        # We use several internal constants that must be of the same
++        # type as self.path, or Python will be quite angry.
++        if _PY3:
++            self._unicode = isinstance(path, str)
++            self.sep = slash if self._unicode else slash.encode("ascii")
++        else:
++            self._unicode = isinstance(path, unicode)
++            self.sep = slash.decode("ascii") if self._unicode else slash
++
++        self._colon    = self._getMatchedStringType(u":")
++        self._globChar = self._getMatchedStringType(u"*")
++        self._extSep   = self._getMatchedStringType(u".")
++
+         self.path = abspath(path)
+         self.alwaysCreate = alwaysCreate
+ 
++    def _getMatchedStringType(self, string):
++        """
++        @param string:
++        @type string: L{str or unicode}
++        """
++        if self._unicode:
++            return string
++        else:
++            return string.encode("ascii")
++
+     def __getstate__(self):
+         """
+         Support serialization by discarding cached L{os.stat} results and
+@@ -664,7 +668,7 @@
+ 
+         @param path: The base name of the new L{FilePath}.  If this contains
+             directory separators or parent references it will be rejected.
+-        @type path: L{bytes}
++        @type path: L{str or bytes}
+ 
+         @raise InsecurePath: If the result of combining this path with C{path}
+             would result in a path which is not a direct child of this path.
+@@ -672,12 +676,13 @@
+         @return: The child path.
+         @rtype: L{FilePath}
+         """
+-        if platform.isWindows() and path.count(b":"):
++        if platform.isWindows() and path.count(self._colon):
+             # Catch paths like C:blah that don't have a slash
+             raise InsecurePath("%r contains a colon." % (path,))
+         norm = normpath(path)
+         if self.sep in norm:
+-            raise InsecurePath("%r contains one or more directory separators" % (path,))
++            raise InsecurePath("%r contains one or more directory "
++                               "separators" % (path,))
+         newpath = abspath(joinpath(self.path, norm))
+         if not newpath.startswith(self.path):
+             raise InsecurePath("%r is not a child of %s" % (newpath, self.path))
+@@ -690,7 +695,7 @@
+ 
+         @param path: A relative path (ie, a path not starting with C{"/"}) which
+             will be interpreted as a child or descendant of this path.
+-        @type path: L{bytes}
++        @type path: L{str or bytes}
+ 
+         @return: The child path.
+         @rtype: L{FilePath}
+@@ -738,9 +743,9 @@
+         for ext in exts:
+             if not ext and self.exists():
+                 return self
+-            if ext == b'*':
+-                basedot = basename(p) + b'.'
+-                for fn in listdir(dirname(p)):
++            if ext == self._globChar:
++                basedot = basename(p) + self._extSep
++                for fn in self.parent().listdir():
+                     if fn.startswith(basedot):
+                         return self.clonePath(joinpath(dirname(p), fn))
+             p2 = p + ext
+@@ -831,8 +836,8 @@
+ 
+     def restat(self, reraise=True):
+         """
+-        Re-calculate cached effects of 'stat'.  To refresh information on this path
+-        after you know the filesystem may have changed, call this method.
++        Re-calculate cached effects of 'stat'.  To refresh information on this
++        path after you know the filesystem may have changed, call this method.
+ 
+         @param reraise: a boolean.  If true, re-raise exceptions from
+             L{os.stat}; otherwise, mark this path as not existing, and remove
+@@ -1169,9 +1174,9 @@
+         """
+         List the base names of the direct children of this L{FilePath}.
+ 
+-        @return: A L{list} of L{bytes} giving the names of the contents of the
+-            directory this L{FilePath} refers to.  These names are relative to
+-            this L{FilePath}.
++        @return: A L{list} of L{str or bytes} giving the names of the contents
++            of the directory this L{FilePath} refers to.  These names are
++            relative to this L{FilePath}.
+         @rtype: L{list}
+ 
+         @raise: Anything the platform L{os.listdir} implementation might raise
+@@ -1243,15 +1248,16 @@
+         representing my children that match the given pattern.
+ 
+         @param pattern: A glob pattern to use to match child paths.
+-        @type pattern: L{bytes}
++        @type pattern: L{str or bytes}
+ 
+         @return: A L{list} of matching children.
+         @rtype: L{list}
+         """
+         import glob
+-        path = self.path[-1] == b'/' and self.path + pattern or self.sep.join(
+-            [self.path, pattern])
+-        return map(self.clonePath, glob.glob(path))
++        path = self.path[-1] == self.sep and self.path + pattern or \
++               self.sep.join([self.path, pattern])
++        return [self.clonePath(globbed_path)
++                for globbed_path in glob.glob(path)]
+ 
+ 
+     def basename(self):
+@@ -1261,7 +1267,7 @@
+ 
+         @return: The final component of the L{FilePath}'s path (Everything
+             after the final path separator).
+-        @rtype: L{bytes}
++        @rtype: L{str or bytes}
+         """
+         return basename(self.path)
+ 
+@@ -1273,7 +1279,7 @@
+ 
+         @return: All of the components of the L{FilePath}'s path except the
+             last one (everything up to the final path separator).
+-        @rtype: L{bytes}
++        @rtype: L{str or bytes}
+         """
+         return dirname(self.path)
+ 
+@@ -1289,7 +1295,7 @@
+         return self.clonePath(self.dirname())
+ 
+ 
+-    def setContent(self, content, ext=b'.new'):
++    def setContent(self, content, ext=None):
+         """
+         Replace the file at this path with a new file that contains the given
+         bytes, trying to avoid data-loss in the meanwhile.
+@@ -1331,10 +1337,18 @@
+         @param ext: An extension to append to the temporary filename used to
+             store the bytes while they are being written.  This can be used to
+             make sure that temporary files can be identified by their suffix,
+-            for cleanup in case of crashes.
++            for cleanup in case of crashes. If it is C{None}, the default
++            extension is ".new".
+ 
+-        @type ext: L{bytes}
++        @type ext: L{str or bytes}
+         """
++        if not isinstance(content, bytes):
++            raise TypeError("New file contents must be bytes.")
++
++        # Get the default extension in the correct string type
++        if ext is None:
++            ext = self._getMatchedStringType(".new")
++
+         sib = self.temporarySibling(ext)
+         f = sib.open('w')
+         try:
+@@ -1391,7 +1405,7 @@
+         return os.fdopen(fdint, 'w+b')
+ 
+ 
+-    def temporarySibling(self, extension=b""):
++    def temporarySibling(self, extension=None):
+         """
+         Construct a path referring to a sibling of this path.
+ 
+@@ -1404,14 +1418,21 @@
+             that if you want an extension with a '.' you must include the '.'
+             yourself.)
+ 
+-        @type extension: L{bytes}
++        @type extension: L{str or bytes}
+ 
+         @return: a path object with the given extension suffix, C{alwaysCreate}
+             set to True.
+ 
+         @rtype: L{FilePath}
+         """
+-        sib = self.sibling(_secureEnoughString() + self.basename() + extension)
++        tempBytes = _secureEnoughBytes()
++        # Ensure the type of temporary string generated matches the input path.
++        if self._unicode:
++            tempBytes = tempBytes.decode("ascii")
++        if extension is None:
++            extension = self._getMatchedStringType("")
++
++        sib = self.sibling(tempBytes + self.basename() + extension)
+         sib.requireCreate()
+         return sib
+ 
+Index: twisted/topfiles/2366.bugfix
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+--- twisted/topfiles/2366.bugfix	(revision )
++++ twisted/topfiles/2366.bugfix	(revision )
+@@ -0,0 +1,1 @@
++twisted.python.filepath now fully supports Unicode pathnames and Python 3 on Windows.
+\ No newline at end of file

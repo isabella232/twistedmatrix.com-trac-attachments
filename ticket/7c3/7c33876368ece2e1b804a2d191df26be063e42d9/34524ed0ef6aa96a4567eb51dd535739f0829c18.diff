@@ -1,0 +1,191 @@
+Index: twisted/test/test_unix.py
+===================================================================
+--- twisted/test/test_unix.py	(revision 10452)
++++ twisted/test/test_unix.py	(working copy)
+@@ -71,6 +71,18 @@
+         self.runReactor(0.2, True)
+         l.stopListening()
+ 
++    def testPIDFile(self):
++        filename = self.mktemp()
++        l = reactor.listenUNIX(filename, Factory(self, filename), mode = 0600, wantPID=1)
++        self.assert_(os.path.exists(filename+".pid"))
++        pid = int(open(filename+".pid").read())
++        self.assertEquals(pid, os.getpid())
++        reactor.connectUNIX(filename, TestClientFactory(self, filename), checkPID=1)
++        self.runReactor(0.2, True)
++        l.stopListening()
++        reactor.iterate(0.1)
++        self.assert_(not os.path.exists(filename+".pid"))
++
+ class ClientProto(protocol.ConnectedDatagramProtocol):
+     def datagramReceived(self, data):
+         self.gotback = data
+Index: twisted/internet/unix.py
+===================================================================
+--- twisted/internet/unix.py	(revision 10452)
++++ twisted/internet/unix.py	(working copy)
+@@ -53,9 +53,13 @@
+ 
+     transport = Server
+ 
+-    def __init__(self, fileName, factory, backlog=5, mode=0666, reactor=None):
++    def __init__(self, fileName, factory, backlog=5, mode=0666, reactor=None, wantPID = 0):
+         tcp.Port.__init__(self, fileName, factory, backlog, reactor=reactor)
+         self.mode = mode
++        if wantPID:
++            self.pidFile = fileName + ".pid"
++        else:
++            self.pidFile = None
+ 
+     def __repr__(self):
+         return '<%s on %r>' % (self.factory.__class__, self.port)
+@@ -83,6 +87,12 @@
+                 os.chmod(self.port, self.mode)
+             except: # probably not a visible filesystem name
+                 pass
++            if self.pidFile:
++                try:
++                    open(self.pidFile, 'w').write(str(os.getpid()))
++                    os.chmod(self.pidFile, self.mode)
++                except:
++                    pass
+             skt.listen(self.backlog)
+             self.connected = True
+             self.socket = skt
+@@ -93,6 +103,8 @@
+     def connectionLost(self, reason):
+         tcp.Port.connectionLost(self, reason)
+         os.unlink(self.port)
++        if self.pidFile:
++            os.remove(self.pidFile)
+ 
+     def getHost(self):
+         """Returns a UNIXAddress.
+@@ -107,9 +119,21 @@
+     addressFamily = socket.AF_UNIX
+     socketType = socket.SOCK_STREAM
+ 
+-    def __init__(self, filename, connector, reactor=None):
++    def __init__(self, filename, connector, reactor=None, checkPID = 0):
+         self.connector = connector
+         self.realAddress = self.addr = filename
++        if checkPID:
++            pidFile = filename + ".pid"
++            try:
++                _checkPIDFile(pidFile)
++            except OSError, why:
++                if why[0] == errno.ESRCH:
++                    os.unlink(filename)
++                self._finishInit(None, None, why, reactor)
++                return
++            except Exception, e:
++                self._finishInit(None, None, e, reactor)
++                return
+         self._finishInit(self.doConnect, self.createInternetSocket(),
+                          None, reactor)
+ 
+@@ -121,12 +145,13 @@
+ 
+ 
+ class Connector(base.BaseConnector):
+-    def __init__(self, address, factory, timeout, reactor):
++    def __init__(self, address, factory, timeout, reactor, checkPID):
+         base.BaseConnector.__init__(self, factory, timeout, reactor)
+         self.address = address
++        self.checkPID = checkPID
+ 
+     def _makeTransport(self):
+-        return Client(self.address, self, self.reactor)
++        return Client(self.address, self, self.reactor, self.checkPID)
+ 
+     def getDestination(self):
+         return address.UNIXAddress(self.address)
+@@ -265,3 +290,22 @@
+ 
+     def getPeer(self):
+         return address.UNIXAddress(self.remoteaddr)
++
++def _checkPIDFile(pidname):
++    try:
++        pid = int(open(pidfile).read())
++    except ValueError:
++        log.msg('pid file %s contains non-numeric' % pidfile)
++        raise
++    else:
++        try:
++            os.kill(pid, 0)
++        except OSError, why:
++            if why[0] == errno.ESRCH:
++                # pid doesn't exist
++                log.msg('removing stale pidfile %s' % pidfile)
++                os.remove(pidfile)
++            else:
++                log.msg("can't check PID %i from file %s: %s" %
++                        (pid, pidfile, why[1]))
++            raise
+Index: twisted/internet/interfaces.py
+===================================================================
+--- twisted/internet/interfaces.py	(revision 10452)
++++ twisted/internet/interfaces.py	(working copy)
+@@ -256,7 +256,7 @@
+ class IReactorUNIX(Interface):
+     """UNIX socket methods."""
+ 
+-    def connectUNIX(self, address, factory, timeout=30):
++    def connectUNIX(self, address, factory, timeout=30, checkPID=0):
+         """Connect a client protocol to a UNIX socket.
+ 
+         @param address: a path to a unix socket on the filesystem.
+@@ -266,10 +266,13 @@
+         @param timeout: number of seconds to wait before assuming the connection
+             has failed.
+ 
++        @param checkPID: if True, check for a pid file to verify that a server
++            is listening.
++
+         @returns: an L{IConnector}.
+         """
+ 
+-    def listenUNIX(self, address, factory, backlog=5, mode=0666):
++    def listenUNIX(self, address, factory, backlog=5, mode=0666, wantPID=0):
+         """Listen on a UNIX socket.
+ 
+         @param address: a path to a unix socket on the filesystem.
+@@ -279,6 +282,8 @@
+         @param backlog: number of connections to allow in backlog.
+ 
+         @param mode: mode to set on the unix socket.
++
++        @param wantPID: if True, create a pidfile for the socket.
+         """
+ 
+ 
+Index: twisted/internet/default.py
+===================================================================
+--- twisted/internet/default.py	(revision 10452)
++++ twisted/internet/default.py	(working copy)
+@@ -231,19 +231,19 @@
+ 
+     # IReactorUNIX
+ 
+-    def connectUNIX(self, address, factory, timeout=30):
++    def connectUNIX(self, address, factory, timeout=30, checkPID=0):
+         """@see: twisted.internet.interfaces.IReactorUNIX.connectUNIX
+         """
+         assert unixEnabled, "UNIX support is not present"
+-        c = unix.Connector(address, factory, timeout, self)
++        c = unix.Connector(address, factory, timeout, self, checkPID)
+         c.connect()
+         return c
+ 
+-    def listenUNIX(self, address, factory, backlog=5, mode=0666):
++    def listenUNIX(self, address, factory, backlog=5, mode=0666, wantPID=0):
+         """@see: twisted.internet.interfaces.IReactorUNIX.listenUNIX
+         """
+         assert unixEnabled, "UNIX support is not present"
+-        p = unix.Port(address, factory, backlog, mode, self)
++        p = unix.Port(address, factory, backlog, mode, self, wantPID)
+         p.startListening()
+         return p
+ 

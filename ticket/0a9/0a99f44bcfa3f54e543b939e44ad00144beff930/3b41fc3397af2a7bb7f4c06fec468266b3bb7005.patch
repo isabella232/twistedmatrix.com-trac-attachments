@@ -1,0 +1,135 @@
+Index: twisted/internet/iocpreactor/udp.py
+===================================================================
+--- twisted/internet/iocpreactor/udp.py	(revision 32802)
++++ twisted/internet/iocpreactor/udp.py	(working copy)
+@@ -213,11 +213,14 @@
+ 
+ 
+     def _loseConnection(self):
++        """
++        Stop receiving incoming datagrams and schedule socket cleanup and a
++        call to C{self.protocol.doStop}.
++        """
+         self.stopReading()
+         self.reactor.removeActiveHandle(self)
+         if self.connected: # actually means if we are *listening*
+-            from twisted.internet import reactor
+-            reactor.callLater(0, self.connectionLost)
++            self.reactor.callLater(0, self.connectionLost)
+ 
+ 
+     def stopListening(self):
+@@ -241,13 +244,9 @@
+         """
+         log.msg('(Port %s Closed)' % self._realPortNumber)
+         self._realPortNumber = None
+-        self.stopReading()
+-        if hasattr(self, "protocol"):
+-            # we won't have attribute in ConnectedPort, in cases
+-            # where there was an error in connection process
+-            self.protocol.doStop()
++        abstract.FileHandle.connectionLost(self, reason)
++        self.protocol.doStop()
+         self.connected = False
+-        self.disconnected = True
+         self.socket.close()
+         del self.socket
+         del self.getFileHandle
+Index: twisted/internet/test/test_udp.py
+===================================================================
+--- twisted/internet/test/test_udp.py	(revision 32802)
++++ twisted/internet/test/test_udp.py	(working copy)
+@@ -14,7 +14,7 @@
+ from twisted.python import context
+ from twisted.python.log import ILogContext, err
+ from twisted.internet.test.reactormixins import ReactorBuilder
+-from twisted.internet.defer import Deferred
++from twisted.internet import defer
+ from twisted.internet.interfaces import IListeningPort
+ from twisted.internet.address import IPv4Address
+ from twisted.internet.protocol import DatagramProtocol
+@@ -57,7 +57,7 @@
+         class CustomLogPrefixDatagramProtocol(DatagramProtocol):
+             def __init__(self, prefix):
+                 self._prefix = prefix
+-                self.system = Deferred()
++                self.system = defer.Deferred()
+ 
+             def logPrefix(self):
+                 return self._prefix
+@@ -84,4 +84,45 @@
+         self.runReactor(reactor)
+ 
+ 
++    def test_stopProtocolScheduling(self):
++        """
++        Datagram transports call C{protocol.stopProtocol} asynchronously in
++        the reactor they are associated with, not in the global reactor.
++        """
++        class DisconnectingProtocol(DatagramProtocol):
++
++            started = stopped = False
++
++            def __init__(self, deferred):
++                self.deferred = deferred
++
++            def startProtocol(self):
++                self.started = True
++                deferred = defer.maybeDeferred(self.transport.stopListening)
++                stoppedSynchronously = self.stopped
++                deferred.addCallback(lambda ignored: stoppedSynchronously)
++                deferred.chainDeferred(self.deferred)
++
++            def stopProtocol(self):
++                self.stopped = True
++
++        reactor = self.buildReactor()
++        deferred = defer.Deferred()
++        protocol = DisconnectingProtocol(deferred)
++        port = reactor.listenUDP(0, protocol)
++
++        stoppedSynchronously = []
++        def stopReactor(result):
++            stoppedSynchronously.append(result)
++            reactor.stop()
++
++        deferred.addCallback(stopReactor)
++        self.runReactor(reactor)
++        self.assertTrue(protocol.started)
++        self.assertTrue(protocol.stopped)
++        self.assertEqual(stoppedSynchronously, [False])
++        return deferred
++
++
++
+ globals().update(UDPServerTestsBuilder.makeTestCaseClasses())
+Index: twisted/internet/udp.py
+===================================================================
+--- twisted/internet/udp.py	(revision 32802)
++++ twisted/internet/udp.py	(working copy)
+@@ -193,12 +193,17 @@
+         self._connectedAddr = (host, port)
+         self.socket.connect((host, port))
+ 
++
+     def _loseConnection(self):
++        """
++        Stop receiving incoming datagrams and schedule socket cleanup and a
++        call to C{self.protocol.doStop}.
++        """
+         self.stopReading()
+         if self.connected: # actually means if we are *listening*
+-            from twisted.internet import reactor
+-            reactor.callLater(0, self.connectionLost)
++            self.reactor.callLater(0, self.connectionLost)
+ 
++
+     def stopListening(self):
+         if self.connected:
+             result = self.d = defer.Deferred()
+Index: twisted/topfiles/5299.bugfix
+===================================================================
+--- twisted/topfiles/5299.bugfix	(revision 0)
++++ twisted/topfiles/5299.bugfix	(revision 0)
+@@ -0,0 +1 @@
++udp.Port now schedules the connectionLost call in the reactor it is associated with, not in the global reactor.

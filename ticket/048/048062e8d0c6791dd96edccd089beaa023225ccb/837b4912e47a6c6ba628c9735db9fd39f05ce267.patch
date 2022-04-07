@@ -1,0 +1,146 @@
+diff --git a/twisted/internet/endpoints.py b/twisted/internet/endpoints.py
+index 238c272..2ce863d 100644
+--- a/twisted/internet/endpoints.py
++++ b/twisted/internet/endpoints.py
+@@ -1337,6 +1337,24 @@ def _parse(description):
+     add(sofar)
+     return args, kw
+ 
++def _constructString(*args, **kwargs):
++    """
++    Convert a list of positional and keyword parameters into a description
++    string. The positional parameters will be placed before the keyword
++    parameters. No ordering is enforced on the keyword parameters.
++
++    @return: a description string as described by L{serverFromString} or
++        L{clientFromString}.
++    """
++    ret = ''
++    for value in args:
++        value = quoteStringArgument(str(value))
++        ret += ':%s' % value if ret else value
++    for item in kwargs.iteritems():
++        item = (item[0], quoteStringArgument(str(item[1])))
++        ret += ':%s=%s' % item if ret else '%s=%s' % item
++    return ret
++
+ 
+ # Mappings from description "names" to endpoint constructors.
+ _endpointServerFactories = {
+@@ -1764,6 +1782,49 @@ def clientFromString(reactor, description):
+ 
+ 
+ 
++_requiredClientParameters = {
++    'TCP': ['host', 'port'],
++    'SSL': ['host', 'port'],
++    'UNIX': ['path'],
++    }
++
++def _filterClientParameters(name, **kwargs):
++    # XXX More intelligence possible?
++    keys = set(_requiredClientParameters[name]) & set(kwargs.keys())
++    return { k: kwargs[k] for k in keys }
++
++
++
++def stripClientString(description):
++    """
++    Strips optional parameters from the provided description string.
++    Positional arguments may be returned as keyword arguments.
++
++    @param description: The strports description to parse.
++    @type description: L{bytes}
++
++    @return: The new strports description.
++    @type description: L{bytes}
++
++    @since: 1X.X
++    """
++    args, kwargs = _parse(description)
++    aname = args.pop(0)
++    name = aname.upper()
++    for plugin in getPlugins(IStreamClientEndpointStringParserWithReactor):
++        if plugin.prefix.upper() == name:
++            if not hasattr(plugin, "getRequiredParameters"):
++                raise ValueError("Endpoint type %r doesn't support parameter filtering" % (aname,))
++            # XXX More intelligence possible?
++            args, kwargs = plugin.getRequiredParameters(*args, **kwargs)
++            return _constructString(aname, *args, **kwargs)
++    if name not in _clientParsers:
++        raise ValueError("Unknown endpoint type: %r" % (aname,))
++    kwargs = _clientParsers[name](*args, **kwargs)
++    return _constructString(aname, **_filterClientParameters(name, **kwargs))
++
++
++
+ def connectProtocol(endpoint, protocol):
+     """
+     Connect a protocol instance to an endpoint.
+diff --git a/twisted/internet/interfaces.py b/twisted/internet/interfaces.py
+index 79ee904..0be4ba0 100644
+--- a/twisted/internet/interfaces.py
++++ b/twisted/internet/interfaces.py
+@@ -2692,3 +2692,26 @@ class IStreamClientEndpointStringParserWithReactor(Interface):
+         @return: a client endpoint
+         @rtype: a provider of L{IStreamClientEndpoint}
+         """
++
++    def getRequiredParameters(*args, **kwargs):
++        """
++        This method is invoked by L{endpoints.stripClientString}, if the type of
++        endpoint matches the return value from this
++        L{IStreamClientEndpointStringParserWithReactor}'s C{prefix} method.
++
++        @param args: The byte string arguments, minus the endpoint type, in the
++            endpoint description string, parsed according to the rules
++            described in L{endpoints.quoteStringArgument}.  For example, if the
++            description were C{b"my-type:foo:bar:baz=qux"}, C{args} would be
++            C{(b'foo', b'bar')}
++
++        @param kwargs: The byte string arguments from the endpoint description
++            passed as keyword arguments.  For example, if the description were
++            C{b"my-type:foo:bar:baz=qux"}, C{kwargs} would be
++            C{dict(baz=b'qux')}.
++
++        @return: a 2-tuple of C{(args, kwargs)}, where 'args' is a list of all
++            ':'-separated C{str}s not containing an '=' and 'kwargs' is a map of
++            all C{str}s which do contain an '='.  For example, the result of
++            C{_parse('a:b:d=1:c')} would be C{(['a', 'b', 'c'], {'d': '1'})}.
++        """
+diff --git a/twisted/internet/test/test_endpoints.py b/twisted/internet/test/test_endpoints.py
+index 41983e2..d311358 100644
+--- a/twisted/internet/test/test_endpoints.py
++++ b/twisted/internet/test/test_endpoints.py
+@@ -2996,6 +2996,31 @@ class SSLClientStringTests(unittest.TestCase):
+ 
+ 
+ 
++class StripClientStringTests(unittest.TestCase):
++    """
++    Tests for L{twisted.internet.endpoints.stripClientString}.
++    """
++
++    def test_tcp(self):
++        """
++        When passed a TCP strports description, L{endpoints.stripClientString}
++        returns a new TCP strports description containing only the required
++        parameters.
++        """
++        stripped = endpoints.stripClientString(b"tcp:123.123.123.123:80:timeout=300")
++        self.assertEqual(stripped, b"tcp:host=123.123.123.123:port=80")
++
++    def test_unixWithEscapedPath(self):
++        """
++        When passed a Unix strports description, L{endpoints.stripClientString}
++        returns a new Unix strports description containing only the required
++        parameters.
++        """
++        stripped = endpoints.stripClientString(b"unix:path=C\\:\\\\foo\\\\bar:lockfile=1:timeout=9")
++        self.assertEqual(stripped, b"unix:path=C\\:\\\\foo\\\\bar")
++
++
++
+ class AdoptedStreamServerEndpointTestCase(ServerEndpointTestCaseMixin,
+                                           unittest.TestCase):
+     """

@@ -1,0 +1,142 @@
+Index: twisted/web/http.py
+===================================================================
+--- twisted/web/http.py	(revision 24619)
++++ twisted/web/http.py	(working copy)
+@@ -605,9 +605,11 @@
+     def gotLength(self, length):
+         """Called when HTTP channel got length of content in this request.
+ 
++        length may be None if chunked encoding is in effect.
++
+         This method is not intended for users.
+         """
+-        if length < 100000:
++        if not getattr(self.channel, 'chunked', 0) and length < 100000:
+             self.content = StringIO()
+         else:
+             self.content = tempfile.TemporaryFile()
+@@ -1144,10 +1146,17 @@
+         pass
+ 
+ class HTTPChannel(basic.LineReceiver, policies.TimeoutMixin):
+-    """A receiver for HTTP requests."""
++    """
++    A receiver for HTTP requests.
++    
++    @ivar chunked: Whether the client is transmitting chunked information
++    @type chunked: bool
++    """
+ 
+     maxHeaders = 500 # max number of headers allowed per request
+ 
++    chunked = 0
++
+     length = 0
+     persistent = 1
+     __header = ''
+@@ -1163,6 +1172,7 @@
+     def __init__(self):
+         # the request queue
+         self.requests = []
++        self._chunkBuffer = StringIO()
+ 
+     def connectionMade(self):
+         self.setTimeout(self.timeOut)
+@@ -1202,7 +1212,7 @@
+                 self.headerReceived(self.__header)
+             self.__header = ''
+             self.allHeadersReceived()
+-            if self.length == 0:
++            if self.length == 0 and not self.chunked:
+                 self.allContentReceived()
+             else:
+                 self.setRawMode()
+@@ -1227,6 +1237,8 @@
+         data = data.strip()
+         if header == 'content-length':
+             self.length = int(data)
++        elif header == 'transfer-encoding' and data.lower() == 'chunked':
++            self.chunked = 1
+         reqHeaders = self.requests[-1].requestHeaders
+ 
+         values = reqHeaders.getRawHeaders(header)
+@@ -1252,6 +1264,9 @@
+         self._header = ''
+         self._receivedHeaderCount = 0
+         self.__first_line = 1
++        self.chunked = 0
++        self._chunkBuffer.close()
++        self._chunkBuffer = StringIO()
+         del self._command, self._path, self._version
+ 
+         # Disable the idle timeout, in case this request takes a long
+@@ -1263,7 +1278,28 @@
+         req.requestReceived(command, path, version)
+ 
+     def rawDataReceived(self, data):
+-        if len(data) < self.length:
++        if self.chunked:
++            self._chunkBuffer.write(data)
++            # Parse as many chunks as possible
++            while True:
++                try:
++                    chunk, data = fromChunk(self._chunkBuffer.getvalue())
++                except ValueError, e:
++                    # No more parseable chunks right now
++                    break
++                else:
++                    if chunk:
++                        # Everything's normal.  Just write a chunk.
++                        self.requests[-1].handleContentChunk(chunk)
++                        # Remove our chunk from the stream
++                        self._chunkBuffer.truncate(0)
++                        self._chunkBuffer.write(data)
++                    else:
++                        # Chunk stream finished
++                        self.allContentReceived()
++                        self.setLineMode(data)
++                        break
++        elif len(data) < self.length:
+             self.requests[-1].handleContentChunk(data)
+             self.length = self.length - len(data)
+         else:
+Index: twisted/web/test/test_http.py
+===================================================================
+--- twisted/web/test/test_http.py	(revision 24619)
++++ twisted/web/test/test_http.py	(working copy)
+@@ -530,6 +530,35 @@
+ '''
+         self.runRequest(req, http.Request, success=False)
+ 
++    def testChunkedEncoding(self):
++        httpRequest = '''\
++GET / HTTP/1.0
++Content-Type: text/plain
++Transfer-Encoding: chunked
++
++7
++Hello, 
++13
++spam,eggs spam spam
++0
++
++'''
++
++        testcase = self
++        class MyRequest(http.Request):
++            def process(self):
++                content = self.content.read()
++                testcase.assertEqual(self.method, 'GET')
++                testcase.assertEqual(self.path, '/')
++                testcase.assertEqual(content, 'Hello, spam,eggs spam spam')
++                testcase.assertEqual(self.channel.chunked, 0)
++                testcase.assertEqual(self.channel._chunkBuffer.getvalue(), '')
++                testcase.assert_(isinstance(self.content, file))
++                testcase.didRequest = 1
++                self.finish()
++
++        self.runRequest(httpRequest, MyRequest)
++
+ class QueryArgumentsTestCase(unittest.TestCase):
+     def testUnquote(self):
+         try:

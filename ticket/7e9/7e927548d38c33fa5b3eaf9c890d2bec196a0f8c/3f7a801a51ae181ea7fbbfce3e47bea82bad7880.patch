@@ -1,0 +1,176 @@
+diff --git a/twisted/python/test/test_zipstream.py b/twisted/python/test/test_zipstream.py
+index e082361..fae249a 100644
+--- a/twisted/python/test/test_zipstream.py
++++ b/twisted/python/test/test_zipstream.py
+@@ -4,6 +4,7 @@
+ """
+ Tests for L{twisted.python.zipstream}
+ """
++import os
+ import sys
+ import random
+ import zipfile
+@@ -453,3 +454,24 @@ class ZipstreamTest(unittest.TestCase):
+             zf.writestr(fn, "")
+         zf.writestr('zipstreamjunk', junk)
+         zf.close()
++
++    def test_filenameWithLeadingSlash(self):
++        tempdir = filepath.FilePath(self.mktemp())
++        tempdir.makedirs()
++        zfpath = tempdir.child('f.zip').path
++
++        zf = zipfile.ZipFile(zfpath, 'w')
++        zf.writestr('/foo/bar', 'foo')
++        zf.close()
++
++        iterpath = tempdir.child('iter').path
++        uziter = zipstream.unzipIter(zfpath, iterpath)
++        for r in uziter:
++            pass
++        self.assertTrue(os.path.exists(os.path.join(iterpath, 'foo/bar')))
++
++        chunkypath = tempdir.child('chunky').path
++        uziter = zipstream.unzipIterChunky(zfpath, chunkypath)
++        for r in uziter:
++            pass
++        self.assertTrue(os.path.exists(os.path.join(chunkypath, 'foo/bar')))
+diff --git a/twisted/python/zipstream.py b/twisted/python/zipstream.py
+index ad014c9..c4692df 100644
+--- a/twisted/python/zipstream.py
++++ b/twisted/python/zipstream.py
+@@ -252,7 +252,6 @@ def unzip(filename, directory=".", overwrite=0):
+     for i in unzipIter(filename, directory, overwrite):
+         pass
+ 
+-DIR_BIT = 16
+ 
+ def unzipIter(filename, directory='.', overwrite=0):
+     """
+@@ -262,28 +261,37 @@ def unzipIter(filename, directory='.', overwrite=0):
+     The value it yields is the number of files left to unzip.
+     """
+     zf = zipfile.ZipFile(filename, 'r')
+-    names = zf.namelist()
+-    if not os.path.exists(directory):
+-        os.makedirs(directory)
+-    remaining = len(zf.namelist())
+-    for entry in names:
+-        remaining -= 1
+-        isdir = zf.getinfo(entry).external_attr & DIR_BIT
+-        f = os.path.join(directory, entry)
+-        if isdir:
+-            # overwrite flag only applies to files
+-            if not os.path.exists(f):
+-                os.makedirs(f)
++    remaining = len(zf.infolist())
++    for info in zf.infolist():
++        # build the destination pathname, replacing
++        # forward slashes to platform specific separators.
++        # Strip trailing path separator, unless it represents the root.
++        if (directory[-1:] in (os.path.sep, os.path.altsep)
++            and len(os.path.splitdrive(directory)[1]) > 1):
++            directory = directory[:-1]
++
++        # don't include leading "/" from file name if present
++        if info.filename[0] == '/':
++            targetpath = os.path.join(directory, info.filename[1:])
++        else:
++            targetpath = os.path.join(directory, info.filename)
++
++        targetpath = os.path.normpath(targetpath)
++
++        # Create all upper directories if necessary.
++        upperdirs = os.path.dirname(targetpath)
++        if upperdirs and not os.path.exists(upperdirs):
++            os.makedirs(upperdirs)
++
++        if info.filename[-1] == '/':
++            if not os.path.isdir(targetpath):
++                os.mkdir(targetpath)
+         else:
+-            # create the directory the file will be in first,
+-            # since we can't guarantee it exists
+-            fdir = os.path.split(f)[0]
+-            if not os.path.exists(fdir):
+-                os.makedirs(fdir)
+-            if overwrite or not os.path.exists(f):
+-                outfile = file(f, 'wb')
+-                outfile.write(zf.read(entry))
++            if overwrite or not os.path.exists(targetpath):
++                outfile = open(targetpath, 'wb')
++                outfile.write(zf.read(info))
+                 outfile.close()
++        remaining -= 1
+         yield remaining
+ 
+ 
+@@ -329,8 +337,7 @@ def countZipFileEntries(filename):
+     return len(zf.namelist())
+ 
+ 
+-def unzipIterChunky(filename, directory='.', overwrite=0,
+-                    chunksize=4096):
++def unzipIterChunky(filename, directory='.', overwrite=0, chunksize=4096):
+     """
+     Return a generator for the zipfile.  This implementation will yield after
+     every chunksize uncompressed bytes, or at the end of a file, whichever
+@@ -339,30 +346,38 @@ def unzipIterChunky(filename, directory='.', overwrite=0,
+     The value it yields is the number of chunks left to unzip.
+     """
+     czf = ChunkingZipFile(filename, 'r')
+-    if not os.path.exists(directory):
+-        os.makedirs(directory)
+     remaining = countZipFileChunks(filename, chunksize)
+-    names = czf.namelist()
+-    infos = czf.infolist()
+-
+-    for entry, info in zip(names, infos):
+-        isdir = info.external_attr & DIR_BIT
+-        f = os.path.join(directory, entry)
+-        if isdir:
+-            # overwrite flag only applies to files
+-            if not os.path.exists(f):
+-                os.makedirs(f)
++
++    for info in czf.infolist():
++        # build the destination pathname, replacing
++        # forward slashes to platform specific separators.
++        # Strip trailing path separator, unless it represents the root.
++        if (directory[-1:] in (os.path.sep, os.path.altsep)
++            and len(os.path.splitdrive(directory)[1]) > 1):
++            directory = directory[:-1]
++
++        # don't include leading "/" from file name if present
++        if info.filename[0] == '/':
++            targetpath = os.path.join(directory, info.filename[1:])
++        else:
++            targetpath = os.path.join(directory, info.filename)
++
++        targetpath = os.path.normpath(targetpath)
++
++        # Create all upper directories if necessary.
++        upperdirs = os.path.dirname(targetpath)
++        if upperdirs and not os.path.exists(upperdirs):
++            os.makedirs(upperdirs)
++
++        if info.filename[-1] == '/':
++            if not os.path.isdir(targetpath):
++                os.mkdir(targetpath)
+             remaining -= 1
+             yield remaining
+         else:
+-            # create the directory the file will be in first,
+-            # since we can't guarantee it exists
+-            fdir = os.path.split(f)[0]
+-            if not os.path.exists(fdir):
+-                os.makedirs(fdir)
+-            if overwrite or not os.path.exists(f):
+-                outfile = file(f, 'wb')
+-                fp = czf.readfile(entry)
++            if overwrite or not os.path.exists(targetpath):
++                outfile = open(targetpath, 'wb')
++                fp = czf.readfile(info.filename)
+                 if info.file_size == 0:
+                     remaining -= 1
+                     yield remaining

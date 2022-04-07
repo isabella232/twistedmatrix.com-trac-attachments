@@ -1,0 +1,439 @@
+Index: suppress-warnings-3639/twisted/protocols/sip.py
+===================================================================
+--- suppress-warnings-3639/twisted/protocols/sip.py	(revision 27376)
++++ suppress-warnings-3639/twisted/protocols/sip.py	(working copy)
+@@ -17,6 +17,7 @@
+ # system imports
+ import socket, time, sys, random, warnings
+ from zope.interface import implements, Interface
++import zope.interface
+ 
+ # twisted imports
+ from twisted.python import log, util
+@@ -24,10 +25,11 @@
+ from twisted.python.versions import Version
+ from twisted.python.hashlib import md5
+ from twisted.internet import protocol, defer, reactor
++from twisted.web import iweb
+ 
+ from twisted import cred
+ import twisted.cred.error
+-from twisted.cred.credentials import UsernameHashedPassword, UsernamePassword
++from twisted.cred.credentials import UsernameHashedPassword, UsernamePassword, DigestCredentialFactory
+ 
+ 
+ # sibling imports
+@@ -1134,6 +1136,55 @@
+             raise SIPError(400)
+ 
+ 
++class _AutoWrapperDict(dict):
++    """A magic dictionary.
++
++    Values added to this dict which do not implement twisted.web.iweb.ICredentialFactory
++    are put into a _AuthorizerInterfaceConverter wrapper.
++    """
++    def __setitem__(self, key, value):
++        if self._needsWrapping(value):
++            warnings.warn(
++                "twisted.protocols.sip.IAuthorizer was deprecated in Twisted 9.0.0. "
++                "Authorizers should implement twisted.web.iweb.ICredentialFactory instead.", 
++                DeprecationWarning, stacklevel=2)
++            value =_AuthorizerInterfaceConverter(value)
++        super(_AutoWrapperDict, self).__setitem__(key, value)
++
++    def copy(self):
++        return self.__class__(self)
++
++    def _needsWrapping(self, thing):
++        for i in zope.interface.implementedBy(_AuthorizerInterfaceConverter):
++            if not i.providedBy(thing):
++                return True
++        return False
++
++class _AuthorizerInterfaceConverter:
++    """Adapter to convert between twisted.protocols.sip.IAuthorizer 
++    and twisted.web.iweb.ICredentialFactory.
++    """
++
++    implements(iweb.ICredentialFactory)
++
++    def __init__(self, target):
++        self.target = target
++
++    def decode(self, response, method, host):
++        return self.target.decode(response)
++
++    def getChallenge(self, address):
++        response = self.target.getChallenge(address)
++        if response is None:
++            return response
++
++        response = ' '.join(response.splitlines())
++        parts = response.split(',')
++        auth = dict([(k.strip(), unq(v.strip())) for (k, v) in [p.split('=', 1) for p in parts]])
++        return auth
++
++
++
+ class RegisterProxy(Proxy):
+     """A proxy that allows registration for a specific domain.
+ 
+@@ -1144,13 +1195,15 @@
+ 
+     registry = None # should implement IRegistry
+ 
+-    authorizers = {
+-        'digest': DigestAuthorizer(),
+-    }
+-
+     def __init__(self, *args, **kw):
+         Proxy.__init__(self, *args, **kw)
+         self.liveChallenges = {}
++        # catch attempts to add authorizers which implement 
++        # twisted.protocol.sip.IAuthorizer.  Convert them to 
++        # twisted.cred.credentials.IAuthorizer and issue a warning.
++        self.authorizers = _AutoWrapperDict()
++        self.authorizers['digest'] = DigestCredentialFactory('md5', self.host)
++
+         
+     def handle_ACK_request(self, message, (host, port)):
+         # XXX
+@@ -1178,11 +1231,21 @@
+     def unauthorized(self, message, host, port):
+         m = self.responseFromRequest(401, message)
+         for (scheme, auth) in self.authorizers.iteritems():
+-            chal = auth.getChallenge((host, port))
++            addr = host
++            # hack to support old deprecated twisted.protocol.sip.IAuthorizer
++            if isinstance(auth, _AuthorizerInterfaceConverter):
++                addr = (host, port)
++            chal = auth.getChallenge(addr)
++
+             if chal is None:
+                 value = '%s realm="%s"' % (scheme.title(), self.host)
+             else:
+-                value = '%s %s,realm="%s"' % (scheme.title(), chal, self.host)
++                # add realm for deprecated twisted.protocol.sip.IAuthorizer
++                if 'realm' not in chal:
++                    chal['realm'] = self.host
++                chalstring = ','.join(['%s="%s"' % (k, v)
++                                       for (k, v) in chal.iteritems()])
++                value = '%s %s' % (scheme.title(), chalstring)
+             m.headers.setdefault('www-authenticate', []).append(value)
+         self.deliverResponse(m)
+ 
+@@ -1192,7 +1255,7 @@
+         a = self.authorizers.get(parts[0].lower())
+         if a:
+             try:
+-                c = a.decode(parts[1])
++                c = a.decode(parts[1], message.method, host)
+             except SIPError:
+                 raise
+             except:
+Index: suppress-warnings-3639/twisted/cred/credentials.py
+===================================================================
+--- suppress-warnings-3639/twisted/cred/credentials.py	(revision 27376)
++++ suppress-warnings-3639/twisted/cred/credentials.py	(working copy)
+@@ -11,6 +11,7 @@
+ from twisted.python.randbytes import secureRandom
+ from twisted.cred._digest import calcResponse, calcHA1, calcHA2
+ from twisted.cred import error
++from twisted.web import iweb
+ 
+ class ICredentials(Interface):
+     """
+@@ -161,6 +162,35 @@
+ 
+ 
+ 
++class BasicAuthorizer:
++    """Authorizer for insecure Basic (base64-encoded plaintext) authentication.
++    
++    This form of authentication is broken and insecure.  Do not use it.
++    """
++
++    implements(iweb.ICredentialFactory)
++
++    def getChallenge(self, address):
++        return None
++
++    def decode(self, response, method, host):
++        # At least one SIP client improperly pads its Base64 encoded messages
++        for i in range(3):
++            try:
++                creds = (response + ('=' * i)).decode('base64')
++            except:
++                pass
++            else:
++                break
++        else:
++            # Totally bogus
++            raise error.LoginFailed('Invalid response. Response did not have a valid base64 encoding.')
++        p = creds.split(':', 1)
++        if len(p) == 2:
++            return UsernamePassword(*p)
++        raise error.LoginFailed('Invalid response. Unable to find username/password pair in decoded response.')
++
++
+ class DigestCredentialFactory(object):
+     """
+     Support for RFC2617 HTTP Digest Authentication
+@@ -180,6 +210,7 @@
+     @param authenticationRealm: case sensitive string that specifies the realm
+         portion of the challenge
+     """
++    implements(iweb.ICredentialFactory)
+ 
+     CHALLENGE_LIFETIME_SECS = 15 * 60    # 15 minutes
+ 
+Index: suppress-warnings-3639/twisted/web/iweb.py
+===================================================================
+--- suppress-warnings-3639/twisted/web/iweb.py	(revision 27376)
++++ suppress-warnings-3639/twisted/web/iweb.py	(working copy)
+@@ -7,7 +7,7 @@
+ """
+ 
+ from zope.interface import Interface, Attribute
+-from twisted.cred.credentials import IUsernameDigestHash
++#from twisted.cred.credentials import IUsernameDigestHash
+ 
+ class IRequest(Interface):
+     """
+@@ -352,4 +352,5 @@
+         @return: The credentials represented by the given response.
+         """
+ 
+-__all__ = ["IUsernameDigestHash", "ICredentialFactory", "IRequest"]
++#__all__ = ["IUsernameDigestHash", "ICredentialFactory", "IRequest"]
++__all__ = ["ICredentialFactory", "IRequest"]
+Index: suppress-warnings-3639/twisted/web/iweb.py
+===================================================================
+--- suppress-warnings-3639/twisted/test/test_sip.py	(revision 27376)
++++ suppress-warnings-3639/twisted/test/test_sip.py	(working copy)
+@@ -5,9 +5,9 @@
+ 
+ """Session Initialization Protocol tests."""
+ 
+-from twisted.trial import unittest
++from twisted.trial import unittest, util
+ from twisted.protocols import sip
+-from twisted.internet import defer, reactor
++from twisted.internet import defer, reactor, utils
+ from twisted.python.versions import Version
+ 
+ from twisted.test import proto_helpers
+@@ -15,6 +15,7 @@
+ from twisted import cred
+ import twisted.cred.portal
+ import twisted.cred.checkers
++import twisted.cred.credentials
+ 
+ from zope.interface import implements
+ 
+@@ -566,13 +567,19 @@
+         self.proxy.authorizers['basic'] = sip.BasicAuthorizer()
+         warnings = self.flushWarnings(
+             offendingFunctions=[self.test_basicAuthentication])
+-        self.assertEqual(len(warnings), 1)
++        self.assertEqual(len(warnings), 2)
+         self.assertEqual(
+             warnings[0]['message'],
+             'twisted.protocols.sip.BasicAuthorizer was deprecated in Twisted 9.0.0')
+         self.assertEqual(
+             warnings[0]['category'],
+             DeprecationWarning)
++        self.assertEqual(
++            warnings[1]['message'],
++            'twisted.protocols.sip.IAuthorizer was deprecated in Twisted 9.0.0. Authorizers should implement twisted.web.iweb.ICredentialFactory instead.')
++        self.assertEqual(
++            warnings[1]['category'],
++            DeprecationWarning)
+         r = sip.Request("REGISTER", "sip:bell.example.com")
+         r.addHeader("to", "sip:joe@bell.example.com")
+         r.addHeader("contact", "sip:joe@client.com:1234")
+@@ -597,13 +604,19 @@
+         self.proxy.authorizers['basic'] = sip.BasicAuthorizer()
+         warnings = self.flushWarnings(
+             offendingFunctions=[self.test_failedBasicAuthentication])
+-        self.assertEqual(len(warnings), 1)
++        self.assertEqual(len(warnings), 2)
+         self.assertEqual(
+             warnings[0]['message'],
+             'twisted.protocols.sip.BasicAuthorizer was deprecated in Twisted 9.0.0')
+         self.assertEqual(
+             warnings[0]['category'],
+             DeprecationWarning)
++        self.assertEqual(
++            warnings[1]['message'],
++            'twisted.protocols.sip.IAuthorizer was deprecated in Twisted 9.0.0. Authorizers should implement twisted.web.iweb.ICredentialFactory instead.')
++        self.assertEqual(
++            warnings[1]['category'],
++            DeprecationWarning)
+         r = sip.Request("REGISTER", "sip:bell.example.com")
+         r.addHeader("to", "sip:joe@bell.example.com")
+         r.addHeader("contact", "sip:joe@client.com:1234")
+@@ -752,7 +765,7 @@
+ From: <sip:exarkun@intarweb.us:50609>\r
+ Call-ID: 94E7E5DAF39111D791C6000393764646@intarweb.us\r
+ CSeq: 9898 REGISTER\r
+-WWW-Authenticate: Digest nonce="92956076410767313901322208775",opaque="1674186428",qop-options="auth",algorithm="MD5",realm="intarweb.us"\r
++WWW-Authenticate: Digest tosh="hey-nonny-nonny",realm="intarweb.us"\r
+ \r
+ """
+ 
+@@ -785,10 +798,19 @@
+ """
+ 
+ class FakeDigestAuthorizer(sip.DigestAuthorizer):
+-    def generateNonce(self):
+-        return '92956076410767313901322208775'
+-    def generateOpaque(self):
+-        return '1674186428'
++    def getChallenge(self, peer):
++        return "tosh=hey-nonny-nonny"
++
++    def decode(self, response):
++        return FakeCredential()
++
++class FakeCredential:
++    implements(cred.credentials.IUsernamePassword)
++
++    def __init__(self):
++        self.username = "exarkun"
++    def checkPassword(self, ignore):
++        return True
+ 
+ 
+ class FakeRegistry(sip.InMemoryRegistry):
+@@ -816,13 +838,19 @@
+         self.proxy.authorizers['digest'] = FakeDigestAuthorizer()
+         warnings = self.flushWarnings(
+             offendingFunctions=[self.setUp])
+-        self.assertEqual(len(warnings), 1)
++        self.assertEqual(len(warnings), 2)
+         self.assertEqual(
+             warnings[0]['message'],
+             'twisted.protocols.sip.DigestAuthorizer was deprecated in Twisted 9.0.0')
+         self.assertEqual(
+             warnings[0]['category'],
+             DeprecationWarning)
++        self.assertEqual(
++            warnings[1]['message'],
++            'twisted.protocols.sip.IAuthorizer was deprecated in Twisted 9.0.0. Authorizers should implement twisted.web.iweb.ICredentialFactory instead.')
++        self.assertEqual(
++            warnings[1]['category'],
++            DeprecationWarning)
+ 
+         self.registry = FakeRegistry("intarweb.us")
+         self.proxy.registry = self.proxy.locator = self.registry
+@@ -851,16 +879,6 @@
+         self.transport.written = []
+ 
+         self.proxy.datagramReceived(authRequest, ("127.0.0.1", 5632))
+-        warnings = self.flushWarnings(
+-            offendingFunctions=[sip.DigestAuthorizer.decode,
+-                                sip.DigestedCredentials.checkPassword])
+-        self.assertEqual(len(warnings), 3)
+-        self.assertEqual(
+-            warnings[0]['message'],
+-            'twisted.protocols.sip.DigestedCredentials was deprecated in Twisted 9.0.0')
+-        self.assertEqual(
+-            warnings[0]['category'],
+-            DeprecationWarning)
+ 
+         self.assertEquals(
+             self.transport.written[-1],
+@@ -910,3 +928,91 @@
+         """
+         self.callDeprecated(Version("Twisted", 9, 0, 0),
+                             sip.DigestedCredentials, '', {}, {})
++
++
++class FakeDigestAuthorizer(sip.DigestAuthorizer):
++    def getChallenge(self, peer):
++        return "tosh=hey-nonny-nonny"
++
++    def decode(self, response):
++        return FakeCredential()
++
++
++class EchoAuthorizer:
++    def getChallenge(self, ignored):
++        return self._challenge
++
++    def decode(self, ignored):
++        return self._decode
++
++class FakeCredentialFactory:
++    implements(twisted.web.iweb.ICredentialFactory)
++    def getChallenge(self, ignored):
++        return None
++
++    def decode(self, ignored):
++        return FakeCredential()
++
++
++class AuthorizerInterfaceConverterTests(unittest.TestCase):
++    """
++    Tests classes that support the deprecated use of twisted.protocols.sip.IAuthorizer
++    in RegisterProxy.authorizers.
++    """
++
++    def setUp(self):
++        self.authorizer = EchoAuthorizer()
++        self.cred_factory = sip._AuthorizerInterfaceConverter(self.authorizer)
++        self.auto_dict = sip._AutoWrapperDict()
++        self.auto_dict['old'] = EchoAuthorizer()
++        self.auto_dict['new'] = FakeCredentialFactory()
++    setUp = utils.suppressWarnings(
++        setUp, util.suppress(category=DeprecationWarning,
++            message=r'twisted.protocols.sip.IAuthorizer was deprecated'))
++
++    def test_converter_getChallenge(self):
++        self.authorizer._challenge = None
++        self.assertEqual(self.cred_factory.getChallenge(""), None)
++
++        self.authorizer._challenge = "key1=value1,  key2  =  value2  ,  key3 = value3a = value3b" 
++        self.assertEqual(self.cred_factory.getChallenge(""), 
++            {'key1':'value1', 'key2':'value2', 'key3':'value3a = value3b'})
++
++    def test_converter_decode(self):
++        self.authorizer._decode = FakeCredential()
++        self.assertIdentical(self.cred_factory.decode("", "", ""), self.authorizer._decode)
++
++    def test_dict_needWrapping(self):
++        self.assertTrue(self.auto_dict._needsWrapping(EchoAuthorizer()))
++        self.assertFalse(self.auto_dict._needsWrapping(FakeCredentialFactory()))
++        self.assertFalse(self.auto_dict._needsWrapping(self.cred_factory))
++
++    def test_dict_copy(self):
++        self.assertEqual(self.auto_dict.copy(), self.auto_dict)
++
++    def test_dict_setitem_converts(self):
++        self.assertIsInstance(self.auto_dict['old'], sip._AuthorizerInterfaceConverter)
++        self.assertIsInstance(self.auto_dict['new'], FakeCredentialFactory)
++
++    def test_add_old_interface(self):
++        self.auto_dict['test'] = EchoAuthorizer()
++
++        warnings = self.flushWarnings(
++            offendingFunctions=[self.test_add_old_interface])
++        self.assertEqual(len(warnings), 1)
++        self.assertEqual(
++            warnings[0]['message'],
++            'twisted.protocols.sip.IAuthorizer was deprecated in Twisted 9.0.0. Authorizers should implement twisted.web.iweb.ICredentialFactory instead.')
++        self.assertEqual(
++            warnings[0]['category'],
++            DeprecationWarning)
++ 
++    def test_add_new_interface(self):
++        self.auto_dict['test'] = FakeCredentialFactory()
++
++        warnings = self.flushWarnings(
++            offendingFunctions=[self.test_add_new_interface])
++        self.assertEqual(len(warnings), 0)
++
++    def test_RegisterProxy(self):
++        self.assertIsInstance(sip.RegisterProxy().authorizers, twisted.protocols.sip._AutoWrapperDict)

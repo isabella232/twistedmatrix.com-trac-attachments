@@ -1,0 +1,161 @@
+diff --git a/twisted/internet/test/test_process.py b/twisted/internet/test/test_process.py
+index c92b97c..e4ce21c 100644
+--- a/twisted/internet/test/test_process.py
++++ b/twisted/internet/test/test_process.py
+@@ -7,8 +7,7 @@ Tests for implementations of L{IReactorProcess}.
+ 
+ __metaclass__ = type
+ 
+-import os
+-import warnings, sys, signal
++import os, warnings, sys, signal, time
+ 
+ from twisted.internet.test.reactormixins import ReactorBuilder
+ from twisted.python.compat import set
+@@ -17,9 +16,9 @@ from twisted.python.runtime import platform
+ from twisted.python.filepath import FilePath
+ from twisted.python.failure import Failure
+ from twisted.internet import utils
+-from twisted.internet.defer import Deferred
++from twisted.internet.defer import Deferred, TimeoutError
+ from twisted.internet.protocol import ProcessProtocol
+-from twisted.internet.error import ProcessDone, PotentialZombieWarning
++from twisted.internet.error import ProcessDone
+ from twisted.internet.error import ProcessTerminated
+ 
+ skipWindowsNopywin32 = None
+@@ -45,7 +44,7 @@ class _ShutdownCallbackProcessProtocol(ProcessProtocol):
+ 
+ 
+ class ProcessTestsBuilderBase(ReactorBuilder):
+-    def spawnProcess(self, reactor):
++    def spawnProcess(self, reactor, childFDs=None):
+         """
+         Call C{reactor.spawnProcess} with some simple arguments.  Do this here
+         so that code object referenced by the stack frame has a C{co_filename}
+@@ -54,66 +53,78 @@ class ProcessTestsBuilderBase(ReactorBuilder):
+         Return a L{Deferred} which fires when the process has exited.
+         """
+         onConnection = Deferred()
+-        reactor.spawnProcess(
++        foo = reactor.spawnProcess(
+             _ShutdownCallbackProcessProtocol(onConnection), sys.executable,
+-            [sys.executable, "-c", ""], usePTY=self.usePTY)
++            [sys.executable, "-c", ""], usePTY=self.usePTY, childFDs=childFDs)
++
+         return onConnection
+ 
+ 
+-    def test_spawnProcessTooEarlyWarns(self):
++    def test_spawnProcessEarlyIsReaped(self):
+         """
+-        C{reactor.spawnProcess} emits a warning if it is called before
+-        C{reactor.run}.
+-
+-        If you can figure out a way to make it safe to run
+-        C{reactor.spawnProcess} before C{reactor.run}, you may delete the
+-        warning and this test.
++        Ensure that a process spawned and terminated before the SIGCLD signal 
++        handler is installed is correctly reaped.
+         """
+-        reactor = self.buildReactor()
+-        whenFinished = self.assertWarns(
+-            PotentialZombieWarning,
+-            PotentialZombieWarning.MESSAGE, __file__,
+-            self.spawnProcess, reactor)
+-
+-        def check():
+-            # Handle the exact problem the warning we're testing for is about.
+-            # If the SIGCHLD arrives before we install our SIGCHLD handler,
+-            # we'll never see the process exit.  So after the SIGCHLD handler
+-            # is installed, try to reap children, just in case.
+-            from twisted.internet.process import reapAllProcesses
+-            reapAllProcesses()
+-        reactor.callWhenRunning(check)
+-
+-        # Now wait for the process to exit before finishing the test.  If we
+-        # don't do this, tearDown might close the PTY before the child is done
+-        # with it.
+-        whenFinished.addCallback(
+-            lambda ignored: reactor.callWhenRunning(reactor.stop))
+-
+-        self.runReactor(reactor)
+ 
++        class SigChildHandler(object):
++            """
++            Context manager which flags the first SIGCHLD to arrive.
++            """
++
++            def __enter__(self):
++                """
++                Register a signal handler for SIGCHLD.
++                """
++                self.process_ended = False
++                self.oldsig = signal.signal(
++                    signal.SIGCHLD, self.onProcessEnd)
++
++            def __exit__(self, exc_type, exc_value, tb):
++                """
++                Restore the previous signal handler for SIGCHLD.
++                """
++                signal.signal(signal.SIGCHLD, self.oldsig)
++                return False
++
++            def onProcessEnd(self, sig, frame):
++                """
++                Set a flag when a SIGCHLD is received.
++                """
++                self.process_ended = True
+ 
+-    def test_callWhenRunningSpawnProcessWarningFree(self):
+-        """
+-        L{PotentialZombieWarning} is not emitted when the reactor is run after
+-        C{reactor.callWhenRunning(reactor.spawnProcess, ...)} has been called.
+-        """
+         reactor = self.buildReactor()
+-        def spawnProcess():
+-            whenFinished = self.spawnProcess(reactor)
+-            # Wait for the process to exit before finishing the test.  If we
+-            # don't do this, tearDown might close the PTY before the child is
+-            # done with it.
+-            whenFinished.addCallback(lambda ign: reactor.stop())
+-        reactor.callWhenRunning(spawnProcess)
+-        self.runReactor(reactor)
+-        self.assertEqual(self.flushWarnings(), [])
++
++        handler = SigChildHandler()
++        handler.__enter__()
++        try:
++            # If the process is given FDs, when they close and 
++            # L{Process.childConnectionLost} is called, it will reap the 
++            # process rather than the reactor reaping it as it would after 
++            # catching a SIGCHLD.
++            kw = {}
++            if not self.usePTY:
++                kw['childFDs'] = {}
++            stop = self.spawnProcess(reactor, **kw)
++
++            wait = [0.0025, 0.0025, 1]
++            while not handler.process_ended:
++                if not wait:
++                    self.fail("SIGCHLD didn't arrive")
++                time.sleep(wait.pop(0))
++        finally:
++            handler.__exit__(*sys.exc_info())
++
++        stop.addCallback(lambda x: reactor.running and reactor.stop())
++
++        try:
++            self.runReactor(reactor, timeout=1)
++        except TimeoutError:
++            self.fail("Test process was not reaped.")
+ 
+ 
+     if getattr(signal, 'SIGCHLD', None) is None:
+         skipMsg = "No SIGCHLD, no zombies possible."
+-        test_spawnProcessTooEarlyWarns.skip = skipMsg
+-        test_callWhenRunningSpawnProcessWarningFree.skip = skipMsg
++        test_spawnProcessTooEarlyReaped.skip = skipMsg
+ 
+ 
+     def test_processExitedWithSignal(self):

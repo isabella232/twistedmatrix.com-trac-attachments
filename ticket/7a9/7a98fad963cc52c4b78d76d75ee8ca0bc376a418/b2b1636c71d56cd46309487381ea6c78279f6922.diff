@@ -1,0 +1,497 @@
+Index: twisted/words/test/test_irc.py
+===================================================================
+--- twisted/words/test/test_irc.py	(revision 26936)
++++ twisted/words/test/test_irc.py	(working copy)
+@@ -15,6 +15,132 @@
+ from twisted.test.proto_helpers import StringTransport, StringIOWithoutClosing
+ 
+ 
++
++class ModeParsingTests(unittest.TestCase):
++    paramModes = ('klb', 'b')
++
++    def test_emptyModes(self):
++        """
++        An exception is raised if the mode string is empty.
++        """
++        self.assertRaises(irc.IRCBadModes, irc.parseModes, '', [])
++
++
++    def test_malformedModes(self):
++        """
++        An exception is raised if the mode string does not start with plus or
++        minus.
++        """
++        self.assertRaises(irc.IRCBadModes, irc.parseModes, 'foo', [])
++        self.assertRaises(irc.IRCBadModes, irc.parseModes, '%', [])
++
++
++    def test_nullModes(self):
++        """
++        An exception is raised if no mode characters are present in the mode
++        string.
++        """
++        self.assertRaises(irc.IRCBadModes, irc.parseModes, '+', [])
++        self.assertRaises(irc.IRCBadModes, irc.parseModes, '-', [])
++
++
++    def test_singleMode(self):
++        """
++        Parse a single mode setting with no parameters.
++        """
++        added, removed = irc.parseModes('+s', [])
++        self.assertEqual(added, [('s', None)])
++        self.assertEqual(removed, [])
++
++        added, removed = irc.parseModes('-s', [])
++        self.assertEqual(added, [])
++        self.assertEqual(removed, [('s', None)])
++
++
++    def test_singleDirection(self):
++        """
++        Parse a single-direction mode setting with multiple modes, and no
++        parameters.
++        """
++        added, removed = irc.parseModes('+stn', [])
++        self.assertEqual(added, [('s', None),
++                                 ('t', None),
++                                 ('n', None)])
++        self.assertEqual(removed, [])
++
++        added, removed = irc.parseModes('-nt', [])
++        self.assertEqual(added, [])
++        self.assertEqual(removed, [('n', None),
++                                   ('t', None)])
++
++
++    def test_multiDirection(self):
++        """
++        Parse a multi-direction mode setting with no parameters.
++        """
++        added, removed = irc.parseModes('+s-n+ti', [])
++        self.assertEqual(added, [('s', None),
++                                 ('t', None),
++                                 ('i', None)])
++        self.assertEqual(removed, [('n', None)])
++
++
++    def test_consecutiveDirection(self):
++        """
++        Parse a multi-direction mode setting containing two consecutive mode
++        sequences with the same direction.
++        """
++        # XXX: This should possibly be an error; if that decision is made, this
++        # test should be changed appropriately.
++        added, removed = irc.parseModes('+sn+ti', [])
++        self.assertEqual(added, [('s', None),
++                                 ('n', None),
++                                 ('t', None),
++                                 ('i', None)])
++        self.assertEqual(removed, [])
++
++
++    def test_mismatchedParams(self):
++        """
++        An exception is raised if the number of mode parameters does not match
++        the number of modes expecting parameters.
++        """
++        self.assertRaises(irc.IRCBadModes,
++                          irc.parseModes,
++                          '+k', [],
++                          self.paramModes)
++        self.assertRaises(irc.IRCBadModes,
++                          irc.parseModes,
++                          '+kl', ['foo', '10', 'lulz_extra_param'],
++                          self.paramModes)
++
++
++    def test_parameters(self):
++        """
++        Parse a mode string containing modes with parameters.
++        """
++        added, removed = irc.parseModes(
++            '+klbb',
++            ['somekey', '42', 'nick!user@host', 'other!*@*'],
++            self.paramModes)
++        self.assertEqual(added, [('k', 'somekey'),
++                                 ('l', '42'),
++                                 ('b', 'nick!user@host'),
++                                 ('b', 'other!*@*')])
++        self.assertEqual(removed, [])
++
++        added, removed = irc.parseModes(
++            '-klbb',
++            ['nick!user@host', 'other!*@*'],
++            self.paramModes)
++        self.assertEqual(added, [])
++        self.assertEqual(removed, [('k', None),
++                                   ('l', None),
++                                   ('b', 'nick!user@host'),
++                                   ('b', 'other!*@*')])
++
++
++
+ stringSubjects = [
+     "Hello, this is a nice string with no complications.",
+     "xargs%(NUL)smight%(NUL)slike%(NUL)sthis" % {'NUL': irc.NUL },
+@@ -154,7 +280,7 @@
+         del dict[key]
+         return value
+ 
+-class ModeTestCase(unittest.TestCase):
++class ClientImplementationTests(unittest.TestCase):
+     def setUp(self):
+         self.file = StringIOWithoutClosing()
+         self.transport = protocol.FileWrapper(self.file)
+@@ -169,170 +295,6 @@
+         del self.transport
+ 
+ 
+-    def _sendModeChange(self, msg, args=''):
+-        """
+-        Format the string and send it to the client.
+-        """
+-        message = ":Wolf!~wolf@yok.utu.fi MODE #chan %s %s\r\n" % (msg, args)
+-        self.client.dataReceived(message)
+-
+-
+-    def _parseModeChange(self, results):
+-        """
+-        Parse the results, do some test and return the data to check.
+-        """
+-        for n,result in enumerate(results):
+-            method, data = result
+-            self.assertEquals(method, 'modeChanged')
+-            self.assertEquals(data['user'], 'Wolf!~wolf@yok.utu.fi')
+-            self.assertEquals(data['channel'], '#chan')
+-            results[n] = tuple([data[key] for key in ('set', 'modes', 'args')])
+-        return results
+-
+-
+-    def _checkModeChange(self, expected):
+-        """
+-        Compare the expected result with the one returned by the client.
+-        """
+-        result = self._parseModeChange(self.client.calls)
+-        self.assertEquals(result, expected)
+-
+-
+-    def test_modeChangeWithASingleMode(self):
+-        """
+-        A single mode added to a user.
+-        """
+-        self._sendModeChange('+o', 'exarkun')
+-        self._checkModeChange([(True, 'o', ('exarkun',))])
+-
+-
+-    def test_modeChangeWithArgsAndDifferentModes(self):
+-        """
+-        Two modes added and one removed, they all accept args.
+-        """
+-        self._sendModeChange('-oo+b', 'foo bar baz')
+-        self._checkModeChange([
+-            (True, 'b', ('baz',)),
+-            (False, 'oo', ('foo', 'bar'))
+-        ])
+-
+-
+-    def test_modeChangeWithArgsAndEqualModes(self):
+-        """
+-        Two modes added, they all accept args.
+-        """
+-        self._sendModeChange('+xy', 'cow frog')
+-        self._checkModeChange([(True, 'xy', ('cow', 'frog'))])
+-
+-
+-    def test_modeChangeWithArgsAndMixedModes(self):
+-        """
+-        Some modes added and others removed, they all accept args.
+-        """
+-        self._sendModeChange('+oo-h+vv-b', 'foo bar baz cow frog bat')
+-        self._checkModeChange([
+-            (True, 'oovv', ('foo','bar','cow','frog')),
+-            (False, 'hb', ('baz', 'bat'))
+-        ])
+-
+-
+-    def test_modeChangeWithNoArgsAndDifferentModes(self):
+-        """
+-        A mode added and another removed, they don't accept any arg.
+-        """
+-        self._sendModeChange('-c+U')
+-        self._checkModeChange([(True, 'U', ()), (False, 'c', ())])
+-
+-
+-    def test_modeChangeWithNoArgsAndEqualModes(self):
+-        """
+-        Two modes removed, they don't accept any arg.
+-        """
+-        self._sendModeChange('-cU')
+-        self._checkModeChange([(False, 'cU', ())])
+-
+-
+-    def test_modeChangeWithNoArgsAndMixedModes(self):
+-        """
+-        Some modes added and others removed, they don't accept any arg.
+-        """
+-        self._sendModeChange('-c+fr-o+og-w')
+-        self._checkModeChange([(True, 'frog', ()), (False, 'cow', ())])
+-
+-
+-    def test_modeChangeWithSomeArgAndDifferentModes(self):
+-        """
+-        Two modes added and two removed, only the last accepts an arg.
+-        """
+-        self._sendModeChange('+sU-lv', 'dea7h')
+-        self._checkModeChange([(True, 'sU', ()), (False, 'lv', ('dea7h',))])
+-
+-
+-    def test_modeChangeWithSomeArgAndEqualModes(self):
+-        """
+-        Two modes added, only the last accepts an arg.
+-        """
+-        self._sendModeChange('+cl 1337')
+-        self._checkModeChange([(True, 'cl', ('1337',))])
+-
+-
+-    def test_modeChangeWithSomeArgAndMixedModes(self):
+-        """
+-        Some modes added and others removed, only the 2nd, 3rd and 5th
+-        accept an arg.
+-        """
+-        self._sendModeChange('-co+l-U+o', 'Wolf 3141592 dea7h')
+-        self._checkModeChange([
+-            (True, 'lo', ('3141592', 'dea7h')),
+-            (False, 'coU', ('Wolf',))
+-        ])
+-
+-
+-    def test_modeChangeWithUnknownModes(self):
+-        """
+-        Some modes added and others removed, only the 3rd is known to
+-        accept an arg, the other modes don't accept anything by default.
+-        """
+-        self._sendModeChange('+a-eo+f-g+qz', 'Wolf')
+-        self._checkModeChange([(True, 'afqz', ()), (False, 'eog', ('Wolf',))])
+-
+-
+-    def test_modeChangeWithWrongModesString(self):
+-        """
+-        The modes string is supposed to start with '+' or '-', if they miss
+-        a '+' will be added by default.
+-        """
+-        self._sendModeChange('o', 'Wolf')
+-        self._checkModeChange([(True, 'o', ('Wolf',))])
+-
+-
+-    def test_modeChangeWithRepeatedAddedModes(self):
+-        """
+-        Two modes are added repeating the '+'.
+-        """
+-        self._sendModeChange('+o+c', 'Wolf')
+-        self._checkModeChange([(True, 'oc', ('Wolf',))])
+-
+-
+-    def test_modeChangeWithRepeatedRemovedModes(self):
+-        """
+-        Two modes are removed repeating the '-'.
+-        """
+-        self._sendModeChange('-o-c', 'Wolf')
+-        self._checkModeChange([(False, 'oc', ('Wolf',))])
+-
+-
+-    def test_modeChangeWithRepeatedMixedModes(self):
+-        """
+-        Several modes are added and removed repeating the '+' and the '-'.
+-        """
+-        self._sendModeChange('+a+v-h-r+o+c-k-l', 'Wolf dea7h Svadilfari')
+-        self._checkModeChange([
+-            (True, 'avoc', ('Wolf', 'Svadilfari')),
+-            (False, 'hrkl', ('dea7h',))
+-        ])
+-
+-
+     def _serverTestImpl(self, code, msg, func, **kw):
+         host = pop(kw, 'host', 'server.host')
+         nick = pop(kw, 'nick', 'nickname')
+Index: twisted/words/protocols/irc.py
+===================================================================
+--- twisted/words/protocols/irc.py	(revision 26936)
++++ twisted/words/protocols/irc.py	(working copy)
+@@ -51,6 +51,15 @@
+ class IRCPasswordMismatch(Exception):
+     pass
+ 
++
++
++class IRCBadModes(ValueError):
++    """
++    A malformed mode was encountered while attempting to parse a mode string.
++    """
++
++
++
+ def parsemsg(s):
+     """Breaks a message from an IRC server into its prefix, command, and arguments.
+     """
+@@ -98,6 +107,66 @@
+         r.extend(str.split('\n'))
+     return r
+ 
++
++
++def parseModes(modes, params, paramModes=('', '')):
++    """
++    Parse an IRC mode string.
++
++    The mode string is parsed into two lists of mode changes (added and
++    removed), with each mode change represented as C{(mode, param)} where mode
++    is the mode character, and param is the parameter passed for that mode, or
++    C{None} if no parameter is required.
++
++    @type modes: C{str}
++    @param modes: Modes string to parse
++
++    @type params: C{list}
++    @param params: Parameters specified along with C{modes}
++
++    @type paramModes: C{(str, str)}
++    @param paramModes: A pair of strings (C{(add, remove)}) that indicate which modes take
++        parameters when added or removed
++
++    @rtype: C{([(mode, param)], [(mode, param]))}
++    @returns: (added, removed) modes
++    """
++    if len(modes) == 0:
++        raise IRCBadModes('Empty mode string')
++
++    if modes[0] not in '+-':
++        raise IRCBadModes('Malformed modes string: %r' % modes)
++
++    changes = ([], [])
++
++    direction = None
++    count = -1
++    for ch in modes:
++        if ch in '+-':
++            if count == 0:
++                raise IRCBadModes('Empty mode sequence: %r' % modes)
++            direction = '+-'.index(ch)
++            count = 0
++        else:
++            param = None
++            if ch in paramModes[direction]:
++                try:
++                    param = params.pop(0)
++                except IndexError:
++                    raise IRCBadModes('Not enough parameters: %r' % ch)
++            changes[direction].append((ch, param))
++            count += 1
++
++    if len(params) > 0:
++        raise IRCBadModes('Too many parameters: %r %r' % (modes, params))
++
++    if count == 0:
++        raise IRCBadModes('Empty mode sequence: %r' % modes)
++
++    return changes
++
++
++
+ class IRC(protocol.Protocol):
+     """Internet Relay Chat server protocol.
+     """
+@@ -1195,42 +1264,25 @@
+         self.userQuit(nick, params[0])
+ 
+ 
+-    def irc_MODE(self, prefix, params):
++    def irc_MODE(self, user, params):
+         """
+-        Parse the server message when one or more modes are changed
++        Parse a server mode change message.
+         """
+-        user, channel, modes, args = prefix, params[0], params[1], params[2:]
+-        if modes[0] not in '+-':
+-            # add a '+' before the modes if it isn't specified (e.g. MODE s)
+-            modes = '+' + modes
+-        if ((modes[0] == '+' and '-' not in modes[1:]) or
+-            (modes[0] == '-' and '+' not in modes[1:])):
+-            # all modes are added or removed
+-            set = (modes[0] == '+')
+-            modes = modes[1:].replace('-+'[set], '')
+-            self.modeChanged(user, channel, set, modes, tuple(args))
++        channel, modes, args = params[0], params[1], params[2:]
++        if user == self.nickname:
++            paramModes = self.getUserModeParams()
+         else:
+-            # some modes added and other removed
+-            modes2, args2 = ['', ''], [[], []]
+-            for c in modes:
+-                if c == '+':
+-                    i = 0
+-                elif c == '-':
+-                    i = 1
+-                else:
+-                    modes2[i] += c
+-                    # take an arg only if the mode accepts it (e.g. +o nick)
+-                    if args and self._modeAcceptsArg.get(c, (False, False))[i]:
+-                        args2[i].append(args.pop(0))
+-            if args:
+-                log.msg('Too many args (%s) received for %s. If one or more '
+-                    'modes are supposed to accept an arg and they are not in '
+-                    '_modeAcceptsArg, add them.' % (' '.join(args), modes))
++            paramModes = self.getChannelModeParams()
+ 
+-            self.modeChanged(user, channel, True, modes2[0], tuple(args2[0]))
+-            self.modeChanged(user, channel, False, modes2[1], tuple(args2[1]))
++        added, removed = parseModes(modes, params, paramModes)
+ 
++        modes, params = zip(*added)
++        self.modeChanged(user, channel, True, modes, params)
+ 
++        modes, params = zip(*removed)
++        self.modeChanged(user, channel, False, modes, params)
++
++
+     def irc_PING(self, prefix, params):
+         """
+         Called when some has pinged us.
+@@ -1728,6 +1780,36 @@
+             self.badMessage(line, *sys.exc_info())
+ 
+ 
++    def getUserModeParams(self):
++        """
++        Get user modes that require parameters for correct parsing.
++
++        @rtype: C{[str, str]}
++        @return C{[add, remove]}
++        """
++        params = ['', '']
++        prefixes = self.isupported.get('PREFIX', None) or {}
++        params[0] = params[1] = ''.join(prefixes.iterkeys())
++        return params
++
++
++    def getChannelModeParams(self):
++        """
++        Get channel modes that require parameters for correct parsing.
++
++        @rtype: C{[str, str]}
++        @return C{[add, remove]}
++        """
++        params = self.getUserModeParams()
++        chanmodes = self.isupported.get('CHANMODES', None)
++        if chanmodes is not None:
++            params[0] += chanmodes.get('addressModes', '')
++            params[0] += chanmodes.get('param', '')
++            params[1] = params[0]
++            params[0] += chanmodes.get('setParam', '')
++        return params
++
++
+     def handleCommand(self, command, prefix, params):
+         """Determine the function to call for the given command and call
+         it with the given arguments.

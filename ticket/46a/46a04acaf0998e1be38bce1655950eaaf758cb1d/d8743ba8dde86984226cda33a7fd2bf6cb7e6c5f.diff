@@ -1,0 +1,174 @@
+Index: twisted/internet/_sslverify.py
+===================================================================
+--- twisted/internet/_sslverify.py	(revision 46356)
++++ twisted/internet/_sslverify.py	(working copy)
+@@ -1340,6 +1340,9 @@
+         ['trustRoot', 'requireCertificate'],
+         ['trustRoot', 'verify'],
+         ['trustRoot', 'caCerts'],
++        ['trustRoot', 'retrieveCertificate'],
++        ['retrieveCertificate', 'verify'],
++        ['retrieveCertificate', 'caCerts'],
+     ])
+     def __init__(self,
+                  privateKey=None,
+@@ -1359,6 +1362,7 @@
+                  dhParameters=None,
+                  trustRoot=None,
+                  acceptableProtocols=None,
++                 retrieveCertificate=False
+                  ):
+         """
+         Create an OpenSSL context SSL connection context factory.
+@@ -1459,6 +1463,12 @@
+             earlier in the list are preferred over those later in the list.
+         @type acceptableProtocols: C{list} of C{bytes}
+ 
++        @param retrieveCertificate: If L{True}, allows retrieval of peer
++            certificates even without CA verification. Defaults to L{False}.
++            Since this conflicts with C{caCerts}, C{verify}, and C{trustRoot},
++            specifying any of those options with this one will raise a
++            L{TypeError}.
++
+         @raise ValueError: when C{privateKey} or C{certificate} are set without
+             setting the respective other.
+         @raise ValueError: when C{verify} is L{True} but C{caCerts} doesn't
+@@ -1563,7 +1573,12 @@
+ 
+         self._acceptableProtocols = acceptableProtocols
+ 
++        if retrieveCertificate and not self.verify:
++            self._retrieveCertificate = True
++        else:
++            self._retrieveCertificate = False
+ 
++
+     def __getstate__(self):
+         d = self.__dict__.copy()
+         try:
+@@ -1606,6 +1621,8 @@
+             if self.verifyOnce:
+                 verifyFlags |= SSL.VERIFY_CLIENT_ONCE
+             self.trustRoot._addCACertsToContext(ctx)
++        elif self._retrieveCertificate:
++            verifyFlags = SSL.VERIFY_PEER
+ 
+         # It'd be nice if pyOpenSSL let us pass None here for this behavior (as
+         # the underlying OpenSSL API call allows NULL to be passed).  It
+@@ -1612,7 +1629,19 @@
+         # doesn't, so we'll supply a function which does the same thing.
+         def _verifyCallback(conn, cert, errno, depth, preverify_ok):
+             return preverify_ok
+-        ctx.set_verify(verifyFlags, _verifyCallback)
++        def _retrieveCallback(conn, cert, errno, depth, preverify_ok):
++            """
++            For retrieving certificates, we still need to pass a no-op
++            function to allow us to retrieve certificates. Since retrieving
++            without verification precludes doing any CA-based verification,
++            we're just returning True here.
++            """
++            return True
++        if self._retrieveCertificate:
++            ctx.set_verify(verifyFlags, _retrieveCallback)
++        else:
++            ctx.set_verify(verifyFlags, _verifyCallback)
++
+         if self.verifyDepth is not None:
+             ctx.set_verify_depth(self.verifyDepth)
+ 
+Index: twisted/internet/endpoints.py
+===================================================================
+--- twisted/internet/endpoints.py	(revision 46356)
++++ twisted/internet/endpoints.py	(working copy)
+@@ -1053,7 +1053,7 @@
+ 
+ def _parseSSL(factory, port, privateKey="server.pem", certKey=None,
+               sslmethod=None, interface='', backlog=50, extraCertChain=None,
+-              dhParameters=None):
++              dhParameters=None, getClientCertificate=None):
+     """
+     Internal parser function for L{_parseServer} to convert the string
+     arguments for an SSL (over TCP/IPv4) stream endpoint into the structured
+@@ -1092,6 +1092,12 @@
+         the forward secret C{DHE} ciphers aren't available for servers.
+     @type dhParameters: L{str}
+ 
++    @param getClientCertificate: If this parameter is enabled, the endpoint
++        will retrieve certificates from the client.
++        This parameter is a boolean parameter and should take one of a "yes"
++        or a "no" value.
++    @type requireCert: L{str}
++
+     @return: a 2-tuple of (args, kwargs), describing  the parameters to
+         L{IReactorSSL.listenSSL} (or, modulo argument 2, the factory, arguments
+         to L{SSL4ServerEndpoint}.
+@@ -1126,6 +1132,14 @@
+             FilePath(dhParameters),
+         )
+ 
++    if getClientCertificate:
++        retrieveCertificate = _valueToBool(getClientCertificate, False)
++        if retrieveCertificate is None:
++            raise ValueError("The value of getClientCertificate must be a "
++                "yes/no value.")
++        if retrieveCertificate:
++            kw["retrieveCertificate"] = True
++
+     cf = ssl.CertificateOptions(
+         privateKey=privateCertificate.privateKey.original,
+         certificate=privateCertificate.original,
+@@ -1137,7 +1151,22 @@
+             {'interface': interface, 'backlog': int(backlog)})
+ 
+ 
++def _valueToBool(value, default):
++    """
++    Verifies that values are reasonable strings that we can parse into some
++    boolean value, and returns that boolean value.
++    Returns None if we can't make a boolean value out of the given string.
++    """
++    if value is None:
++        return default
++    lowerValue = value.lower()
++    if lowerValue in ("yes", "true", "y", "t"):
++        return True
++    if lowerValue in ("no", "false", "n", "f"):
++        return False
++    return None
+ 
++
+ @implementer(IPlugin, IStreamServerEndpointStringParser)
+ class _StandardIOParser(object):
+     """
+Index: twisted/internet/test/test_endpoints.py
+===================================================================
+--- twisted/internet/test/test_endpoints.py	(revision 46356)
++++ twisted/internet/test/test_endpoints.py	(working copy)
+@@ -2575,12 +2575,27 @@
+         self.assertIsInstance(cf.dhParameters, DiffieHellmanParameters)
+         self.assertEqual(FilePath(fileName), cf.dhParameters._dhFile)
+ 
++    def test_sslServerGetsClientCerts(self):
++        """
++        If C{getClientCertificate} is specified, client certificates
++        will be retrieved.
++        """
++        reactor = object()
++        server = endpoints.serverFromString(
++            reactor,
++            "ssl:4321:privateKey={0}:certKey={1}:getClientCertificate=yes"
++            .format(escapedPEMPathName, escapedPEMPathName)
++        )
++        cf = server._sslContextFactory
++        self.assertTrue(cf._retrieveCertificate)
+ 
++
+     if skipSSL:
+         test_ssl.skip = test_sslWithDefaults.skip = skipSSL
+         test_sslChainLoads.skip = skipSSL
+         test_sslChainFileMustContainCert.skip = skipSSL
+         test_sslDHparameters.skip = skipSSL
++        test_sslServerGetsClientCerts.skip = skipSSL
+ 
+ 
+     def test_unix(self):

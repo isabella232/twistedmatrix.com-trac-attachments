@@ -1,0 +1,228 @@
+diff --git a/twisted/runner/inetdtap.py b/twisted/runner/inetdtap.py
+index 3e62877..900bcf2 100644
+--- a/twisted/runner/inetdtap.py
++++ b/twisted/runner/inetdtap.py
+@@ -1,7 +1,7 @@
+ # Copyright (c) Twisted Matrix Laboratories.
+ # See LICENSE for details.
+ 
+-# 
++#
+ 
+ """
+ Twisted inetd TAP support
+@@ -11,19 +11,15 @@ Maintainer: Andrew Bennetts
+ Future Plans: more configurability.
+ """
+ 
+-import os, pwd, grp, socket
++import grp
++import pwd
++import socket
+ 
+ from twisted.runner import inetd, inetdconf
+ from twisted.python import log, usage
+ from twisted.internet.protocol import ServerFactory
+ from twisted.application import internet, service as appservice
+ 
+-try:
+-    import portmap
+-    rpcOk = 1
+-except ImportError:
+-    rpcOk = 0
+-
+ 
+ # Protocol map
+ protocolDict = {'tcp': socket.IPPROTO_TCP, 'udp': socket.IPPROTO_UDP}
+@@ -32,7 +28,6 @@ protocolDict = {'tcp': socket.IPPROTO_TCP, 'udp': socket.IPPROTO_UDP}
+ class Options(usage.Options):
+ 
+     optParameters = [
+-        ['rpc', 'r', '/etc/rpc', 'RPC procedure table file'],
+         ['file', 'f', '/etc/inetd.conf', 'Service configuration file']
+     ]
+ 
+@@ -42,72 +37,20 @@ class Options(usage.Options):
+         optActions={"file": usage.CompleteFiles('*.conf')}
+         )
+ 
+-class RPCServer(internet.TCPServer):
+-
+-    def __init__(self, rpcVersions, rpcConf, proto, service):
+-        internet.TCPServer.__init__(0, ServerFactory())
+-        self.rpcConf = rpcConf
+-        self.proto = proto
+-        self.service = service
+-
+-    def startService(self):
+-        internet.TCPServer.startService(self)
+-        import portmap
+-        portNo = self._port.getHost()[2]
+-        service = self.service
+-        for version in rpcVersions:
+-            portmap.set(self.rpcConf.services[name], version, self.proto,
+-                        portNo)
+-            inetd.forkPassingFD(service.program, service.programArgs,
+-                                os.environ, service.user, service.group, p)
+ 
+ def makeService(config):
+     s = appservice.MultiService()
+     conf = inetdconf.InetdConf()
+     conf.parseFile(open(config['file']))
+ 
+-    rpcConf = inetdconf.RPCServicesConf()
+-    try:
+-        rpcConf.parseFile(open(config['rpc']))
+-    except:
+-        # We'll survive even if we can't read /etc/rpc
+-        log.deferr()
+-    
+     for service in conf.services:
+-        rpc = service.protocol.startswith('rpc/')
+         protocol = service.protocol
+ 
+-        if rpc and not rpcOk:
+-            log.msg('Skipping rpc service due to lack of rpc support')
++        if service.protocol.startswith('rpc/'):
++            log.msg('Skipping rpc service due to the fact that RPC support has'
++                    ' been removed')
+             continue
+ 
+-        if rpc:
+-            # RPC has extra options, so extract that
+-            protocol = protocol[4:]     # trim 'rpc/'
+-            if not protocolDict.has_key(protocol):
+-                log.msg('Bad protocol: ' + protocol)
+-                continue
+-            
+-            try:
+-                name, rpcVersions = service.name.split('/')
+-            except ValueError:
+-                log.msg('Bad RPC service/version: ' + service.name)
+-                continue
+-
+-            if not rpcConf.services.has_key(name):
+-                log.msg('Unknown RPC service: ' + repr(service.name))
+-                continue
+-
+-            try:
+-                if '-' in rpcVersions:
+-                    start, end = map(int, rpcVersions.split('-'))
+-                    rpcVersions = range(start, end+1)
+-                else:
+-                    rpcVersions = [int(rpcVersions)]
+-            except ValueError:
+-                log.msg('Bad RPC versions: ' + str(rpcVersions))
+-                continue
+-            
+         if (protocol, service.socketType) not in [('tcp', 'stream'),
+                                                   ('udp', 'dgram')]:
+             log.msg('Skipping unsupported type/protocol: %s/%s'
+@@ -148,12 +91,8 @@ def makeService(config):
+                 continue
+             factory = ServerFactory()
+             factory.protocol = inetd.internalProtocols[service.name]
+-        elif rpc:
+-            i = RPCServer(rpcVersions, rpcConf, proto, service)
+-            i.setServiceParent(s)
+-            continue
+         else:
+-            # Non-internal non-rpc services use InetdFactory
++            # Non-internal services use InetdFactory
+             factory = inetd.InetdFactory(service)
+ 
+         if protocol == 'tcp':
+diff --git a/twisted/runner/portmap.c b/twisted/runner/portmap.c
+deleted file mode 100644
+index ca0c1c9..0000000
+--- a/twisted/runner/portmap.c
++++ /dev/null
+@@ -1,57 +0,0 @@
+-/*
+- * Copyright (c) 2001-2004 Twisted Matrix Laboratories.
+- * See LICENSE for details.
+-
+- * 
+- */
+-
+-/* portmap.c: A simple Python wrapper for pmap_set(3) and pmap_unset(3) */
+-
+-#include <Python.h>
+-#include <rpc/rpc.h>
+-#include <rpc/pmap_clnt.h>
+-
+-static PyObject * portmap_set(PyObject *self, PyObject *args)
+-{
+-	unsigned long program, version;
+-	int protocol;
+-	unsigned short port;
+-	
+-	if (!PyArg_ParseTuple(args, "llih:set", 
+-			      &program, &version, &protocol, &port))
+-		return NULL;
+-
+-	pmap_unset(program, version);
+-	pmap_set(program, version, protocol, port);
+-	
+-	Py_INCREF(Py_None);
+-	return Py_None;
+-}
+-
+-static PyObject * portmap_unset(PyObject *self, PyObject *args)
+-{
+-	unsigned long program, version;
+-	
+-	if (!PyArg_ParseTuple(args, "ll:unset",
+-			      &program, &version))
+-		return NULL;
+-
+-	pmap_unset(program, version);
+-	
+-	Py_INCREF(Py_None);
+-	return Py_None;
+-}
+-
+-static PyMethodDef PortmapMethods[] = {
+-	{"set", portmap_set, METH_VARARGS, 
+-	 "Set an entry in the portmapper."},
+-	{"unset", portmap_unset, METH_VARARGS,
+-	 "Unset an entry in the portmapper."},
+-	{NULL, NULL, 0, NULL}
+-};
+-
+-void initportmap(void)
+-{
+-	(void) Py_InitModule("portmap", PortmapMethods);
+-}
+-
+diff --git a/twisted/runner/topfiles/setup.py b/twisted/runner/topfiles/setup.py
+index 27f65d3..7997beb 100644
+--- a/twisted/runner/topfiles/setup.py
++++ b/twisted/runner/topfiles/setup.py
+@@ -2,18 +2,12 @@
+ # See LICENSE for details.
+ 
+ try:
+-    from twisted.python.dist import setup, ConditionalExtension as Extension
++    from twisted.python.dist import setup
+ except ImportError:
+     raise SystemExit("twisted.python.dist module not found.  Make sure you "
+                      "have installed the Twisted core package before "
+                      "attempting to install any other Twisted projects.")
+ 
+-extensions = [
+-    Extension("twisted.runner.portmap",
+-              ["twisted/runner/portmap.c"],
+-              condition=lambda builder: builder._check_header("rpc/rpc.h")),
+-]
+-
+ if __name__ == '__main__':
+     setup(
+         twisted_subproject="runner",
+@@ -30,6 +24,4 @@ if __name__ == '__main__':
+ Twisted Runner contains code useful for persistent process management
+ with Python and Twisted, and has an almost full replacement for inetd.
+ """,
+-        # build stuff
+-        conditionalExtensions=extensions,
+     )

@@ -1,0 +1,146 @@
+Index: twisted/trial/test/test_class.py
+===================================================================
+--- twisted/trial/test/test_class.py	(revision 18437)
++++ twisted/trial/test/test_class.py	(working copy)
+@@ -134,18 +134,53 @@
+ 
+         def tearDownClass(self):
+             self.__class__._tearDownClassRun += 1
+-            
+-    
++
++    class LastSetupFailsTestCase(MyTestCase):
++        _setUpClassRun = 0
++        _tearDownClassRun = 0
++
++        def setUp(self):
++            raise unittest.SkipTest('reason')
++
++    class LastTestSkippedTestCase(MyTestCase):
++        _setUpClassRun = 0
++        _tearDownClassRun = 0
++
++        def test_2(self):
++            pass
++
++        test_2.skip = 'asdf'
++
++    class FirstTestSkippedTestCase(MyTestCase):
++        _setUpClassRun = 0
++        _tearDownClassRun = 0
++
++        def test_1(self):
++            pass
++
++        test_1.skip = 'asdf'
++
++    class AllTestsSkippedTestCase(MyTestCase):
++        _setUpClassRun = 0
++        _tearDownClassRun = 0
++    AllTestsSkippedTestCase.skip = 'asdf'
++
+     def setUp(self):
+         self.factory = FactoryCounting.MyTestCase
+         self.subFactory = FactoryCounting.AnotherTestCase
++        self.factory3 = FactoryCounting.LastSetupFailsTestCase
++        self.factory4 = FactoryCounting.LastTestSkippedTestCase
++        self.factory5 = FactoryCounting.FirstTestSkippedTestCase
++        self.factory6 = FactoryCounting.AllTestsSkippedTestCase
+         self._reset()
+ 
+     def _reset(self):
+         self.factory._setUpClassRun = self.factory._tearDownClassRun = 0
+         self.subFactory._setUpClassRun = self.subFactory._tearDownClassRun = 0
++        self.factory3._setUpClassRun = self.factory3._tearDownClassRun = 0
+         self.factory._instances = sets.Set()
+         self.factory._instancesRun = sets.Set()
++        self.factory._instancesSkipped = sets.Set()
+ 
+     def test_createAndRun(self):
+         test = self.factory('test_1')
+@@ -196,4 +231,41 @@
+         tests[1](result)
+         self.failUnlessEqual(self.subFactory._setUpClassRun, 2)
+         self.failUnlessEqual(self.subFactory._tearDownClassRun, 0)
+-        
++
++    def test_setUpFailure(self):
++        tests = map(self.factory3, ['test_1','test_2'])
++        results = reporter.TestResult()
++        tests[0](results)
++        self.failUnlessEqual(self.factory3._setUpClassRun, 1)
++        self.failUnlessEqual(self.factory3._tearDownClassRun, 0)
++        tests[1](results)
++        self.failUnlessEqual(self.factory3._setUpClassRun, 1)
++        self.failUnlessEqual(self.factory3._tearDownClassRun, 1)
++
++    def test_lastskip(self):
++        tests = map(self.factory4, ['test_1','test_2'])
++        results = reporter.TestResult()
++        tests[0](results)
++        self.failUnlessEqual(self.factory4._setUpClassRun, 1)
++        self.failUnlessEqual(self.factory4._tearDownClassRun, 0)
++        tests[1](results)
++        self.failUnlessEqual(self.factory4._setUpClassRun, 1)
++        self.failUnlessEqual(self.factory4._tearDownClassRun, 1)
++
++    def test_firstskip(self):
++        tests = map(self.factory5, ['test_1','test_2'])
++        results = reporter.TestResult()
++        tests[0](results)
++        #self.failUnlessEqual(self.factory5._setUpClassRun, 1)
++        self.failUnlessEqual(self.factory5._tearDownClassRun, 0)
++        tests[1](results)
++        self.failUnlessEqual(self.factory5._setUpClassRun, 1)
++        self.failUnlessEqual(self.factory5._tearDownClassRun, 1)
++
++    def test_allskip(self):
++        tests = map(self.factory6, ['test_1','test_2'])
++        results = reporter.TestResult()
++        tests[0](results)
++        tests[1](results)
++        self.failUnlessEqual(self.factory6._setUpClassRun,
++                             self.factory6._tearDownClassRun)
+Index: twisted/trial/unittest.py
+===================================================================
+--- twisted/trial/unittest.py	(revision 18437)
++++ twisted/trial/unittest.py	(working copy)
+@@ -471,13 +471,16 @@
+     def _initInstances(cls):
+         cls._instances = sets.Set()
+         cls._instancesRun = sets.Set()
++        cls._instancesSkipped = sets.Set()
+     _initInstances = classmethod(_initInstances)
+ 
+     def _isFirst(self):
+         return len(self.__class__._instancesRun) == 0
+ 
+     def _isLast(self):
+-        return self.__class__._instancesRun == self.__class__._instances
++        return    len(self.__class__._instancesRun) \
++                + len(self.__class__._instancesSkipped) \
++               == len(self.__class__._instances)
+ 
+     def _prepareClassFixture(self):
+         """Lots of tests assume that test methods all run in the same instance
+@@ -573,6 +576,8 @@
+             result.upDownError('setUp', failure, warn=False, printStatus=False)
+             if failure.check(KeyboardInterrupt):
+                 result.stop()
++        if self._shared and hasattr(self, 'tearDownClass') and self._isLast():
++            return self.deferTearDownClass(failure, result)
+ 
+     def deferTestMethod(self, ignored, result):
+         d = self._run(self._testMethodName, result)
+@@ -735,6 +740,11 @@
+         if self.getSkip(): # don't run test methods that are marked as .skip
+             result.addSkip(self, self.getSkip())
+             result.stopTest(self)
++            if self._shared:
++                self.__class__._instancesSkipped.add(self)
++                if hasattr(self, 'tearDownClass') and self._isLast() \
++                   and not self._isFirst():
++                    return self.deferTearDownClass(failure, result)
+             return
+         self._installObserver()
+         self._passed = False

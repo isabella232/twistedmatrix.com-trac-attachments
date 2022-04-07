@@ -1,0 +1,88 @@
+Index: twisted/spread/pb.py
+===================================================================
+RCS file: /cvs/Twisted/twisted/spread/pb.py,v
+retrieving revision 1.157
+diff -u -u -r1.157 pb.py
+--- twisted/spread/pb.py	28 Feb 2004 23:59:57 -0000	1.157
++++ twisted/spread/pb.py	12 Mar 2004 12:44:09 -0000
+@@ -79,6 +79,7 @@
+ import sys
+ import types
+ import warnings
++import weakref
+ 
+ # Twisted Imports
+ from twisted.python import log, failure
+@@ -334,7 +335,8 @@
+         self.doRefCount = doRefCount
+         self.perspective = perspective
+         self.disconnectCallbacks = []
+-
++        self.broker._registerRemoteReference(self)
++            
+     def notifyOnDisconnect(self, callback):
+         """Register a callback to be called if our broker gets disconnected.
+ 
+@@ -404,12 +406,12 @@
+     def __hash__(self):
+         """Hash me.
+         """
+-        return self.luid
++        return hash(self.luid)
+ 
+     def __del__(self):
+         """Do distributed reference counting on finalization.
+         """
+-        if self.doRefCount:
++        if self.doRefCount and self.broker:
+             self.broker.sendDecRef(self.luid)
+ 
+ setUnjellyableForClass("remote", RemoteReference)
+@@ -500,7 +502,9 @@
+     version = 6
+     username = None
+     factory = None
+-
++    unjellyableRegistry = None
++    unjellyableFactoryRegistry = None
++    
+     def __init__(self, isClient=1, security=globalSecurity):
+         banana.Banana.__init__(self, isClient)
+         self.disconnected = 0
+@@ -532,7 +536,11 @@
+         # Dictionary mapping (remote) LUIDs to (locally cached) objects.
+         self.locallyCachedObjects = {}
+         self.waitingForAnswers = {}
++        self._remoteReferences = weakref.WeakKeyDictionary()
+ 
++    def _registerRemoteReference(self, rr):
++        self._remoteReferences[rr]=None
++    
+     def resumeProducing(self):
+         """Called when the consumer attached to me runs out of buffer.
+         """
+@@ -627,6 +635,12 @@
+         self.disconnected = 1
+         # nuke potential circular references.
+         self.luids = None
++
++        for rr in self._remoteReferences:
++            rr.broker = None
++            rr.perspective = None
++        self._remoteReferences = weakref.WeakKeyDictionary()
++    
+         if self.waitingForAnswers:
+             for d in self.waitingForAnswers.values():
+                 try:
+@@ -826,10 +840,9 @@
+ 
+         self.unserializingPerspective = perspective
+         try:
+-            return unjelly(sexp, self.security, None, self)
++            return unjelly(sexp, self.security, None, self, self.unjellyableRegistry, self.unjellyableFactoryRegistry)
+         finally:
+             self.unserializingPerspective = None
+-
+     def newLocalID(self):
+         """Generate a new LUID.
+         """

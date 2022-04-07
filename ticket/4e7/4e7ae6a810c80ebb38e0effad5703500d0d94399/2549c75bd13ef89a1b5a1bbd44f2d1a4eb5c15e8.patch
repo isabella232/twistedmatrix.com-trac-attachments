@@ -1,0 +1,295 @@
+=== modified file 'twisted/application/internet.py'
+--- twisted/application/internet.py	2013-06-15 20:57:50 +0000
++++ twisted/application/internet.py	2013-07-04 19:21:38 +0000
+@@ -398,8 +398,13 @@
+ 
+ 
+ 
++class DatagramEndpointService(StreamServerEndpointService):
++    pass
++
++
++
+ __all__ = (['TimerService', 'CooperatorService', 'MulticastServer',
+-            'StreamServerEndpointService'] +
++            'StreamServerEndpointService', 'DatagramEndpointService'] +
+            [tran+side
+             for tran in 'TCP UNIX SSL UDP UNIXDatagram'.split()
+             for side in 'Server Client'.split()])
+
+=== modified file 'twisted/application/strports.py'
+--- twisted/application/strports.py	2012-04-07 15:52:13 +0000
++++ twisted/application/strports.py	2013-07-04 21:14:07 +0000
+@@ -11,10 +11,10 @@
+ 
+ import warnings
+ 
+-from twisted.internet import endpoints
++from twisted.internet import endpoints, interfaces
+ from twisted.python.deprecate import deprecatedModuleAttribute
+ from twisted.python.versions import Version
+-from twisted.application.internet import StreamServerEndpointService
++from twisted.application.internet import StreamServerEndpointService, DatagramEndpointService
+ 
+ 
+ 
+@@ -35,7 +35,7 @@
+ 
+ _DEFAULT = object()
+ 
+-def service(description, factory, default=_DEFAULT, reactor=None):
++def service(description, factoryOrProtocol, default=_DEFAULT, reactor=None):
+     """
+     Return the service corresponding to a description.
+ 
+@@ -44,10 +44,10 @@
+ 
+     @type description: C{str}
+ 
+-    @param factory: The protocol factory which will build protocols for
++    @param factoryOrProtocol: The protocol factory which will build protocols for
+         connections to this service.
+ 
+-    @type factory: L{twisted.internet.interfaces.IProtocolFactory}
++    @type factoryOrProtocol: L{twisted.internet.interfaces.IProtocolFactory}
+ 
+     @type default: C{str} or C{None}
+ 
+@@ -73,9 +73,13 @@
+                 "'tcp:%s'." % (description,))
+         warnings.warn(
+             message=message, category=DeprecationWarning, stacklevel=2)
+-    svc = StreamServerEndpointService(
+-        endpoints._serverFromStringLegacy(reactor, description, default),
+-        factory)
++
++    ep = endpoints._serverFromStringLegacy(reactor, description, default),
++    if interfaces.IStreamServerEndpoint.providedBy(ep):
++        svc = StreamServerEndpointService(ep, factoryOrProtocol)
++    else:
++        svc = DatagramEndpointService(ep, factoryOrProtocol)
++
+     svc._raiseSynchronously = True
+     return svc
+ 
+
+=== modified file 'twisted/internet/endpoints.py'
+--- twisted/internet/endpoints.py	2013-06-21 23:05:46 +0000
++++ twisted/internet/endpoints.py	2013-07-04 18:43:54 +0000
+@@ -13,7 +13,7 @@
+ """
+ 
+ from __future__ import division, absolute_import
+-
++from itertools import chain
+ import os
+ import re
+ import socket
+@@ -27,6 +27,7 @@
+         ClientFactory, Protocol, ProcessProtocol, Factory)
+ from twisted.internet.interfaces import IStreamServerEndpointStringParser
+ from twisted.internet.interfaces import IStreamClientEndpointStringParser
++from twisted.internet.interfaces import IDatagramEndpointStringParser
+ from twisted.python.filepath import FilePath
+ from twisted.python.systemd import ListenFDs
+ from twisted.internet.abstract import isIPv6Address
+@@ -34,6 +35,7 @@
+ from twisted.python import log
+ from twisted.internet.address import _ProcessAddress
+ from twisted.python.components import proxyForInterface
++from twisted.python.util import socketTypeFromFd
+ 
+ if not _PY3:
+     from twisted.plugin import IPlugin, getPlugins
+@@ -844,6 +846,85 @@
+ 
+ 
+ 
++@implementer(interfaces.IDatagramEndpoint)
++class DatagramEndpoint(object):
++    """
++    A UDP endpoint interface
++    """
++
++    def __init__(self, reactor, port, interface):
++        """
++        @param reactor: An L{IReactorTCP} provider.
++
++        @param port: The port number used for listening
++        @type port: int
++
++        @param interface: The hostname to bind to
++        @type interface: str
++        """
++        self._reactor = reactor
++        self._port = port
++        self._interface = interface
++
++
++    def listen(self, protocol):
++        """
++        Implement L{IDatagramEndpoint.listen} to listen on a UDP
++        socket
++        """
++        return defer.execute(self._reactor.listenUDP,
++                             self._port,
++                             protocol,
++                             interface=self._interface)
++
++
++
++@implementer(interfaces.IDatagramEndpoint)
++class AdoptedDatagramEndpoint(object):
++    """
++
++    @ivar _used: A C{bool} indicating whether this endpoint has been used to
++        listen with a factory yet.  C{True} if so.
++    """
++    _close = os.close
++    _setNonBlocking = staticmethod(fdesc.setNonBlocking)
++
++    def __init__(self, reactor, fileno, addressFamily):
++        """
++        @param reactor: An L{IReactorSocket} provider.
++
++        @param fileno: An integer file descriptor corresponding to a listening
++            I{SOCK_STREAM} socket.
++
++        @param addressFamily: The address family of the socket given by
++            C{fileno}.
++        """
++        self.reactor = reactor
++        self.fileno = fileno
++        self.addressFamily = addressFamily
++        self._used = False
++
++
++    def listen(self, protocol):
++        """
++        Implement L{IStreamServerEndpoint.listen} to start listening on, and
++        then close, C{self._fileno}.
++        """
++        if self._used:
++            return defer.fail(error.AlreadyListened())
++        self._used = True
++
++        try:
++            self._setNonBlocking(self.fileno)
++            port = self.reactor.adoptDatagramPort(
++                self.fileno, self.addressFamily, protocol)
++            self._close(self.fileno)
++        except:
++            return defer.fail()
++        return defer.succeed(port)
++
++
++
+ def _parseTCP(factory, port, interface="", backlog=50):
+     """
+     Internal parser function for L{_parseServer} to convert the string
+@@ -980,6 +1061,23 @@
+ 
+ 
+ 
++def _parseUDP(factory, port, interface=""):
++    """
++    Internal parser function for L{_parseServer} to convert the string
++    arguments for a TCP(IPv4) datagram endpoint into the structured arguments.
++
++    @param port: the integer port number to bind
++    @type port: C{str}
++
++    @param interface: the interface IP to listen on
++
++    @return: a 2-tuple of (args, kwargs), describing  the parameters to
++        L{IReactorTCP.listenTCP}.
++    """
++    return (int(port),), {'interface': interface,}
++
++
++
+ @implementer(IPlugin, IStreamServerEndpointStringParser)
+ class _StandardIOParser(object):
+     """
+@@ -1096,6 +1194,7 @@
+ _serverParsers = {"tcp": _parseTCP,
+                   "unix": _parseUNIX,
+                   "ssl": _parseSSL,
++                  "udp": _parseUDP,
+                   }
+ 
+ _OP, _STRING = range(2)
+@@ -1172,6 +1271,7 @@
+     'TCP': TCP4ServerEndpoint,
+     'SSL': SSL4ServerEndpoint,
+     'UNIX': UNIXServerEndpoint,
++    'UDP': DatagramEndpoint,
+     }
+ 
+ _endpointClientFactories = {
+@@ -1223,7 +1323,7 @@
+     if parser is None:
+         # If the required parser is not found in _server, check if
+         # a plugin exists for the endpointType
+-        for plugin in getPlugins(IStreamServerEndpointStringParser):
++        for plugin in chain(getPlugins(IStreamServerEndpointStringParser), getPlugins(IDatagramEndpointStringParser)):
+             if plugin.prefix == endpointType:
+                 return (plugin, args[1:], kw)
+         raise ValueError("Unknown endpoint type: '%s'" % (endpointType,))
+
+=== modified file 'twisted/internet/interfaces.py'
+--- twisted/internet/interfaces.py	2013-07-03 20:14:17 +0000
++++ twisted/internet/interfaces.py	2013-07-04 18:07:32 +0000
+@@ -2497,3 +2497,51 @@
+         @return: a client endpoint
+         @rtype: L{IStreamClientEndpoint}
+         """
++
++
++
++class IDatagramEndpoint(Interface):
++    """
++    A stream server endpoint is a place that a L{Factory} can listen for
++    incoming connections.
++
++    @since: 10.1
++    """
++
++    def listen(protocol):
++        """
++        Listen with C{protocolFactory} at the location specified by this
++        L{IStreamServerEndpoint} provider.
++
++        @param protocolFactory: A provider of L{IProtocolFactory}
++        @return: A L{Deferred} that results in an L{IListeningPort} or an
++            L{CannotListenError}
++        """
++
++
++
++class IDatagramEndpointStringParser(Interface):
++    """
++    An L{IStreamServerEndpointStringParser} is like an
++    L{IStreamClientEndpointStringParser}, except for L{IStreamServerEndpoint}s
++    instead of clients.  It integrates with L{endpoints.serverFromString} in
++    much the same way.
++    """
++
++    prefix = Attribute(
++        """
++        @see: L{IStreamClientEndpointStringParser.prefix}
++        """
++    )
++
++
++    def parseDatagram(reactor, *args, **kwargs):
++        """
++        Parse a stream server endpoint from a reactor and string-only arguments
++        and keyword arguments.
++
++        @see: L{IStreamClientEndpointStringParser.parseStreamClient}
++
++        @return: a stream server endpoint
++        @rtype: L{IStreamServerEndpoint}
++        """
+

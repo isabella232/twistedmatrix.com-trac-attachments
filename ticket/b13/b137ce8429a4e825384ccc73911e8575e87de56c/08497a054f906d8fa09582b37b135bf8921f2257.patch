@@ -1,0 +1,169 @@
+=== modified file 'twisted/conch/ls.py'
+--- twisted/conch/ls.py	2011-02-14 04:45:15 +0000
++++ twisted/conch/ls.py	2011-03-14 19:21:27 +0000
+@@ -7,6 +7,10 @@
+ 
+ from time import time, strftime, localtime
+ 
++# locale-independent month names to use instead of strftime's
++MONTH_NAMES = dict(zip(range(1, 13),
++                   "Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec".split()))
++
+ 
+ def lsLine(name, s):
+     mode = s.st_mode
+@@ -39,22 +43,24 @@
+     if mode&stat.S_ISGID:
+         if perms[6] == 'x': perms[6] = 's'
+         else: perms[6] = 'S'
+-    l = perms.tostring()
+-    l += str(s.st_nlink).rjust(5) + ' '
++
+     un = str(s.st_uid)
+-    l += un.ljust(9)
+     gr = str(s.st_gid)
+-    l += gr.ljust(9)
+     sz = str(s.st_size)
+-    l += sz.rjust(8)
+-    l += ' '
+     sixmo = 60 * 60 * 24 * 7 * 26
++    l = [perms.tostring(), str(s.st_nlink).rjust(5), ' ',
++         un.ljust(9), gr.ljust(9), sz.rjust(8), ' ']
++
++    # need to specify the month manually, as strftime depends on locale
++    ttup = localtime(s.st_mtime)
+     if s.st_mtime + sixmo < time(): # last edited more than 6mo ago
+-        l += strftime("%b %d  %Y ", localtime(s.st_mtime))
++        strtime = strftime("%%s %d  %Y ", ttup)
+     else:
+-        l += strftime("%b %d %H:%M ", localtime(s.st_mtime))
+-    l += name
+-    return l
++        strtime = strftime("%%s %d %H:%M ", ttup)
++    l.append(strtime % (MONTH_NAMES[ttup[1]],))
++
++    l.append(name)
++    return ''.join(l)
+ 
+ 
+ __all__ = ['lsLine']
+
+=== modified file 'twisted/conch/test/test_cftp.py'
+--- twisted/conch/test/test_cftp.py	2010-05-30 16:10:42 +0000
++++ twisted/conch/test/test_cftp.py	2011-03-14 19:44:33 +0000
+@@ -6,10 +6,12 @@
+ Tests for L{twisted.conch.scripts.cftp}.
+ """
+ 
++import locale
+ import time, sys, os, operator, getpass, struct
+ from StringIO import StringIO
+ 
+ from twisted.conch.test.test_ssh import Crypto, pyasn1
++from twisted.python import runtime
+ 
+ _reason = None
+ if Crypto and pyasn1:
+@@ -142,6 +144,30 @@
+             '!---------    0 0        0               0 Aug 29 09:33 foo')
+ 
+ 
++    def test_localeIndependent(self):
++        """
++        The month name in the date should be locale independent.
++        """
++        # A point about three months in the past.
++        then = self.now - (60 * 60 * 24 * 31 * 3)
++        stat = os.stat_result((0, 0, 0, 0, 0, 0, 0, 0, then, 0))
++
++        # Fake that we're in a language where August is not Aug (e.g.: Spanish)
++        current_locale = locale.getlocale()
++        locale.setlocale(locale.LC_ALL, "es_AR.UTF8")
++        self.addCleanup(locale.setlocale, locale.LC_ALL, current_locale)
++
++        self.assertEqual(
++            self._lsInTimezone('America/New_York', stat),
++            '!---------    0 0        0               0 Aug 28 17:33 foo')
++        self.assertEqual(
++            self._lsInTimezone('Pacific/Auckland', stat),
++            '!---------    0 0        0               0 Aug 29 09:33 foo')
++
++    if runtime.platform.isWindows():
++        test_localeIndependent.skip = "No es_AR.UTF8 locale in Windows."
++
++
+     def test_newSingleDigitDayOfMonth(self):
+         """
+         A file with a high-resolution timestamp which falls on a day of the
+
+=== modified file 'twisted/mail/imap4.py'
+--- twisted/mail/imap4.py	2011-02-14 04:45:15 +0000
++++ twisted/mail/imap4.py	2011-03-14 19:21:27 +0000
+@@ -49,6 +49,9 @@
+ import twisted.cred.credentials
+ 
+ 
++# locale-independent month names to use instead of strftime's
++MONTH_NAMES = dict(zip(range(1, 13),
++                   "Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec".split()))
+ 
+ class MessageSet(object):
+     """
+@@ -1904,7 +1907,9 @@
+             log.msg("%d:%r: unpareseable internaldate: %r" % (id, msg, idate))
+             raise IMAP4Exception("Internal failure generating INTERNALDATE")
+ 
+-        odate = time.strftime("%d-%b-%Y %H:%M:%S ", ttup[:9])
++        # need to specify the month manually, as strftime depends on locale
++        strdate = time.strftime("%d-%%s-%Y %H:%M:%S ", ttup[:9])
++        odate = strdate % (MONTH_NAMES[ttup[1]],)
+         if ttup[9] is None:
+             odate = odate + "+0000"
+         else:
+
+=== modified file 'twisted/mail/test/test_imap.py'
+--- twisted/mail/test/test_imap.py	2011-02-14 04:45:15 +0000
++++ twisted/mail/test/test_imap.py	2011-03-14 19:37:03 +0000
+@@ -12,9 +12,10 @@
+ except ImportError:
+     from StringIO import StringIO
+ 
++import codecs
++import locale
+ import os
+ import types
+-import codecs
+ 
+ from zope.interface import implements
+ 
+@@ -29,6 +30,7 @@
+ from twisted.trial import unittest
+ from twisted.python import util
+ from twisted.python import failure
++from twisted.python import runtime
+ 
+ from twisted import cred
+ import twisted.cred.error
+@@ -3461,6 +3463,21 @@
+     def testFetchInternalDateUID(self):
+         return self.testFetchInternalDate(1)
+ 
++    def testFetchInternalDateLocaleIndependent(self):
++        """
++        The month name in the date should be locale independent.
++        """
++        # Fake that we're in a language where December is not Dec
++        current_locale = locale.getlocale()
++        locale.setlocale(locale.LC_ALL, "es_AR.UTF8")
++        self.addCleanup(locale.setlocale, locale.LC_ALL, current_locale)
++        return self.testFetchInternalDate(1)
++
++    if runtime.platform.isWindows():
++        testFetchInternalDateLocaleIndependent.skip = """
++            No es_AR.UTF8 locale in Windows.
++        """
++
+     def testFetchEnvelope(self, uid=0):
+         self.function = self.client.fetchEnvelope
+         self.messages = '15'
+

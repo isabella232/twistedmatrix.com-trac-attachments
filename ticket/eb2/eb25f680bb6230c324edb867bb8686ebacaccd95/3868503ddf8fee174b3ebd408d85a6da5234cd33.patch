@@ -1,0 +1,235 @@
+=== modified file 'twisted/conch/ssh/session.py'
+--- twisted/conch/ssh/session.py	2008-05-25 10:15:27 +0000
++++ twisted/conch/ssh/session.py	2009-10-09 08:42:01 +0000
+@@ -1,5 +1,5 @@
+-# -*- test-case-name: twisted.conch.test.test_conch -*-
+-# Copyright (c) 2001-2008 Twisted Matrix Laboratories.
++# -*- test-case-name: twisted.conch.test.test_session -*-
++# Copyright (c) 2001-2009 Twisted Matrix Laboratories.
+ # See LICENSE for details.
+ 
+ 
+@@ -7,10 +7,13 @@
+ This module contains the implementation of SSHSession, which (by default)
+ allows access to a shell and a python interpreter over SSH.
+ 
+-Maintainer: U{Paul Swartz<mailto:z3p@twistedmatrix.com>}
++Maintainer: Paul Swartz
+ """
+ 
+ import struct
++import signal
++import sys
++import os
+ 
+ from twisted.internet import protocol
+ from twisted.python import log
+@@ -164,9 +167,21 @@
+ def wrapProtocol(proto):
+     return _DummyTransport(proto)
+ 
++
++
++# SUPPORTED_SIGNALS is a list of signals that every session channel is supposed
++# to accept.  See RFC 4254
++SUPPORTED_SIGNALS = ["ABRT", "ALRM", "FPE", "HUP", "ILL", "INT", "KILL",
++                     "PIPE", "QUIT", "SEGV", "TERM", "USR1", "USR2"]
++
++
++
+ class SSHSessionProcessProtocol(protocol.ProcessProtocol):
+ 
+-#    __implements__ = I
++    # once initialized, a dictionary mapping signal values to strings
++    # that follow RFC 4254.
++    _signalValuesToNames = None
++
+     def __init__(self, session):
+         self.session = session
+ 
+@@ -187,10 +202,52 @@
+     def connectionLost(self, reason = None):
+         self.session.loseConnection()
+ 
+-    def processEnded(self, reason = None):
+-        if reason and hasattr(reason.value, 'exitCode'):
+-            log.msg('exitCode: %s' % repr(reason.value.exitCode))
+-            self.session.conn.sendRequest(self.session, 'exit-status', struct.pack('!L', reason.value.exitCode))
++
++    def _getSignalName(self, signum):
++        """
++        Get a signal name given a signal number.
++        """
++        if self._signalValuesToNames is None:
++            self._signalValuesToNames = {}
++            # make sure that the POSIX ones are the defaults
++            for signame in SUPPORTED_SIGNALS:
++                signame = 'SIG' + signame
++                sigvalue = getattr(signal, signame, None)
++                if sigvalue is not None:
++                    self._signalValuesToNames[sigvalue] = signame
++            for k, v in signal.__dict__.items():
++                # Check for platform specific signals, ignoring Python specific
++                # SIG_DFL and SIG_IGN
++                if k.startswith('SIG') and not k.startswith('SIG_'):
++                    if v not in self._signalValuesToNames:
++                        self._signalValuesToNames[v] = k + '@' + sys.platform
++        return self._signalValuesToNames[signum]
++
++
++    def processEnded(self, reason=None):
++        """
++        When we are told the process ended, try to notify the other side about
++        how the process ended using the exit-signal or exit-status requests.
++        Also, close the channel.
++        """
++        if reason is not None:
++            err = reason.value
++            if err.signal is not None:
++                signame = self._getSignalName(err.signal)
++                if (getattr(os, 'WCOREDUMP', None) is not None and
++                    os.WCOREDUMP(err.status)):
++                    log.msg('exitSignal: %s (core dumped)' % (signame,))
++                    coreDumped = 1
++                else:
++                    log.msg('exitSignal: %s' % (signame,))
++                    coreDumped = 0
++                self.session.conn.sendRequest(self.session, 'exit-signal',
++                        common.NS(signame[3:]) + chr(coreDumped) +
++                        common.NS('') + common.NS(''))
++            elif err.exitCode is not None:
++                log.msg('exitCode: %r' % (err.exitCode,))
++                self.session.conn.sendRequest(self.session, 'exit-status',
++                        struct.pack('>L', err.exitCode))
+         self.session.loseConnection()
+ 
+     # transport stuff (we are also a transport!)
+
+=== modified file 'twisted/conch/test/test_ssh.py'
+--- twisted/conch/test/test_ssh.py	2008-06-02 13:08:51 +0000
++++ twisted/conch/test/test_ssh.py	2009-10-09 10:24:19 +0000
+@@ -2,11 +2,18 @@
+ # Copyright (c) 2001-2008 Twisted Matrix Laboratories.
+ # See LICENSE for details.
+ 
++import struct
++
+ try:
+-    import Crypto
++    import Crypto.Cipher.DES3
+ except ImportError:
+     Crypto = None
+ 
++try:
++    import pyasn1
++except ImportError:
++    pyasn1 = None
++
+ from twisted.conch.ssh import common, session, forwarding
+ from twisted.conch import avatar, error
+ from twisted.conch.test.keydata import publicRSA_openssh, privateRSA_openssh
+@@ -20,8 +27,6 @@
+ 
+ from zope.interface import implements
+ 
+-import struct
+-
+ 
+ 
+ class ConchTestRealm:
+@@ -115,7 +120,7 @@
+ 
+ 
+     def logout(self):
+-        loggedOut = True
++        self.loggedOut = True
+         for listener in self.listeners.values():
+             log.msg('stopListening %s' % listener)
+             listener.stopListening()
+@@ -349,7 +354,7 @@
+ 
+ 
+ 
+-if Crypto: # stuff that needs PyCrypto to even import
++if Crypto is not None and pyasn1 is not None:
+     from twisted.conch import checkers
+     from twisted.conch.ssh import channel, connection, factory, keys
+     from twisted.conch.ssh import transport, userauth
+@@ -993,6 +998,9 @@
+     if not Crypto:
+         skip = "can't run w/o PyCrypto"
+ 
++    if not pyasn1:
++        skip = "can't run w/o PyASN1"
++
+     def _setUp(self, avatar=None, clientConnection=None):
+         """
+         Create Conch client and server protocols and loopback transports for
+@@ -1070,16 +1078,46 @@
+     if not Crypto:
+         skip = "can't run w/o PyCrypto"
+ 
+-    def testMultipleFactories(self):
+-        f1 = factory.SSHFactory()
+-        f2 = factory.SSHFactory()
++    if not pyasn1:
++        skip = "can't run w/o PyASN1"
++
++    def makeSSHFactory(self, primes=None):
++        sshFactory = factory.SSHFactory()
+         gpk = lambda: {'ssh-rsa' : keys.Key(None)}
+-        f1.getPrimes = lambda: None
+-        f2.getPrimes = lambda: {1:(2,3)}
+-        f1.getPublicKeys = f2.getPublicKeys = gpk
+-        f1.getPrivateKeys = f2.getPrivateKeys = gpk
+-        f1.startFactory()
+-        f2.startFactory()
++        sshFactory.getPrimes = lambda: primes
++        sshFactory.getPublicKeys = sshFactory.getPrivateKeys = gpk
++        sshFactory.startFactory()
++        return sshFactory
++
++
++    def test_buildProtocol(self):
++        """
++        By default, buildProtocol() constructs an instance of
++        SSHServerTransport.
++        """
++        factory = self.makeSSHFactory()
++        protocol = factory.buildProtocol(None)
++        self.assertIsInstance(protocol, transport.SSHServerTransport)
++
++
++    def test_buildProtocolRespectsProtocol(self):
++        """
++        buildProtocol() calls 'self.protocol()' to construct a protocol
++        instance.
++        """
++        calls = []
++        def makeProtocol(*args):
++            calls.append(args)
++            return transport.SSHServerTransport()
++        factory = self.makeSSHFactory()
++        factory.protocol = makeProtocol
++        factory.buildProtocol(None)
++        self.assertEquals([()], calls)
++
++
++    def test_multipleFactories(self):
++        f1 = self.makeSSHFactory(primes=None)
++        f2 = self.makeSSHFactory(primes={1:(2,3)})
+         p1 = f1.buildProtocol(None)
+         p2 = f2.buildProtocol(None)
+         self.failIf('diffie-hellman-group-exchange-sha1' in p1.supportedKeyExchanges,
+@@ -1119,6 +1157,10 @@
+     if not Crypto:
+         skip = "can't run w/o PyCrypto"
+ 
++    if not pyasn1:
++        skip = "can't run w/o PyASN1"
++
++
+     def test_getMP(self):
+         """
+         L{common.getMP} should parse the a multiple precision integer from a
+

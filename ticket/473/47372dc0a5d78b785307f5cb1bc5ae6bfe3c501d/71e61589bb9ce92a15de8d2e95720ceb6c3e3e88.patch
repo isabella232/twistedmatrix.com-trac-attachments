@@ -1,0 +1,150 @@
+Wait for the helper reactor to stop before shutting down the main reactor.
+
+Otherwise, the helper reactor's thread could get blocked and prevent the
+process from exiting.
+
+Index: twisted/internet/test/test_win32events.py
+===================================================================
+--- twisted/internet/test/test_win32events.py	(patch add-remove-race)
++++ twisted/internet/test/test_win32events.py	(patch fix-shutdown-races)
+@@ -205,5 +205,68 @@
+         self.assertFalse(listener.success, listener.success)
+ 
+ 
++    def _testEventSignaledWhileStopping(self, stage):
++        """
++        If a win32 event added with L{IReactorWin32Events.addEvent} is signaled
++        while the reactor is stopping, no deadlocked threads are left lying
++        around.
++
++        This test was added in response to the following deadlock:
++         - win32 event gets signaled
++         - main reactor's main loop terminated during shutdown event
++         - helper reactor blocked forever in C{_ThreadFDWrapper._execute},
++           waiting for the main reactor to process its thread queue.
++        """
++        reactor = self.buildReactor()
++        event = win32event.CreateEvent(None, False, False, None)
++        finished = Deferred()
++        listener = Listener(finished)
++
++        def setup():
++            reactor.addEvent(event, listener, 'occurred')
++            reactor.addSystemEventTrigger(
++                stage, 'shutdown', win32event.SetEvent, event)
++            reactor.stop()
++
++        reactor.callWhenRunning(setup)
++        self.runReactor(reactor)
++        helperThread = getattr(reactor, '_reactorThread', None)
++        if helperThread is not None:
++            self.assertFalse(helperThread.isAlive())
++        # TODO: decide up to which shutdown phase the event callback should
++        # still get called. I assume that events signaled during before
++        # shutdown should have their callback called, while those signaled
++        # after shutdown should not. For events signaled during shutdown, the
++        # behaviour can be left undefined.
++        # The current situation is a bit messy, Win32Reactor fires callbacks
++        # during all shutdown phases, while other reactors fire callbacks
++        # during none of the shutdown phases.
++        return listener
++
++
++    def test_eventSignaledBeforeShutdown(self):
++        """
++        A win32 event becoming signaled during "before" stage of the main
++        reactor shutdown has no ill effect on the shutdown process.
++        """
++        self._testEventSignaledWhileStopping('before')
++
++
++    def test_eventSignaledDuringShutdown(self):
++        """
++        A win32 event becoming signaled during "during" stage of the main
++        reactor shutdown has no ill effect on the shutdown process.
++        """
++        self._testEventSignaledWhileStopping('during')
++
++
++    def test_eventSignaledAfterShutdown(self):
++        """
++        A win32 event becoming signaled during "after" stage of the main
++        reactor shutdown has no ill effect on the shutdown process.
++        """
++        self._testEventSignaledWhileStopping('after')
++
++
+ 
+ globals().update(Win32EventsTestsBuilder.makeTestCaseClasses())
+Index: twisted/internet/win32eventreactor.py
+===================================================================
+--- twisted/internet/win32eventreactor.py	(patch add-remove-race)
++++ twisted/internet/win32eventreactor.py	(patch fix-shutdown-races)
+@@ -59,7 +59,7 @@
+ import win32gui
+ 
+ # Twisted imports
+-from twisted.internet import posixbase
++from twisted.internet import posixbase, defer, task
+ from twisted.python import log, threadable, failure
+ from twisted.internet.interfaces import IReactorFDSet, IReactorProcess
+ from twisted.internet.interfaces import IReactorWin32Events
+@@ -334,10 +334,46 @@
+ 
+     def _unmakeHelperReactor(self):
+         """
+-        Stop and discard the reactor started by C{_makeHelperReactor}.
++        Discard the reactor started by C{_makeHelperReactor} and wait until it
++        stops.
++
++        @return: A deferred which will fire when the helper reactor has
++            stopped.
+         """
+-        self._reactor.callFromThread(self._reactor.stop)
+-        self._reactor = None
++        deferred = defer.Deferred()
++        reactor, self._reactor = self._reactor, None
++        reactor.callFromThread(self._stopHelperReactor, reactor, deferred)
++        return deferred.addCallback(self._helperReactorStopped)
++
++
++    def _stopHelperReactor(self, reactor, deferred):
++        """
++        Stop the helper reactor. Runs in the helper reactor's thread.
++
++        @param reactor: The reactor to stop.
++
++        @param deferred: The deferred that will be fired in the main reactor
++            thread once the helper reactor has stopped.
++        """
++        reactor.addSystemEventTrigger(
++            'after', 'shutdown', self.callFromThread, deferred.callback, None)
++        reactor.stop()
++
++
++    def _helperReactorStopped(self, ignored):
++        """
++        Called when the helper reactor has stopped.
++
++        Wait for the helper reactor's thread to terminate before allowing the
++        main reactor to move to the "during" stage of shutdown.
++        """
++        # Spin the reactor until the helper thread finishes. I don't think
++        # the helper reactor could be waiting for us at this stage, but better
++        # safe than sorry. Spin with a small timeout, we don't want to hog the
++        # system.
++        if self._reactorThread.isAlive():
++            return task.deferLater(
++                self, 0.01, self._helperReactorStopped, None)
+ 
+ 
+     def _makeHelperReactor(self):
+@@ -353,7 +389,7 @@
+         self._reactorThread = Thread(
+             target=self._reactor.run, args=(False,))
+         self.addSystemEventTrigger(
+-            'after', 'shutdown', self._unmakeHelperReactor)
++            'before', 'shutdown', self._unmakeHelperReactor)
+         self._reactorThread.start()
+ 
+ 

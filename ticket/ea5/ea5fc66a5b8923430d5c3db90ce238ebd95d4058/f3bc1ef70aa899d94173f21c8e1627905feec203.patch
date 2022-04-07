@@ -1,0 +1,201 @@
+Index: twisted/conch/test/test_ssh.py
+===================================================================
+--- twisted/conch/test/test_ssh.py	(revision 23809)
++++ twisted/conch/test/test_ssh.py	(working copy)
+@@ -18,30 +18,64 @@
+ from twisted.trial import unittest
+ 
+ from twisted.conch.test.test_recvline import LoopbackRelay
++from zope.interface import implements
+ 
+ import struct
+ 
+ 
+ 
+ class ConchTestRealm:
++    """
++    I'm generating avatars for an authenticated users.
++    """
++    implements(portal.IRealm)
+ 
+ 
++    def __init__(self, avatar):
++        """
++        Initialize class with a avatar.
++        @param avatar: an instance of C{avatar.ConchUser}.
++        """
++        self.avatar = avatar
++
++
+     def requestAvatar(self, avatarID, mind, *interfaces):
++        """
++        Return a new avatar.If avatar implements a C{logout} method it'll be
++        invoked at the end of avatar's existance.
++        """
+         unittest.assertEquals(avatarID, 'testuser')
+-        a = ConchTestAvatar()
+-        return interfaces[0], a, a.logout
++        logout = getattr(self.avatar, 'logout', lambda: None)
++        if not callable(logout):
++            logout = lambda: None
++        return interfaces[0], self.avatar, logout
+ 
+ 
+ 
+-class ConchTestAvatar(avatar.ConchUser):
++class ConchTestBaseAvatar(avatar.ConchUser):
++    """
++    Base class for creating avatars.
++    """
++
++
++    def __init__(self):
++        """
++        Add C{session.SSHSession} to avaliable channels.
++        """
++        avatar.ConchUser.__init__(self)
++        self.channelLookup.update({'session': session.SSHSession})
++
++
++
++class ConchTestAvatar(ConchTestBaseAvatar):
+     loggedOut = False
+ 
+ 
+     def __init__(self):
+-        avatar.ConchUser.__init__(self)
++        ConchTestBaseAvatar.__init__(self)
+         self.listeners = {}
+-        self.channelLookup.update({'session': session.SSHSession,
+-                        'direct-tcpip':forwarding.openConnectForwardingClient})
++        self.channelLookup.update({'direct-tcpip':
++                                   forwarding.openConnectForwardingClient})
+         self.subsystemLookup.update({'crazy': CrazySubsystem,
+             'test_connectionLost': TestConnectionLostSubsystem})
+ 
+@@ -91,6 +125,7 @@
+ 
+ 
+ class ConchSessionForTestAvatar:
++    implements(session.ISession)
+ 
+ 
+     def __init__(self, avatar):
+@@ -158,9 +193,35 @@
+             unittest.assert_(self.eof)
+ 
+ 
++class ConchSessionTestLoseConnection:
++    """
++    Test if closing client's session is raising an exception.
++    """
++    implements(session.ISession)
+ 
++
++    def __init__(self, avatar):
++        """
++        Initialize class with a avatar.
++        """
++        self.avatar = avatar
++
++
++    def execCommand(self, proto, cmd):
++        """
++        Try to close client's side connection.
++        """
++        proto.loseConnection()
++
++
++    def closed(self):
++        pass
++
++
++
+ from twisted.python import components
+ components.registerAdapter(ConchSessionForTestAvatar, ConchTestAvatar, session.ISession)
++components.registerAdapter(ConchSessionTestLoseConnection, ConchTestBaseAvatar, session.ISession)
+ 
+ 
+ 
+@@ -933,18 +994,38 @@
+ 
+ 
+ 
++    class SSHExecChannel(channel.SSHChannel):
++        """
++        Execute a comand on a server.
++        """
++        name = 'session'
++ 
++        
++        def channelOpen(self, data):
++            d = self.conn.sendRequest(self, 'exec',
++            common.NS('some_command'), wantReply=True)
++            d.addCallback(self._cbRequestWorked)
++
++
++        def _cbRequestWorked(self, ignored):
++            pass
++
++
++
+ class SSHProtocolTestCase(unittest.TestCase):
+ 
+     if not Crypto:
+         skip = "can't run w/o PyCrypto"
+ 
+ 
+-    def setUp(self):
++    def _setUp(self, avatar=ConchTestAvatar()):
+         """
+         Create Conch client and server protocols and loopback transports for
+-        them.
++        them.Should be run at the beggining of each test.
++
++        @paran: avatar: an instance of C{avatar.ConchUser}.
+         """
+-        realm = ConchTestRealm()
++        realm = ConchTestRealm(avatar)
+         p = portal.Portal(realm)
+         sshpc = ConchTestSSHChecker()
+         sshpc.registerChecker(ConchTestPasswordChecker())
+@@ -979,6 +1060,7 @@
+         """
+         Test the Conch server against the Conch client.
+         """
++        self._setUp()
+         self._runServerClient()
+         errors = self.flushLoggedErrors(error.ConchError)
+         self.assertEquals(len(errors), 2)
+@@ -988,6 +1070,7 @@
+         """
+         Test if subsystem's connectionLost is executed only once.
+         """
++        self._setUp()
+         self.server.connectionLostCount = 0
+         conn = ConchTestClientBaseConnection(
+             [(SSHTestSubsystemConnectionLostChannel, {})])
+@@ -999,7 +1082,23 @@
+             "not executed at all.")
+ 
+ 
++    def test_sessionLoseConnection(self):
++        """
++        Test closing a client's session by a server.
++        """
++        self._setUp(avatar=ConchTestBaseAvatar())
++        conn = ConchTestClientBaseConnection(
++        [(SSHExecChannel,{})])
++        self.client = ConchTestClient(ConchTestClientAuth('testuser', conn))
++        self.serverTransport = LoopbackRelay(self.client)
++        self._runServerClient()
++        err = self.flushLoggedErrors(AttributeError)
++        if err:
++            self.failIfEquals(err.pop(0).check(AttributeError), AttributeError,
++            "Closing client's side of connection failed.")
+ 
++
++
+ class TestSSHFactory(unittest.TestCase):
+ 
+     if not Crypto:

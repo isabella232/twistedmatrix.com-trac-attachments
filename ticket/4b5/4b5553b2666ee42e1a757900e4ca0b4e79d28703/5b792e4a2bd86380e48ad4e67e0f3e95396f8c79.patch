@@ -1,0 +1,99 @@
+=== modified file 'twisted/web/test/test_xmlrpc.py'
+--- twisted/web/test/test_xmlrpc.py	2010-11-05 07:59:48 +0000
++++ twisted/web/test/test_xmlrpc.py	2010-11-05 10:19:18 +0000
+@@ -13,7 +13,7 @@
+ from twisted.trial import unittest
+ from twisted.web import xmlrpc
+ from twisted.web.xmlrpc import (
+-    XMLRPC, payloadTemplate, addIntrospection, _QueryFactory, Proxy)
++    XMLRPC, payloadTemplate, addIntrospection, _QueryFactory, Proxy, withRequest)
+ from twisted.web import server, static, client, error, http
+ from twisted.internet import reactor, defer
+ from twisted.internet.error import ConnectionDone
+@@ -136,6 +136,10 @@
+         return map[key]
+     xmlrpc_dict.help = 'Help for dict.'
+ 
++    @withRequest
++    def xmlrpc_withRequest(self, request):
++        return request.method # as a proof that request is a request
++
+     def _getFunction(self, functionPath):
+         try:
+             return XMLRPC._getFunction(self, functionPath)
+@@ -526,7 +530,7 @@
+                  'deferFault', 'dict', 'echo', 'fail', 'fault',
+                  'pair', 'system.listMethods',
+                  'system.methodHelp',
+-                 'system.methodSignature'])
++                 'system.methodSignature', 'withRequest'])
+ 
+         d = self.proxy().callRemote("system.listMethods")
+         d.addCallback(cbMethods)
+@@ -663,3 +667,21 @@
+         d = self.queryFactory.deferred
+         self.queryFactory.parseResponse(content)
+         return self.assertFailure(d, IndexError)
++
++
++
++class XMLRPCTestWithRequest(unittest.TestCase):
++
++    def setUp(self):
++        self.resource = Test()
++
++    def test_withRequest(self):
++        request = DummyRequest('/RPC2')
++        request.method = "POST"
++        request.content = StringIO(xmlrpclib.dumps((), 'withRequest'))
++        def valid(n, request):
++            data = xmlrpclib.loads(request.written[0])
++            self.assertEquals(data, (('POST',), None))
++        request.notifyFinish().addCallback(valid, request)
++
++        self.resource.render_POST(request)
+
+=== modified file 'twisted/web/xmlrpc.py'
+--- twisted/web/xmlrpc.py	2010-11-05 07:59:48 +0000
++++ twisted/web/xmlrpc.py	2010-11-05 09:04:27 +0000
+@@ -10,6 +10,7 @@
+ 
+ # System Imports
+ import sys, xmlrpclib, urlparse
++from functools import wraps
+ 
+ # Sibling Imports
+ from twisted.web import resource, server, http
+@@ -32,6 +33,19 @@
+     _decode = DateTime.decode
+     DateTime.decode = lambda self, value: _decode(self, value.encode('ascii'))
+ 
++def withRequest(f, *args, **kwargs):
++    """
++    Pass the request as the first argument to the method.
++    If a method is wrapped with C{withRequest}, the request object is
++    passed as the first argument to that method.
++
++    Example:
++    @withRequest
++    def xmlrpc_echo(self, request, s):
++        return s
++    """
++    f.withRequest = True
++    return f
+ 
+ class NoSuchFunction(Fault):
+     """
+@@ -145,7 +159,10 @@
+                 # Deferred should be written out and Request.finish called.
+                 responseFailed = []
+                 request.notifyFinish().addErrback(responseFailed.append)
+-                d = defer.maybeDeferred(function, *args)
++                if getattr(function, 'withRequest', False):
++                    d = defer.maybeDeferred(function, request, *args)
++                else:
++                    d = defer.maybeDeferred(function, *args)
+                 d.addErrback(self._ebRender)
+                 d.addCallback(self._cbRender, request, responseFailed)
+         return server.NOT_DONE_YET
+

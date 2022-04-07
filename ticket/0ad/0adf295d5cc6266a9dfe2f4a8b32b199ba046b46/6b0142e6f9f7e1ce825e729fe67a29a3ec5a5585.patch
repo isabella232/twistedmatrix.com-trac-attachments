@@ -1,0 +1,399 @@
+==== Patch <twisted-process-improvements> level 1
+Source: 4ed7e550-c718-0410-ac9a-b82090e61d08:/local/twisted-process-idea-dev:11405
+Target: bbbe8e31-12d6-0310-92fd-ac37d47ddeeb:/trunk:17576
+        (svn://svn.twistedmatrix.com/svn/Twisted/trunk)
+Log:
+ r11396@taby:  naked | 2006-07-19 10:48:04 +0300
+ Branched twisted-trunk to for developing the process module.
+ r11399@taby:  naked | 2006-07-19 20:56:44 +0300
+ Added first helpers for process childFDs.
+ r11400@taby:  naked | 2006-07-19 21:23:05 +0300
+ First version of rework of childFDs handling. We should be in working state
+ again, so let me try testing.
+ r11401@taby:  naked | 2006-07-19 21:56:49 +0300
+ Implemented ProcessPTY as the reader/writer for PTY processes.
+ r11402@taby:  naked | 2006-07-19 22:16:56 +0300
+ Bugfixes to PTY process handling.
+ r11403@taby:  naked | 2006-07-19 22:27:38 +0300
+ Added defaultWriter hack to maybe make Process behave a bit like PTYProces if
+ wanted.
+ r11404@taby:  naked | 2006-07-19 22:34:55 +0300
+ Bugfix.
+ r11405@taby:  naked | 2006-07-19 22:36:24 +0300
+ Modify posixbase to use the new Process PTY interface.
+
+=== twisted/internet/posixbase.py
+==================================================================
+--- twisted/internet/posixbase.py	(revision 17576)
++++ twisted/internet/posixbase.py	(patch twisted-process-improvements level 1)
+@@ -275,8 +275,9 @@
+             if usePTY:
+                 if childFDs is not None:
+                     raise ValueError("Using childFDs is not supported with usePTY=True.")
+-                return process.PTYProcess(self, executable, args, env, path,
+-                                          processProtocol, uid, gid, usePTY)
++                return process.Process(self, executable, args, env, path,
++                                       processProtocol, uid, gid, {'_defaultWriter': 1,
++                                                                   1: (process.PTY(), (0, 1, 2,))})
+             else:
+                 return process.Process(self, executable, args, env, path,
+                                        processProtocol, uid, gid, childFDs)
+=== twisted/internet/process.py
+==================================================================
+--- twisted/internet/process.py	(revision 17576)
++++ twisted/internet/process.py	(patch twisted-process-improvements level 1)
+@@ -233,6 +233,154 @@
+         self.proc.childConnectionLost(self.name, reason)
+ 
+ 
++class ProcessPTY(abstract.FileDescriptor):
++    connected = 1
++
++    def __init__(self, reactor, proc, name, fileno):
++        abstract.FileDescriptor.__init__(self, reactor)
++        fdesc.setNonBlocking(fileno)
++        self.proc = proc
++        self.name = name
++        self.fd = fileno
++        self.startReading()
++
++    def fileno(self):
++        return self.fd
++
++    def writeSomeData(self, data):
++        try:
++            return os.write(self.fd, data)
++        except IOError,io:
++            if io.args[0] == errno.EAGAIN:
++                return 0
++            return CONNECTION_LOST
++        except OSError, ose:
++            if ose.errno == errno.EAGAIN: # MacOS-X does this # FIXME: really needed?
++                return 0
++            raise
++
++    def doRead(self):
++        try:
++            return fdesc.readFromFD(self.fd, self.dataReceived)
++        except OSError: # FIXME: really needed?
++            return CONNECTION_LOST
++
++    def dataReceived(self, data):
++        self.proc.childDataReceived(self.name, data)
++
++    def connectionLost(self, reason):
++        abstract.FileDescriptor.connectionLost(self, reason)
++        self.proc.childConnectionLost(self.name, reason)
++
++
++class ProcessHelper:
++    def setupPrefork(self):
++        raise NotImplementedError("%s does not implement setup" %
++                                  reflect.qual(self.__class__))
++
++    def setupChild(self):
++        raise NotImplementedError("%s does not implement setup" %
++                                  reflect.qual(self.__class__))
++
++    def setupParent(self):
++        raise NotImplementedError("%s does not implement setup" %
++                                  reflect.qual(self.__class__))
++
++
++class PassthroughFD(ProcessHelper):
++    def __init__(self, fd):
++        self.fd = fd
++
++    def setupPrefork(self):
++        pass
++
++    def setupChild(self):
++        return self.fd
++
++    def setupParent(self, reactor, proc, name):
++        return None
++
++
++class ReadPipe(ProcessHelper):
++    def setupPrefork(self):
++        readFD, writeFD = os.pipe()
++        self.parentFD = readFD
++        self.childFD = writeFD
++
++    def setupChild(self):
++        os.close(self.parentFD)
++        return self.childFD
++
++    def setupParent(self, reactor, proc, name):
++        os.close(self.childFD)
++        reader = ProcessReader(reactor, proc, name, self.parentFD)
++        return reader
++
++
++class WritePipe(ProcessHelper):
++    def setupPrefork(self):
++        readFD, writeFD = os.pipe()
++        self.parentFD = writeFD
++        self.childFD = readFD
++
++    def setupChild(self):
++        os.close(self.parentFD)
++        return self.childFD
++
++    def setupParent(self, reactor, proc, name):
++        os.close(self.childFD)
++        reader = ProcessWriter(reactor, proc, name, self.parentFD)
++        return reader
++
++
++class PTY(ProcessHelper):
++    def __init__(self, usePTY=None):
++        if not pty and type(usePTY) not in (types.ListType, types.TupleType):
++            # no pty module and we didn't get a pty to use
++            raise NotImplementedError, "cannot use PTYProcess on platforms without the pty module."
++        self.usePTY = usePTY
++
++    def setupPrefork(self):
++        if type(self.usePTY) in (types.ListType, types.TupleType):
++            masterFD, slaveFD, ttyname = self.usePTY
++        else:
++            masterFD, slaveFD = pty.openpty()
++            ttyname = os.ttyname(slaveFD)
++        self.parentFD = masterFD
++        self.childFD = slaveFD
++        self.ttyname = ttyname
++
++    def setupChild(self):
++        os.close(self.parentFD)
++        if hasattr(termios, 'TIOCNOTTY'):
++            try:
++                fd = os.open("/dev/tty", os.O_RDWR | os.O_NOCTTY)
++            except OSError:
++                pass
++            else:
++                try:
++                    fcntl.ioctl(fd, termios.TIOCNOTTY, '')
++                except:
++                    pass
++                os.close(fd)
++                    
++        os.setsid()
++                
++        if hasattr(termios, 'TIOCSCTTY'):
++            fcntl.ioctl(self.childFD, termios.TIOCSCTTY, '')
++
++        return self.childFD
++
++    def setupParent(self, reactor, proc, name):
++        os.close(self.childFD)
++        processpty = ProcessPTY(reactor, proc, name, self.parentFD)
++        return processpty
++
++
++class SocketPair(ProcessHelper):
++    pass
++
++
+ class Process(styles.Ephemeral):
+     """An operating-system Process.
+ 
+@@ -252,6 +400,8 @@
+     status = -1
+     pid = None
+ 
++    defaultWriter = 0 # FIXME: hack
++
+     def __init__(self,
+                  reactor, command, args, environment, path, proto,
+                  uid=None, gid=None, childFDs=None):
+@@ -266,9 +416,10 @@
+         nuances of setXXuid on UNIX: it will assume that either your effective
+         or real UID is 0.)
+         """
+-        if not proto:
+-            assert 'r' not in childFDs.values()
+-            assert 'w' not in childFDs.values()
++        # FIXME: check for just integers?
++        # if not proto:
++        #     assert 'r' not in childFDs.values()
++        #     assert 'w' not in childFDs.values()
+         if not signal.getsignal(signal.SIGCHLD):
+             log.msg("spawnProcess called, but the SIGCHLD handler is not "
+                     "installed. This probably means you have not yet "
+@@ -313,29 +464,29 @@
+         debug = self.debug
+         if debug: print "childFDs", childFDs
+ 
+-        # fdmap.keys() are filenos of pipes that are used by the child.
+-        fdmap = {} # maps childFD to parentFD
+         for childFD, target in childFDs.items():
+             if debug: print "[%d]" % childFD, target
+-            if target == "r":
+-                # we need a pipe that the parent can read from
+-                readFD, writeFD = os.pipe()
+-                if debug: print "readFD=%d, writeFD%d" % (readFD, writeFD)
+-                fdmap[childFD] = writeFD     # child writes to this
+-                helpers[childFD] = readFD    # parent reads from this
++            if childFD == '_defaultWriter': # FIXME: hack
++                self.defaultWriter = target
++            elif target == "r":
++                helpers[childFD] = (ReadPipe(), (childFD,))
+             elif target == "w":
+-                # we need a pipe that the parent can write to
+-                readFD, writeFD = os.pipe()
+-                if debug: print "readFD=%d, writeFD=%d" % (readFD, writeFD)
+-                fdmap[childFD] = readFD      # child reads from this
+-                helpers[childFD] = writeFD   # parent writes to this
++                helpers[childFD] = (WritePipe(), (childFD,))
++            elif type(target) == int: # FIXME: isinstance??
++                helpers[childFD] = (PassthroughFD(target), (childFD,))
++            elif isinstance(target, ProcessHelper):
++                helpers[childFD] = (target, (childFD,))
++            elif type(target) in (types.ListType, types.TupleType): # FIXME: isinstance??
++                helpers[childFD] = target # FIXME: more checks?
+             else:
+-                assert type(target) == int, '%r should be an int' % (target,)
+-                fdmap[childFD] = target      # parent ignores this
+-        if debug: print "fdmap", fdmap
++                raise ValueError('%r is of unknown type' % (target,))
+         if debug: print "helpers", helpers
+-        # the child only cares about fdmap.values()
+ 
++        # FIXME: check for duplicates in childFD lists?
++
++        for helper, _ in helpers.values():
++            helper.setupPrefork()
++
+         self.pid = os.fork()
+         if self.pid == 0: # pid is 0 in the child process
+ 
+@@ -351,7 +502,13 @@
+             try:
+                 # stop debugging, if I am!  I don't care anymore!
+                 sys.settrace(None)
+-                # close all parent-side pipes
++                # setup child FDs
++                fdmap = {}
++                for helper, childFDlist in helpers.values():
++                    childFD = helper.setupChild()
++                    for fd in childFDlist:
++                        fdmap[fd] = childFD
++                # map all FDs to where they belong
+                 self._setupChild(fdmap)
+                 self._execChild(path, settingUID, uid, gid,
+                                 command, args, environment)
+@@ -385,18 +542,12 @@
+ 
+         self.proto = proto
+         
+-        # arrange for the parent-side pipes to be read and written
+-        for childFD, parentFD in helpers.items():
+-            os.close(fdmap[childFD])
++        # setup the parent side helpers
++        for childFD, (helper, _) in helpers.items():
++            trans = helper.setupParent(reactor, self, childFD)
++            if trans is not None:
++                self.pipes[childFD] = trans
+ 
+-            if childFDs[childFD] == "r":
+-                reader = ProcessReader(reactor, self, childFD, parentFD)
+-                self.pipes[childFD] = reader
+-
+-            if childFDs[childFD] == "w":
+-                writer = ProcessWriter(reactor, self, childFD, parentFD, forceReadHack=True)
+-                self.pipes[childFD] = writer
+-
+         try:
+             # the 'transport' is used for some compatibility methods
+             if self.proto is not None:
+@@ -580,8 +731,8 @@
+         
+         NOTE: This will silently lose data if there is no standard input.
+         """
+-        if self.pipes.has_key(0):
+-            self.pipes[0].write(data)
++        if self.pipes.has_key(self.defaultWriter):
++            self.pipes[self.defaultWriter].write(data)
+ 
+     def registerProducer(self, producer, streaming):
+         """Call this to register producer for standard input.
+@@ -589,23 +740,23 @@
+         If there is no standard input producer.stopProducing() will
+         be called immediately.
+         """
+-        if self.pipes.has_key(0):
+-            self.pipes[0].registerProducer(producer, streaming)
++        if self.pipes.has_key(self.defaultWriter):
++            self.pipes[self.defaultWriter].registerProducer(producer, streaming)
+         else:
+             producer.stopProducing()
+ 
+     def unregisterProducer(self):
+         """Call this to unregister producer for standard input."""
+-        if self.pipes.has_key(0):
+-            self.pipes[0].unregisterProducer()
++        if self.pipes.has_key(self.defaultWriter):
++            self.pipes[self.defaultWriter].unregisterProducer()
+     
+     def writeSequence(self, seq):
+         """Call this to write to standard input on this process.
+ 
+         NOTE: This will silently lose data if there is no standard input.
+         """
+-        if self.pipes.has_key(0):
+-            self.pipes[0].writeSequence(seq)
++        if self.pipes.has_key(self.defaultWriter):
++            self.pipes[self.defaultWriter].writeSequence(seq)
+ 
+     def childDataReceived(self, name, data):
+         self.proto.childDataReceived(name, data)
+
+==== BEGIN SVK PATCH BLOCK ====
+Version: svk 1.08 (linux)
+
+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
+==== END SVK PATCH BLOCK ====

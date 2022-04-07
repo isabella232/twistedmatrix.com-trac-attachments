@@ -1,0 +1,154 @@
+Index: src/twisted/web2/test/test_http.py
+===================================================================
+--- src/twisted/web2/test/test_http.py	(revision 13629)
++++ src/twisted/web2/test/test_http.py	(working copy)
+@@ -72,7 +72,7 @@
+         # none match
+         request.headers.setRawHeaders("If-Match", ('"baz", "bob"',))
+         self.checkPreconditions(request, out_headers, False, responsecode.PRECONDITION_FAILED)
+-
++        
+         # But if we have an error code already, ignore this header
+         self.checkPreconditions(request, out_headers, True, responsecode.INTERNAL_SERVER_ERROR,
+                                 initCode=responsecode.INTERNAL_SERVER_ERROR)
+@@ -718,6 +718,55 @@
+         cxn.client.loseConnection()
+         self.assertDone(cxn)
+ 
++    def testBytesSent(self):
++        entries = []
++        def listen(eventDict):
++            entries.append(eventDict)
++
++        from twisted.python import log
++        log.addObserver(listen)
++        
++        cxn = self.connect()
++        cxn.client.write("GET / HTTP/1.1\r\n\r\n")
++        self.compareResult(cxn, [[('init', 'GET', '/', (1, 1), ()),
++                                  ('contentComplete',)]], '')
++
++        response = TestResponse()
++        response.headers.setRawHeaders("Content-Length", ("18",))
++        cxn.requests[0].writeResponse(response)
++        response.write("18 bytes + headers")
++        response.finish()
++        cxn.client.loseConnection()
++        self.assertDone(cxn)
++
++        self.assertEqual(entries[0]['request'].bytesSent, 57)
++
++    def testLogging(self):
++        entries = []
++        def listen(eventDict):
++            entries.append(eventDict)
++
++        from twisted.python import log
++        log.addObserver(listen)
++        
++        cxn = self.connect()
++        cxn.client.write("GET / HTTP/1.1\r\n\r\n")
++        self.compareResult(cxn, [[('init', 'GET', '/', (1, 1), ()),
++                                  ('contentComplete',)]], '')
++
++        response = TestResponse()
++        response.headers.setRawHeaders("Content-Length", ("18",))
++        cxn.requests[0].writeResponse(response)
++        response.write("18 bytes + headers")
++        response.finish()
++        cxn.client.loseConnection()
++        self.assertDone(cxn)
++
++        self.assertEqual(entries[0]['interface'], iweb.IRequest)
++        self.assert_(iweb.IRequest.providedBy(entries[0]['request']))
++        self.assertEqual(entries[0]['response'], response)
++
++
+ class ErrorTestCase(HTTPTests):
+     def assertStartsWith(self, first, second, msg=None):
+         self.assert_(first.startswith(second), '%r.startswith(%r)' % (first, second))
+@@ -815,6 +864,7 @@
+         cxn.client.write("GET / HTTP/1.1\r\n")
+         cxn.client.write("Transfer-Encoding: gzip\r\n\r\n")
+         self.checkError(cxn, 400)
++        
+ 
+ class PipelinedErrorTestCase(ErrorTestCase):
+     # Make sure that even low level reading errors don't corrupt the data stream,
+Index: src/twisted/web2/http.py
+===================================================================
+--- src/twisted/web2/http.py	(revision 13629)
++++ src/twisted/web2/http.py	(working copy)
+@@ -257,6 +257,7 @@
+         self.method = command
+         self.uri = path
+         self.clientproto = version
++        self.bytesSent = 0
+         
+         self.headers = headers
+         
+@@ -301,10 +302,10 @@
+     def _sendContinue(self):
+         self.chanRequest.writeIntermediateResponse(responsecode.CONTINUE)
+     
+-    def _finished(self, x):
++    def _finished(self, x, response):
+         """We are finished writing data."""
+         # log request
+-        log.msg(interface=iweb.IRequest, request=self)
++        log.msg(interface=iweb.IRequest, request=self, response=response)
+         self.chanRequest.finish()
+ 
+     def _error(self, reason):
+@@ -345,11 +346,11 @@
+         if self.method == "HEAD" or response.code in NO_BODY_CODES:
+             if response.stream is not None:
+                 response.stream.close()
+-            self._finished(None)
++            self._finished(None, response)
+             return
+             
+         d = stream.StreamProducer(response.stream).beginProducing(self.chanRequest)
+-        d.addCallback(self._finished).addErrback(self._error)
++        d.addCallback(self._finished, response).addErrback(self._error)
+ 
+ class AbortedException(Exception):
+     pass
+@@ -632,6 +633,11 @@
+     chunkedOut = False
+     finished = False
+     
++    def addBytesSent(self, num):
++        # TODO: For some reason the request is None here during tests.
++        if self.request:
++            self.request.bytesSent += num
++
+     ##### Request Callbacks #####
+     def writeIntermediateResponse(self, code, headers=None):
+         if self.version >= (1,1):
+@@ -673,6 +679,9 @@
+                 l.append("%s: %s\r\n" % ('Connection', 'Keep-Alive'))
+         
+         l.append("\r\n")
++        # keep track of the written bytes
++        for entry in l:
++            self.addBytesSent(len(entry))
+         self.transport.writeSequence(l)
+         
+     
+@@ -680,8 +689,14 @@
+         if not data:
+             return
+         elif self.chunkedOut:
+-            self.transport.writeSequence(("%X\r\n" % len(data), data, "\r\n"))
++            # keep track of the written bytes
++            chunks = ("%X\r\n" % len(data), data, "\r\n")
++            for chunk in chunks:
++                self.addBytesSent(len(chunk))
++            self.transport.writeSequence(chunks)
+         else:
++            # keep track of the written bytes
++            self.addBytesSent(len(data))
+             self.transport.write(data)
+         
+     def finish(self):

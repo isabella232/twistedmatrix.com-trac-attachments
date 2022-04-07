@@ -1,0 +1,949 @@
+diff -urN words.trunk/protocols/irc.py words.current/protocols/irc.py
+--- words.trunk/protocols/irc.py	2006-04-30 23:04:32.000000000 +0700
++++ words.current/protocols/irc.py	2006-04-30 23:42:31.692743250 +0700
+@@ -44,15 +44,14 @@
+ import random
+ import re
+ import stat
+-import string
+ import struct
+ import sys
+ import time
+-import types
+ import traceback
+ import socket
+ 
+ from os import path
++from string import letters, digits, punctuation
+ 
+ NUL = chr(0)
+ CR = chr(015)
+@@ -68,13 +67,15 @@
+ class IRCPasswordMismatch(Exception):
+     pass
+ 
+-def parsemsg(s):
++def parsemsg(s, encoding='utf-8'):
+     """Breaks a message from an IRC server into its prefix, command, and arguments.
+     """
+     prefix = ''
+     trailing = []
++    if encoding is None:
++        encoding = 'utf-8'
+     if not s:
+-        raise IRCBadMessage("Empty line.")
++        raise IRCBadMessage(u"Empty line.")
+     if s[0] == ':':
+         prefix, s = s[1:].split(' ', 1)
+     if s.find(' :') != -1:
+@@ -84,6 +85,14 @@
+     else:
+         args = s.split()
+     command = args.pop(0)
++    
++    try:
++        prefix = prefix.decode(encoding)
++        command = command.decode(encoding)
++        args = map(lambda x: x.decode(encoding), args)
++    except UnicodeDecodeError:
++        raise IRCBadMessage(u"Couldn't decode your %s-string: %s" % (encoding, repr(s)))
++    log.msg("irc: parsemsg: prefix=%s, command=%s, args=%s" % (repr(prefix), repr(command), repr(args)), debug=True)
+     return prefix, command, args
+ 
+ 
+@@ -125,6 +134,7 @@
+ 
+ 
+     def sendLine(self, line):
++        log.msg("irc: IRC.sendLine %s" % repr(line), debug=True)
+         if self.encoding is not None:
+             if isinstance(line, unicode):
+                 line = line.encode(self.encoding)
+@@ -147,8 +157,8 @@
+             # sanity checking to catch likely dumb mistakes.
+             raise ValueError, "Somebody screwed up, 'cuz this doesn't" \
+                   " look like a command to me: %s" % command
+-
+-        line = string.join([command] + list(parameter_list))
++        log.msg("irc: IRC.sendMessage: command=%s parameter_list=%s prefix=%s" % (repr(command), repr(parameter_list), repr(prefix)), debug=True)
++        line = ' '.join([command] + list(parameter_list))
+         if prefix.has_key('prefix'):
+             line = ":%s %s" % (prefix['prefix'], line)
+         self.sendLine(line)
+@@ -164,7 +174,8 @@
+         of LineReceiver to turn "line mode" on and off was not
+         required.)
+         """
+-        lines = (self.buffer + data).split(LF)
++        self.buffer = self.buffer + data
++        lines = self.buffer.split(LF)
+         # Put the (possibly empty) element after the last LF back in the
+         # buffer
+         self.buffer = lines.pop()
+@@ -175,7 +186,11 @@
+                 continue
+             if line[-1] == CR:
+                 line = line[:-1]
+-            prefix, command, params = parsemsg(line)
++            try:
++                prefix, command, params = parsemsg(line, self.encoding)
++            except IRCBadMessage, msg:
++                self.sendMessage(str(ERR_UNKNOWNCOMMAND), str(msg))
++                break
+             # mIRC is a big pile of doo-doo
+             command = command.upper()
+             # DEBUG: log.msg( "%s %s %s" % (prefix, command, params))
+@@ -187,7 +202,10 @@
+         """Determine the function to call for the given command and call
+         it with the given arguments.
+         """
+-        method = getattr(self, "irc_%s" % command, None)
++        try:
++            method = getattr(self, "irc_%s" % command, None)
++        except UnicodeEncodeError:
++            method = None
+         try:
+             if method is not None:
+                 method(prefix, params)
+@@ -531,6 +549,7 @@
+         C{None}, no delay will be imposed.
+     @type lineRate: Number of Seconds.
+     """
++    encoding = None
+ 
+     motd = ""
+     nickname = 'irc'
+@@ -928,7 +947,7 @@
+             self._pings = {}
+ 
+         if text is None:
+-            chars = string.letters + string.digits + string.punctuation
++            chars = letters + digits + punctuation
+             key = ''.join([random.choice(chars) for i in range(12)])
+         else:
+             key = str(text)
+@@ -944,7 +963,7 @@
+                 del self._pings[byValue[i][1]]
+ 
+     def dccSend(self, user, file):
+-        if type(file) == types.StringType:
++        if isinstance(file, basestring):
+             file = open(file, 'r')
+ 
+         size = fileSize(file)
+@@ -965,7 +984,7 @@
+         if not (size is None):
+             args.append(size)
+ 
+-        args = string.join(args, ' ')
++        args = ' '.join(args)
+ 
+         self.ctcpMakeQuery(user, [('DCC', args)])
+ 
+@@ -994,7 +1013,7 @@
+         self.signedOn()
+ 
+     def irc_JOIN(self, prefix, params):
+-        nick = string.split(prefix,'!')[0]
++        nick = prefix.split('!')[0]
+         channel = params[-1]
+         if nick == self.nickname:
+             self.joined(channel)
+@@ -1002,7 +1021,7 @@
+             self.userJoined(nick, channel)
+ 
+     def irc_PART(self, prefix, params):
+-        nick = string.split(prefix,'!')[0]
++        nick = prefix.split('!')[0]
+         channel = params[0]
+         if nick == self.nickname:
+             self.left(channel)
+@@ -1010,7 +1029,7 @@
+             self.userLeft(nick, channel)
+ 
+     def irc_QUIT(self, prefix, params):
+-        nick = string.split(prefix,'!')[0]
++        nick = prefix.split('!')[0]
+         self.userQuit(nick, params[0])
+ 
+     def irc_MODE(self, prefix, params):
+@@ -1038,7 +1057,7 @@
+             if not m['normal']:
+                 return
+ 
+-            message = string.join(m['normal'], ' ')
++            message = ' '.join(m['normal'])
+ 
+         self.privmsg(user, channel, message)
+ 
+@@ -1055,12 +1074,12 @@
+             if not m['normal']:
+                 return
+ 
+-            message = string.join(m['normal'], ' ')
++            message = ' '.join(m['normal'])
+ 
+         self.noticed(user, channel, message)
+ 
+     def irc_NICK(self, prefix, params):
+-        nick = string.split(prefix,'!', 1)[0]
++        nick = prefix.split('!', 1)[0]
+         if nick == self.nickname:
+             self.nickChanged(params[0])
+         else:
+@@ -1069,11 +1088,11 @@
+     def irc_KICK(self, prefix, params):
+         """Kicked?  Who?  Not me, I hope.
+         """
+-        kicker = string.split(prefix,'!')[0]
++        kicker = prefix.split('!')[0]
+         channel = params[0]
+         kicked = params[1]
+         message = params[-1]
+-        if string.lower(kicked) == string.lower(self.nickname):
++        if kicked.lower() == self.nickname.lower():
+             # Yikes!
+             self.kickedFrom(channel, kicker, message)
+         else:
+@@ -1082,7 +1101,7 @@
+     def irc_TOPIC(self, prefix, params):
+         """Someone in the channel set the topic.
+         """
+-        user = string.split(prefix, '!')[0]
++        user = prefix.split('!')[0]
+         channel = params[0]
+         newtopic = params[1]
+         self.topicUpdated(user, channel, newtopic)
+@@ -1090,13 +1109,13 @@
+     def irc_RPL_TOPIC(self, prefix, params):
+         """I just joined the channel, and the server is telling me the current topic.
+         """
+-        user = string.split(prefix, '!')[0]
++        user = prefix.split('!')[0]
+         channel = params[1]
+         newtopic = params[2]
+         self.topicUpdated(user, channel, newtopic)
+ 
+     def irc_RPL_NOTOPIC(self, prefix, params):
+-        user = string.split(prefix, '!')[0]
++        user = prefix.split('!')[0]
+         channel = params[1]
+         newtopic = ""
+         self.topicUpdated(user, channel, newtopic)
+@@ -1171,7 +1190,7 @@
+         self.action(user, channel, data)
+ 
+     def ctcpQuery_PING(self, user, channel, data):
+-        nick = string.split(user,"!")[0]
++        nick = user.split("!")[0]
+         self.ctcpMakeReply(nick, [("PING", data)])
+ 
+     def ctcpQuery_FINGER(self, user, channel, data):
+@@ -1186,7 +1205,7 @@
+         else:
+             reply = str(self.fingerReply)
+ 
+-        nick = string.split(user,"!")[0]
++        nick = user.split("!")[0]
+         self.ctcpMakeReply(nick, [('FINGER', reply)])
+ 
+     def ctcpQuery_VERSION(self, user, channel, data):
+@@ -1195,7 +1214,7 @@
+                                % (user, data))
+ 
+         if self.versionName:
+-            nick = string.split(user,"!")[0]
++            nick = user.split("!")[0]
+             self.ctcpMakeReply(nick, [('VERSION', '%s:%s:%s' %
+                                        (self.versionName,
+                                         self.versionNum,
+@@ -1206,7 +1225,7 @@
+             self.quirkyMessage("Why did %s send '%s' with a SOURCE query?"
+                                % (user, data))
+         if self.sourceURL:
+-            nick = string.split(user,"!")[0]
++            nick = user.split("!")[0]
+             # The CTCP document (Zeuge, Rollo, Mesander 1994) says that SOURCE
+             # replies should be responded to with the location of an anonymous
+             # FTP server in host:directory:file format.  I'm taking the liberty
+@@ -1219,7 +1238,7 @@
+             self.quirkyMessage("Why did %s send '%s' with a USERINFO query?"
+                                % (user, data))
+         if self.userinfo:
+-            nick = string.split(user,"!")[0]
++            nick = user.split("!")[0]
+             self.ctcpMakeReply(nick, [('USERINFO', self.userinfo)])
+ 
+     def ctcpQuery_CLIENTINFO(self, user, channel, data):
+@@ -1230,7 +1249,7 @@
+         the usage of that tag.
+         """
+ 
+-        nick = string.split(user,"!")[0]
++        nick = user.split("!")[0]
+         if not data:
+             # XXX: prefixedMethodNames gets methods from my *class*,
+             # but it's entirely possible that this *instance* has more
+@@ -1239,9 +1258,9 @@
+                                                 'ctcpQuery_')
+ 
+             self.ctcpMakeReply(nick, [('CLIENTINFO',
+-                                       string.join(names, ' '))])
++                                       ' '.join(names))])
+         else:
+-            args = string.split(data)
++            args = data.split()
+             method = getattr(self, 'ctcpQuery_%s' % (args[0],), None)
+             if not method:
+                 self.ctcpMakeReply(nick, [('ERRMSG',
+@@ -1256,7 +1275,7 @@
+     def ctcpQuery_ERRMSG(self, user, channel, data):
+         # Yeah, this seems strange, but that's what the spec says to do
+         # when faced with an ERRMSG query (not a reply).
+-        nick = string.split(user,"!")[0]
++        nick = user.split("!")[0]
+         self.ctcpMakeReply(nick, [('ERRMSG',
+                                    "%s :No error has occoured." % data)])
+ 
+@@ -1264,7 +1283,7 @@
+         if data is not None:
+             self.quirkyMessage("Why did %s send '%s' with a TIME query?"
+                                % (user, data))
+-        nick = string.split(user,"!")[0]
++        nick = user.split("!")[0]
+         self.ctcpMakeReply(nick,
+                            [('TIME', ':%s' %
+                              time.asctime(time.localtime(time.time())))])
+@@ -1282,7 +1301,7 @@
+             data = data[len(dcctype)+1:]
+             handler(user, channel, data)
+         else:
+-            nick = string.split(user,"!")[0]
++            nick = user.split("!")[0]
+             self.ctcpMakeReply(nick, [('ERRMSG',
+                                        "DCC %s :Unknown DCC type '%s'"
+                                        % (data, dcctype))])
+@@ -1392,7 +1411,7 @@
+     #    raise NotImplementedError
+ 
+     def ctcpUnknownQuery(self, user, channel, tag, data):
+-        nick = string.split(user,"!")[0]
++        nick = user.split("!")[0]
+         self.ctcpMakeReply(nick, [('ERRMSG',
+                                    "%s %s: Unknown query '%s'"
+                                    % (tag, data, tag))])
+@@ -1457,9 +1476,9 @@
+         """When I get a message that's so broken I can't use it.
+         """
+         log.msg(line)
+-        log.msg(string.join(traceback.format_exception(excType,
++        log.msg(''.join(traceback.format_exception(excType,
+                                                         excValue,
+-                                                        tb),''))
++                                                        tb)))
+ 
+     def quirkyMessage(self, s):
+         """This is called when I receive a message which is peculiar,
+@@ -1480,7 +1499,7 @@
+     def lineReceived(self, line):
+         line = lowDequote(line)
+         try:
+-            prefix, command, params = parsemsg(line)
++            prefix, command, params = parsemsg(line, self.encoding)
+             if numeric_to_symbolic.has_key(command):
+                 command = numeric_to_symbolic[command]
+             self.handleCommand(command, prefix, params)
+@@ -1564,7 +1583,7 @@
+     connected = 0
+ 
+     def __init__(self, file):
+-        if type(file) is types.StringType:
++        if isinstance(file, basestring):
+             self.file = open(file, 'r')
+ 
+     def connectionMade(self):
+@@ -1691,7 +1710,7 @@
+ 
+     def dataReceived(self, data):
+         self.buffer = self.buffer + data
+-        lines = string.split(self.buffer, LF)
++        lines = self.buffer.split(LF)
+         # Put the (possibly empty) element after the last LF back in the
+         # buffer
+         self.buffer = lines.pop()
+@@ -1730,7 +1749,7 @@
+     """
+ 
+     orig_data = data
+-    data = string.split(data)
++    data = data.split()
+     if len(data) < 4:
+         return orig_data
+ 
+@@ -1752,7 +1771,7 @@
+                 )
+             # The mapping to 'int' is to get rid of those accursed
+             # "L"s which python 1.5.2 puts on the end of longs.
+-            address = string.join(map(str,map(int,address)), ".")
++            address = '.'.join(map(str,map(int,address)))
+ 
+     if dcctype == 'SEND':
+         filename = arg
+@@ -1924,7 +1943,7 @@
+     retval = {'extended': extended_messages,
+               'normal': normal_messages }
+ 
+-    messages = string.split(message, X_DELIM)
++    messages = message.split(X_DELIM)
+     odd = 0
+ 
+     # X1 extended data X2 nomal data X3 extended data X4 normal...
+@@ -1940,7 +1959,7 @@
+ 
+     extended_messages[:] = map(ctcpDequote, extended_messages)
+     for i in xrange(len(extended_messages)):
+-        m = string.split(extended_messages[i], SPC, 1)
++        m = extended_messages[i].split(SPC, 1)
+         tag = m[0]
+         if len(m) > 1:
+             data = m[1]
+@@ -1971,7 +1990,7 @@
+ 
+ def lowQuote(s):
+     for c in (M_QUOTE, NUL, NL, CR):
+-        s = string.replace(s, c, mQuoteTable[c])
++        s = s.replace(c, mQuoteTable[c])
+     return s
+ 
+ def lowDequote(s):
+@@ -2001,7 +2020,7 @@
+ 
+ def ctcpQuote(s):
+     for c in (X_QUOTE, X_DELIM):
+-        s = string.replace(s, c, xQuoteTable[c])
++        s = s.replace(c, xQuoteTable[c])
+     return s
+ 
+ def ctcpDequote(s):
+@@ -2026,7 +2045,7 @@
+     coded_messages = []
+     for (tag, data) in messages:
+         if data:
+-            if not isinstance(data, types.StringType):
++            if not isinstance(data, basestring):
+                 try:
+                     # data as list-of-strings
+                     data = " ".join(map(str, data))
+@@ -2040,7 +2059,7 @@
+         m = "%s%s%s" % (X_DELIM, m, X_DELIM)
+         coded_messages.append(m)
+ 
+-    line = string.join(coded_messages, '')
++    line = ''.join(coded_messages)
+     return line
+ 
+ 
+diff -urN words.trunk/service.py words.current/service.py
+--- words.trunk/service.py	2006-04-30 23:04:06.000000000 +0700
++++ words.current/service.py	2006-04-30 23:41:51.954259750 +0700
+@@ -210,7 +210,7 @@
+         if not kw.has_key('prefix'):
+             kw['prefix'] = self.hostname
+         if not kw.has_key('to'):
+-            kw['to'] = self.name.encode(self.encoding)
++            kw['to'] = self.name
+ 
+         arglist = [self, command, kw['to']] + list(parameter_list)
+         irc.IRC.sendMessage(*arglist, **kw)
+@@ -219,16 +219,16 @@
+     # IChatClient implementation
+     def userJoined(self, group, user):
+         self.join(
+-            "%s!%s@%s" % (user.name, user.name, self.hostname),
+-            '#' + group.name)
++            u"%s!%s@%s" % (user.name, user.name, self.hostname),
++            u'#' + group.name)
+ 
+ 
+     def userLeft(self, group, user, reason=None):
+         assert reason is None or isinstance(reason, unicode)
+         self.part(
+-            "%s!%s@%s" % (user.name, user.name, self.hostname),
+-            '#' + group.name,
+-            (reason or u"leaving").encode(self.encoding, 'replace'))
++            u"%s!%s@%s" % (user.name, user.name, self.hostname),
++            u'#' + group.name,
++            (reason or u"leaving"))
+ 
+ 
+     def receive(self, sender, recipient, message):
+@@ -236,14 +236,14 @@
+ 
+         # omg???????????
+         if iwords.IGroup.providedBy(recipient):
+-            recipientName = '#' + recipient.name
++            recipientName = u'#' + recipient.name
+         else:
+             recipientName = recipient.name
+ 
+         text = message.get('text', '<an unrepresentable message>')
+         for L in text.splitlines():
+             self.privmsg(
+-                '%s!%s@%s' % (sender.name, sender.name, self.hostname),
++                u'%s!%s@%s' % (sender.name, sender.name, self.hostname),
+                 recipientName,
+                 L)
+ 
+@@ -254,9 +254,9 @@
+             author = meta.get('topic_author', '')
+             self.topic(
+                 self.name,
+-                '#' + group.name,
++                u'#' + group.name,
+                 topic,
+-                '%s!%s@%s' % (author, author, self.hostname)
++                u'%s!%s@%s' % (author, author, self.hostname)
+                 )
+ 
+     # irc.IRC callbacks - starting with login related stuff.
+@@ -283,15 +283,8 @@
+ 
+         [REQUIRED]
+         """
+-        try:
+-            nickname = params[0].decode(self.encoding)
+-        except UnicodeDecodeError:
+-            self.privmsg(
+-                NICKSERV,
+-                nickname,
+-                'Your nickname is cannot be decoded.  Please use ASCII or UTF-8.')
+-            self.transport.loseConnection()
+-            return
++        nickname = params[0]
++        assert isinstance(nickname, unicode)
+ 
+         if self.password is None:
+             self.nickname = nickname
+@@ -339,6 +332,7 @@
+ 
+ 
+     def logInAs(self, nickname, password):
++        log.msg("service: IRCUser.logInAs nick=%s" % repr(nickname), debug=True)
+         d = self.factory.portal.login(
+             credentials.UsernamePassword(nickname, password),
+             self,
+@@ -348,11 +342,11 @@
+ 
+     _welcomeMessages = [
+         (irc.RPL_WELCOME,
+-         ":connected to Twisted IRC"),
++         u":connected to Twisted IRC"),
+         (irc.RPL_YOURHOST,
+-         ":Your host is %(serviceName)s, running version %(serviceVersion)s"),
++         u":Your host is %(serviceName)s, running version %(serviceVersion)s"),
+         (irc.RPL_CREATED,
+-         ":This server was created on %(creationDate)s"),
++         u":This server was created on %(creationDate)s"),
+ 
+         # "Bummer.  This server returned a worthless 004 numeric.
+         #  I'll have to guess at all the values"
+@@ -360,7 +354,7 @@
+         (irc.RPL_MYINFO,
+          # w and n are the currently supported channel and user modes
+          # -- specify this better
+-         "%(serviceName)s %(serviceVersion)s w n"),
++         u"%(serviceName)s %(serviceVersion)s w n"),
+         ]
+ 
+ 
+@@ -413,7 +407,7 @@
+         Parameters: <server1> [ <server2> ]
+         """
+         if self.realm is not None:
+-            self.sendMessage('PONG', self.hostname)
++            self.sendMessage(u'PONG', self.hostname)
+ 
+ 
+     def irc_QUIT(self, prefix, params):
+@@ -428,7 +422,7 @@
+         if modes:
+             self.sendMessage(
+                 irc.ERR_UNKNOWNMODE,
+-                ":Unknown MODE flag.")
++                u":Unknown MODE flag.")
+         else:
+             self.channelMode(self.name, '#' + group.name, '+')
+ 
+@@ -437,15 +431,15 @@
+         if modes:
+             self.sendMessage(
+                 irc.ERR_UNKNOWNMODE,
+-                ":Unknown MODE flag.")
++                u":Unknown MODE flag.")
+         elif user is self.avatar:
+             self.sendMessage(
+                 irc.RPL_UMODEIS,
+-                "+")
++                u"+")
+         else:
+             self.sendMessage(
+                 irc.ERR_USERSDONTMATCH,
+-                ":You can't look at someone else's modes.")
++                u":You can't look at someone else's modes.")
+ 
+ 
+     def irc_MODE(self, prefix, params):
+@@ -455,20 +449,15 @@
+         *( ( "+" / "-" ) *( "i" / "w" / "o" / "O" / "r" ) )
+ 
+         """
+-        try:
+-            channelOrUser = params[0].decode(self.encoding)
+-        except UnicodeDecodeError:
+-            self.sendMessage(
+-                irc.ERR_NOSUCHNICK, params[0],
+-                ":No such nickname (could not decode your unicode!)")
+-            return
++        channelOrUser = params[0]
++        assert(channelOrUser, unicode)
+ 
+         if channelOrUser.startswith('#'):
+             def ebGroup(err):
+                 err.trap(ewords.NoSuchGroup)
+                 self.sendMessage(
+                     irc.ERR_NOSUCHCHANNEL, params[0],
+-                    ":That channel doesn't exist.")
++                    u":That channel doesn't exist.")
+             d = self.realm.lookupGroup(channelOrUser[1:])
+             d.addCallbacks(
+                 self._channelMode,
+@@ -478,7 +467,7 @@
+             def ebUser(err):
+                 self.sendMessage(
+                     irc.ERR_NOSUCHNICK,
+-                    ":No such nickname.")
++                    u":No such nickname.")
+ 
+             d = self.realm.lookupUser(channelOrUser)
+             d.addCallbacks(
+@@ -502,13 +491,8 @@
+ 
+         Parameters: <msgtarget> <text to be sent>
+         """
+-        try:
+-            targetName = params[0].decode(self.encoding)
+-        except UnicodeDecodeError:
+-            self.sendMessage(
+-                irc.ERR_NOSUCHNICK, targetName,
+-                ":No such nick/channel (could not decode your unicode!)")
+-            return
++        targetName = params[0]
++        assert isinstance(targetName, unicode)
+ 
+         messageText = params[-1]
+         if targetName.startswith('#'):
+@@ -523,7 +507,7 @@
+         def ebTarget(err):
+             self.sendMessage(
+                 irc.ERR_NOSUCHNICK, targetName,
+-                ":No such nick/channel.")
++                u":No such nick/channel.")
+ 
+         target.addCallbacks(cbTarget, ebTarget)
+ 
+@@ -533,13 +517,8 @@
+ 
+         Parameters: ( <channel> *( "," <channel> ) [ <key> *( "," <key> ) ] )
+         """
+-        try:
+-            groupName = params[0].decode(self.encoding)
+-        except UnicodeDecodeError:
+-            self.sendMessage(
+-                irc.IRC_NOSUCHCHANNEL, params[0],
+-                ":No such channel (could not decode your unicode!)")
+-            return
++        groupName = params[0]
++        assert isinstance(groupName, unicode)
+ 
+         if groupName.startswith('#'):
+             groupName = groupName[1:]
+@@ -549,15 +528,15 @@
+                 self.userJoined(group, self)
+                 self.names(
+                     self.name,
+-                    '#' + group.name,
++                    u'#' + group.name,
+                     [user.name for user in group.iterusers()])
+                 self._sendTopic(group)
+             return self.avatar.join(group).addCallback(cbJoin)
+ 
+         def ebGroup(err):
+             self.sendMessage(
+-                irc.ERR_NOSUCHCHANNEL, '#' + groupName,
+-                ":No such channel.")
++                irc.ERR_NOSUCHCHANNEL, u'#' + groupName,
++                u":No such channel.")
+ 
+         self.realm.getGroup(groupName).addCallbacks(cbGroup, ebGroup)
+ 
+@@ -567,19 +546,15 @@
+ 
+         Parameters: <channel> *( "," <channel> ) [ <Part Message> ]
+         """
+-        try:
+-            groupName = params[0].decode(self.encoding)
+-        except UnicodeDecodeError:
+-            self.sendMessage(
+-                irc.ERR_NOTONCHANNEL, params[0],
+-                ":Could not decode your unicode!")
+-            return
++        groupName = params[0]
++        assert isinstance(groupName, unicode)
+ 
+         if groupName.startswith('#'):
+             groupName = groupName[1:]
+ 
+         if len(params) > 1:
+-            reason = params[1].decode('utf-8')
++            reason = params[1]
++            assert isinstance(reason, unicode)
+         else:
+             reason = None
+ 
+@@ -592,8 +567,8 @@
+             err.trap(ewords.NoSuchGroup)
+             self.sendMessage(
+                 irc.ERR_NOTONCHANNEL,
+-                '#' + groupName,
+-                ":" + err.getErrorMessage())
++                u'#' + groupName,
++                u":" + err.getErrorMessage())
+ 
+         self.realm.lookupGroup(groupName).addCallbacks(cbGroup, ebGroup)
+ 
+@@ -606,13 +581,8 @@
+         #<< NAMES #python
+         #>> :benford.openprojects.net 353 glyph = #python :Orban ... @glyph ... Zymurgy skreech
+         #>> :benford.openprojects.net 366 glyph #python :End of /NAMES list.
+-        try:
+-            channel = params[-1].decode(self.encoding)
+-        except UnicodeDecodeError:
+-            self.sendMessage(
+-                irc.ERR_NOSUCHCHANNEL, params[-1],
+-                ":No such channel (could not decode your unicode!)")
+-            return
++        channel = params[-1]
++        assert isinstance(channel, unicode)
+ 
+         if channel.startswith('#'):
+             channel = channel[1:]
+@@ -620,7 +590,7 @@
+         def cbGroup(group):
+             self.names(
+                 self.name,
+-                '#' + group.name,
++                u'#' + group.name,
+                 [user.name for user in group.iterusers()])
+ 
+         def ebGroup(err):
+@@ -628,7 +598,7 @@
+             # No group?  Fine, no names!
+             self.names(
+                 self.name,
+-                '#' + group.name,
++                u'#' + group.name,
+                 [])
+ 
+         self.realm.lookupGroup(channel).addCallbacks(cbGroup, ebGroup)
+@@ -639,13 +609,8 @@
+ 
+         Parameters: <channel> [ <topic> ]
+         """
+-        try:
+-            channel = params[0].decode(self.encoding)
+-        except UnicodeDecodeError:
+-            self.sendMessage(
+-                irc.ERR_NOSUCHCHANNEL,
+-                ":That channel doesn't exist (could not decode your unicode!)")
+-            return
++        channel = params[0]
++        assert isinstance(channel, unicode)
+ 
+         if channel.startswith('#'):
+             channel = channel[1:]
+@@ -660,8 +625,8 @@
+         topic = group.meta.get("topic")
+         author = group.meta.get("topic_author") or "<noone>"
+         date = group.meta.get("topic_date", 0)
+-        self.topic(self.name, '#' + group.name, topic)
+-        self.topicAuthor(self.name, '#' + group.name, author, date)
++        self.topic(self.name, u'#' + group.name, topic)
++        self.topicAuthor(self.name, u'#' + group.name, author, date)
+ 
+ 
+     def _getTopic(self, channel):
+@@ -672,7 +637,7 @@
+             err.trap(ewords.NoSuchGroup)
+             self.sendMessage(
+                 irc.ERR_NOSUCHCHANNEL, '=', channel,
+-                ":That channel doesn't exist.")
++                u":That channel doesn't exist.")
+ 
+         self.realm.lookupGroup(channel).addCallbacks(self._sendTopic, ebGroup)
+ 
+@@ -690,8 +655,8 @@
+             def ebSet(err):
+                 self.sendMessage(
+                     ERR_CHANOPRIVSNEEDED,
+-                    "#" + group.name,
+-                    ":You need to be a channel operator to do that.")
++                    u"#" + group.name,
++                    u":You need to be a channel operator to do that.")
+ 
+             return group.setMetadata(newMeta).addErrback(ebSet)
+ 
+@@ -699,7 +664,7 @@
+             err.trap(ewords.NoSuchGroup)
+             self.sendMessage(
+                 irc.ERR_NOSUCHCHANNEL, '=', channel,
+-                ":That channel doesn't exist.")
++                u":That channel doesn't exist.")
+ 
+         self.realm.lookupGroup(channel).addCallbacks(cbGroup, ebGroup)
+ 
+@@ -713,7 +678,7 @@
+         """
+         for (name, size, topic) in channels:
+             self.sendMessage(irc.RPL_LIST, name, str(size), ":" + topic)
+-        self.sendMessage(irc.RPL_LISTEND, ":End of /LIST")
++        self.sendMessage(irc.RPL_LISTEND, u":End of /LIST")
+ 
+ 
+     def irc_LIST(self, prefix, params):
+@@ -730,16 +695,12 @@
+         #>> :orwell.freenode.net 323 exarkun :End of /LIST
+         if params:
+             # Return information about indicated channels
+-            try:
+-                channels = params[0].decode(self.encoding).split(',')
+-            except UnicodeDecodeError:
+-                self.sendMessage(
+-                    irc.ERR_NOSUCHCHANNEL, params[0],
+-                    ":No such channel (could not decode your unicode!)")
+-                return
+-
++            channels_list = params[0]
++            assert isinstance(channels_list, unicode)
++            channels = channels_list.split(',')
+             groups = []
+             for ch in channels:
++                ch = ch.strip()
+                 if ch.startswith('#'):
+                     ch = ch[1:]
+                 groups.append(self.realm.lookupGroup(ch))
+@@ -767,7 +728,7 @@
+ 
+     def _userWho(self, user):
+         self.sendMessage(irc.RPL_ENDOFWHO,
+-                         ":User /WHO not implemented")
++                         u":User /WHO not implemented")
+ 
+ 
+     def irc_WHO(self, prefix, params):
+@@ -785,23 +746,18 @@
+         #>> :x.opn 352 glyph #python glyph adsl-64-123-27-108.dsl.austtx.swbell.net x.opn glyph H :0 glyph
+         #>> :x.opn 315 glyph glyph :End of /WHO list.
+         if not params:
+-            self.sendMessage(irc.RPL_ENDOFWHO, ":/WHO not supported.")
+-            return
+-
+-        try:
+-            channelOrUser = params[0].decode(self.encoding)
+-        except UnicodeDecodeError:
+-            self.sendMessage(
+-                irc.RPL_ENDOFWHO, params[0],
+-                ":End of /WHO list (could not decode your unicode!)")
++            self.sendMessage(irc.RPL_ENDOFWHO, u":/WHO not supported.")
+             return
++        
++        channelOrUser = params[0]
++        assert isinstance(channelOrUser, unicode)
+ 
+         if channelOrUser.startswith('#'):
+             def ebGroup(err):
+                 err.trap(ewords.NoSuchGroup)
+                 self.sendMessage(
+                     irc.RPL_ENDOFWHO, channelOrUser,
+-                    ":End of /WHO list.")
++                    u":End of /WHO list.")
+             d = self.realm.lookupGroup(channelOrUser[1:])
+             d.addCallbacks(self._channelWho, ebGroup)
+         else:
+@@ -809,7 +765,7 @@
+                 err.trap(ewords.NoSuchUser)
+                 self.sendMessage(
+                     irc.RPL_ENDOFWHO, channelOrUser,
+-                    ":End of /WHO list.")
++                    u":End of /WHO list.")
+             d = self.realm.lookupUser(channelOrUser)
+             d.addCallbacks(self._userWho, ebUser)
+ 
+@@ -833,16 +789,9 @@
+             self.sendMessage(
+                 irc.ERR_NOSUCHNICK,
+                 params[0],
+-                ":No such nick/channel")
+-
+-        try:
+-            user = params[0].decode(self.encoding)
+-        except UnicodeDecodeError:
+-            self.sendMessage(
+-                irc.ERR_NOSUCHNICK,
+-                params[0],
+-                ":No such nick/channel")
+-            return
++                u":No such nick/channel")
++        user = params[0]
++        assert isinstance(user, unicode)
+ 
+         self.realm.lookupUser(user).addCallbacks(cbUser, ebUser)
+ 
+@@ -853,7 +802,7 @@
+ 
+         Parameters: <name> <password>
+         """
+-        self.sendMessage(irc.ERR_NOOPERHOST, ":O-lines not applicable")
++        self.sendMessage(irc.ERR_NOOPERHOST, u":O-lines not applicable")
+ 
+ 
+ class IRCFactory(protocol.ServerFactory):
+@@ -932,6 +881,7 @@
+ 
+ 
+     def jellyFor(self, jellier):
++        #### FIXME why explicit encoding?
+         return reflect.qual(self.__class__), self.group.name.encode('utf-8'), jellier.invoker.registerReference(self)
+ 
+ 
+@@ -948,6 +898,7 @@
+ 
+     def unjellyFor(self, unjellier, unjellyList):
+         clsName, name, ref = unjellyList
++        #### FIXME why explicit encoding? why not unicode?
+         self.name = name.decode('utf-8')
+         return pb.RemoteReference.unjellyFor(self, unjellier, [clsName, ref])
+ 
+@@ -1104,7 +1055,12 @@
+ 
+ 
+     def getUser(self, name):
+-        assert isinstance(name, unicode)
++        assert isinstance(name, basestring)
++        # fixup for doing all tests done. update tests??
++        if isinstance(name, str):
++            # FIXME why str? must be unicode!
++            warnings.warn("Why name in WordsRealm.getUser is str? it must be unicode!", DeprecationWarning, stacklevel=2) 
++            name = name.decode(self._encoding)
+         if self.createUserOnRequest:
+             def ebUser(err):
+                 err.trap(ewords.DuplicateUser)

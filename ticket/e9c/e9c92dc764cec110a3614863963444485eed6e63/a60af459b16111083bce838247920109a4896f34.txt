@@ -1,0 +1,180 @@
+4:51:50 PM dreid: Ok, actors.
+4:52:14 PM oubiwann: you got fzZzy's email I cc'ed you on, right?
+4:52:24 PM dreid: Yes.
+4:52:27 PM oubiwann: I think I'll paste it here for the record
+4:52:47 PM dreid: OK.
+4:52:49 PM oubiwann: From fzZzy:
+4:52:50 PM oubiwann: Basically the conclusion I came to after messing around with bizarre control flow stuff for quite a while is that Actors and selective receive with timeout are all that's needed to implement any other form of control flow. The mailbox provides a sync-to-async operation, and selective receive provides an async-to-sync operation, and then actors can be built up into trees to implement pooling, failing, distribution, etc. Since the mailbox is fundamentally async, any messages can transparently go over the network without rewriting the original code. Reliable and unreliable transports can be used. Since selective-receive-or-timeout is the fundamental cooperatively-blocking operation, code is written with the failure case of timeout as part of every message receive and not a rarely tested exceptional condition that's handled at another layer in the stack. If people don't write timeouts they can block forever on lost messages, but the default style encourages thinking about timeout conditions any time a receive is performed.
+
+Add grand central style dispatch to this, and code that's written in this style for one processor can transparently be distributed across multiple processors, or even machines.
+4:54:00 PM dreid: So first the interface.  An actor necessarily has two interfaces, one is an external reference to the actor (this is the interface which has a send method) and one is the internal interface which should only be invoked from within the actor (the interface with a receive message).
+4:54:27 PM oubiwann: *nods*
+4:55:29 PM oubiwann: and I'm down with the send vs. cast name
+4:55:52 PM dreid: send also has no meaningful return value.
+jriddy [~jreed@unaffiliated/jriddy] entered the room. (4:55:55 PM)
+4:56:46 PM oubiwann: I'm trying to imagine a counter example
+4:56:49 PM oubiwann: coming up null
+4:56:57 PM dreid: Good, then we're on the same page.
+4:57:09 PM oubiwann: in that case, send shouldn't return a deferred
+4:57:14 PM jriddy: this is the discussion for implementing the actor model in twisted, right?
+4:57:17 PM dreid: call is implement as a send to one actor, and a receive in the current actor.
+4:57:39 PM oubiwann: jriddy: yup
+4:57:45 PM dreid: oubiwann: Deferreds + Actor model is kind of … awkward?
+4:58:02 PM oubiwann: yeah… they are
+mmattice [mmattice@unaffiliated/mmattice] entered the room. (4:58:14 PM)
+4:58:20 PM oubiwann: radix's corotwine combined them
+4:58:21 PM dreid: I tried implementing them in erlang and what I ended up with was not very useful.
+4:58:40 PM dreid: Based on my erlang experience I'm pretty certain that receive should block.
+4:58:54 PM oubiwann: really? why's that?
+4:59:20 PM dreid: Or rather receive should appear blocking.
+5:00:06 PM dreid: The Actor should not do more work when it's waiting for a message.  If it can do more work while waiting for a message then it shouldn't wait for the message until it can't do more work. 
+5:00:18 PM dreid: Maybe I should back up give a quick actors in erlang 101.
+5:00:59 PM dreid: In erlang code is never running outside of an actor.
+ralphm [~ralphm@s53751670.adsl.wanadoo.nl] entered the room. (5:01:36 PM)
+5:01:41 PM dreid: an actor or process as erlang calls them have a pid.
+5:02:06 PM dreid: You can send messages to that pid and they get put into a message queue/mailbox.
+5:02:29 PM dreid: User code in a process will execute until it uses a receive statement.
+5:03:25 PM dreid: That receive statement will scan the current processes message queue for messages that match it's patterns (It's important to note that there can be multiple patterns)
+5:04:22 PM dreid: If no messages match and a user-specified timeout has not been reached then it'll wait for more messages.  An interesting note is that the process will not be scheduled to run again until a new message is inserted int he mailbox.
+5:04:47 PM dreid: If a message matches a pattern then the code in that branch of the receive statement is executed.
+5:04:57 PM dreid: fzZzy referred to this as "selective-receive-or-timeout"
+5:05:18 PM dreid: It's actually a multiple-selective-receive-or-timeout.
+5:05:33 PM dreid: There are multiple possible branches that can be taken depending on which messages arrive.
+5:06:52 PM dreid: The other very useful thing about erlang actors is that anything in the stack under the actor can be call receive.
+5:07:16 PM oubiwann: parse failure
+5:07:22 PM dreid: can call receive.
+5:07:26 PM oubiwann: *nods*
+5:08:14 PM dreid: so spawn(fun loop/0) will create a new actor, loop() can call library code which might call other library code which might call receive.  But it's running in the same process so it's interacting with the same message queue.
+5:09:35 PM dreid: This allows you to do things like have a library implementing RPC.
+5:10:32 PM dreid: a function like call would be implemented as send then receive waiting for a response specifically from the actor you called send on.
+5:11:44 PM dreid: It's very useful to do this, and it's particularly handy to do this without having to pass an explicit reference to the current actor to call receive on.
+5:13:32 PM dreid: I'm not sure what that looks like in Python of course. 
+5:14:51 PM oubiwann: hehe
+5:15:11 PM dreid: Probably like this: http://twistedmatrix.com/documents/current/api/twisted.python.context.ContextTracker.html
+5:15:57 PM oubiwann: oh, wow
+5:16:07 PM oubiwann: I had no idea this was in Twisted...
+5:16:21 PM dreid: For good reason.
+5:16:36 PM oubiwann: This is a pretty understatement: "This should be used sparingly, since the lack of a clear connection between the two halves can result in code which is difficult to understand and maintain."
+
+
+5:17:14 PM ralphm: woah. I'm not sure if I want to see how that works
+5:17:19 PM oubiwann: hehehe
+5:19:55 PM dreid: Anyway, that's not really important.
+5:20:32 PM dreid: Well I mean, it'd be nice if receive didn't require an explicit reference to the current actor and therefor worked all the way down the stack.
+5:20:54 PM dreid: So here is what I think is really cool.
+5:21:13 PM dreid: You should be able to implement actors on top of twisted.internet.task.Cooperator
+5:23:12 PM oubiwann: but… do we *want* to
+5:23:23 PM oubiwann: the overhead might be a bit much...
+5:23:26 PM dreid: oubiwann: Sure, why not, cooperator exists today.
+5:23:53 PM oubiwann: the abstractions seem a perfect fit
+5:23:55 PM oubiwann: but...
+5:24:10 PM oubiwann: I think it's worth exploring both with and without
+5:24:12 PM oubiwann: in a simple case
+5:24:24 PM oubiwann: and examine potential performance differences
+5:24:59 PM dreid: oubiwann: Cooperator exists today.  What do you expect the "without" implementation to look like?  Greenlets?
+5:25:24 PM oubiwann: yup
+5:25:45 PM dreid: Do greenlets work on pypy?  
+5:25:52 PM oubiwann: hehe
+5:25:55 PM dreid: (Cooperator works on pypy)
+5:26:35 PM dreid: oubiwann: Supporting multiple implementations is easy.  And because of the interface multiple implementations can work together.
+5:26:55 PM oubiwann: dreid: +1
+5:26:57 PM oubiwann: also: http://doc.pypy.org/en/latest/stackless.html
+5:27:14 PM ralphm: dreid: do you recon that pypy eliminates most of the potential performance issues?
+5:27:34 PM dreid: Who knows?  But it is more likely to eliminate the performance issues in the future.
+5:28:48 PM ralphm: right
+5:28:53 PM oubiwann: dreid: also, I would still like to see a libevent reactor, which could help with performance 
+5:29:12 PM dreid: Sure.
+5:29:19 PM oubiwann: but yeah
+5:29:33 PM oubiwann: supporting multiple "backends" is a good thing
+5:30:04 PM dreid: Ok, so the interface looks something like this, there is a thing you call spawn on, spawn takes a function and returns a thing you can call send on.  That function will run, call receive, wait for messages, handle messages, and when it exits the actor is gone.
+5:30:28 PM oubiwann: +1 so far
+5:30:59 PM dreid: You might want to look at this API: https://github.com/boundary/scalang/
+5:31:06 PM dreid: That is Erlang actors in Scala.
+5:31:19 PM ralphm: so the returned thing is like a generator?
+5:31:49 PM dreid: ralphm: No, not like a generator.
+5:32:03 PM dreid: Has a method for sending a message to an actor.
+idnar [~quassel@unaffiliated/idnar] entered the room. (5:32:37 PM)
+5:32:40 PM dreid: oubiwann: The other approach is that rather than have selective receive you have a class which has a messageReceived which gets called for every message.
+5:32:59 PM oubiwann: that's what fzZzy did
+5:33:49 PM dreid: That form is more Twisted and less Erlang.
+5:34:24 PM oubiwann: *nods*
+5:35:20 PM dreid: I actually like both of them.
+5:35:32 PM dreid: I think selective-receive requires some useful form of pattern matching though.
+5:35:58 PM oubiwann: I tend to be more in favor of the Twisted approach, but only due to familiarity
+5:36:38 PM dreid: That's fine.  It's certainly probably easier to implement and believe selective receive can be implemented on top of it.
+5:38:01 PM ralphm: the selective receive reminds me a bit of how t.w.xish.util.EventDispatcher handles XMPP stanzas
+5:38:55 PM ralphm: dreid: is it indeed compatible?
+5:38:56 PM dreid: Yes you could implement it that way.
+5:38:58 PM ralphm: comparible
+5:40:09 PM ralphm: dreid: with this pattern, are there typically many different patterns (observers)?
+5:40:10 PM dreid: So, I don't know that have much more to say about actors.  
+5:40:27 PM dreid: ralphm: You've written erlang code right? 
+5:40:37 PM dreid: oubiwann: Oh!
+5:40:38 PM dreid: Links!
+5:40:41 PM ralphm: dreid: not really, no?
+5:41:37 PM dreid: ralphm: Oh, well there could be many, but usually it's a couple of specific patterns, and then a catchall.  It depends what you want your application to do when you get a message you don't explicitly know how to handle.
+5:41:55 PM dreid: oubiwann: So, the other thing Erlang has is that it's actors can be linked.
+5:42:08 PM ralphm: dreid: I have /read/ a bunch of it, though. I was just wondering what typical use cases were.
+5:42:28 PM dreid: For an Actor A, that is linked to B when B dies A gets told that B died and why.  
+5:42:53 PM ralphm: right
+5:42:59 PM dreid: Or depending on configuration A will die as well.
+5:43:36 PM dreid: oubiwann: So in general you want some way of an actor to kill itself, and if it raises an unhandled exception it should die.  And you want to let other actors get messages when it dies.
+5:43:58 PM oubiwann: *nods*
+5:44:12 PM dreid: This is how you implement things like superivision hierarchies and process pools and in general Crash Only Programming is great.
+5:45:13 PM dreid: afk.
+5:50:35 PM dreid: back
+5:51:36 PM oubiwann: dreid: I've been downloading some of the early literature on the actor model
+5:51:48 PM dreid: oubiwann: Neat, I've never read any of that. 
+5:51:59 PM oubiwann: pretty awesome stuff
+5:52:12 PM dreid: I've read http://pragprog.com/book/jaerlang/programming-erlang
+5:52:36 PM oubiwann: I feel virtual dust swirling around me as I find pdf scans of papers published in the 60s and 70s
+5:53:59 PM oubiwann: Looks like go implements channels for their support of concurrency
+5:56:15 PM dreid: The other thing to know is that applications aren't written as sending messages from one part of the program to another.  They're written by calling functions, which might send messages.  In that case it might be useful for an actor to be a given a reference to a deferred, and for that deferred to fire when a certain message is receive.  Thus allowing you to have an API which sends a message, and waits for a response. and does something with the result
+5:56:31 PM dreid: But we should probably have working actors before we think too hard about how to write code using them.
+5:56:40 PM oubiwann: *nods*
+5:57:07 PM oubiwann: however, that will still be part of this branch
+5:57:15 PM oubiwann: just the second half
+6:00:41 PM oubiwann: Okay, I've got some pretty good PDFs now,
+6:00:46 PM oubiwann: I can put these up somewhere
+jriddy left the room. (6:00:51 PM)
+6:00:52 PM oubiwann: but the list is this:
+6:00:54 PM oubiwann: Actor induction and meta-evaluation
+6:01:02 PM oubiwann: Actor-oriented Metaprogramming
+6:01:11 PM oubiwann: Actor-oriented Metaprogramming
+6:01:22 PM oubiwann: whoops
+6:01:23 PM oubiwann: Actors and Continuous Functionals
+6:01:36 PM oubiwann: Communicating Sequential Processes
+6:01:44 PM oubiwann: Laws for Communicating Parallel Processes
+6:01:51 PM oubiwann: Protection and Synchronization in Actor Systems
+6:09:21 PM ralphm: oubiwann: regarding old papers: I don't think much *new* stuff is being discovered.
+6:09:58 PM ralphm: oubiwann: rather, each generation invents it all over again
+6:10:14 PM oubiwann: hehe
+6:10:17 PM oubiwann: yeah, I think so
+6:10:32 PM oubiwann: (which is why I respect these old papers so much)
+6:10:47 PM ralphm: right
+6:25:32 PM oubiwann: okay, I've uploaded the papers I've found here: http://www.twistedmatrix.com/users/oubiwann/actorModel/papers/
+6:25:49 PM oubiwann: I tried to get the original, but couldn't find an electronic copy of it anywhere
+6:26:54 PM oubiwann: "A Universal Modular Actor Formalism for Artificial Intelligence"
+6:33:38 PM dreid: oubiwann: The Society of Mind is pretty good. 
+6:35:10 PM oubiwann: dreid: hehe
+6:35:16 PM oubiwann: good ol' Minsky
+6:36:11 PM oubiwann: I think MS ended up using his terminology for some of their concurrency patterns
+6:38:03 PM oubiwann: the correlations between physics and the actor model for concurrency are quite delightful to me 
+6:38:32 PM oubiwann: I haven't read anyone mention light cones, but it's not to far off
+6:39:16 PM oubiwann: there are mentions of relativistic communications, though
+6:39:37 PM ralphm: hah
+6:39:40 PM oubiwann: oh, and *quantum mechanics* if you can believe that!
+6:40:13 PM dreid: Any questions about the things I said?  
+6:40:38 PM oubiwann: when someone comes up with an M-theoretic model for async processing, I'll be in heaven
+6:40:45 PM oubiwann: dreid: I don't think so
+6:40:56 PM dreid: oubiwann: http://pre.aps.org/abstract/PRE/v82/i5/e056104
+6:41:14 PM oubiwann: I've got a bunch of reading to do, and then I'll start putting it all together from a practical perspective
+6:41:22 PM oubiwann: and code will happen
+6:41:49 PM oubiwann: dreid: ha!
+6:41:51 PM oubiwann: nice 
+6:42:15 PM oubiwann: *chuckles as he reads the rest of the abstract*
+6:42:27 PM oubiwann: that sounds like the beginning of a Charlie Stross novel...
+dreid left the room ("Textual IRC Client: http://www.textualapp.com/"). (6:43:33 PM)
+6:46:31 PM oubiwann: I'll push up the IRC log later tonight, post a summary to to #5565, and give it a tweet, too
+6:46:35 PM oubiwann: thanks everyone
+6:46:46 PM oubiwann: and thanks dreid (even though you're gone now)

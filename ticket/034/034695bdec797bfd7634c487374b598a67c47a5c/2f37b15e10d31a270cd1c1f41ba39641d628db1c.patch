@@ -1,0 +1,100 @@
+Index: twisted/internet/defer.py
+===================================================================
+--- twisted/internet/defer.py	(revision 35103)
++++ twisted/internet/defer.py	(working copy)
+@@ -1092,6 +1092,35 @@
+             return deferred
+ 
+         if isinstance(result, Deferred):
++            def extendErrbackStack(r):
++                """
++                A failure was yielded by the generator, so for the failure's
++                traceback to be useful insert the current yield line into the
++                stack of frames.
++                """
++                f = g.gi_frame
++
++                # The following code is lifted almost straight from
++                # twisted.python.failure.Failure.__init__()
++                localz = f.f_locals.copy()
++                if f.f_locals is f.f_globals:
++                    globalz = {}
++                else:
++                    globalz = f.f_globals.copy()
++                for d in globalz, localz:
++                    if d.has_key("__builtins__"):
++                        del d["__builtins__"]
++
++                r.frames.insert(0, [
++                    f.f_code.co_name,
++                    f.f_code.co_filename,
++                    f.f_lineno,
++                    localz.items(),
++                    globalz.items(),
++                    ])
++                return r
++            result.addErrback(extendErrbackStack)
++
+             # a deferred was yielded, get the result.
+             def gotResult(r):
+                 if waiting[0]:
+Index: twisted/internet/test/inlinecb_tests.py
+===================================================================
+--- twisted/internet/test/inlinecb_tests.py	(revision 35103)
++++ twisted/internet/test/inlinecb_tests.py	(working copy)
+@@ -15,6 +15,7 @@
+ 
+ from twisted.trial.unittest import TestCase
+ from twisted.internet.defer import Deferred, returnValue, inlineCallbacks
++from twisted.python.failure import Failure
+ 
+ class NonLocalExitTests(TestCase):
+     """
+@@ -90,3 +91,35 @@
+         self.assertMistakenMethodWarning(results)
+ 
+ 
++class FrameStackTests(TestCase):
++    def test_failureContainsCallingFrames(self):
++        """
++        When L{inlineCallbacks} yields a failure, it should add itself to the
++        failure's frames so that the traceback is more useful.
++        """
++        @inlineCallbacks
++        def inline1():
++            yield 1/0
++
++        @inlineCallbacks
++        def inline2():
++            yield inline1()
++
++        @inlineCallbacks
++        def inline3():
++            yield inline2()
++
++        d = inline3()
++        results = []
++        d.addBoth(results.append)
++
++        failure = results[0]
++        self.assertIsInstance(failure, Failure)
++
++        functionNames = []
++        for funcName, filename, lineno, localVars, globalVars in failure.frames:
++            functionNames.append(funcName)
++        self.assertIn('inline1', functionNames)
++        self.assertIn('inline2', functionNames)
++        self.assertIn('inline3', functionNames)
++
+Index: twisted/internet/test/test_inlinecb.py
+===================================================================
+--- twisted/internet/test/test_inlinecb.py	(revision 35103)
++++ twisted/internet/test/test_inlinecb.py	(working copy)
+@@ -9,5 +9,6 @@
+ __all__ = ['NonLocalExitTests']
+ 
+ if sys.version_info[:2] >= (2, 5):
+-    from twisted.internet.test.inlinecb_tests import NonLocalExitTests
++    from twisted.internet.test.inlinecb_tests import (NonLocalExitTests,
++            FrameStackTests)
+ 

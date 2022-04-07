@@ -1,0 +1,216 @@
+=== modified file 'twisted/web/server.py'
+--- twisted/web/server.py	2009-04-15 23:23:02 +0000
++++ twisted/web/server.py	2009-07-27 18:14:00 +0000
+@@ -52,6 +52,80 @@
+     else:
+         return tuple(addr)
+ 
++
++def _handleUnsupportedMethod(request, resrc, e):
++    allowedMethods = e.allowedMethods
++    if (request.method == "HEAD") and ("GET" in allowedMethods):
++        # We must support HEAD (RFC 2616, 5.1.1).  If the
++        # resource doesn't, fake it by giving the resource
++        # a 'GET' request and then return only the headers,
++        # not the body.
++        log.msg("Using GET to fake a HEAD request for %s" %
++                (resrc,))
++        request.method = "GET"
++        body = resrc.render(request)
++
++        if body is NOT_DONE_YET:
++            log.msg("Tried to fake a HEAD request for %s, but "
++                    "it got away from me." % resrc)
++            # Oh well, I guess we won't include the content length.
++        else:
++            request.setHeader('content-length', str(len(body)))
++
++        request.write('')
++        request.finish()
++        return
++
++    if request.method in (supportedMethods):
++        # We MUST include an Allow header
++        # (RFC 2616, 10.4.6 and 14.7)
++        request.setHeader('Allow', allowedMethods)
++        s = ('''Your browser approached me (at %(URI)s) with'''
++             ''' the method "%(method)s".  I only allow'''
++             ''' the method%(plural)s %(allowed)s here.''' % {
++            'URI': request.uri,
++            'method': request.method,
++            'plural': ((len(allowedMethods) > 1) and 's') or '',
++            'allowed': string.join(allowedMethods, ', ')
++            })
++        epage = resource.ErrorPage(http.NOT_ALLOWED,
++                                   "Method Not Allowed", s)
++        body = epage.render(request)
++    else:
++        epage = resource.ErrorPage(http.NOT_IMPLEMENTED, "Huh?",
++                                   "I don't know how to treat a"
++                                   " %s request." % (request.method,))
++        body = epage.render(request)
++    # end except UnsupportedMethod
++    return body
++
++
++def _handleBody(request, resrc, body):
++    if body == NOT_DONE_YET:
++        return
++    if type(body) is not types.StringType:
++        body = resource.ErrorPage(
++            http.INTERNAL_SERVER_ERROR,
++            "Request did not return a string",
++            "Request: " + html.PRE(reflect.safe_repr(request)) + "<br />" +
++            "Resource: " + html.PRE(reflect.safe_repr(resrc)) + "<br />" +
++            "Value: " + html.PRE(reflect.safe_repr(body))).render(request)
++
++    if request.method == "HEAD":
++        if len(body) > 0:
++            # This is a Bad Thing (RFC 2616, 9.4)
++            log.msg("Warning: HEAD request %s for resource %s is"
++                    " returning a message body."
++                    "  I think I'll eat it."
++                    % (request, resrc))
++            request.setHeader('content-length', str(len(body)))
++        request.write('')
++    else:
++        request.setHeader('content-length', str(len(body)))
++        request.write(body)
++    request.finish()
++
++
+ class Request(pb.Copyable, http.Request, components.Componentized):
+     implements(iweb.IRequest)
+ 
+@@ -132,73 +206,9 @@
+         try:
+             body = resrc.render(self)
+         except UnsupportedMethod, e:
+-            allowedMethods = e.allowedMethods
+-            if (self.method == "HEAD") and ("GET" in allowedMethods):
+-                # We must support HEAD (RFC 2616, 5.1.1).  If the
+-                # resource doesn't, fake it by giving the resource
+-                # a 'GET' request and then return only the headers,
+-                # not the body.
+-                log.msg("Using GET to fake a HEAD request for %s" %
+-                        (resrc,))
+-                self.method = "GET"
+-                body = resrc.render(self)
+-
+-                if body is NOT_DONE_YET:
+-                    log.msg("Tried to fake a HEAD request for %s, but "
+-                            "it got away from me." % resrc)
+-                    # Oh well, I guess we won't include the content length.
+-                else:
+-                    self.setHeader('content-length', str(len(body)))
+-
+-                self.write('')
+-                self.finish()
+-                return
+-
+-            if self.method in (supportedMethods):
+-                # We MUST include an Allow header
+-                # (RFC 2616, 10.4.6 and 14.7)
+-                self.setHeader('Allow', allowedMethods)
+-                s = ('''Your browser approached me (at %(URI)s) with'''
+-                     ''' the method "%(method)s".  I only allow'''
+-                     ''' the method%(plural)s %(allowed)s here.''' % {
+-                    'URI': self.uri,
+-                    'method': self.method,
+-                    'plural': ((len(allowedMethods) > 1) and 's') or '',
+-                    'allowed': string.join(allowedMethods, ', ')
+-                    })
+-                epage = resource.ErrorPage(http.NOT_ALLOWED,
+-                                           "Method Not Allowed", s)
+-                body = epage.render(self)
+-            else:
+-                epage = resource.ErrorPage(http.NOT_IMPLEMENTED, "Huh?",
+-                                           "I don't know how to treat a"
+-                                           " %s request." % (self.method,))
+-                body = epage.render(self)
+-        # end except UnsupportedMethod
+-
+-        if body == NOT_DONE_YET:
+-            return
+-        if type(body) is not types.StringType:
+-            body = resource.ErrorPage(
+-                http.INTERNAL_SERVER_ERROR,
+-                "Request did not return a string",
+-                "Request: " + html.PRE(reflect.safe_repr(self)) + "<br />" +
+-                "Resource: " + html.PRE(reflect.safe_repr(resrc)) + "<br />" +
+-                "Value: " + html.PRE(reflect.safe_repr(body))).render(self)
+-
+-        if self.method == "HEAD":
+-            if len(body) > 0:
+-                # This is a Bad Thing (RFC 2616, 9.4)
+-                log.msg("Warning: HEAD request %s for resource %s is"
+-                        " returning a message body."
+-                        "  I think I'll eat it."
+-                        % (self, resrc))
+-                self.setHeader('content-length', str(len(body)))
+-            self.write('')
+-        else:
+-            self.setHeader('content-length', str(len(body)))
+-            self.write(body)
+-        self.finish()
++            body = _handleUnsupportedMethod(self, resrc, e)
++        _handleBody(self, resrc, body)
++
+ 
+     def processingFailed(self, reason):
+         log.err(reason)
+
+=== modified file 'twisted/web/test/test_httpauth.py'
+--- twisted/web/test/test_httpauth.py	2009-07-26 16:18:18 +0000
++++ twisted/web/test/test_httpauth.py	2009-07-27 18:14:00 +0000
+@@ -576,3 +576,20 @@
+         d.addCallback(cbFinished)
+         render(child, request)
+         return d
++
++
++    def test_unsupportedMethod(self):
++        """
++        Requests for a L{Resource} that doesn't implement the requested method
++        must result in 405 response code (Method Not Allowed).
++        """
++        self.avatar.putChild(self.childName, Resource())
++        self.credentialFactories.append(BasicCredentialFactory('example.com'))
++        request = self.makeRequest([self.childName])
++        child = self._authorizedBasicLogin(request)
++        d = request.notifyFinish()
++        def cbFinished(ignored):
++            self.assertEquals(request.responseCode, 405)
++        d.addCallback(cbFinished)
++        render(child, request)
++        return d
+
+=== modified file 'twisted/web/util.py'
+--- twisted/web/util.py	2004-08-25 08:36:30 +0000
++++ twisted/web/util.py	2009-07-27 18:14:00 +0000
+@@ -92,7 +92,8 @@
+     
+     def render(self, request):
+         self.d.addCallback(self._cbChild, request).addErrback(
+-            self._ebChild,request)
++            self._ebChildUnsupportedMethod, request).addErrback(
++            self._ebChild, request)
+         from twisted.web.server import NOT_DONE_YET
+         return NOT_DONE_YET
+ 
+@@ -105,6 +106,14 @@
+             request.write(result)
+             request.finish()
+ 
++    def _ebChildUnsupportedMethod(self, reason, request):
++        from twisted.web.server import UnsupportedMethod
++        from twisted.web.server import _handleBody, _handleUnsupportedMethod
++        reason.trap(UnsupportedMethod)
++        e = reason.value
++        body = _handleUnsupportedMethod(request, self, e)
++        _handleBody(request, self, body)
++
+     def _ebChild(self, reason, request):
+         request.processingFailed(reason)
+         return reason
+

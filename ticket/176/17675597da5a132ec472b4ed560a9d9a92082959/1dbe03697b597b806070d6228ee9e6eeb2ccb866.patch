@@ -1,0 +1,87 @@
+Index: test/test_tap.py
+===================================================================
+--- test/test_tap.py	(revision 33677)
++++ test/test_tap.py	(working copy)
+@@ -7,9 +7,10 @@
+ 
+ from twisted.trial.unittest import TestCase
+ from twisted.python.usage import UsageError
+-from twisted.names.tap import Options
++from twisted.names.tap import Options, _buildResolvers
+ from twisted.names.dns import PORT
+ from twisted.names.secondary import SecondaryAuthorityService
++from twisted.names.resolve import ResolverChain
+ 
+ 
+ class OptionsTests(TestCase):
+@@ -75,3 +76,22 @@
+         self.assertIsInstance(options.svcs[1], SecondaryAuthorityService)
+         self.assertEqual(secondary.primary, '1.2.3.5')
+         self.assertEqual(secondary._port, 5354)
++
++
++    def test_recursiveConfiguration(self):
++        """
++        Recursive DNS lookups, if enabled, should be a last-resort option.
++        Any other lookup method (cache, local lookup, etc.) should take
++        precedence over recursive lookups
++        """
++        options = Options()
++        options.parseOptions(['--hosts-file', 'hosts.txt', '--recursive'])
++        ca, cl = _buildResolvers(options)
++
++        # Clean the reactor -- boo
++        from twisted.internet import reactor
++        for p in reactor.getDelayedCalls():
++            if p.active():
++                p.cancel()
++
++        self.assertIsInstance(cl[-1], ResolverChain)
+Index: tap.py
+===================================================================
+--- tap.py	(revision 33677)
++++ tap.py	(working copy)
+@@ -16,6 +16,8 @@
+ from twisted.names import authority
+ from twisted.names import secondary
+ 
++from twisted.names import client, cache, hosts
++
+ class Options(usage.Options):
+     optParameters = [
+         ["interface", "i", "",   "The interface to which to bind"],
+@@ -112,17 +114,30 @@
+             raise usage.UsageError("Invalid port: %r" % (self['port'],))
+ 
+ 
+-def makeService(config):
+-    import client, cache, hosts
++def _buildResolvers(config):
++    """
++    Build DNS resolver instances in an order which leaves recursive
++    resolving as a last resort.
+ 
++    @type config: L{usage.Config} instance
++    @param config: Parsed command-line configuration
++
++    @return: Two-item tuple of a list of cache resovers and a list of client
++        resolvers
++    """
+     ca, cl = [], []
+     if config['cache']:
+         ca.append(cache.CacheResolver(verbose=config['verbose']))
++    if config['hosts-file']:
++        cl.append(hosts.Resolver(file=config['hosts-file']))
+     if config['recursive']:
+         cl.append(client.createResolver(resolvconf=config['resolv-conf']))
+-    if config['hosts-file']:
+-        cl.append(hosts.Resolver(file=config['hosts-file']))
++    return ca, cl
+ 
++
++def makeService(config):
++    ca, cl = _buildResolvers(config)
++
+     f = server.DNSServerFactory(config.zones, ca, cl, config['verbose'])
+     p = dns.DNSDatagramProtocol(f)
+     f.noisy = 0

@@ -1,0 +1,523 @@
+diff -ruN --exclude .svn --exclude '*.pyc' twisted.orig/protocols/policies.py twisted/protocols/policies.py
+--- twisted.orig/protocols/policies.py	2011-02-19 11:48:00.995103352 +0100
++++ twisted/protocols/policies.py	2011-07-03 17:10:49.226769912 +0200
+@@ -10,6 +10,7 @@
+ 
+ # system imports
+ import sys, operator
++import zlib
+ 
+ from zope.interface import directlyProvides, providedBy
+ 
+@@ -664,3 +665,57 @@
+         Override to define behavior other than dropping the connection.
+         """
+         self.transport.loseConnection()
++
++
++
++class CompressingProtocol(ProtocolWrapper):
++    """
++    Wraps a transport with zlib compression.
++
++    @ivar _compressor: Zlib object to compress the data stream
++    @type _compressor: C{zlib.compressobj}
++    @ivar _decompressor: Zlib object to decompress the data stream
++    @type _decompressor: C{zlib.decompressobj}
++
++    @since: 11.1
++    """
++
++    def __init__(self, factory, wrappedProtocol):
++        ProtocolWrapper.__init__(self, factory, wrappedProtocol)
++        self._compressor = zlib.compressobj()
++        self._decompressor = zlib.decompressobj()
++
++
++    def write(self, data):
++        if not data:
++            return
++        compressed = self._compressor.compress(data)
++        compressed += self._compressor.flush(zlib.Z_SYNC_FLUSH)
++        self.transport.write(compressed)
++
++
++    def writeSequence(self, dataSequence):
++        if not dataSequence:
++            return
++        compressed = [ self._compressor.compress(data)
++                       for data in dataSequence if data ]
++        if not compressed:
++            return
++        compressed.append(self._compressor.flush(zlib.Z_SYNC_FLUSH))
++        self.transport.writeSequence(compressed)
++
++
++    def dataReceived(self, data):
++        toDecompress = self._decompressor.unconsumed_tail + data
++        decompressed = self._decompressor.decompress(toDecompress, 1024)
++        self.wrappedProtocol.dataReceived(decompressed)
++
++
++    def connectionLost(self, reason):
++        try:
++            self.wrappedProtocol.dataReceived(self._decompressor.flush())
++        finally:
++            ProtocolWrapper.connectionLost(self, reason)
++
++
++
+diff -ruN --exclude .svn --exclude '*.pyc' twisted.orig/test/test_policies.py twisted/test/test_policies.py
+--- twisted.orig/test/test_policies.py	2011-02-19 11:47:58.445133226 +0100
++++ twisted/test/test_policies.py	2011-07-05 07:41:48.863740027 +0200
+@@ -5,7 +5,10 @@
+ Test code for policies.
+ """
+ 
++import zlib
++
+ from zope.interface import Interface, implements, implementedBy
++from zope.interface import providedBy, directlyProvides
+ 
+ from StringIO import StringIO
+ 
+@@ -40,6 +43,16 @@
+ 
+ 
+ 
++class SynchronousSimpleProtocol(SimpleProtocol):
++
++    def connectionMade(self):
++        self.connected = 1
++
++    def connectionLost(self, reason):
++        self.disconnected = 1
++
++
++
+ class SillyFactory(protocol.ClientFactory):
+ 
+     def __init__(self, p):
+@@ -681,3 +694,137 @@
+         f.resetCounter()
+         self.assertEqual(f._counter, 0)
+ 
++
++
++class CompressingProtocolTestCase(unittest.TestCase):
++    """
++    Tests for L{policies.CompressingProtocol}.
++    """
++
++    def setUp(self):
++        self.output = []
++        self.proto = SynchronousSimpleProtocol()
++        self.proto.makeConnection(StringTransport())
++        self.compress = policies.CompressingProtocol(WrappingFactory(None),
++                                                     self.proto)
++
++
++    def test_makeConnection(self):
++        """
++        The underlying transport should be wrapped transparently, and
++        C{connectionMade} should be called.
++        """
++        self.compress.makeConnection(self.proto.transport)
++        self.assertIdentical(self.proto.transport, self.compress)
++        self.assertEqual(self.proto.connected, 1)
++
++
++    def test_forwardProvides(self):
++        """
++        The underlying transport's interfaces should be provided by the wrapped
++        transport.
++        """
++        class ITesting(Interface):
++            pass
++
++        directlyProvides(self.proto.transport, ITesting)
++        self.compress.makeConnection(self.proto.transport)
++        for iface in providedBy(self.proto.transport):
++            self.assertTrue(iface.providedBy(self.compress))
++
++
++    def test_write(self):
++        """
++        Data passed to the transport is zlib compressed before being sent
++        over the connection.
++        """
++        self.proto.transport.write = self.output.append
++        self.compress.makeConnection(self.proto.transport)
++
++        data = "x" * 100
++        self.proto.transport.write(data)
++
++        self.assertTrue(len(self.output) > 0)
++        decompressor = zlib.decompressobj()
++        decompressedData = decompressor.decompress(self.output[0])
++        decompressedData += decompressor.flush()
++        self.assertEquals(data, decompressedData)
++
++
++    def test_writeSequence(self):
++        """
++        A sequence of data passed to the transport is zlib compressed
++        before being sent over the connection.
++        """
++        self.proto.transport.writeSequence = self.output.extend
++        self.compress.makeConnection(self.proto.transport)
++
++        data = [ "x" * 100 for i in range(10) ]
++        self.compress.writeSequence(data)
++
++        self.assertTrue(len(self.output) > 0)
++        decompressor = zlib.decompressobj()
++        decompressedData = [ decompressor.decompress(d)
++                             for d in self.output ]
++        self.assertEquals(''.join(data), ''.join(decompressedData))
++
++
++    def test_writeNoData(self):
++        """
++        If given no data, it should produce no output.
++        """
++        self.proto.transport.write = self.output.append
++        self.compress.makeConnection(self.proto.transport)
++        self.compress.write("")
++        self.assertEqual(len(self.output), 0)
++
++
++    def test_writeSequenceNoData(self):
++        """
++        If given an empty sequence as data, it should produce no output.
++        """
++        self.proto.transport.writeSequence = self.output.extend
++        self.compress.makeConnection(self.proto.transport)
++        self.compress.writeSequence([])
++        self.assertEqual(len(self.output), 0)
++
++
++    def test_writeSequenceOnlyEmpty(self):
++        """
++        If given a sequence with only empty data, it should produce no output.
++        """
++        self.proto.transport.writeSequence = self.output.extend
++        self.compress.makeConnection(self.proto.transport)
++        self.compress.writeSequence(["", "", ""])
++        self.assertEqual(len(self.output), 0)
++
++
++    def test_read(self):
++        """
++        Data comming from the connection should be zlib decompressed before
++        being passed to the protocol's C{dataReceived} method.
++        """
++        self.proto.dataReceived = self.output.append
++        self.compress.makeConnection(self.proto.transport)
++        data = "x" * 100
++        self.compress.dataReceived(zlib.compress(data))
++        self.compress.connectionLost(None)
++        self.assertEquals(data, ''.join(self.output))
++
++
++    def test_read_flush(self):
++        """
++        The C{zlib.Decompress.flush} method should be called on connection loss
++        and pass to C{dataReceived} the decompressed bytes left
++        before relaying C{connectionLost}.
++        """
++        self.proto.dataReceived = self.output.append
++        self.compress.makeConnection(self.proto.transport)
++        data = "x" * 4096
++        self.compress.dataReceived(zlib.compress(data))
++        assert len(self.output[0]) < 4096 # too much data, should be bufferred
++        self.compress.connectionLost(None)
++        self.assertEquals(data, ''.join(self.output))
++
++
++
+diff -ruN --exclude .svn --exclude '*.pyc' twisted.orig/words/protocols/jabber/xmlstream.py twisted/words/protocols/jabber/xmlstream.py
+--- twisted.orig/words/protocols/jabber/xmlstream.py	2011-07-03 10:51:52.549230845 +0200
++++ twisted/words/protocols/jabber/xmlstream.py	2011-07-05 07:48:25.459920570 +0200
+@@ -20,7 +20,7 @@
+ from twisted.internet.interfaces import ISSLTransport
+ from twisted.python import failure, log, randbytes
+ from twisted.python.hashlib import sha1
+-from twisted.protocols.policies import ProtocolWrapper, WrappingFactory
++from twisted.protocols.policies import CompressingProtocol, WrappingFactory
+ from twisted.words.protocols.jabber import error, ijabber, jid
+ from twisted.words.xish import domish, xmlstream
+ from twisted.words.xish.xmlstream import STREAM_CONNECTED_EVENT
+@@ -452,30 +452,23 @@
+ 
+ 
+ 
+-class CompressedTransport(ProtocolWrapper):
++class XmppCompressingProtocol(CompressingProtocol):
+     """
+     Wraps a transport with zlib compression, to implement XEP-0138 (stream
+     compression). Used by L{CompressInitiatingInitializer}.
+ 
+-    @ivar _compressor: Zlib object to compress the data stream
+-    @type _compressor: C{zlib.compressobj}
+-    @ivar _decompressor: Zlib object to decompress the data stream
+-    @type _decompressor: C{zlib.decompressobj}
+-
+     @since: 11.1
+     """
+ 
+     def __init__(self, wrappedProtocol):
+-        ProtocolWrapper.__init__(self, WrappingFactory(None), wrappedProtocol)
+-        self._compressor = zlib.compressobj()
+-        self._decompressor = zlib.decompressobj()
++        CompressingProtocol.__init__(self, WrappingFactory(None), wrappedProtocol)
+ 
+ 
+     def makeConnection(self, transport):
+         """
+         Connects the factory to us and us to the underlying transport.
+ 
+-        L{ProtocolWrapper.makeConnection}() can't be used because it calls
++        L{CompressingProtocol.makeConnection}() can't be used because it calls
+         makeConnection on the wrapped protocol, which causes a second full
+         initialization, while the stream just needs a reset (done by
+         L{CompressInitiatingInitializer}).
+@@ -487,38 +480,6 @@
+         transport.protocol = self
+ 
+ 
+-    def write(self, data):
+-        if not data:
+-            return
+-        compressed = self._compressor.compress(data)
+-        compressed += self._compressor.flush(zlib.Z_SYNC_FLUSH)
+-        self.transport.write(compressed)
+-
+-
+-    def writeSequence(self, dataSequence):
+-        if not dataSequence:
+-            return
+-        compressed = [ self._compressor.compress(data)
+-                       for data in dataSequence if data ]
+-        if not compressed:
+-            return
+-        compressed.append(self._compressor.flush(zlib.Z_SYNC_FLUSH))
+-        self.transport.writeSequence(compressed)
+-
+-
+-    def dataReceived(self, data):
+-        toDecompress = self._decompressor.unconsumed_tail + data
+-        decompressed = self._decompressor.decompress(toDecompress, 1024)
+-        self.wrappedProtocol.dataReceived(decompressed)
+-
+-
+-    def connectionLost(self, reason):
+-        try:
+-            self.wrappedProtocol.dataReceived(self._decompressor.flush())
+-        finally:
+-            ProtocolWrapper.connectionLost(self, reason)
+-
+-
+ 
+ class CompressNegotiationFailed(Exception):
+     """
+@@ -532,7 +493,7 @@
+ 
+ class CompressInitiatingInitializer(BaseFeatureInitiatingInitializer):
+     """
+-    Compressed stream initializer for the initiating entity.
++    Compressing stream initializer for the initiating entity.
+ 
+     If it is included in the list of initializers for an XMPP stream, it must
+     be after the TLS initializer. The spec allows stream compression after
+@@ -559,8 +520,8 @@
+         Negotiation succeeded, wrap the transport in zlib compression
+         """
+         self.xmlstream.removeObserver('/failure', self._onFailure)
+-        compressedTransport = CompressedTransport(self.xmlstream)
+-        compressedTransport.makeConnection(self.xmlstream.transport)
++        compressingProtocol = XmppCompressingProtocol(self.xmlstream)
++        compressingProtocol.makeConnection(self.xmlstream.transport)
+         self.xmlstream.reset()
+         self.xmlstream.sendHeader()
+         self._deferred.callback(Reset)
+@@ -1293,7 +1254,7 @@
+            'STREAM_CONNECTED_EVENT', 'STREAM_END_EVENT', 'STREAM_ERROR_EVENT',
+            'STREAM_START_EVENT', 'StreamManager', 'TLSError', 'TLSFailed',
+            'TLSInitiatingInitializer', 'TLSNotSupported', 'TLSRequired',
+-           'CompressedTransport', 'CompressInitiatingInitializer',
++           'XmppCompressingProtocol', 'CompressInitiatingInitializer',
+            'CompressNegotiationFailed', 'TimeoutError', 'XMPPHandler',
+            'XMPPHandlerCollection', 'XmlStream', 'XmlStreamFactory',
+            'XmlStreamServerFactory', 'hashPassword', 'toResponse',
+diff -ruN --exclude .svn --exclude '*.pyc' twisted.orig/words/test/test_jabberxmlstream.py twisted/words/test/test_jabberxmlstream.py
+--- twisted.orig/words/test/test_jabberxmlstream.py	2011-07-03 10:51:13.879721421 +0200
++++ twisted/words/test/test_jabberxmlstream.py	2011-07-05 07:47:37.190413405 +0200
+@@ -1306,9 +1306,9 @@
+ 
+ 
+ 
+-class CompressedTransportTest(unittest.TestCase):
++class CompressingProtocolTestCase(unittest.TestCase):
+     """
+-    Tests for L{xmlstream.CompressedTransport}. They cover the case where
++    Tests for L{xmlstream.CompressingProtocol}. They cover the case where
+     compression is enabled (offered by the server and requested by the client).
+ 
+     Negotiation is not covered in this class, so compression is activated by
+@@ -1317,8 +1317,6 @@
+ 
+     def setUp(self):
+         self.output = []
+-        self.done = []
+-
+         self.authenticator = xmlstream.Authenticator()
+         self.xmlstream = xmlstream.XmlStream(self.authenticator)
+         self.xmlstream.transport = proto_helpers.StringTransport()
+@@ -1326,7 +1324,7 @@
+         self.xmlstream.dataReceived("<stream:stream xmlns='jabber:client' "
+                         "xmlns:stream='http://etherx.jabber.org/streams' "
+                         "from='example.com' id='12345' version='1.0'>")
+-        self.compressed = xmlstream.CompressedTransport(self.xmlstream)
++        self.compress = xmlstream.XmppCompressingProtocol(self.xmlstream)
+ 
+ 
+     def test_makeConnection(self):
+@@ -1334,115 +1332,11 @@
+         The underlying transport should be wrapped transparently, without
+         calling L{XmlStream.connectionMade} twice.
+         """
+-        self.xmlstream.connectionMade = lambda: self.done.append("connMade")
+-        self.compressed.makeConnection(self.xmlstream.transport)
+-        self.assertIdentical(self.xmlstream.transport, self.compressed)
++        self.xmlstream.connectionMade = lambda: self.output.append("connMade")
++        self.compress.makeConnection(self.xmlstream.transport)
++        self.assertIdentical(self.xmlstream.transport, self.compress)
+         # connectionMade must not be called twice
+-        self.assertEquals([], self.done)
+-
+-
+-    def test_forwardProvides(self):
+-        """
+-        The underlying transport's interfaces should be provided by the wrapped
+-        transport.
+-        """
+-        self.compressed.makeConnection(self.xmlstream.transport)
+-        for iface in providedBy(self.xmlstream.transport):
+-            self.assertTrue(iface.providedBy(self.compressed))
+-
+-
+-    def test_write(self):
+-        """
+-        Data passed to L{XmlStream.send} is zlib compressed before being sent
+-        over the connection.
+-        """
+-        self.xmlstream.transport.write = self.done.append
+-        self.compressed.makeConnection(self.xmlstream.transport)
+-
+-        data = "x" * 100
+-        self.xmlstream.send(data)
+-
+-        self.assertTrue(len(self.done) > 0)
+-        decompressor = zlib.decompressobj()
+-        decompressedData = decompressor.decompress(self.done[0])
+-        decompressedData += decompressor.flush()
+-        self.assertEquals(data, decompressedData)
+-
+-
+-    def test_writeSequence(self):
+-        """
+-        A sequence of data passed to L{XmlStream.send} is zlib compressed
+-        before being sent over the connection.
+-        """
+-        self.xmlstream.transport.writeSequence = self.done.extend
+-        self.compressed.makeConnection(self.xmlstream.transport)
+-
+-        data = [ "x" * 100 for i in range(10) ]
+-        self.compressed.writeSequence(data)
+-
+-        self.assertTrue(len(self.done) > 0)
+-        decompressor = zlib.decompressobj()
+-        decompressedData = [ decompressor.decompress(d)
+-                              for d in self.done ]
+-        self.assertEquals(''.join(data), ''.join(decompressedData))
+-
+-
+-    def test_writeNoData(self):
+-        """
+-        If given no data, it should produce no output.
+-        """
+-        self.xmlstream.transport.write = self.done.append
+-        self.compressed.makeConnection(self.xmlstream.transport)
+-        self.compressed.write("")
+-        self.assertEqual(len(self.done), 0)
+-
+-
+-    def test_writeSequenceNoData(self):
+-        """
+-        If given an empty sequence as data, it should produce no output.
+-        """
+-        self.xmlstream.transport.writeSequence = self.done.extend
+-        self.compressed.makeConnection(self.xmlstream.transport)
+-        self.compressed.writeSequence([])
+-        self.assertEqual(len(self.done), 0)
+-
+-
+-    def test_writeSequenceOnlyEmpty(self):
+-        """
+-        If given a sequence with only empty data, it should produce no output.
+-        """
+-        self.xmlstream.transport.writeSequence = self.done.extend
+-        self.compressed.makeConnection(self.xmlstream.transport)
+-        self.compressed.writeSequence(["", "", ""])
+-        self.assertEqual(len(self.done), 0)
+-
+-
+-    def test_read(self):
+-        """
+-        Data comming from the connection should be zlib decompressed before
+-        being passed to L{XmlStream.dataReceived}.
+-        """
+-        self.xmlstream.dataReceived = self.done.append
+-        self.compressed.makeConnection(self.xmlstream.transport)
+-        data = "x" * 100
+-        self.compressed.dataReceived(zlib.compress(data))
+-        self.compressed.connectionLost(None)
+-        self.assertEquals(data, ''.join(self.done))
+-
+-
+-    def test_read_flush(self):
+-        """
+-        The C{zlib.Decompress.flush} method should be called on connection loss
+-        and pass to L{XmlStream.dataReceived} the decompressed bytes left
+-        before relaying L{XmlStream.connectionLost}.
+-        """
+-        self.xmlstream.dataReceived = self.done.append
+-        self.compressed.makeConnection(self.xmlstream.transport)
+-        data = "x" * 4096
+-        self.compressed.dataReceived(zlib.compress(data))
+-        assert len(self.done[0]) < 4096 # too much data, should be bufferred
+-        self.compressed.connectionLost(None)
+-        self.assertEquals(data, ''.join(self.done))
++        self.assertEquals([], self.output)
+ 
+ 
+ 
+@@ -1477,7 +1371,7 @@
+         def cb(result):
+             self.assertEquals(result, xmlstream.Reset)
+             self.assertTrue(isinstance(self.xmlstream.transport,
+-                                       xmlstream.CompressedTransport))
++                                       xmlstream.CompressingProtocol))
+         d.addCallback(cb)
+         self.assertTrue(len(self.output) > 0)
+         compress = self.output[0]
+@@ -1526,7 +1420,7 @@
+         def cb(result):
+             self.assertEquals(result, xmlstream.Reset)
+             self.assertTrue(isinstance(self.xmlstream.transport,
+-                                       xmlstream.CompressedTransport))
++                                       xmlstream.CompressingProtocol))
+         d.addCallback(cb)
+         self.assertTrue(len(self.output) > 0)
+         compress = self.output[0]

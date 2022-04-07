@@ -1,0 +1,142 @@
+Index: twisted/tap/test/test_portforward.py
+===================================================================
+--- twisted/tap/test/test_portforward.py	(revision 0)
++++ twisted/tap/test/test_portforward.py	(revision 0)
+@@ -0,0 +1,28 @@
++# Copyright (c) Twisted Matrix Laboratories.
++# See LICENSE for details.
++
++"""
++Tests for L{twisted.tap.portforward}.
++"""
++
++from twisted.trial.unittest import TestCase
++
++from twisted.python.usage import UsageError
++from twisted.tap.portforward import Options
++
++
++class OptionsTestCase(TestCase):
++    """
++    Tests for the command line option parser used for C{twistd portforward}.
++    """
++    def testListenWithoutRemote(self):
++        """
++        Test that specifying --listen without specifying --remote
++        raises a UsageError.
++        """
++        self.assertRaises(
++            UsageError,
++            Options().parseOptions,
++            ['--listen', "tcp:3939"])
++
++
+Index: twisted/tap/portforward.py
+===================================================================
+--- twisted/tap/portforward.py	(revision 30886)
++++ twisted/tap/portforward.py	(working copy)
+@@ -5,9 +5,13 @@
+ """
+ Support module for making a port forwarder with twistd.
+ """
++from twisted.internet import reactor
++from twisted.internet import endpoints
+ from twisted.protocols import portforward
+ from twisted.python import usage
+ from twisted.application import strports
++from twisted.application import service
++from twisted.application import internet
+ 
+ class Options(usage.Options):
+     synopsis = "[options]"
+@@ -16,9 +20,34 @@
+           ["port", "p", "6666","Set the port number."],
+           ["host", "h", "localhost","Set the host."],
+           ["dest_port", "d", 6665,"Set the destination port."],
++          ["connect", "c", None, "Endpoint to connect to."],
+     ]
+     zsh_actions = {"host" : "_hosts"}
+ 
++    def __init__(self):
++        usage.Options.__init__(self)
++        self['listen'] = []
++        self['connect'] = None
++
++    def opt_listen(self, strport):
++        self['listen'].append(endpoints.serverFromString(reactor, strport))
++    opt_l = opt_listen
++
++    def postOptions(self):
++        if self['listen'] and self['connect'] is None:
++            raise usage.UsageError("--listen requires --connect")
++
+ def makeService(config):
+-    f = portforward.ProxyFactory(config['host'], int(config['dest_port']))
+-    return strports.service(config['port'], f)
++    if config['connect'] is None:
++        factory = portforward.ProxyFactory(config['host'],
++                                     int(config['dest_port']))
++        return strports.service(config['port'], factory)
++
++    multiService = service.MultiService()
++    factory = portforward.EndpointProxyFactory(config['connect'])
++    for endpoint in config['listen']:
++        epService = internet.StreamServerEndpointService(endpoint, factory)
++        epService.setServiceParent(multiService)
++
++    return multiService
++
+Index: twisted/tap/topfiles/4927.feature
+===================================================================
+--- twisted/tap/topfiles/4927.feature	(revision 0)
++++ twisted/tap/topfiles/4927.feature	(revision 0)
+@@ -0,0 +1 @@
++The twistd portforward plugin now accepts two new options (--listen and --remote).  The --listen option expects a server strport and can be specified multiple times to listen on different endpoints.  Only stream-oriented endpoints should be specified.  The --remote options expects a client strport and is the endpoint to forward to.
+Index: twisted/protocols/portforward.py
+===================================================================
+--- twisted/protocols/portforward.py	(revision 30886)
++++ twisted/protocols/portforward.py	(working copy)
+@@ -7,7 +7,9 @@
+ """
+ 
+ # Twisted imports
++from twisted.internet import reactor
+ from twisted.internet import protocol
++from twisted.internet import endpoints
+ from twisted.python import log
+ 
+ class Proxy(protocol.Protocol):
+@@ -61,8 +63,9 @@
+ 
+         client = self.clientProtocolFactory()
+         client.setServer(self)
++        self.connectToRemoteServer(client)
+ 
+-        from twisted.internet import reactor
++    def connectToRemoteServer(self, client):
+         reactor.connectTCP(self.factory.host, self.factory.port, client)
+ 
+ 
+@@ -74,3 +77,22 @@
+     def __init__(self, host, port):
+         self.host = host
+         self.port = port
++
++
++class EndpointProxyServer(ProxyServer):
++
++    clientProtocolFactory = ProxyClientFactory
++
++    def connectToRemoteServer(self, client):
++        endpoint = endpoints.clientFromString(reactor, self.factory.strport)
++        endpoint.connect(client)
++
++
++class EndpointProxyFactory(protocol.Factory):
++    """Factory for port forwarder that uses stream endpoints."""
++
++    protocol = EndpointProxyServer
++
++    def __init__(self, strport):
++        self.strport = strport
++

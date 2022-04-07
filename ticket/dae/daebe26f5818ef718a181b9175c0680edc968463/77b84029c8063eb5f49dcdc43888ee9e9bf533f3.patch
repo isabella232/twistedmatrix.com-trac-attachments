@@ -1,0 +1,1614 @@
+diff --git twisted/internet/endpoints.py twisted/internet/endpoints.py
+index b68ac75..5f08a4a 100644
+--- twisted/internet/endpoints.py
++++ twisted/internet/endpoints.py
+@@ -34,6 +34,7 @@ from twisted.internet.protocol import ProcessProtocol, Protocol
+ from twisted.internet.stdio import StandardIO, PipeAddress
+ from twisted.internet.task import LoopingCall
+ from twisted.plugin import IPlugin, getPlugins
++from twisted.protocols import haproxy
+ from twisted.python import log
+ from twisted.python.compat import nativeString, unicode, _matchingString
+ from twisted.python.components import proxyForInterface
+@@ -41,6 +42,7 @@ from twisted.python.constants import NamedConstant, Names
+ from twisted.python.failure import Failure
+ from twisted.python.filepath import FilePath
+ from twisted.python.compat import iterbytes
++from twisted.python.compat import iteritems
+ from twisted.python.systemd import ListenFDs
+ 
+ 
+@@ -1283,6 +1285,41 @@ class _TCP6ServerParser(object):
+ 
+ 
+ 
++@implementer(IPlugin, IStreamServerEndpointStringParser)
++class _HAProxyServerParser(object):
++    """
++    Stream server endpoint string parser for the HAProxyServerEndpoint type.
++
++    @ivar prefix: See L{IStreamServerEndpointStringParser.prefix}.
++    """
++    prefix = "haproxy"
++
++    def _parseServer(self, reactor, *args, **kwargs):
++        """
++        Internal parser function.
++
++        @param reactor: An L{IReactorTCP} provider.
++
++        @param wrapped: The name of the endpoint to wrap. Ex: tcp6.
++        @type wrapped: str
++        """
++        # Rebuild the description to re-dispatch the request.
++        description = ':'.join(str(arg) for arg in args)
++        description += ':'.join(
++            '%s=%s' % (str(key), quoteStringArgument(str(value)))
++            for key, value in iteritems(kwargs)
++        )
++        return _WrapperServerEndpoint(
++            serverFromString(reactor, description),
++            haproxy.HAProxyFactory,
++        )
++
++
++    def parseStreamServer(self, reactor, *args, **kwargs):
++        return self._parseServer(reactor, *args, **kwargs)
++
++
++
+ _serverParsers = {"tcp": _parseTCP,
+                   "unix": _parseUNIX,
+                   "ssl": _parseSSL,
+@@ -1906,6 +1943,30 @@ class _WrapperEndpoint(object):
+ 
+ 
+ 
++@implementer(interfaces.IStreamServerEndpoint)
++class _WrapperServerEndpoint(object):
++    """
++    A server endpoint that wraps another server endpoint.
++    """
++
++    def __init__(self, wrappedEndpoint, wrapperFactory):
++        """
++        Construct a L{_WrapperServerEndpoint}.
++        """
++        self._wrappedEndpoint = wrappedEndpoint
++        self._wrapperFactory = wrapperFactory
++
++
++    def listen(self, protocolFactory):
++        """
++        Connect the given protocol factory and unwrap its result.
++        """
++        return self._wrappedEndpoint.listen(
++            self._wrapperFactory(protocolFactory)
++        )
++
++
++
+ def wrapClientTLS(connectionCreator, wrappedEndpoint):
+     """
+     Wrap an endpoint which upgrades to TLS as soon as the connection is
+@@ -2027,6 +2088,3 @@ class _TLSClientEndpointParser(object):
+         @rtype: L{IStreamClientEndpoint}
+         """
+         return _parseClientTLS(reactor, *args, **kwargs)
+-
+-
+-
+diff --git twisted/plugins/twisted_core.py twisted/plugins/twisted_core.py
+index a2010b3..7d8a4b7 100644
+--- twisted/plugins/twisted_core.py
++++ twisted/plugins/twisted_core.py
+@@ -4,10 +4,10 @@
+ 
+ from twisted.internet.endpoints import (
+     _SystemdParser, _TCP6ServerParser, _StandardIOParser,
+-    _TLSClientEndpointParser)
++    _TLSClientEndpointParser, _HAProxyServerParser)
+ 
+ systemdEndpointParser = _SystemdParser()
+ tcp6ServerEndpointParser = _TCP6ServerParser()
+ stdioEndpointParser = _StandardIOParser()
+ tlsClientEndpointParser = _TLSClientEndpointParser()
+-
++haProxyServerEndpointParser = _HAProxyServerParser()
+diff --git twisted/protocols/haproxy/__init__.py twisted/protocols/haproxy/__init__.py
+new file mode 100644
+index 0000000..1f334f5
+--- /dev/null
++++ twisted/protocols/haproxy/__init__.py
+@@ -0,0 +1,35 @@
++# Copyright (c) Twisted Matrix Laboratories.
++# See LICENSE for details.
++
++"""
++HAProxy PROXY protocol implementations.
++"""
++
++from ._exc import InvalidProxyHeader
++from ._exc import InvalidNetworkProtocol
++from ._exc import MissingAddressData
++
++from ._info import ProxyInfo
++
++from ._interfaces import IProxyInfo
++from ._interfaces import IProxyParser
++
++from ._v1parser import V1Parser
++
++from ._v2parser import V2Parser
++
++from ._wrapper import HAProxyProtocol
++from ._wrapper import HAProxyFactory
++
++__all__ = (
++    'InvalidProxyHeader',
++    'InvalidNetworkProtocol',
++    'MissingAddressData',
++    'ProxyInfo',
++    'IProxyInfo',
++    'IProxyParser',
++    'V1Parser',
++    'V2Parser',
++    'HAProxyProtocol',
++    'HAProxyFactory',
++)
+diff --git twisted/protocols/haproxy/_exc.py twisted/protocols/haproxy/_exc.py
+new file mode 100644
+index 0000000..ffa2856
+--- /dev/null
++++ twisted/protocols/haproxy/_exc.py
+@@ -0,0 +1,54 @@
++# Copyright (c) Twisted Matrix Laboratories.
++# See LICENSE for details.
++
++"""
++HAProxy specific exceptions.
++"""
++
++import contextlib
++import sys
++
++from twisted.python import compat
++
++
++class InvalidProxyHeader(Exception):
++    """
++    The provided PROXY protocol header is invalid.
++    """
++
++
++
++class InvalidNetworkProtocol(InvalidProxyHeader):
++    """
++    The network protocol was not one of TCP4 TCP6 or UNKNOWN.
++    """
++
++
++
++class MissingAddressData(InvalidProxyHeader):
++    """
++    The address data is missing or incomplete.
++    """
++
++
++
++@contextlib.contextmanager
++def convertError(sourceType, targetType):
++    """
++    Convert an error into a different error type.
++
++    @param sourceType: The type of exception that should be caught and
++        converted.
++    @type sourceType: L{Exception}
++
++    @param targetType: The type of exception to which the original should be
++        converted.
++    @type targetType: L{Exception}
++    """
++    try:
++
++        yield None
++
++    except sourceType:
++
++        compat.reraise(targetType(), sys.exc_info()[-1])
+diff --git twisted/protocols/haproxy/_info.py twisted/protocols/haproxy/_info.py
+new file mode 100644
+index 0000000..f69b2c6
+--- /dev/null
++++ twisted/protocols/haproxy/_info.py
+@@ -0,0 +1,36 @@
++# Copyright (c) Twisted Matrix Laboratories.
++# See LICENSE for details.
++
++"""
++IProxyInfo implementation.
++"""
++
++import zope.interface
++
++from . import _interfaces
++
++
++class ProxyInfo(object):
++    """
++    A data container for parsed PROXY protocol information.
++
++    @ivar header: The raw header bytes extracted from the connection.
++    @type header: bytes
++    @ivar source: The connection source address.
++    @type source: L{twisted.internet.interfaces.IAddress}
++    @ivar destination: The connection destination address.
++    @type destination: L{twisted.internet.interfaces.IAddress}
++    """
++
++    zope.interface.implements(_interfaces.IProxyInfo)
++
++    __slots__ = (
++        'header',
++        'source',
++        'destination',
++    )
++
++    def __init__(self, header, source, destination):
++        self.header = header
++        self.source = source
++        self.destination = destination
+diff --git twisted/protocols/haproxy/_interfaces.py twisted/protocols/haproxy/_interfaces.py
+new file mode 100644
+index 0000000..f6297e5
+--- /dev/null
++++ twisted/protocols/haproxy/_interfaces.py
+@@ -0,0 +1,65 @@
++# Copyright (c) Twisted Matrix Laboratories.
++# See LICENSE for details.
++
++"""
++Interfaces used by the PROXY protocol modules.
++"""
++
++import zope.interface
++
++
++class IProxyInfo(zope.interface.Interface):
++    """
++    Data container for PROXY protocol header data.
++    """
++
++    header = zope.interface.Attribute(
++        "The raw byestring that represents the PROXY protocol header.",
++    )
++    source = zope.interface.Attribute(
++        "An L{twisted.internet.interfaces.IAddress} representing the "
++        "connection source."
++    )
++    destination = zope.interface.Attribute(
++        "An L{twisted.internet.interfaces.IAddress} representing the "
++        "connection destination."
++    )
++
++
++
++class IProxyParser(zope.interface.Interface):
++    """
++    Streaming parser that handles PROXY protocol headers.
++    """
++
++    def feed(self, data):
++        """
++        Consume a chunk of data and attempt to parse it.
++
++        @param data: A bytestring.
++        @type data: bytes
++
++        @return: A two-tuple containing, in order, a
++            L{twisted.protocols.haproxy.IProxyInfo} and any bytes fed to the
++            parser that followed the end of the header. Both of these values
++            are None until a complete header is parsed.
++
++        @raises InvalidProxyHeader: If the bytes fed to the parser create an
++            invalid PROXY header.
++        """
++
++
++    def parse(self, line):
++        """
++        Parse a bytestring as a full PROXY protocol header line.
++
++        @param line: A bytestring that represents a valid HAProxy PROXY
++            protocol header line.
++        @type line: bytes
++
++        @return: A L{twisted.protocols.haproxy.IProxyInfo} containing the parsed
++            data.
++
++        @raises InvalidProxyHeader: If the bytestring does not represent a
++            valid PROXY header.
++        """
+diff --git twisted/protocols/haproxy/_v1parser.py twisted/protocols/haproxy/_v1parser.py
+new file mode 100644
+index 0000000..ca35fb2
+--- /dev/null
++++ twisted/protocols/haproxy/_v1parser.py
+@@ -0,0 +1,151 @@
++# -*- test-case-name: twisted.protocols.haproxy.test.test_v1parser -*-
++
++# Copyright (c) Twisted Matrix Laboratories.
++# See LICENSE for details.
++
++"""
++IProxyParser implementation for version one of the PROXY protocol.
++"""
++
++import zope.interface
++
++from twisted.internet import address
++
++from . import _exc
++from . import _info
++from . import _interfaces
++
++
++
++class V1Parser(object):
++    """
++    PROXY protocol version one header parser.
++
++    Version one of the PROXY protocol is a human readable format represented
++    by a single, newline delimited binary string that contains all of the
++    relevant source and destination data.
++    """
++
++    zope.interface.implements(_interfaces.IProxyParser)
++
++    PROXYSTR = b'PROXY'
++    UNKNOWN_PROTO = b'UNKNOWN'
++    TCP4_PROTO = b'TCP4'
++    TCP6_PROTO = b'TCP6'
++    ALLOWED_NET_PROTOS = (
++        TCP4_PROTO,
++        TCP6_PROTO,
++        UNKNOWN_PROTO,
++    )
++    NEWLINE = b'\r\n'
++
++    def __init__(self):
++        self.buffer = b''
++
++
++    def feed(self, data):
++        """
++        Consume a chunk of data and attempt to parse it.
++
++        @param data: A bytestring.
++        @type data: bytes
++
++        @return: A two-tuple containing, in order, a
++            L{twisted.protocols.haproxy.IProxyInfo} and any bytes fed to the
++            parser that followed the end of the header. Both of these values
++            are None until a complete header is parsed.
++
++        @raises InvalidProxyHeader: If the bytes fed to the parser create an
++            invalid PROXY header.
++        """
++        self.buffer += data
++        if len(self.buffer) > 107 and self.NEWLINE not in self.buffer:
++            raise InvalidProxyHeader()
++        lines = (self.buffer).split(self.NEWLINE, 1)
++        if not len(lines) > 1:
++            return (None, None)
++        self.buffer = b''
++        remaining = lines.pop()
++        header = lines.pop()
++        info = self.parse(header)
++        return (info, remaining)
++
++
++    @classmethod
++    def parse(cls, line):
++        """
++        Parse a bytestring as a full PROXY protocol header line.
++
++        @param line: A bytestring that represents a valid HAProxy PROXY
++            protocol header line.
++        @type line: bytes
++
++        @return: A L{twisted.protocols.haproxy.IProxyInfo} containing the
++            parsed data.
++
++        @raises InvalidProxyHeader: If the bytestring does not represent a
++            valid PROXY header.
++
++        @raises InvalidNetworkProtocol: When no protocol can be parsed or is
++            not one of the allowed values.
++
++        @raises MissingAddressData: When the protocol is TCP* but the header
++            does not contain a complete set of addresses and ports.
++        """
++        originalLine = line
++        proxyStr = None
++        networkProtocol = None
++        sourceAddr = None
++        sourcePort = None
++        destAddr = None
++        destPort = None
++
++        with _exc.convertError(ValueError, _exc.InvalidProxyHeader):
++
++            proxyStr, line = line.split(b' ', 1)
++
++        if proxyStr != cls.PROXYSTR:
++
++            raise _exc.InvalidProxyHeader()
++
++        with _exc.convertError(ValueError, _exc.InvalidNetworkProtocol):
++
++            networkProtocol, line = line.split(b' ', 1)
++
++        if networkProtocol not in cls.ALLOWED_NET_PROTOS:
++
++            raise _exc.InvalidNetworkProtocol()
++
++        if networkProtocol == cls.UNKNOWN_PROTO:
++
++            return _info.ProxyInfo(originalLine, None, None)
++
++        with _exc.convertError(ValueError, _exc.MissingAddressData):
++
++            sourceAddr, line = line.split(b' ', 1)
++
++        with _exc.convertError(ValueError, _exc.MissingAddressData):
++
++            destAddr, line = line.split(b' ', 1)
++
++        with _exc.convertError(ValueError, _exc.MissingAddressData):
++
++            sourcePort, line = line.split(b' ', 1)
++
++        with _exc.convertError(ValueError, _exc.MissingAddressData):
++
++            destPort = line.split(b' ')[0]
++
++        if networkProtocol == cls.TCP4_PROTO:
++
++            return _info.ProxyInfo(
++                originalLine,
++                address.IPv4Address('TCP', sourceAddr, int(sourcePort)),
++                address.IPv4Address('TCP', destAddr, int(destPort)),
++            )
++
++        return _info.ProxyInfo(
++            originalLine,
++            address.IPv6Address('TCP', sourceAddr, int(sourcePort)),
++            address.IPv6Address('TCP', destAddr, int(destPort)),
++        )
+diff --git twisted/protocols/haproxy/_v2parser.py twisted/protocols/haproxy/_v2parser.py
+new file mode 100644
+index 0000000..a646cf8
+--- /dev/null
++++ twisted/protocols/haproxy/_v2parser.py
+@@ -0,0 +1,180 @@
++# -*- test-case-name: twisted.protocols.haproxy.test.test_v2parser -*-
++
++# Copyright (c) Twisted Matrix Laboratories.
++# See LICENSE for details.
++
++"""
++IProxyParser implementation for version two of the PROXY protocol.
++"""
++
++import binascii
++import struct
++import zope.interface
++
++from twisted.internet import address
++
++from . import _exc
++from . import _info
++from . import _interfaces
++
++
++_HIGH = 0b11110000
++_LOW = 0b00001111
++
++
++
++class V2Parser(object):
++    """
++    PROXY protocol version two header parser.
++
++    Version two of the PROXY protocol is a binary format.
++    """
++
++    zope.interface.implements(_interfaces.IProxyParser)
++
++    PREFIX = b'\x0D\x0A\x0D\x0A\x00\x0D\x0A\x51\x55\x49\x54\x0A'
++    VERSIONS = (32,)
++    COMMANDS = {0: 'LOCAL', 1: 'PROXY'}
++    NETFAMILIES = {
++        0: 'AF_UNSPEC',
++        16: 'AF_INET',
++        32: 'AF_INET6',
++        48: 'AF_UNIX',
++    }
++    NETPROTOCOLS = {
++        0: 'UNSPEC',
++        1: 'STREAM',
++        2: 'DGRAM',
++    }
++    ADDRESSFORMATS = {
++        # TCP4
++        17: '!4s4s2H',
++        18: '!4s4s2H',
++        # TCP6
++        33: '!16s16s2H',
++        34: '!16s16s2H',
++        # UNIX
++        49: '!108s108s',
++        50: '!108s108s',
++    }
++
++    def __init__(self):
++        self.buffer = b''
++
++
++    def feed(self, data):
++        """
++        Consume a chunk of data and attempt to parse it.
++
++        @param data: A bytestring.
++        @type data: bytes
++
++        @return: A two-tuple containing, in order, a
++            L{twisted.protocols.haproxy.IProxyInfo} and any bytes fed to the
++            parser that followed the end of the header. Both of these values
++            are None until a complete header is parsed.
++
++        @raises InvalidProxyHeader: If the bytes fed to the parser create an
++            invalid PROXY header.
++        """
++        self.buffer += data
++        if len(self.buffer) < 16:
++            return (None, None)
++
++        size = struct.unpack('!H', self.buffer[14:16])[0] + 16
++        if len(self.buffer) < size:
++            return (None, None)
++
++        header, remaining = self.buffer[:size], self.buffer[size:]
++        self.buffer = b''
++        info = self.parse(header)
++        return (info, remaining)
++
++
++    @staticmethod
++    def _bytesToIPv4(bytestring):
++        """
++        Convert a bytestring to an IPv4 representation.
++        """
++        return '.'.join(str(ord(b)) for b in bytestring)
++
++
++    @staticmethod
++    def _bytesToIPv6(bytestring):
++        """
++        Convert a bytestring to an IPv6 representation.
++        """
++        hexString = binascii.b2a_hex(bytestring)
++        return ':'.join(
++            '%x' % (int(hexString[b:b+4], 16),) for b in range(0, 32, 4)
++        )
++
++
++    @classmethod
++    def parse(cls, line):
++        """
++        Parse a bytestring as a full PROXY protocol header.
++
++        @param line: A bytestring that represents a valid HAProxy PROXY
++            protocol version 2 header.
++        @type line: bytes
++
++        @return: A L{twisted.protocols.haproxy.IProxyInfo} containing the
++            parsed data.
++
++        @raises InvalidProxyHeader: If the bytestring does not represent a
++            valid PROXY header.
++        """
++        prefix = line[:12]
++        addrInfo = None
++        with _exc.convertError(IndexError, _exc.InvalidProxyHeader):
++            versionCommand = ord(line[12])
++            familyProto = ord(line[13])
++
++        if prefix != cls.PREFIX:
++            raise _exc.InvalidProxyHeader()
++
++        version, command = versionCommand & _HIGH, versionCommand & _LOW
++        if version not in cls.VERSIONS or command not in cls.COMMANDS:
++            raise _exc.InvalidProxyHeader()
++
++        if cls.COMMANDS[command] == 'LOCAL':
++            return _info.ProxyInfo(line, None, None)
++
++        family, netproto = familyProto & _HIGH, familyProto & _LOW
++        if family not in cls.NETFAMILIES or netproto not in cls.NETPROTOCOLS:
++            raise _exc.InvalidNetworkProtocol()
++
++        if (
++                cls.NETFAMILIES[family] == 'AF_UNSPEC' or
++                cls.NETPROTOCOLS[netproto] == 'UNSPEC'
++        ):
++            return _info.ProxyInfo(line, None, None)
++
++        addressFormat = cls.ADDRESSFORMATS[familyProto]
++        addrInfo = line[16:16+struct.calcsize(addressFormat)]
++        if cls.NETFAMILIES[family] == 'AF_UNIX':
++            with _exc.convertError(struct.error, _exc.MissingAddressData):
++                source, dest = struct.unpack(addressFormat, addrInfo)
++            return _info.ProxyInfo(
++                line,
++                address.UNIXAddress(source.rstrip(b'\x00')),
++                address.UNIXAddress(dest.rstrip(b'\x00')),
++            )
++
++        addrType = 'TCP' if cls.NETPROTOCOLS[netproto] == 'STREAM' else 'UDP'
++        addrCls = address.IPv4Address
++        addrParser = cls._bytesToIPv4
++        if cls.NETFAMILIES[family] == 'AF_INET6':
++            addrCls = address.IPv6Address
++            addrParser = cls._bytesToIPv6
++
++        with _exc.convertError(struct.error, _exc.MissingAddressData):
++            info = struct.unpack(addressFormat, addrInfo)
++            source, dest, sPort, dPort = info
++
++        return _info.ProxyInfo(
++            line,
++            addrCls(addrType, addrParser(source), sPort),
++            addrCls(addrType, addrParser(dest), dPort),
++        )
+diff --git twisted/protocols/haproxy/_wrapper.py twisted/protocols/haproxy/_wrapper.py
+new file mode 100644
+index 0000000..c5c7ea9
+--- /dev/null
++++ twisted/protocols/haproxy/_wrapper.py
+@@ -0,0 +1,91 @@
++# -*- test-case-name: twisted.protocols.haproxy.test.test_wrapper -*-
++
++# Copyright (c) Twisted Matrix Laboratories.
++# See LICENSE for details.
++
++"""
++Protocol wrapper that provides HAProxy PROXY protocol support.
++"""
++
++from twisted.protocols import policies
++from twisted.internet import interfaces
++
++from . import _exc
++from . import _v1parser
++from . import _v2parser
++
++
++
++class HAProxyProtocol(policies.ProtocolWrapper, object):
++    """
++    A Protocol wrapper that provides HAProxy support.
++    """
++
++    V1PARSER = _v1parser.V1Parser
++    V1BYTES = V1PARSER.PROXYSTR
++    V2PARSER = _v2parser.V2Parser
++    V2BYTES = V2PARSER.PREFIX
++
++    def __init__(self, factory, wrappedProtocol):
++        policies.ProtocolWrapper.__init__(self, factory, wrappedProtocol)
++        self.buffer = b''
++        self.info = None
++        self.parser = None
++
++
++    def dataReceived(self, data):
++        if self.info:
++            return self.wrappedProtocol.dataReceived(data)
++
++        if not self.parser:
++            if (
++                    len(data) >= 16 and
++                    data[:12] == self.V2BYTES and
++                    ord(data[12]) & 0b11110000 == 0x20
++            ):
++                self.parser = self.V2PARSER()
++            elif len(data) >= 8 and data[:5] == self.V1BYTES:
++                self.parser = self.V1PARSER()
++            else:
++                self.loseConnection()
++                return None
++
++        try:
++            self.info, remaining = self.parser.feed(data)
++            if remaining:
++                self.wrappedProtocol.dataReceived(remaining)
++        except _exc.InvalidProxyHeader:
++            self.loseConnection()
++
++
++    def getPeer(self):
++        if self.info and self.info.source:
++            return self.info.source
++        return self.transport.getPeer()
++
++
++    def getHost(self):
++        if self.info and self.info.destination:
++            return self.info.destination
++        return self.transport.getHost()
++
++
++
++class HAProxyFactory(policies.WrappingFactory):
++    """
++    A Factory wrapper that adds PROXY protocol support to connections.
++    """
++    protocol = HAProxyProtocol
++
++    def logPrefix(self):
++        """
++        Annotate the wrapped factory's log prefix with some text indicating
++        the PROXY protocol is in use.
++
++        @rtype: C{str}
++        """
++        if interfaces.ILoggingContext.providedBy(self.wrappedFactory):
++            logPrefix = self.wrappedFactory.logPrefix()
++        else:
++            logPrefix = self.wrappedFactory.__class__.__name__
++        return "%s (PROXY)" % (logPrefix,)
+diff --git twisted/protocols/haproxy/test/__init__.py twisted/protocols/haproxy/test/__init__.py
+new file mode 100644
+index 0000000..29fa9a0
+--- /dev/null
++++ twisted/protocols/haproxy/test/__init__.py
+@@ -0,0 +1,6 @@
++# Copyright (c) Twisted Matrix Laboratories.
++# See LICENSE for details.
++
++"""
++Unit tests for L{twisted.protocols.haproxy}.
++"""
+diff --git twisted/protocols/haproxy/test/test_v1parser.py twisted/protocols/haproxy/test/test_v1parser.py
+new file mode 100644
+index 0000000..98a4222
+--- /dev/null
++++ twisted/protocols/haproxy/test/test_v1parser.py
+@@ -0,0 +1,133 @@
++# Copyright (c) Twisted Matrix Laboratories.
++# See LICENSE for details.
++
++"""
++Test cases for L{twisted.protocols.haproxy.V1Parser}.
++"""
++
++from twisted.trial import unittest
++from twisted.internet import address
++
++from .. import _exc
++from .. import _v1parser
++
++
++class V1ParserTests(unittest.TestCase):
++    """
++    Test L{twisted.protocols.haproxy.V1Parser} behaviour.
++    """
++
++    def test_missingPROXYHeaderValue(self):
++        """
++        Test that an exception is raised when the PROXY header is missing.
++        """
++        self.assertRaises(
++            _exc.InvalidProxyHeader,
++            _v1parser.V1Parser.parse,
++            b'NOTPROXY ',
++        )
++
++
++    def test_invalidNetworkProtocol(self):
++        """
++        Test that an exception is raised when the proto is not TCP or UNKNOWN.
++        """
++        self.assertRaises(
++            _exc.InvalidNetworkProtocol,
++            _v1parser.V1Parser.parse,
++            b'PROXY WUTPROTO ',
++        )
++
++
++    def test_missingSourceData(self):
++        """
++        Test that an exception is raised when the proto has no source data.
++        """
++        self.assertRaises(
++            _exc.MissingAddressData,
++            _v1parser.V1Parser.parse,
++            b'PROXY TCP4 ',
++        )
++
++
++    def test_missingDestData(self):
++        """
++        Test that an exception is raised when the proto has no destination.
++        """
++        self.assertRaises(
++            _exc.MissingAddressData,
++            _v1parser.V1Parser.parse,
++            b'PROXY TCP4 127.0.0.1 8080 8888',
++        )
++
++
++    def test_fullParsingSuccess(self):
++        """
++        Test that parsing is successful for a PROXY header.
++        """
++        info = _v1parser.V1Parser.parse(
++            b'PROXY TCP4 127.0.0.1 127.0.0.1 8080 8888',
++        )
++        self.assertTrue(isinstance(info.source, address.IPv4Address))
++        self.assertEqual(info.source.host, b'127.0.0.1')
++        self.assertEqual(info.source.port, 8080)
++        self.assertEqual(info.destination.host, b'127.0.0.1')
++        self.assertEqual(info.destination.port, 8888)
++
++
++    def test_fullParsingSuccess_IPv6(self):
++        """
++        Test that parsing is successful for an IPv6 PROXY header.
++        """
++        info = _v1parser.V1Parser.parse(
++            b'PROXY TCP6 ::1 ::1 8080 8888',
++        )
++        self.assertTrue(isinstance(info.source, address.IPv6Address))
++        self.assertEqual(info.source.host, b'::1')
++        self.assertEqual(info.source.port, 8080)
++        self.assertEqual(info.destination.host, b'::1')
++        self.assertEqual(info.destination.port, 8888)
++
++
++    def test_fullParsingSuccess_UNKNOWN(self):
++        """
++        Test that parsing is successful for a UNKNOWN PROXY header.
++        """
++        info = _v1parser.V1Parser.parse(
++            b'PROXY UNKNOWN anything could go here',
++        )
++        self.assertIs(info.source, None)
++        self.assertIs(info.destination, None)
++
++
++    def test_feedParsing(self):
++        """
++        Test that parsing happens when fed a complete line.
++        """
++        parser = _v1parser.V1Parser()
++        info, remaining = parser.feed(b'PROXY TCP4 127.0.0.1 127.0.0.1 ')
++        self.assertFalse(info)
++        self.assertFalse(remaining)
++        info, remaining = parser.feed(b'8080 8888')
++        self.assertFalse(info)
++        self.assertFalse(remaining)
++        info, remaining = parser.feed(b'\r\n')
++        self.assertFalse(remaining)
++        self.assertTrue(isinstance(info.source, address.IPv4Address))
++        self.assertEqual(info.source.host, b'127.0.0.1')
++        self.assertEqual(info.source.port, 8080)
++        self.assertEqual(info.destination.host, b'127.0.0.1')
++        self.assertEqual(info.destination.port, 8888)
++
++
++    def test_feedParsingOverflow(self):
++        """
++        Test that parsing leaves overflow bytes in the buffer.
++        """
++        parser = _v1parser.V1Parser()
++        info, remaining = parser.feed(
++            b'PROXY TCP4 127.0.0.1 127.0.0.1 8080 8888\r\nHTTP/1.1 GET /\r\n',
++        )
++        self.assertTrue(info)
++        self.assertEqual(remaining, b'HTTP/1.1 GET /\r\n')
++        self.assertFalse(parser.buffer)
+diff --git twisted/protocols/haproxy/test/test_v2parser.py twisted/protocols/haproxy/test/test_v2parser.py
+new file mode 100644
+index 0000000..95987a7
+--- /dev/null
++++ twisted/protocols/haproxy/test/test_v2parser.py
+@@ -0,0 +1,318 @@
++# Copyright (c) Twisted Matrix Laboratories.
++# See LICENSE for details.
++
++"""
++Test cases for L{twisted.protocols.haproxy.V2Parser}.
++"""
++
++from twisted.trial import unittest
++from twisted.internet import address
++
++from .. import _exc
++from .. import _v2parser
++
++
++class V2ParserTests(unittest.TestCase):
++    """
++    Test L{twisted.protocols.haproxy.V2Parser} behaviour.
++    """
++
++    def _makeHeaderIPv6(
++            self,
++            sig=None,
++            verCom=None,
++            famProto=None,
++            addrLength=None,
++            addrs=None,
++            ports=None,
++    ):
++        """
++        Construct a version 2 header with custom bytes.
++        """
++        sig = sig or b'\x0D\x0A\x0D\x0A\x00\x0D\x0A\x51\x55\x49\x54\x0A'
++        # V2 PROXY
++        verCom = verCom or b'\x21'
++        # AF_INET6/STREAM
++        famProto = famProto or b'\x21'
++        # 16 bytes for 2 IPv6 addresses and two ports
++        addrLength = addrLength or b'\x00\x24'
++        # ::1 for source and destination
++        addrs = addrs or ((b'\x00' * 15) + b'\x01') * 2
++        # 8080 for source 8888 for destination
++        ports = ports or b'\x1F\x90\x22\xB8'
++        return sig + verCom + famProto + addrLength + addrs + ports
++
++
++    def _makeHeaderIPv4(
++            self,
++            sig=None,
++            verCom=None,
++            famProto=None,
++            addrLength=None,
++            addrs=None,
++            ports=None,
++    ):
++        """
++        Construct a version 2 header with custom bytes.
++        """
++        sig = sig or b'\x0D\x0A\x0D\x0A\x00\x0D\x0A\x51\x55\x49\x54\x0A'
++        # V2 PROXY
++        verCom = verCom or b'\x21'
++        # AF_INET/STREAM
++        famProto = famProto or b'\x11'
++        # 12 bytes for 2 IPv4 addresses and two ports
++        addrLength = addrLength or b'\x00\x0C'
++        # 127.0.0.1 for source and destination
++        addrs = addrs or b'\x7F\x00\x00\x01\x7F\x00\x00\x01'
++        # 8080 for source 8888 for destination
++        ports = ports or b'\x1F\x90\x22\xB8'
++        return sig + verCom + famProto + addrLength + addrs + ports
++
++
++    def _makeHeaderUnix(
++            self,
++            sig=None,
++            verCom=None,
++            famProto=None,
++            addrLength=None,
++            addrs=None,
++    ):
++        """
++        Construct a version 2 header with custom bytes.
++        """
++        sig = sig or b'\x0D\x0A\x0D\x0A\x00\x0D\x0A\x51\x55\x49\x54\x0A'
++        # V2 PROXY
++        verCom = verCom or b'\x21'
++        # AF_UNIX/STREAM
++        famProto = famProto or b'\x31'
++        # 108 bytes for 2 null terminated paths
++        addrLength = addrLength or b'\x00\xD8'
++        # /home/tests/mysockets/sock for source and destination paths
++        defaultAddrs = (
++            b'\x2F\x68\x6F\x6D\x65\x2F\x74\x65\x73\x74\x73\x2F\x6D\x79\x73\x6F'
++            b'\x63\x6B\x65\x74\x73\x2F\x73\x6F\x63\x6B' + (b'\x00' * 82)
++        ) * 2
++        addrs = addrs or defaultAddrs
++        return sig + verCom + famProto + addrLength + addrs
++
++
++    def test_happyPathIPv4(self):
++        """
++        Test if a well formed IPv4 header is parsed without error.
++        """
++        header = self._makeHeaderIPv4()
++        self.assertTrue(_v2parser.V2Parser.parse(header))
++
++
++    def test_happyPathIPv6(self):
++        """
++        Test if a well formed IPv6 header is parsed without error.
++        """
++        header = self._makeHeaderIPv6()
++        self.assertTrue(_v2parser.V2Parser.parse(header))
++
++
++    def test_happyPathUnix(self):
++        """
++        Test if a well formed UNIX header is parsed without error.
++        """
++        header = self._makeHeaderUnix()
++        self.assertTrue(_v2parser.V2Parser.parse(header))
++
++
++    def test_invalidSignature(self):
++        """
++        Test if an invalid signature block raises InvalidProxyError.
++        """
++        header = self._makeHeaderIPv4(sig=b'\x00'*12)
++        self.assertRaises(
++            _exc.InvalidProxyHeader,
++            _v2parser.V2Parser.parse,
++            header,
++        )
++
++
++    def test_invalidVersion(self):
++        """
++        Test if an invalid version raises InvalidProxyError.
++        """
++        header = self._makeHeaderIPv4(verCom=b'\x11')
++        self.assertRaises(
++            _exc.InvalidProxyHeader,
++            _v2parser.V2Parser.parse,
++            header,
++        )
++
++
++    def test_invalidCommand(self):
++        """
++        Test if an invalid command raises InvalidProxyError.
++        """
++        header = self._makeHeaderIPv4(verCom=b'\x23')
++        self.assertRaises(
++            _exc.InvalidProxyHeader,
++            _v2parser.V2Parser.parse,
++            header,
++        )
++
++
++    def test_localCommandIpv4(self):
++        """
++        Test that local does not return endpoint data for IPv4 connections.
++        """
++        header = self._makeHeaderIPv4(verCom=b'\x20')
++        info = _v2parser.V2Parser.parse(header)
++        self.assertFalse(info.source)
++        self.assertFalse(info.destination)
++
++
++    def test_localCommandIpv6(self):
++        """
++        Test that local does not return endpoint data for IPv6 connections.
++        """
++        header = self._makeHeaderIPv6(verCom=b'\x20')
++        info = _v2parser.V2Parser.parse(header)
++        self.assertFalse(info.source)
++        self.assertFalse(info.destination)
++
++
++    def test_localCommandUnix(self):
++        """
++        Test that local does not return endpoint data for UNIX connections.
++        """
++        header = self._makeHeaderUnix(verCom=b'\x20')
++        info = _v2parser.V2Parser.parse(header)
++        self.assertFalse(info.source)
++        self.assertFalse(info.destination)
++
++
++    def test_proxyCommandIpv4(self):
++        """
++        Test that proxy returns endpoint data for IPv4 connections.
++        """
++        header = self._makeHeaderIPv4(verCom=b'\x21')
++        info = _v2parser.V2Parser.parse(header)
++        self.assertTrue(info.source)
++        self.assertTrue(isinstance(info.source, address.IPv4Address))
++        self.assertTrue(info.destination)
++        self.assertTrue(isinstance(info.destination, address.IPv4Address))
++
++
++    def test_proxyCommandIpv6(self):
++        """
++        Test that proxy returns endpoint data for IPv6 connections.
++        """
++        header = self._makeHeaderIPv6(verCom=b'\x21')
++        info = _v2parser.V2Parser.parse(header)
++        self.assertTrue(info.source)
++        self.assertTrue(isinstance(info.source, address.IPv6Address))
++        self.assertTrue(info.destination)
++        self.assertTrue(isinstance(info.destination, address.IPv6Address))
++
++
++    def test_proxyCommandUnix(self):
++        """
++        Test that proxy returns endpoint data for UNIX connections.
++        """
++        header = self._makeHeaderUnix(verCom=b'\x21')
++        info = _v2parser.V2Parser.parse(header)
++        self.assertTrue(info.source)
++        self.assertTrue(isinstance(info.source, address.UNIXAddress))
++        self.assertTrue(info.destination)
++        self.assertTrue(isinstance(info.destination, address.UNIXAddress))
++
++
++    def test_unspecFamilyIpv4(self):
++        """
++        Test that UNSPEC does not return endpoint data for IPv4 connections.
++        """
++        header = self._makeHeaderIPv4(famProto=b'\x01')
++        info = _v2parser.V2Parser.parse(header)
++        self.assertFalse(info.source)
++        self.assertFalse(info.destination)
++
++
++    def test_unspecFamilyIpv6(self):
++        """
++        Test that UNSPEC does not return endpoint data for IPv6 connections.
++        """
++        header = self._makeHeaderIPv6(famProto=b'\x01')
++        info = _v2parser.V2Parser.parse(header)
++        self.assertFalse(info.source)
++        self.assertFalse(info.destination)
++
++
++    def test_unspecFamilyUnix(self):
++        """
++        Test that UNSPEC does not return endpoint data for UNIX connections.
++        """
++        header = self._makeHeaderUnix(famProto=b'\x01')
++        info = _v2parser.V2Parser.parse(header)
++        self.assertFalse(info.source)
++        self.assertFalse(info.destination)
++
++
++    def test_unspecProtoIpv4(self):
++        """
++        Test that UNSPEC does not return endpoint data for IPv4 connections.
++        """
++        header = self._makeHeaderIPv4(famProto=b'\x10')
++        info = _v2parser.V2Parser.parse(header)
++        self.assertFalse(info.source)
++        self.assertFalse(info.destination)
++
++
++    def test_unspecProtoIpv6(self):
++        """
++        Test that UNSPEC does not return endpoint data for IPv6 connections.
++        """
++        header = self._makeHeaderIPv6(famProto=b'\x20')
++        info = _v2parser.V2Parser.parse(header)
++        self.assertFalse(info.source)
++        self.assertFalse(info.destination)
++
++
++    def test_unspecProtoUnix(self):
++        """
++        Test that UNSPEC does not return endpoint data for UNIX connections.
++        """
++        header = self._makeHeaderUnix(famProto=b'\x30')
++        info = _v2parser.V2Parser.parse(header)
++        self.assertFalse(info.source)
++        self.assertFalse(info.destination)
++
++
++    def test_overflowIpv4(self):
++        """
++        Test that overflow bits are preserved during feed parsing for IPv4.
++        """
++        testValue = b'TEST DATA\r\n\r\nTEST DATA'
++        header = self._makeHeaderIPv4() + testValue
++        parser = _v2parser.V2Parser()
++        info, overflow = parser.feed(header)
++        self.assertTrue(info)
++        self.assertEqual(overflow, testValue)
++
++
++    def test_overflowIpv6(self):
++        """
++        Test that overflow bits are preserved during feed parsing for IPv6.
++        """
++        testValue = b'TEST DATA\r\n\r\nTEST DATA'
++        header = self._makeHeaderIPv6() + testValue
++        parser = _v2parser.V2Parser()
++        info, overflow = parser.feed(header)
++        self.assertTrue(info)
++        self.assertEqual(overflow, testValue)
++
++
++    def test_overflowUnix(self):
++        """
++        Test that overflow bits are preserved during feed parsing for Unix.
++        """
++        testValue = b'TEST DATA\r\n\r\nTEST DATA'
++        header = self._makeHeaderUnix() + testValue
++        parser = _v2parser.V2Parser()
++        info, overflow = parser.feed(header)
++        self.assertTrue(info)
++        self.assertEqual(overflow, testValue)
+diff --git twisted/protocols/haproxy/test/test_wrapper.py twisted/protocols/haproxy/test/test_wrapper.py
+new file mode 100644
+index 0000000..ac1aed2
+--- /dev/null
++++ twisted/protocols/haproxy/test/test_wrapper.py
+@@ -0,0 +1,355 @@
++# Copyright (c) Twisted Matrix Laboratories.
++# See LICENSE for details.
++
++"""
++Test cases for L{twisted.protocols.haproxy.HAProxyProtocol}.
++"""
++
++from twisted.trial import unittest
++from twisted.internet import address
++from twisted.internet import protocol
++
++from .. import _wrapper
++
++
++class StaticTransport(object):
++
++    """
++    Transport stand-in that maintains test state.
++    """
++
++    def __init__(self):
++        self.disconnected = False
++
++
++    def loseConnection(self):
++        self.disconnected = True
++
++
++
++class StaticProtocol(protocol.Protocol):
++
++    """
++    Protocol stand-in that maintains test state.
++    """
++
++    def __init__(self):
++        self.source = None
++        self.destination = None
++        self.data = b''
++        self.disconnected = False
++
++
++    def dataReceived(self, data):
++        self.source = self.transport.getPeer()
++        self.destination = self.transport.getHost()
++        self.data += data
++
++
++
++class StaticFactory(protocol.Factory):
++
++    """
++    Protocol factory stand-in that maintains test state.
++    """
++
++    protocol = StaticProtocol
++
++
++
++class HAProxyFactoryV1Tests(unittest.TestCase):
++    """
++    Test L{twisted.protocols.haproxy.HAProxyFactory} with v1 PROXY headers.
++    """
++
++    def test_invalidHeaderDisconnects(self):
++        """
++        Test if invalid headers result in connectionLost events.
++        """
++        factory = _wrapper.HAProxyFactory(StaticFactory())
++        proto = factory.buildProtocol(
++            address.IPv4Address('TCP', '127.1.1.1', 8080),
++        )
++        transport = StaticTransport()
++        proto.makeConnection(transport)
++        proto.dataReceived(b'NOTPROXY anything can go here\r\n')
++        self.assertTrue(transport.disconnected)
++
++
++    def test_validIPv4HeaderResolves_getPeerHost(self):
++        """
++        Test if IPv4 headers result in the correct host and peer data.
++        """
++        factory = _wrapper.HAProxyFactory(StaticFactory())
++        proto = factory.buildProtocol(
++            address.IPv4Address('TCP', '127.0.0.1', 8080),
++        )
++        transport = StaticTransport()
++        proto.makeConnection(transport)
++        proto.dataReceived(b'PROXY TCP4 1.1.1.1 2.2.2.2 8080 8888\r\n')
++        self.assertEqual(proto.getPeer().host, '1.1.1.1')
++        self.assertEqual(proto.getPeer().port, 8080)
++        self.assertEqual(
++            proto.wrappedProtocol.transport.getPeer().host,
++            '1.1.1.1',
++        )
++        self.assertEqual(
++            proto.wrappedProtocol.transport.getPeer().port,
++            8080,
++        )
++        self.assertEqual(proto.getHost().host, '2.2.2.2')
++        self.assertEqual(proto.getHost().port, 8888)
++        self.assertEqual(
++            proto.wrappedProtocol.transport.getHost().host,
++            '2.2.2.2',
++        )
++        self.assertEqual(
++            proto.wrappedProtocol.transport.getHost().port,
++            8888,
++        )
++
++
++    def test_validIPv6HeaderResolves_getPeerHost(self):
++        """
++        Test if IPv6 headers result in the correct host and peer data.
++        """
++        factory = _wrapper.HAProxyFactory(StaticFactory())
++        proto = factory.buildProtocol(
++            address.IPv6Address('TCP', '::1', 8080),
++        )
++        transport = StaticTransport()
++        proto.makeConnection(transport)
++        proto.dataReceived(b'PROXY TCP6 ::1 ::2 8080 8888\r\n')
++        self.assertEqual(proto.getPeer().host, '::1')
++        self.assertEqual(proto.getPeer().port, 8080)
++        self.assertEqual(
++            proto.wrappedProtocol.transport.getPeer().host,
++            '::1',
++        )
++        self.assertEqual(
++            proto.wrappedProtocol.transport.getPeer().port,
++            8080,
++        )
++        self.assertEqual(proto.getHost().host, '::2')
++        self.assertEqual(proto.getHost().port, 8888)
++        self.assertEqual(
++            proto.wrappedProtocol.transport.getHost().host,
++            '::2',
++        )
++        self.assertEqual(
++            proto.wrappedProtocol.transport.getHost().port,
++            8888,
++        )
++
++
++    def test_overflowBytesSentToWrappedProtocol(self):
++        """
++        Test if non-header bytes are passed to the wrapped protocol.
++        """
++        factory = _wrapper.HAProxyFactory(StaticFactory())
++        proto = factory.buildProtocol(
++            address.IPv6Address('TCP', '::1', 8080),
++        )
++        transport = StaticTransport()
++        proto.makeConnection(transport)
++        proto.dataReceived(b'PROXY TCP6 ::1 ::2 8080 8888\r\nHTTP/1.1 / GET')
++        self.assertEqual(proto.wrappedProtocol.data, b'HTTP/1.1 / GET')
++
++
++    def test_overflowBytesSentToWrappedProtocolChunks(self):
++        """
++        Test if header streaming passes extra data appropriately.
++        """
++        factory = _wrapper.HAProxyFactory(StaticFactory())
++        proto = factory.buildProtocol(
++            address.IPv6Address('TCP', '::1', 8080),
++        )
++        transport = StaticTransport()
++        proto.makeConnection(transport)
++        proto.dataReceived(b'PROXY TCP6 ::1 ::2 ')
++        proto.dataReceived('8080 8888\r\nHTTP/1.1 / GET')
++        self.assertEqual(proto.wrappedProtocol.data, b'HTTP/1.1 / GET')
++
++
++
++class HAProxyFactoryV2Tests(unittest.TestCase):
++    """
++    Test L{twisted.protocols.haproxy.HAProxyFactory} with v2 PROXY headers.
++    """
++
++    IPV4HEADER = (
++        # V2 Signature
++        b'\x0D\x0A\x0D\x0A\x00\x0D\x0A\x51\x55\x49\x54\x0A'
++        # V2 PROXY command
++        b'\x21'
++        # AF_INET/STREAM
++        b'\x11'
++        # 12 bytes for 2 IPv4 addresses and two ports
++        b'\x00\x0C'
++        # 127.0.0.1 for source and destination
++        b'\x7F\x00\x00\x01\x7F\x00\x00\x01'
++        # 8080 for source 8888 for destination
++        b'\x1F\x90\x22\xB8'
++    )
++    IPV6HEADER = (
++        # V2 Signature
++        b'\x0D\x0A\x0D\x0A\x00\x0D\x0A\x51\x55\x49\x54\x0A'
++        # V2 PROXY command
++        b'\x21'
++        # AF_INET6/STREAM
++        b'\x21'
++        # 16 bytes for 2 IPv6 addresses and two ports
++        b'\x00\x24'
++        # ::1 for source and destination
++        b'\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x01'
++        b'\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x01'
++        # 8080 for source 8888 for destination
++        b'\x1F\x90\x22\xB8'
++    )
++
++    _SOCK_PATH = (
++        b'\x2F\x68\x6F\x6D\x65\x2F\x74\x65\x73\x74\x73\x2F\x6D\x79\x73\x6F'
++        b'\x63\x6B\x65\x74\x73\x2F\x73\x6F\x63\x6B' + (b'\x00' * 82)
++    )
++    UNIXHEADER = (
++        # V2 Signature
++        b'\x0D\x0A\x0D\x0A\x00\x0D\x0A\x51\x55\x49\x54\x0A'
++        # V2 PROXY command
++        b'\x21'
++        # AF_UNIX/STREAM
++        b'\x31'
++        # 108 bytes for 2 null terminated paths
++        b'\x00\xD8'
++        # /home/tests/mysockets/sock for source and destination paths
++    ) + _SOCK_PATH + _SOCK_PATH
++
++    def test_invalidHeaderDisconnects(self):
++        """
++        Test if invalid headers result in connectionLost events.
++        """
++        factory = _wrapper.HAProxyFactory(StaticFactory())
++        proto = factory.buildProtocol(
++            address.IPv6Address('TCP', '::1', 8080),
++        )
++        transport = StaticTransport()
++        proto.makeConnection(transport)
++        proto.dataReceived(b'\x00' + self.IPV4HEADER[1:])
++        self.assertTrue(transport.disconnected)
++
++
++    def test_validIPv4HeaderResolves_getPeerHost(self):
++        """
++        Test if IPv4 headers result in the correct host and peer data.
++        """
++        factory = _wrapper.HAProxyFactory(StaticFactory())
++        proto = factory.buildProtocol(
++            address.IPv4Address('TCP', '127.0.0.1', 8080),
++        )
++        transport = StaticTransport()
++        proto.makeConnection(transport)
++        proto.dataReceived(self.IPV4HEADER)
++        self.assertEqual(proto.getPeer().host, '127.0.0.1')
++        self.assertEqual(proto.getPeer().port, 8080)
++        self.assertEqual(
++            proto.wrappedProtocol.transport.getPeer().host,
++            '127.0.0.1',
++        )
++        self.assertEqual(
++            proto.wrappedProtocol.transport.getPeer().port,
++            8080,
++        )
++        self.assertEqual(proto.getHost().host, '127.0.0.1')
++        self.assertEqual(proto.getHost().port, 8888)
++        self.assertEqual(
++            proto.wrappedProtocol.transport.getHost().host,
++            '127.0.0.1',
++        )
++        self.assertEqual(
++            proto.wrappedProtocol.transport.getHost().port,
++            8888,
++        )
++
++
++    def test_validIPv6HeaderResolves_getPeerHost(self):
++        """
++        Test if IPv6 headers result in the correct host and peer data.
++        """
++        factory = _wrapper.HAProxyFactory(StaticFactory())
++        proto = factory.buildProtocol(
++            address.IPv4Address('TCP', '::1', 8080),
++        )
++        transport = StaticTransport()
++        proto.makeConnection(transport)
++        proto.dataReceived(self.IPV6HEADER)
++        self.assertEqual(proto.getPeer().host, '0:0:0:0:0:0:0:1')
++        self.assertEqual(proto.getPeer().port, 8080)
++        self.assertEqual(
++            proto.wrappedProtocol.transport.getPeer().host,
++            '0:0:0:0:0:0:0:1',
++        )
++        self.assertEqual(
++            proto.wrappedProtocol.transport.getPeer().port,
++            8080,
++        )
++        self.assertEqual(proto.getHost().host, '0:0:0:0:0:0:0:1')
++        self.assertEqual(proto.getHost().port, 8888)
++        self.assertEqual(
++            proto.wrappedProtocol.transport.getHost().host,
++            '0:0:0:0:0:0:0:1',
++        )
++        self.assertEqual(
++            proto.wrappedProtocol.transport.getHost().port,
++            8888,
++        )
++
++
++    def test_validUNIXHeaderResolves_getPeerHost(self):
++        """
++        Test if UNIX headers result in the correct host and peer data.
++        """
++        factory = _wrapper.HAProxyFactory(StaticFactory())
++        proto = factory.buildProtocol(
++            address.UNIXAddress(b'/home/test/sockets/server.sock'),
++        )
++        transport = StaticTransport()
++        proto.makeConnection(transport)
++        proto.dataReceived(self.UNIXHEADER)
++        self.assertEqual(proto.getPeer().name, b'/home/tests/mysockets/sock')
++        self.assertEqual(
++            proto.wrappedProtocol.transport.getPeer().name,
++            b'/home/tests/mysockets/sock',
++        )
++        self.assertEqual(proto.getHost().name, b'/home/tests/mysockets/sock')
++        self.assertEqual(
++            proto.wrappedProtocol.transport.getHost().name,
++            b'/home/tests/mysockets/sock',
++        )
++
++
++    def test_overflowBytesSentToWrappedProtocol(self):
++        """
++        Test if non-header bytes are passed to the wrapped protocol.
++        """
++        factory = _wrapper.HAProxyFactory(StaticFactory())
++        proto = factory.buildProtocol(
++            address.IPv6Address('TCP', '::1', 8080),
++        )
++        transport = StaticTransport()
++        proto.makeConnection(transport)
++        proto.dataReceived(self.IPV6HEADER + b'HTTP/1.1 / GET')
++        self.assertEqual(proto.wrappedProtocol.data, b'HTTP/1.1 / GET')
++
++
++    def test_overflowBytesSentToWrappedProtocolChunks(self):
++        """
++        Test if header streaming passes extra data appropriately.
++        """
++        factory = _wrapper.HAProxyFactory(StaticFactory())
++        proto = factory.buildProtocol(
++            address.IPv6Address('TCP', '::1', 8080),
++        )
++        transport = StaticTransport()
++        proto.makeConnection(transport)
++        proto.dataReceived(self.IPV6HEADER[:18])
++        proto.dataReceived(self.IPV6HEADER[18:] + b'HTTP/1.1 / GET')
++        self.assertEqual(proto.wrappedProtocol.data, b'HTTP/1.1 / GET')
+diff --git twisted/topfiles/8203.feature twisted/topfiles/8203.feature
+new file mode 100644
+index 0000000..e94ff32
+--- /dev/null
++++ twisted/topfiles/8203.feature
+@@ -0,0 +1 @@
++twisted.protocol.haproxy provides a Protocol and Factory wrappers that handle the data stream annotations injected by HAProxy.

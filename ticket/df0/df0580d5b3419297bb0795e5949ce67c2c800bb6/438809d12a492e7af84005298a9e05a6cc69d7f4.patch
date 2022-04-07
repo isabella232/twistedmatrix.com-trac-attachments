@@ -1,0 +1,372 @@
+Index: twisted/words/test/test_jabberxmlstream.py
+===================================================================
+--- twisted/words/test/test_jabberxmlstream.py	(révision 30883)
++++ twisted/words/test/test_jabberxmlstream.py	(copie de travail)
+@@ -9,11 +9,12 @@
+ 
+ from twisted.trial import unittest
+ 
++from zope.interface import directlyProvides
+ from zope.interface.verify import verifyObject
+ 
+ from twisted.internet import defer, task
+ from twisted.internet.error import ConnectionLost
+-from twisted.internet.interfaces import IProtocolFactory
++from twisted.internet.interfaces import IProtocolFactory, ISSLTransport
+ from twisted.test import proto_helpers
+ from twisted.words.test.test_xmlstream import GenericXmlStreamFactoryTestsMixin
+ from twisted.words.xish import domish
+@@ -21,12 +22,6 @@
+ 
+ 
+ 
+-NS_XMPP_TLS = 'urn:ietf:params:xml:ns:xmpp-tls'
+-NS_XMPP_FEATURE_COMPRESS = "http://jabber.org/features/compress"
+-NS_XMPP_COMPRESS = "http://jabber.org/protocol/compress"
+-
+-
+-
+ class HashPasswordTest(unittest.TestCase):
+     """
+     Tests for L{xmlstream.hashPassword}.
+@@ -689,8 +684,9 @@
+         d.addCallback(self.assertEquals, xmlstream.Reset)
+         starttls = self.output[0]
+         self.assertEquals('starttls', starttls.name)
+-        self.assertEquals(NS_XMPP_TLS, starttls.uri)
+-        self.xmlstream.dataReceived("<proceed xmlns='%s'/>" % NS_XMPP_TLS)
++        self.assertEquals(xmlstream.NS_XMPP_TLS, starttls.uri)
++        self.xmlstream.dataReceived("<proceed xmlns='%s'/>"
++                                    % xmlstream.NS_XMPP_TLS)
+         self.assertEquals(['TLS', 'reset', 'header'], self.done)
+ 
+         return d
+@@ -767,7 +763,8 @@
+ 
+         d = self.init.start()
+         self.assertFailure(d, xmlstream.TLSFailed)
+-        self.xmlstream.dataReceived("<failure xmlns='%s'/>" % NS_XMPP_TLS)
++        self.xmlstream.dataReceived("<failure xmlns='%s'/>"
++                                    % xmlstream.NS_XMPP_TLS)
+         return d
+ 
+ 
+@@ -1310,6 +1307,10 @@
+ 
+ 
+ class CompressedTransportTest(unittest.TestCase):
++    """
++    Tests for L{xmlstream.CompressedTransport}.
++    """
++
+     def setUp(self):
+         self.output = []
+         self.done = []
+@@ -1326,56 +1327,118 @@
+ 
+     def test_makeConnection(self):
+         """
+-        Test wrapping the transport.
++        When compression is enabled, the underlying transport should be wrapped
++        transparently, without calling L{XmlStream.connectionMade} twice.
+         """
+         self.xmlstream.connectionMade = lambda: self.done.append("connMade")
+         self.compressed.makeConnection(self.xmlstream.transport)
+-        self.assertTrue(self.xmlstream.transport is self.compressed)
++        self.assertIdentical(self.xmlstream.transport, self.compressed)
+         # connectionMade must not be called twice
+         self.assertEquals([], self.done)
+ 
+ 
+     def test_write(self):
+         """
+-        Test data compression.
++        When compression is enabled, data passed to L{XmlStream.send} is zlib
++        compressed before being sent over the connection.
+         """
+         self.xmlstream.transport.write = self.done.append
+         self.compressed.makeConnection(self.xmlstream.transport)
+ 
+         data = "x" * 100
+-        compressed_data = zlib.compress(data)
+         self.xmlstream.send(data)
+ 
+         self.assertTrue(len(self.done) > 0)
+-        # there is a difference in content due to the compression methods
+-        # used (stream vs. block) but the lengths can be checked
+-        self.assertEquals(len(compressed_data), len(self.done[0]))
++        decompressor = zlib.decompressobj()
++        decompressed_data = decompressor.decompress(self.done[0])
++        decompressed_data += decompressor.flush()
++        self.assertEquals(data, decompressed_data)
+ 
+ 
++    def test_writeSequence(self):
++        """
++        When compression is enabled, a sequence of data passed to
++        L{XmlStream.send} is zlib compressed before being sent over the
++        connection.
++        """
++        self.xmlstream.transport.writeSequence = self.done.extend
++        self.compressed.makeConnection(self.xmlstream.transport)
++
++        data = [ "x" * 100 for i in range(10) ]
++        self.compressed.writeSequence(data)
++
++        self.assertTrue(len(self.done) > 0)
++        decompressor = zlib.decompressobj()
++        decompressed_data = [ decompressor.decompress(d)
++                              for d in self.done ]
++        self.assertEquals(''.join(data), ''.join(decompressed_data))
++
++
++    def test_writeNoData(self):
++        """
++        With compression enabled, no given data should produce no output
++        """
++        self.xmlstream.transport.write = self.done.append
++        self.compressed.makeConnection(self.xmlstream.transport)
++        self.compressed.write("")
++        self.assertEqual(len(self.done), 0)
++
++
++    def test_writeSequenceNoData(self):
++        """
++        With compression enabled, no given data should produce no output
++        """
++        self.xmlstream.transport.write = self.done.extend
++        self.compressed.makeConnection(self.xmlstream.transport)
++        self.compressed.writeSequence([])
++        self.assertEqual(len(self.done), 0)
++
++
+     def test_read(self):
+         """
+-        Test data decompression.
++        When compression is enabled, data comming from the connection should
++        be zlib decompressed before being passed to L{XmlStream.dataReceived}.
+         """
+         self.xmlstream.dataReceived = self.done.append
+         self.compressed.makeConnection(self.xmlstream.transport)
+         data = "x" * 100
+         self.compressed.dataReceived(zlib.compress(data))
+-        self.assertEquals([data], self.done)
++        self.compressed.connectionLost(None)
++        self.assertEquals(data, ''.join(self.done))
+ 
+ 
++    def test_read_flush(self):
++        """
++        The C{zlib.Decompress.flush} method should be called on connection loss
++        and pass to L{XmlStream.dataReceived} the decompressed bytes left
++        before relaying L{XmlStream.connectionLost}.
++        """
++        self.xmlstream.dataReceived = self.done.append
++        self.compressed.makeConnection(self.xmlstream.transport)
++        data = "x" * 4096
++        self.compressed.dataReceived(zlib.compress(data))
++        assert len(self.done[0]) < 4096 # too much data, should be bufferred
++        self.compressed.connectionLost(None)
++        self.assertEquals(data, ''.join(self.done))
+ 
++
++
+ class CompressInitiatingInitializerTest(unittest.TestCase):
++    """
++    Tests for L{xmlstream.CompressInitiatingInitializer}.
++    """
++
+     def setUp(self):
+         self.output = []
+ 
+         self.authenticator = xmlstream.Authenticator()
+         self.xmlstream = xmlstream.XmlStream(self.authenticator)
+         self.xmlstream.send = self.output.append
+-        self.xmlstream.transport = proto_helpers.StringTransport()
+-        feature = domish.Element((NS_XMPP_FEATURE_COMPRESS, 'compression'))
++        self.xmlstream.makeConnection(proto_helpers.StringTransport())
++        feature = domish.Element((xmlstream.NS_XMPP_FEATURE_COMPRESS,
++                                  'compression'))
+         feature.addElement('method', None, content="zlib")
+         self.xmlstream.features = {(feature.uri, feature.name): feature}
+-        self.xmlstream.connectionMade()
+         self.xmlstream.dataReceived("<stream:stream xmlns='jabber:client' "
+                         "xmlns:stream='http://etherx.jabber.org/streams' "
+                         "from='example.com' id='12345' version='1.0'>")
+@@ -1385,7 +1448,7 @@
+ 
+     def test_wantedSupported(self):
+         """
+-        Test start when compression is wanted.
++        Make sure compression is started when it is wanted and supported.
+         """
+         d = self.init.start()
+         def cb(result):
+@@ -1396,17 +1459,29 @@
+         self.assertTrue(len(self.output) > 0)
+         compress = self.output[0]
+         self.assertEquals('compress', compress.name)
+-        self.assertEquals(NS_XMPP_COMPRESS, compress.uri)
++        self.assertEquals(xmlstream.NS_XMPP_COMPRESS, compress.uri)
+         self.xmlstream.dataReceived("<compressed xmlns='%s'/>"
+-                                    % NS_XMPP_COMPRESS)
++                                    % xmlstream.NS_XMPP_COMPRESS)
+         return d
+ 
+ 
++    def test_notWanted(self):
++        """
++        Make sure compression is not started when it is not wanted
++        """
++        self.init.wanted = False
++        d = self.init.start()
++        d.addCallback(self.assertEquals, None)
++        d.addCallback(lambda r: self.assertEquals([], self.output))
++        return d
++
++
+     def test_TLSAlreadyOn(self):
+         """
+-        Test start when compression is wanted and the TLS already set up.
++        Make sure compression is not started when it is wanted but TLS is
++        already set up.
+         """
+-        self.xmlstream.transport.TLS = True
++        directlyProvides(self.xmlstream.transport, ISSLTransport)
+ 
+         d = self.init.start()
+         d.addCallback(self.assertEquals, None)
+@@ -1417,12 +1492,12 @@
+ 
+     def test_TLSAlreadyOnButWithTLSSet(self):
+         """
+-        Test start when compression is wanted and the TLS already set up, but
+-        stream compression has been explicitely asked for using the with_tls
+-        attribute.
++        Test compression is started when it is wanted and the TLS already set
++        up, but stream compression has been explicitely asked for using the
++        withTLS attribute.
+         """
+-        self.xmlstream.transport.TLS = True
+-        self.init.with_tls = True
++        directlyProvides(self.xmlstream.transport, ISSLTransport)
++        self.init.withTLS = True
+ 
+         d = self.init.start()
+         def cb(result):
+@@ -1434,16 +1509,17 @@
+         compress = self.output[0]
+         self.assertEquals('compress', compress.name)
+         self.xmlstream.dataReceived("<compressed xmlns='%s'/>"
+-                                    % NS_XMPP_COMPRESS)
++                                    % xmlstream.NS_XMPP_COMPRESS)
+ 
+         return d
+ 
+ 
+     def test_noMethod(self):
+         """
+-        Test start when there is no allowed method.
++        Test compression is not attempted when there is no allowed method.
+         """
+-        feature = domish.Element((NS_XMPP_FEATURE_COMPRESS, 'compression'))
++        feature = domish.Element((xmlstream.NS_XMPP_FEATURE_COMPRESS,
++                                  'compression'))
+         self.xmlstream.features = {(feature.uri, feature.name): feature}
+ 
+         d = self.init.start()
+@@ -1455,9 +1531,10 @@
+ 
+     def test_otherMethod(self):
+         """
+-        Test start when zlib is not an allowed method.
++        Test compression is not started when zlib is not an allowed method.
+         """
+-        feature = domish.Element((NS_XMPP_FEATURE_COMPRESS, 'compression'))
++        feature = domish.Element((xmlstream.NS_XMPP_FEATURE_COMPRESS,
++                                  'compression'))
+         feature.addElement('method', None, content="lzma")
+         self.xmlstream.features = {(feature.uri, feature.name): feature}
+ 
+@@ -1470,11 +1547,12 @@
+ 
+     def test_failed(self):
+         """
+-        Test failed compression negotiation.
++        Test failure on compression negotiation.
+         """
+         d = self.init.start()
+         self.assertFailure(d, xmlstream.CompressError)
+-        self.xmlstream.dataReceived("<failure xmlns='%s'/>" % NS_XMPP_COMPRESS)
++        self.xmlstream.dataReceived("<failure xmlns='%s'/>"
++                                    % xmlstream.NS_XMPP_COMPRESS)
+         return d
+ 
+ 
+Index: twisted/words/protocols/jabber/xmlstream.py
+===================================================================
+--- twisted/words/protocols/jabber/xmlstream.py	(révision 30883)
++++ twisted/words/protocols/jabber/xmlstream.py	(copie de travail)
+@@ -17,6 +17,7 @@
+ 
+ from twisted.internet import defer, protocol
+ from twisted.internet.error import ConnectionLost
++from twisted.internet.interfaces import ISSLTransport
+ from twisted.python import failure, log, randbytes
+ from twisted.python.hashlib import sha1
+ from twisted.protocols.policies import ProtocolWrapper, WrappingFactory
+@@ -500,12 +501,12 @@
+ 
+     def dataReceived(self, data):
+         to_decompress = self._decompressor.unconsumed_tail + data
+-        decompressed = self._decompressor.decompress(to_decompress)
++        decompressed = self._decompressor.decompress(to_decompress, 1024)
+         self.wrappedProtocol.dataReceived(decompressed)
+ 
+ 
+     def connectionLost(self, reason):
+-        self.dataReceived(self._decompressor.flush())
++        self.wrappedProtocol.dataReceived(self._decompressor.flush())
+         ProtocolWrapper.connectionLost(self, reason)
+ 
+ 
+@@ -531,16 +532,16 @@
+ 
+     @cvar wanted: indicates if stream compression negotiation is wanted.
+     @type wanted: C{bool}
+-    @cvar with_tls: if set to C{True}, allows negociating compression when TLS
++    @cvar withTLS: if set to C{True}, allows negociating compression when TLS
+         is already used.
+-    @type with_tls: C{bool}
++    @type withTLS: C{bool}
+ 
+     @since: 11.0
+     """
+ 
+     feature = (NS_XMPP_FEATURE_COMPRESS, 'compression')
+     wanted = True
+-    with_tls = False
++    withTLS = False
+     _deferred = None
+ 
+     def onProceed(self, obj):
+@@ -567,7 +568,7 @@
+         This checks the TLS status and the proposed compression methods.
+         TLS and stream compression should be mutually exclusive: XEP-0138
+         states that compression may be offered if TLS failed.
+-        If both TLS and stream compression are desired, the L{with_tls}
++        If both TLS and stream compression are desired, the L{withTLS}
+         attribute should be set to C{True}.
+ 
+         If TLS is active or if no proposed compression method is supported,
+@@ -575,8 +576,8 @@
+         """
+         if not self.wanted:
+             return defer.succeed(None)
+-        if (not self.with_tls and hasattr(self.xmlstream.transport, "TLS")
+-                and self.xmlstream.transport.TLS):
++        if (not self.withTLS and
++                ISSLTransport.providedBy(self.xmlstream.transport)):
+             return defer.succeed(None)
+ 
+         allowed_methods = [ str(m) for m in

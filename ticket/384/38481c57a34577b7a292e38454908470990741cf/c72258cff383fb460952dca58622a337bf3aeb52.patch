@@ -1,0 +1,430 @@
+=== modified file 'twisted/internet/base.py'
+--- twisted/internet/base.py	2013-01-19 02:08:01 +0000
++++ twisted/internet/base.py	2013-02-11 13:59:51 +0000
+@@ -17,10 +17,12 @@
+ 
+ import traceback
+ 
++from twisted.python.util import FancyEqMixin
+ from twisted.python.compat import set
+ from twisted.internet.interfaces import IReactorCore, IReactorTime, IReactorThreads
+ from twisted.internet.interfaces import IResolverSimple, IReactorPluggableResolver
+ from twisted.internet.interfaces import IConnector, IDelayedCall
++from twisted.internet.interfaces import INameResolver
+ from twisted.internet import fdesc, main, error, abstract, defer, threads
+ from twisted.python import log, failure, _reflectpy3 as reflect
+ from twisted.python.runtime import seconds as runtimeSeconds, platform
+@@ -209,6 +211,27 @@
+         return "".join(L)
+ 
+ 
++@implementer(INameResolver)
++class _ResolverComplexifier(object):
++    def __init__(self, resolver):
++        self._resolver = resolver
++
++
++    def getAddressInformation(self, name, service, *args):
++        d = self._resolver.getHostByName(name)
++        def cbResolved(address):
++            family = socket.getaddrinfo(address, 0)[0][0]
++            return [
++                AddressInformation(
++                    family,
++                    socket.SOCK_STREAM,
++                    socket.IPPROTO_TCP,
++                    "",
++                    (address, service))]
++        d.addCallback(cbResolved)
++        return d
++
++
+ 
+ @implementer(IResolverSimple)
+ class ThreadedResolver(object):
+@@ -278,6 +301,18 @@
+ 
+ 
+ 
++class AddressInformation(object, FancyEqMixin):
++    compareAttributes = ('family', 'type', 'protocol', 'canonicalName', 'address')
++
++    def __init__(self, family, type, protocol, canonicalName, address):
++        self.family = family
++        self.type = type
++        self.protocol = protocol
++        self.canonicalName = canonicalName
++        self.address = address
++
++
++
+ @implementer(IResolverSimple)
+ class BlockingResolver:
+ 
+@@ -507,7 +542,7 @@
+             reflect.qual(self.__class__) + " did not implement installWaker")
+ 
+     def installResolver(self, resolver):
+-        assert IResolverSimple.providedBy(resolver)
++        resolver = INameResolver(resolver)
+         oldResolver = self.resolver
+         self.resolver = resolver
+         return oldResolver
+@@ -567,7 +602,15 @@
+             return defer.succeed('0.0.0.0')
+         if abstract.isIPAddress(name):
+             return defer.succeed(name)
+-        return self.resolver.getHostByName(name, timeout)
++        d = self.resolver.getAddressInformation(name, 0)
++        def cbGotInfo(addresses):
++            for info in addresses:
++                if info.family == socket.AF_INET:
++                    return info.address[0]
++            # XXX Test me
++        d.addCallback(cbGotInfo)
++        return d
++
+ 
+     # Installation.
+ 
+
+=== modified file 'twisted/internet/interfaces.py'
+--- twisted/internet/interfaces.py	2012-10-10 19:14:17 +0000
++++ twisted/internet/interfaces.py	2013-02-11 13:59:51 +0000
+@@ -54,6 +54,56 @@
+         """
+ 
+ 
++
++class INameResolver(Interface):
++    """
++    XXX Write me.
++
++    RFC 3484.
++    """
++    def getAddressInformation(name, service, family=None, socktype=None,
++                              proto=None, flags=None):
++        """
++        Get the address information associated with the given name.
++
++        @param name: A hostname to resolve.
++        @type name: C{str}
++
++        @param service: A port number or the name of the service for which to find address
++            information.  For example, C{22} or C{"ssh"}.
++        @type service: C{int} or C{str}
++
++        @param family: If specified, limit results to addresses from this family.  Must be one
++            of the address family constants from the socket module.  For example,
++            L{socket.AF_INET}.
++
++        @param socktype: If specified, limit results to addresses for this socket type.  Must be
++            one of the socket type constants from the socket module.  For example,
++            L{socket.SOCK_STREAM}.
++
++        @param proto: If specified, limit results to addresses for this socket protocol.  Must
++            be one of the protocol constants from the socket module.  For example,
++            L{socket.IPPROTO_TCP}.
++
++        @param flags: A bitvector specifying zero or more of the following::
++            - Yea right.  Go read the `getaddrinfo(3)` man page.
++
++        @raise ValueError: If one of the specified flags is not supported by the
++            implementation.  All flags are optional.
++
++        @return: A L{Deferred} which will fire when the resolution completes.  If resolution is
++            successful, the result will be a list of objects with the following attributes:
++
++            - C{family}: the family of this address
++            - C{type}: the type of this address
++            - C{protocol}: the protocol of this address
++            - C{canonicalName}: the canonical name associated with this address, or an empty
++                                string.
++            - C{address}: The actual address itself, including a port number.  This is suitable
++                          to be passed directly to L{socket.socket.connect}.
++        """
++
++
+ class IResolverSimple(Interface):
+ 
+     def getHostByName(name, timeout = (1, 3, 11, 45)):
+
+=== modified file 'twisted/internet/test/test_base.py'
+--- twisted/internet/test/test_base.py	2013-01-19 02:08:01 +0000
++++ twisted/internet/test/test_base.py	2013-02-11 14:27:11 +0000
+@@ -12,14 +12,20 @@
+     from queue import Queue
+ 
+ from zope.interface import implementer
++from zope.interface.verify import verifyClass
+ 
+ from twisted.python.threadpool import ThreadPool
+ from twisted.internet.interfaces import IReactorTime, IReactorThreads
++from twisted.internet.interfaces import INameResolver
+ from twisted.internet.error import DNSLookupError
+-from twisted.internet.base import ThreadedResolver, DelayedCall
++from twisted.internet.base import (
++    ThreadedNameResolver, ThreadedResolver, AddressInformation,
++    _ResolverComplexifier, DelayedCall)
+ from twisted.internet.task import Clock
+ from twisted.trial.unittest import TestCase
+ 
++from twisted.internet.test.test_tcp import FakeResolver
++
+ 
+ @implementer(IReactorTime, IReactorThreads)
+ class FakeReactor(object):
+@@ -53,6 +59,90 @@
+ 
+ 
+ 
++class NameResolverAdapterTests(TestCase):
++    """
++    L{_ResolverComplexifier} adapters an L{IResolverSimple} provider
++    to L{INameResolver}.
++    """
++    def test_interface(self):
++        """
++        L{_ResolverComplexifier} implements L{INameResolver}.
++        """
++        self.assertTrue(verifyClass(INameResolver, _ResolverComplexifier))
++
++
++    def _successTest(self, address, family):
++        simple = FakeResolver({'example.com': address})
++        resolver = _ResolverComplexifier(simple)
++        d = resolver.getAddressInformation('example.com', 1234)
++        d.addCallback(
++            self.assertEquals, [
++                AddressInformation(
++                    family,
++                    socket.SOCK_STREAM,
++                    socket.IPPROTO_TCP,
++                    "",
++                    (address, 1234))])
++        return d
++
++
++    def test_ipv4Success(self):
++        """
++        L{_ResolverComplexifier} calls the wrapped object's
++        C{getHostByName} method and returns a L{Deferred} which fires
++        with a list of one element containing an AF_INET element with
++        the IPv4 address which C{getHostByName}'s L{Deferred} fired
++        with.
++        """
++        return self._successTest('192.168.1.12', socket.AF_INET)
++
++
++    def test_ipv6Success(self):
++        """
++        L{_ResolverComplexifier} calls the wrapped object's
++        C{getHostByName} method and returns a L{Deferred} which fires
++        with a list of one element containing an AF_INET6 element with
++        the IPv6 address which C{getHostByName}'s L{Deferred} fired
++        with.
++        """
++        return self._successTest('::1', socket.AF_INET6)
++
++
++    def test_failure(self):
++        """
++        The L{Deferred} L{_ResolverComplexifier.getAddressInformation}
++        returns fails if the wrapped resolver's C{getHostByName}
++        L{Deferred} fails.
++        """
++        error = DNSLookupError("Problems abound")
++        simple = FakeResolver({'example.com': error})
++        resolver = _ResolverComplexifier(simple)
++        d = resolver.getAddressInformation('example.com', 1234)
++        return self.assertFailure(d, DNSLookupError)
++
++
++
++class ThreadedNameResolverTests(TestCase):
++    """
++    Tests for L{ThreadedNameResolver}.
++    """
++    def test_interface(self):
++        """
++        L{ThreadedNameResolver} implements L{INameResolver}.
++        """
++        self.assertTrue(verifyClass(INameResolver, ThreadedNameResolver))
++
++
++    def test_success(self):
++        """
++        If the underlying C{getaddrinfo} library call completes
++        successfully and returns results, the L{Deferred} returned by
++        L{ThreadedNameResolver.getAddressInformation} fires with a
++        list of L{AddressInformation} instances representing those
++        results.
++        """
++
++
+ class ThreadedResolverTests(TestCase):
+     """
+     Tests for L{ThreadedResolver}.
+
+=== modified file 'twisted/internet/test/test_core.py'
+--- twisted/internet/test/test_core.py	2012-10-11 16:19:34 +0000
++++ twisted/internet/test/test_core.py	2013-02-11 14:21:29 +0000
+@@ -12,13 +12,19 @@
+ import signal
+ import time
+ import inspect
+-
++import socket
++
++from zope.interface import implementer
++
++from twisted.internet.interfaces import INameResolver
+ from twisted.internet.abstract import FileDescriptor
+ from twisted.internet.error import ReactorAlreadyRunning, ReactorNotRestartable
+-from twisted.internet.defer import Deferred
++from twisted.internet.defer import Deferred, succeed
++from twisted.internet.base import AddressInformation
+ from twisted.internet.test.reactormixins import ReactorBuilder
+ 
+ 
++
+ class ObjectModelIntegrationMixin(object):
+     """
+     Helpers for tests about the object model of reactor-related objects.
+@@ -41,6 +47,23 @@
+ 
+ 
+ 
++@implementer(INameResolver)
++class MemoryNameResolver(object):
++    def __init__(self, names):
++        self._names = names
++
++    def getAddressInformation(self, name, service, family=None, type=None,
++                              protocol=None, flags=None):
++        return succeed([
++                address
++                for address
++                in self._names[name, service]
++                if family is None or family == address.family
++                and type is None or type == address.type
++                and protocol is None or protocol == address.protocol])
++
++
++
+ class ObjectModelIntegrationTest(ReactorBuilder, ObjectModelIntegrationMixin):
+     """
+     Test details of object model integration against all reactors.
+@@ -328,6 +351,34 @@
+         self.assertEqual(events, ['tested'])
+ 
+ 
++    def test_resolve(self):
++        """
++        C{reactor.resolve(name)} calls the C{getAddressInformation}
++        method of the installed resolver and returns a L{Deferred}
++        which fires with the first C{AF_INET} family element from the
++        result of C{getAddressInformation}.
++        """
++        resolver = MemoryNameResolver({
++                ('example.com', 0): [
++                    AddressInformation(
++                        socket.AF_INET6,
++                        socket.SOCK_STREAM,
++                        socket.IPPROTO_TCP,
++                        "",
++                        ("::1", 0)),
++                    AddressInformation(
++                        socket.AF_INET,
++                        socket.SOCK_STREAM,
++                        socket.IPPROTO_TCP,
++                        "",
++                        ("127.0.0.1", 22))]})
++
++        reactor = self.buildReactor()
++        reactor.installResolver(resolver)
++        d = reactor.resolve("example.com")
++        d.addCallback(self.assertEquals, "127.0.0.1")
++        return d
++
+ 
+ globals().update(SystemEventTestsBuilder.makeTestCaseClasses())
+ globals().update(ObjectModelIntegrationTest.makeTestCaseClasses())
+
+=== modified file 'twisted/internet/test/test_tcp.py'
+--- twisted/internet/test/test_tcp.py	2013-01-01 02:45:04 +0000
++++ twisted/internet/test/test_tcp.py	2013-02-11 13:59:51 +0000
+@@ -25,11 +25,12 @@
+     ConnectionLost, UserError, ConnectionRefusedError, ConnectionDone,
+     ConnectionAborted)
+ from twisted.internet.interfaces import (
+-    ILoggingContext, IConnector, IReactorFDSet, IReactorSocket, IReactorTCP)
++    ILoggingContext, IConnector, IReactorFDSet, IReactorSocket, IReactorTCP, IResolverSimple)
+ from twisted.internet.address import IPv4Address, IPv6Address
+ from twisted.internet.defer import (
+-    Deferred, DeferredList, maybeDeferred, gatherResults)
++    Deferred, DeferredList, maybeDeferred, gatherResults, succeed, fail)
+ from twisted.internet.endpoints import TCP4ServerEndpoint, TCP4ClientEndpoint
++from twisted.internet.error import DNSLookupError
+ from twisted.internet.protocol import ServerFactory, ClientFactory, Protocol
+ from twisted.internet.interfaces import (
+     IPushProducer, IPullProducer, IHalfCloseableProtocol)
+@@ -108,6 +109,57 @@
+     client.connect(address)
+ 
+ 
++class Stop(ClientFactory):
++    """
++    A client factory which stops a reactor when a connection attempt fails.
++    """
++    def __init__(self, reactor):
++        self.reactor = reactor
++
++
++    def clientConnectionFailed(self, connector, reason):
++        self.reactor.stop()
++
++
++@implementer(IResolverSimple)
++class FakeResolver:
++    """
++    A resolver implementation based on a C{dict} mapping names to addresses.
++    """
++
++    def __init__(self, names):
++        self.names = names
++
++
++    def getHostByName(self, name, timeout=None):
++        try:
++            return succeed(self.names[name])
++        except KeyError:
++            return fail(DNSLookupError("FakeResolver couldn't find " + name))
++
++
++
++class TCPClientTestsBuilder(ReactorBuilder):
++    """
++    Builder defining tests relating to L{IReactorTCP.connectTCP}.
++    """
++    def _freePort(self, interface='127.0.0.1'):
++        probe = socket.socket()
++        try:
++            probe.bind((interface, 0))
++            return probe.getsockname()
++        finally:
++            probe.close()
++
++    def test_clientConnectionFailedStopsReactor(self):
++        """
++        The reactor can be stopped by a client factory's
++        C{clientConnectionFailed} method.
++        """
++        host, port = self._freePort()
++        reactor = self.buildReactor()
++        reactor.connectTCP(host, port, Stop(reactor))
++
+ 
+ class FakeSocket(object):
+     """
+

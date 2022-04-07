@@ -1,0 +1,464 @@
+Index: twisted/conch/test/test_ckeygen.py
+===================================================================
+--- twisted/conch/test/test_ckeygen.py	(revision 35300)
++++ twisted/conch/test/test_ckeygen.py	(working copy)
+@@ -5,6 +5,7 @@
+ Tests for L{twisted.conch.scripts.ckeygen}.
+ """
+ 
++import getpass
+ import sys
+ from StringIO import StringIO
+ 
+@@ -14,12 +15,16 @@
+ except ImportError:
+     skip = "PyCrypto and pyasn1 required for twisted.conch.scripts.ckeygen."
+ else:
+-    from twisted.conch.ssh.keys import Key
+-    from twisted.conch.scripts.ckeygen import printFingerprint, _saveKey
++    from twisted.conch.ssh.keys import Key, BadKeyError
++    from twisted.conch.scripts.ckeygen import (
++        displayPublicKey, printFingerprint, _saveKey
++    )
+ 
+ from twisted.python.filepath import FilePath
+ from twisted.trial.unittest import TestCase
+-from twisted.conch.test.keydata import publicRSA_openssh, privateRSA_openssh
++from twisted.conch.test.keydata import (
++    publicRSA_openssh, privateRSA_openssh, privateRSA_openssh_encrypted
++)
+ 
+ 
+ 
+@@ -78,3 +83,31 @@
+             Key.fromString(base.child('id_rsa.pub').getContent()),
+             key.public())
+ 
++
++    def test_displayPublicKey(self):
++        """
++        L{displayPublicKey} prints out the public key associated with a given
++        private key
++        """
++        # Unencrypted key - no passphrase
++        filename = self.mktemp()
++        FilePath(filename).setContent(privateRSA_openssh)
++        displayPublicKey({'filename':filename})
++        self.assertEqual(
++            self.stdout.getvalue().strip('\n'),
++            publicRSA_openssh.strip(' comment')
++        )
++
++        # Encrypted key should require a passphrase
++        self.stdout.seek(0)
++        filename = self.mktemp()
++        FilePath(filename).setContent(privateRSA_openssh_encrypted)
++        displayPublicKey({'filename':filename, 'pass':'encrypted'})
++        self.assertEqual(
++            self.stdout.getvalue().strip('\n'),
++            publicRSA_openssh.strip(' comment')
++        )
++        # Encrypted key with a bad passphrase is an error
++        self.patch(getpass, 'getpass', lambda x: 'badpassphrase')
++        self.assertRaises(BadKeyError,
++            displayPublicKey, {'filename':filename})
+Index: twisted/conch/scripts/ckeygen.py
+===================================================================
+--- twisted/conch/scripts/ckeygen.py	(revision 35300)
++++ twisted/conch/scripts/ckeygen.py	(working copy)
+@@ -19,6 +19,7 @@
+ from twisted.python import filepath, log, usage, randbytes
+ 
+ 
++
+ class GeneralOptions(usage.Options):
+     synopsis = """Usage:    ckeygen [options]
+  """
+@@ -40,6 +41,8 @@
+     compData = usage.Completions(
+         optActions={"type": usage.CompleteList(["rsa", "dsa"])})
+ 
++
++
+ def run():
+     options = GeneralOptions()
+     try:
+@@ -67,6 +70,8 @@
+         options.opt_help()
+         sys.exit(1)
+ 
++
++
+ def handleError():
+     from twisted.python import failure
+     global exitStatus
+@@ -75,12 +80,16 @@
+     reactor.stop()
+     raise
+ 
++
++
+ def generateRSAkey(options):
+     from Crypto.PublicKey import RSA
+     print 'Generating public/private rsa key pair.'
+     key = RSA.generate(int(options['bits']), randbytes.secureRandom)
+     _saveKey(key, options)
+ 
++
++
+ def generateDSAkey(options):
+     from Crypto.PublicKey import DSA
+     print 'Generating public/private dsa key pair.'
+@@ -88,6 +97,7 @@
+     _saveKey(key, options)
+ 
+ 
++
+ def printFingerprint(options):
+     if not options['filename']:
+         filename = os.path.expanduser('~/.ssh/id_rsa')
+@@ -106,6 +116,7 @@
+         sys.exit('bad key')
+ 
+ 
++
+ def changePassPhrase(options):
+     if not options['filename']:
+         filename = os.path.expanduser('~/.ssh/id_rsa')
+@@ -133,23 +144,24 @@
+     print 'Your identification has been saved with the new passphrase.'
+ 
+ 
++
+ def displayPublicKey(options):
+     if not options['filename']:
+         filename = os.path.expanduser('~/.ssh/id_rsa')
+         options['filename'] = raw_input('Enter file in which the key is (%s): ' % filename)
+     try:
+         key = keys.Key.fromFile(options['filename']).keyObject
++    except keys.EncryptedKeyError, e:
++        if not options.get('pass'):
++            options['pass'] = getpass.getpass('Enter passphrase: ')
++        key = keys.Key.fromFile(
++            options['filename'], passphrase = options['pass']).keyObject
+     except keys.BadKeyError, e:
+-        if e.args[0] != 'encrypted key with no passphrase':
+-            raise
+-        else:
+-            if not options['pass']:
+-                options['pass'] = getpass.getpass('Enter passphrase: ')
+-            key = keys.Key.fromFile(
+-                options['filename'], passphrase = options['pass']).keyObject
+-    print keys.Key(key).public().toString()
++        raise
++    print keys.Key(key).public().toString('openssh')
+ 
+ 
++
+ def _saveKey(key, options):
+     if not options['filename']:
+         kind = keys.objectType(key)
+@@ -185,6 +197,7 @@
+     print 'The key fingerprint is:'
+     print keyObj.fingerprint()
+ 
++
++
+ if __name__ == '__main__':
+     run()
+-
+Index: twisted/conch/ssh/keys.py
+===================================================================
+--- twisted/conch/ssh/keys.py	(revision 35300)
++++ twisted/conch/ssh/keys.py	(working copy)
+@@ -28,6 +28,7 @@
+ from twisted.conch.ssh import common, sexpy
+ 
+ 
++
+ class BadKeyError(Exception):
+     """
+     Raised when a key isn't what we expected from it.
+@@ -36,6 +37,7 @@
+     """
+ 
+ 
++
+ class EncryptedKeyError(Exception):
+     """
+     Raised when an encrypted key is presented to fromString/fromFile without
+@@ -43,6 +45,7 @@
+     """
+ 
+ 
++
+ class Key(object):
+     """
+     An object representing a key.  A key can be either a public or
+@@ -63,6 +66,7 @@
+         return Class.fromString(file(filename, 'rb').read(), type, passphrase)
+     fromFile = classmethod(fromFile)
+ 
++
+     def fromString(Class, data, type=None, passphrase=None):
+         """
+         Return a Key object corresponding to the string data.
+@@ -91,6 +95,7 @@
+             return method(data, passphrase)
+     fromString = classmethod(fromString)
+ 
++
+     def _fromString_BLOB(Class, blob):
+         """
+         Return a public key object corresponding to this public key blob.
+@@ -121,6 +126,7 @@
+             raise BadKeyError('unknown blob type: %s' % keyType)
+     _fromString_BLOB = classmethod(_fromString_BLOB)
+ 
++
+     def _fromString_PRIVATE_BLOB(Class, blob):
+         """
+         Return a private key object corresponding to this private key blob.
+@@ -161,6 +167,7 @@
+             raise BadKeyError('unknown blob type: %s' % keyType)
+     _fromString_PRIVATE_BLOB = classmethod(_fromString_PRIVATE_BLOB)
+ 
++
+     def _fromString_PUBLIC_OPENSSH(Class, data):
+         """
+         Return a public key object corresponding to this OpenSSH public key
+@@ -175,6 +182,7 @@
+         return Class._fromString_BLOB(blob)
+     _fromString_PUBLIC_OPENSSH = classmethod(_fromString_PUBLIC_OPENSSH)
+ 
++
+     def _fromString_PRIVATE_OPENSSH(Class, data, passphrase):
+         """
+         Return a private key object corresponding to this OpenSSH private key
+@@ -199,8 +207,9 @@
+         @return: a C{Crypto.PublicKey.pubkey.pubkey} object
+         @raises BadKeyError: if
+             * a passphrase is provided for an unencrypted key
+-            * a passphrase is not provided for an encrypted key
+             * the ASN.1 encoding is incorrect
++        @raises EncryptedKeyError: if
++            * a passphrase is not provided for an encrypted key        
+         """
+         lines = data.strip().split('\n')
+         kind = lines[0][11:14]
+@@ -241,7 +250,7 @@
+         try:
+             decodedKey = berDecoder.decode(keyData)[0]
+         except Exception:
+-            raise BadKeyError('something wrong with decode')
++            raise BadKeyError('Failed to decode key')
+         if kind == 'RSA':
+             if len(decodedKey) == 2:  # alternate RSA key
+                 decodedKey = decodedKey[0]
+@@ -258,6 +267,7 @@
+             return Class(DSA.construct((y, g, p, q, x)))
+     _fromString_PRIVATE_OPENSSH = classmethod(_fromString_PRIVATE_OPENSSH)
+ 
++
+     def _fromString_PUBLIC_LSH(Class, data):
+         """
+         Return a public key corresponding to this LSH public key string.
+@@ -284,6 +294,7 @@
+             raise BadKeyError('unknown lsh key type %s' % sexp[1][0])
+     _fromString_PUBLIC_LSH = classmethod(_fromString_PUBLIC_LSH)
+ 
++
+     def _fromString_PRIVATE_LSH(Class, data):
+         """
+         Return a private key corresponding to this LSH private key string.
+@@ -316,6 +327,7 @@
+             raise BadKeyError('unknown lsh key type %s' % sexp[1][0])
+     _fromString_PRIVATE_LSH = classmethod(_fromString_PRIVATE_LSH)
+ 
++
+     def _fromString_AGENTV3(Class, data):
+         """
+         Return a private key object corresponsing to the Secure Shell Key
+@@ -362,6 +374,7 @@
+             raise BadKeyError("unknown key type %s" % keyType)
+     _fromString_AGENTV3 = classmethod(_fromString_AGENTV3)
+ 
++
+     def _guessStringType(Class, data):
+         """
+         Guess the type of key in data.  The types map to _fromString_*
+@@ -387,6 +400,7 @@
+                 return 'blob'
+     _guessStringType = classmethod(_guessStringType)
+ 
++
+     def __init__(self, keyObject):
+         """
+         Initialize a PublicKey with a C{Crypto.PublicKey.pubkey.pubkey}
+@@ -396,6 +410,7 @@
+         """
+         self.keyObject = keyObject
+ 
++
+     def __eq__(self, other):
+         """
+         Return True if other represents an object with the same key.
+@@ -405,6 +420,7 @@
+         else:
+             return NotImplemented
+ 
++
+     def __ne__(self, other):
+         """
+         Return True if other represents anything other than this key.
+@@ -414,6 +430,7 @@
+             return result
+         return not result
+ 
++
+     def __repr__(self):
+         """
+         Return a pretty representation of this object.
+@@ -438,12 +455,14 @@
+         lines[-1] = lines[-1] + '>'
+         return '\n'.join(lines)
+ 
++
+     def isPublic(self):
+         """
+         Returns True if this Key is a public key.
+         """
+         return not self.keyObject.has_private()
+ 
++
+     def public(self):
+         """
+         Returns a version of this key containing only the public key data.
+@@ -452,6 +471,7 @@
+         """
+         return Key(self.keyObject.publickey())
+ 
++
+     def fingerprint(self):
+         """
+         Get the user presentation of the fingerprint of this L{Key}.  As
+@@ -474,6 +494,7 @@
+         """
+         return ':'.join([x.encode('hex') for x in md5(self.blob()).digest()])
+ 
++
+     def type(self):
+         """
+         Return the type of the object we wrap.  Currently this can only be
+@@ -490,6 +511,7 @@
+         else:
+             raise RuntimeError('unknown type of key: %s' % type)
+ 
++
+     def sshType(self):
+         """
+         Return the type of the object we wrap as defined in the ssh protocol.
+@@ -497,6 +519,7 @@
+         """
+         return {'RSA': 'ssh-rsa', 'DSA': 'ssh-dss'}[self.type()]
+ 
++
+     def data(self):
+         """
+         Return the values of the public key as a dictionary.
+@@ -510,6 +533,7 @@
+                 keyData[name] = value
+         return keyData
+ 
++
+     def blob(self):
+         """
+         Return the public key blob for this key.  The blob is the
+@@ -539,6 +563,7 @@
+                     common.MP(data['q']) + common.MP(data['g']) +
+                     common.MP(data['y']))
+ 
++
+     def privateBlob(self):
+         """
+         Return the private key blob for this key.  The blob is the
+@@ -573,6 +598,7 @@
+                     common.MP(data['q']) + common.MP(data['g']) +
+                     common.MP(data['y']) + common.MP(data['x']))
+ 
++
+     def toString(self, type, extra=None):
+         """
+         Create a string representation of this key.  If the key is a private
+@@ -599,6 +625,7 @@
+         else:
+             return method()
+ 
++
+     def _toString_OPENSSH(self, extra):
+         """
+         Return a public or private OpenSSH string.  See
+@@ -646,6 +673,7 @@
+             lines.append('-----END %s PRIVATE KEY-----' % self.type())
+             return '\n'.join(lines)
+ 
++
+     def _toString_LSH(self):
+         """
+         Return a public or private LSH key.  See _fromString_PUBLIC_LSH and
+@@ -690,6 +718,7 @@
+                                      ['y', common.MP(data['y'])[4:]],
+                                      ['x', common.MP(data['x'])[4:]]]]])
+ 
++
+     def _toString_AGENTV3(self):
+         """
+         Return a private Secure Shell Agent v3 key.  See
+@@ -707,6 +736,7 @@
+                           data['x'])
+             return common.NS(self.sshType()) + ''.join(map(common.MP, values))
+ 
++
+     def sign(self, data):
+         """
+         Returns a signature with this Key.
+@@ -730,6 +760,7 @@
+                             Util.number.long_to_bytes(sig[1], 20))
+         return common.NS(self.sshType()) + ret
+ 
++
+     def verify(self, signature, data):
+         """
+         Returns true if the signature for data is valid for this Key.
+@@ -756,6 +787,7 @@
+         return self.keyObject.verify(digest, numbers)
+ 
+ 
++
+ def objectType(obj):
+     """
+     Return the SSH key type corresponding to a
+@@ -775,6 +807,7 @@
+         raise BadKeyError("invalid key object", obj)
+ 
+ 
++
+ def pkcs1Pad(data, messageLength):
+     """
+     Pad out data to messageLength according to the PKCS#1 standard.
+@@ -785,6 +818,7 @@
+     return '\x01' + ('\xff' * lenPad) + '\x00' + data
+ 
+ 
++
+ def pkcs1Digest(data, messageLength):
+     """
+     Create a message digest using the SHA1 hash algorithm according to the
+@@ -796,6 +830,7 @@
+     return pkcs1Pad(ID_SHA1 + digest, messageLength)
+ 
+ 
++
+ def lenSig(obj):
+     """
+     Return the length of the signature in bytes for a key object.

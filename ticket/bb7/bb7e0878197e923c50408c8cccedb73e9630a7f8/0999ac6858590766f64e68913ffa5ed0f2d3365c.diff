@@ -1,0 +1,691 @@
+Index: test/test_web.py
+===================================================================
+--- test/test_web.py	(Revision 23613)
++++ test/test_web.py	(Arbeitskopie)
+@@ -12,12 +12,41 @@
+ from zope.interface import implements
+ 
+ class DummyRequest:
++    """
++    Represents a dummy or fake request.
++
++    @type headers: C{dict}
++    @ivar headers: Holds all request header fields in
++    I{'field-name':'field-value'} manner
++    @type outgoingHeaders: C{dict}
++    @ivar outgoingHeaders: Holds all response header fields in
++    I{'field-name':'field-value'} manner
++    @type responseCode: C{http.STATUS_CODE}
++    @ivar responseCode: Carry the HTTP status code which will be respond the
++    request
++    @type written: C{string}
++    @ivar written: Serves as a container where the request is rendered into
++    """
++
+     uri='http://dummy/'
+     method = 'GET'
+ 
+-    def getHeader(self, h):
+-        return None
+ 
++    def getHeader(self, name):
++        """
++        Returns the header I{field value} if present, otherwise an
++        AttributeError will be raised.
++
++        The seperating colon is not returned. The field name is mapped to
++        lower case before the look up.
++
++        @return: The I{field value} from a HTTP header field.
++        @raise AttributeError: if there is no such header field with name
++        C{name}.
++        """
++        return self.headers.get(name.lower(), None)
++
++
+     def registerProducer(self, prod,s):
+         self.go = 1
+         while self.go:
+@@ -26,6 +55,7 @@
+     def unregisterProducer(self):
+         self.go = 0
+ 
++
+     def __init__(self, postpath, session=None):
+         self.sitepath = []
+         self.written = []
+@@ -36,7 +66,10 @@
+         self.protoSession = session or server.Session(0, self)
+         self.args = {}
+         self.outgoingHeaders = {}
++        self.headers = {}
++        self.responseCode = None
+ 
++
+     def setHeader(self, name, value):
+         """TODO: make this assert on write() if the header is content-length
+         """
+@@ -54,8 +87,17 @@
+         self.finished = self.finished + 1
+     def addArg(self, name, value):
+         self.args[name] = [value]
++
++
+     def setResponseCode(self, code):
++        """
++        Set the HTTP status response code, but takes care that this is written
++        before any data is written.
++        """
+         assert not self.written, "Response code cannot be set after data has been written: %s." % "@@@@".join(self.written)
++        self.responseCode = code
++
++
+     def setLastModified(self, when):
+         assert not self.written, "Last-Modified cannot be set after data has been written: %s." % "@@@@".join(self.written)
+     def setETag(self, tag):
+@@ -65,8 +107,8 @@
+     def testListEntities(self):
+         r = resource.Resource()
+         self.failUnlessEqual([], r.listEntities())
+-        
+ 
++
+ class SimpleResource(resource.Resource):
+     def render(self, request):
+         if http.CACHED in (request.setLastModified(10),
+@@ -153,9 +195,9 @@
+ 
+         self.failIf(self.clock.calls)
+         self.failIf(loop.running)
+-        
+ 
+ 
++
+ # Conditional requests:
+ # If-None-Match, If-Modified-Since
+ 
+@@ -203,7 +245,7 @@
+         for l in ["GET / HTTP/1.1",
+                   "Accept: text/html"]:
+             self.channel.lineReceived(l)
+-    
++
+     def tearDown(self):
+         self.channel.connectionLost(None)
+ 
+@@ -535,13 +577,6 @@
+     clientproto = 'HTTP/1.0'
+     sentLength = None
+ 
+-    def __init__(self, *a, **kw):
+-        DummyRequest.__init__(self, *a, **kw)
+-        self.headers = {}
+-
+-    def getHeader(self, h):
+-        return self.headers.get(h.lower(), None)
+-
+     def getClientIP(self):
+         return self.client
+ 
+Index: test/test_static.py
+===================================================================
+--- test/test_static.py	(Revision 23613)
++++ test/test_static.py	(Arbeitskopie)
+@@ -1,64 +1,306 @@
+-from twisted.trial import unittest
+ import os
+-from twisted.web import static
+ 
+-class FakeRequest:
+-    method = 'GET'
++from twisted.python import log
++from twisted.trial import unittest
++from twisted.web import static, http, error
++from twisted.web.test.test_web import DummyRequest
+ 
+-    _headers = None
+-    _setHeaders = None
+-    _written = ''
+ 
+-    def __init__(self):
+-        self._headers = {}
+-        self._setHeaders = {}
+ 
+-    def getHeader(self, k):
+-        if self._headers is None:
+-            return None
+-        return self._headers.get(k)
++class RangeTests(unittest.TestCase):
++    """
++    Accommodates several unit tests for the Range-Header implementation.
+ 
+-    def setHeader(self, k, v):
+-        self._setHeaders.setdefault(k, []).append(v)
++    Each test a temp file with a fixed payload of 64 bytes is created. Then a
++    C{resource} and a C{DummyRequest} are build up using that file as target.
++    The request for example may be modified in each test method, so the
++    resource may be tested in various ways.
++    @type file: File
++    @ivar file: Binary temp file (64 Bytes) which is served.
++    @type resource: static.File
++    @ivar resource: A leaf web resource using C{self.file} as content.
++    @type request: DummyRequest
++    @ivar request: A fake request, requesting C{self.resource}.
++    @type catcher: List
++    @ivar catcher: List which gathers all log information.
++    """
++    def setUp(self):
++        self.file = file(self.mktemp(), 'w')
++        self.payload = ('\xf8u\xf3E\x8c7\xce\x00\x9e\xb6a0y0S\xf0\xef\xac\xb7'
++                        '\xbe\xb5\x17M\x1e\x136k{\x1e\xbe\x0c\x07\x07\t\xd0'
++                        '\xbckY\xf5I\x0b\xb8\x88oZ\x1d\x85b\x1a\xcdk\xf2\x1d'
++                        '&\xfd%\xdd\x82q/A\x10Y\x8b')
++        self.file.write(self.payload)
++        self.file.flush()
++        self.resource = static.File(self.file.name)
++        self.resource.isLeaf = 1
++        self.request = DummyRequest([''])
++        self.request.uri = self.file.name
++        self.file.seek(0)
++        self.catcher = []
++        log.addObserver(self.catcher.append)
+ 
+-    def setLastModified(self, x):
+-        pass
+-    def registerProducer(self, producer, x):
+-        producer.resumeProducing()
+-    def unregisterProducer(self):
+-        pass
+-    def finish(self):
+-        pass
+ 
+-    def write(self, data):
+-        self._written = self._written + data
++    def tearDown(self):
++        self.file.close()
++        log.removeObserver(self.catcher.append)
+ 
+-class Range(unittest.TestCase):
+-    todo = (unittest.FailTest, 'No range support yet.')
+ 
++    def _assertLogged(self, expected):
++        """
++        Asserts that a given log occured with an expected message.
++        """
++
++        log_item = self.catcher.pop()
++        self.assertEquals(log_item["message"][0], expected)
++        self.assert_(len(self.catcher) == 0, "An additional log occured: " +
++                     repr(log_item))
++
++
++    def test_bodyLength(self):
++        """
++        A correct response to a range request is as long as the length of
++        the requested range.
++
++        If multiple ranges requests requested in one request, only the first
++        one is evaluated and answered. This is correct behaviour to RFC 2616.
++        """
++        self.request.headers['range'] = 'bytes=0-43'
++        self.resource.render(self.request)
++        self.assertEquals(len(''.join(self.request.written)), 44)
++
++
++    def test_bytesUnit(self):
++        """
++        A correct range request starts with an Bytes-Unit followed by a '='
++        character and then followed by a specific range starting with an
++        identifier as Bytes-Unit. In RFC 2616 only 'bytes' is defined as
++        Bytes-Unit.
++        """
++        self.request.headers['range'] = 'foobar=0-43'
++        self.resource.render(self.request)
++        expected = ("Warning: ignoring malformed Range-Header due to:\n\t400 "
++                    "Unsupported Bytes-Unit: 'foobar'\n\tProceed without this"
++                    " header field")
++        self._assertLogged(expected)
++        self.assertEquals(''.join(self.request.written), self.payload)
++        self.assertEquals(self.request.responseCode, http.OK)
++
++    def test_bodyContent(self):
++        """
++        A correct response to a range header request: bytes=A-B starts with
++        A'th byte and ends with (including) the B'th byte. The first byte of
++        a page is numbered with 0.
++        """
++        self.request.headers['range'] = 'bytes=3-43'
++        self.resource.render(self.request)
++        self.assertEquals(''.join(self.request.written), self.payload[3:44])
++
++
++    def test_contentLength(self):
++        """
++        The Content-Length reponse header field should match the body length
++        which in turn should match the length of the requested range.
++        """
++
++        self.request.headers['range'] = 'bytes=0-43'
++        self.resource.render(self.request)
++        self.assertEquals(self.request.outgoingHeaders['content-length'], '44')
++
++
++    def test_contentRange(self):
++        """
++        The response header field Content-Range of a range header request is
++        correct if the range delivered is repeated and followed by a slash with
++        the overall size of the document.
++        """
++
++        self.request.headers['range'] = 'bytes=0-43'
++        self.resource.render(self.request)
++        self.assertEquals(self.request.outgoingHeaders['content-range'],
++                          'bytes 0-43/64')
++
++
++    def test_statusCodePartialContent(self):
++        """
++        If a range header request could be processed without any errors, the
++        status code: 206 has to be submitted instead of 200.
++        """
++
++        self.request.headers['range'] = 'bytes=0-43'
++        self.resource.render(self.request)
++        self.assertEquals(self.request.responseCode, http.PARTIAL_CONTENT)
++
++
++    def test_statusCodeRequestedRangeNotSatisfiable(self):
++        """
++        AFAIK: Status code 416 is only submitted if the range is not
++        satisfiable due to an invalid range. A range is invalid if the start
++        byte is smaller than the end byte or the start byte is greater than
++        the length of.
++        """
++        self.request.headers['range'] = 'bytes=20-13'
++        self.resource.render(self.request)
++        self.assertEquals(self.request.responseCode,
++                          http.REQUESTED_RANGE_NOT_SATISFIABLE)
++
++
++    def test_invalidStartBytePos(self):
++        """
++        If a range header requests has a "first-byte-pos value greater than
++        the current length of the selected resource" (as the RFC 2616 says)
++        we should return a 416 status code.
++        """
++
++        self.request.headers['range'] = 'bytes=67-108'
++        self.resource.render(self.request)
++        self.assertEquals(self.request.responseCode,
++                          http.REQUESTED_RANGE_NOT_SATISFIABLE)
++        self.assertEquals(len(''.join(self.request.written)), 0)
++
++
++    def test_firstByteSupport(self):
++        """
++        If the last-byte-pos is omitted, then it is assumed to be just
++        the last byte of the ressource.
++        """
++
++        self.request.headers['range'] = 'bytes=23-'
++        self.resource.render(self.request)
++        self.assertEquals(''.join(self.request.written), self.payload[23:])
++        self.assertEquals(len(''.join(self.request.written)), 41)
++        self.assertEquals(self.request.outgoingHeaders['content-range'],
++                          'bytes 23-63/64')
++        self.assertEquals(self.request.outgoingHeaders['content-length'], '41')
++
++
++    def test_lastByteSupport(self):
++        """
++        If the first-byte-pos is omitted, then it is assumed to be just
++        the pos  size - last-byte-pos. That is, the last-byte-pos is the
++        length of the delivered byte range: the last-byte-pos'th bytes of
++        the ressource.
++        """
++
++        self.request.headers['range'] = 'bytes=-17'
++        self.resource.render(self.request)
++        self.assertEquals(''.join(self.request.written), self.payload[-17:])
++        self.assertEquals(len(''.join(self.request.written)), 17)
++        self.assertEquals(self.request.outgoingHeaders['content-range'],
++                          'bytes 47-63/64')
++        self.assertEquals(self.request.outgoingHeaders['content-length'], '17')
++
++
++    def test_invalidByteRangeNoStartNoEnd(self):
++        """
++        A byte range containing no first-byte-pos nor last-byte-pos is
++        syntactically invalid and must be ignored.
++        """
++
++        self.request.headers['range'] = 'bytes=-'
++        self.resource.render(self.request)
++        self.assertEquals(self.request.responseCode, http.OK)
++        self.assertEquals(len(''.join(self.request.written)), 64)
++        self.assertEquals(''.join(self.request.written), self.payload)
++        expected = ("Warning: ignoring malformed Range-Header due to:\n\t400 "
++                    "Invalid Byte-Range: '-'\n\tProceed without this header "
++                    "field")
++        self._assertLogged(expected)
++
++
++    def test_multipleRanges(self):
++        """
++        If multiple ranges are given, only the first byte range is delivered.
++        """
++
++        self.request.headers['range'] = 'bytes=23-43,17-28'
++        self.resource.render(self.request)
++        self.assertEquals(self.request.responseCode, http.PARTIAL_CONTENT)
++        self.assertEquals(len(''.join(self.request.written)), 21)
++        self.assertEquals(''.join(self.request.written), self.payload[23:44])
++
++
++    def test_invalidByteRangeContainingNaNs(self):
++        """
++        If a byte range is syntactically invalid it should be ignored.
++        """
++
++        self.request.headers['range'] = 'bytes=-abc#'
++        self.resource.render(self.request)
++        self.assertEquals(self.request.responseCode, http.OK)
++        self.assertEquals(len(''.join(self.request.written)), 64)
++        self.assertEquals(''.join(self.request.written), self.payload)
++        expected = ("Warning: ignoring malformed Range-Header due to:\n\t400 "
++                    "Invalid Byte-Range: '-abc#'\n\tProceed without this "
++                    "header field")
++        self._assertLogged(expected)
++
++
++
++class FileTests(unittest.TestCase):
++    """
++    Accommodates several test for the File class.
++    """
++
++
+     def setUp(self):
+-        self.tmpdir = self.mktemp()
+-        os.mkdir(self.tmpdir)
+-        name = os.path.join(self.tmpdir, 'junk')
+-        f = file(name, 'w')
+-        f.write(8000 * 'x')
+-        f.close()
+-        self.file = static.File(name)
+-        self.request = FakeRequest()
++        self.file = file(self.mktemp(), 'w')
++        self.file.write("payload")
++        self.file.flush()
++        self.resource = static.File(self.file.name)
++        self.resource.isLeaf = 1
++        self.request = DummyRequest([''])
++        self.request.uri = self.file.name
++        self.file.seek(0)
++        self.catcher = []
++        log.addObserver(self.catcher.append)
+ 
+-    def testBodyLength(self):
+-        self.request._headers['range'] = 'bytes=0-1999'
+-        self.file.render(self.request)
+-        self.assertEquals(len(self.request._written), 2000)
+ 
+-    def testContentLength(self):
+-        """Content-Length of a request is correct."""
+-        self.request._headers['range'] = 'bytes=0-1999'
+-        self.file.render(self.request)
+-        self.assertEquals(self.request._setHeaders['content-length'], ['2000'])
++    def tearDown(self):
++        self.file.close()
++        log.removeObserver(self.catcher.append)
+ 
+-    def testContentRange(self):
+-        """Content-Range of a request is correct."""
+-        self.request._headers['range'] = 'bytes=0-1999'
+-        self.file.render(self.request)
+-        self.assertEquals(self.request._setHeaders.get('content-range'), ['bytes 0-1999/8000'])
++
++    def test_malformedRangeHeadersInvalidByteUnit(self):
++        """
++        A correct range header field could have just 'bytes' as Bytes-Unit,
++        nothing else.
++        """
++        self.request.headers['range'] = 'unkown=foo-bar'
++        self.assertRaises(error.MalformedHeader,
++                          self.resource._doRangeRequest,
++                          self.request,
++                          self.file)
++
++
++    def test_malformedRangeHeadersInvalidStartByte(self):
++        """
++        A Range-Specifier starts either with a number, or with a '-'.
++        """
++        self.request.headers['range'] = 'bytes=foo-23'
++        self.assertRaises(error.MalformedHeader,
++                          self.resource._doRangeRequest,
++                          self.request,
++                          self.file)
++
++    def test_malformedRangeHeadersInvalidLastByte(self):
++        """
++        A Range-Specifier ends with a number or with an end of line.
++        """
++        self.request.headers['range'] = 'bytes=23-bar'
++        self.assertRaises(error.MalformedHeader,
++                          self.resource._doRangeRequest,
++                          self.request,
++                          self.file)
++
++
++    def test_malformedRangeHeadersMissingEqualChar(self):
++        """
++        The Bytes-Unit and the Byte-Range-Set is always seperated by an
++        equal character: '=', nothing else.
++        """
++        self.request.headers['range'] = 'bytes:23-234'
++        self.assertRaises(error.MalformedHeader,
++                          self.resource._doRangeRequest,
++                          self.request,
++                          self.file)
+Index: error.py
+===================================================================
+--- error.py	(Revision 23613)
++++ error.py	(Arbeitskopie)
+@@ -12,14 +12,44 @@
+ 
+ class Error(Exception):
+     def __init__(self, code, message = None, response = None):
++        """
++        Initializes a basic exception.
++
++        @param code: Refers to an HTTP status code for example http.NOT_FOUND.
++        If no message is given the given code is mapped to a descriptive 
++        string and used instead.
++        """
++
+         message = message or http.responses.get(code)
+         Exception.__init__(self, code, message, response)
+         self.status = code
+         self.response = response
+-    
++
++
+     def __str__(self):
+         return '%s %s' % (self[0], self[1])
+ 
++
++
++class MalformedHeader(Error):
++    """
++    Indicates a malformed HTTP header, e.g. when a request header has invalid
++    syntax in e.g. the range-header field.
++    
++    If no HTTP status code is given then C{http.BAD_REQUEST} is used instead.
++    """
++
++    def __init__(self, code = None, message = None, response = None):
++        """
++        Creates a malformed header error with http.BAD_REQUEST as standard 
++        status code.
++        """
++        if (not code):
++            code = http.BAD_REQUEST
++        Error.__init__(self, code, message, response)
++
++
++
+ class PageRedirect(Error):
+     """A request that resulted in a http redirect """
+     def __init__(self, code, message = None, response = None, location = None):
+Index: static.py
+===================================================================
+--- static.py	(Revision 23613)
++++ static.py	(Arbeitskopie)
+@@ -150,6 +150,8 @@
+     type = types.get(ext, defaultType)
+     return type, enc
+ 
++
++
+ class File(resource.Resource, styles.Versioned, filepath.FilePath):
+     """
+     File is a resource that represents a plain non-interpreted file
+@@ -287,6 +289,66 @@
+         return self.getsize()
+ 
+ 
++    def _doRangeRequest(self, request, file):
++        """
++        Performs (simple) Range-Header requests. Simple means, that only
++        the first byte range is handled.
++
++        @param file: file handle for the corresponding ressource
++        @type file: file object
++        @raise MalformedHeader: If the given Byte-Ranges-Specifier was invalid
++        @return: content-length and the number of the byte to where to stop.
++        @rtype: C{int}, C{int}
++        """
++
++        size = self.getFileSize()
++        range = request.getHeader('range')
++        if not ('=' in range):
++            raise error.MalformedHeader(message="Missing '=' seperator in " +
++                                                "range field: " + repr(range))
++        bytesrange = string.split(range, '=')
++        if not (bytesrange[0] == 'bytes'):
++            raise error.MalformedHeader(message="Unsupported Bytes-Unit: " +
++                                        repr(bytesrange[0]))
++        first_byte_pos, last_byte_pos = bytesrange[1].split(',')[0].split('-')
++        if (not first_byte_pos ) and (not last_byte_pos):
++            raise error.MalformedHeader(message="Invalid Byte-Range: " +
++                                        repr(bytesrange[1]))
++        try:
++            if first_byte_pos:
++                start = int(first_byte_pos)
++            if last_byte_pos:
++                stop = int(last_byte_pos)
++        except ValueError, e:
++            raise error.MalformedHeader(message="Invalid Byte-Range: " + 
++                                      repr(range.split('=')[1].split(',')[0]))
++        if first_byte_pos:
++            if last_byte_pos and (stop < size):
++                stop = stop + 1
++            else:
++                stop = size
++        else:
++            lastbytes = stop
++            if size < lastbytes:
++                lastbytes = size
++            start = size - lastbytes
++            stop = size
++        if start <= size:
++            file.seek(start)
++        content_length = stop - start
++        if content_length <= 0:
++            request.setResponseCode(http.REQUESTED_RANGE_NOT_SATISFIABLE)
++            content_length = size
++            request.method = 'HEAD' # no msg body will be transferred
++        else:
++            request.setResponseCode(http.PARTIAL_CONTENT)
++            request.setHeader('content-range',
++                              "bytes %s-%s/%s" % (str(start),
++                                                  str(stop-1),
++                                                  str(size)))
++        return content_length, stop
++
++
+     def render(self, request):
+         """You know what you doing."""
+         self.restat()
+@@ -303,11 +365,8 @@
+         if self.isdir():
+             return self.redirect(request)
+ 
+-        #for content-length
+-        fsize = size = self.getFileSize()
++        request.setHeader('accept-ranges','bytes')
+ 
+-#         request.setHeader('accept-ranges','bytes')
+-
+         if self.type:
+             request.setHeader('content-type', self.type)
+         if self.encoding:
+@@ -325,43 +384,28 @@
+         if request.setLastModified(self.getmtime()) is http.CACHED:
+             return ''
+ 
+-# Commented out because it's totally broken. --jknight 11/29/04
+-#         try:
+-#             range = request.getHeader('range')
+-# 
+-#             if range is not None:
+-#                 # This is a request for partial data...
+-#                 bytesrange = string.split(range, '=')
+-#                 assert bytesrange[0] == 'bytes',\
+-#                        "Syntactically invalid http range header!"
+-#                 start, end = string.split(bytesrange[1],'-')
+-#                 if start:
+-#                     f.seek(int(start))
+-#                 if end:
+-#                     end = int(end)
+-#                     size = end
+-#                 else:
+-#                     end = size
+-#                 request.setResponseCode(http.PARTIAL_CONTENT)
+-#                 request.setHeader('content-range',"bytes %s-%s/%s " % (
+-#                     str(start), str(end), str(size)))
+-#                 #content-length should be the actual size of the stuff we're
+-#                 #sending, not the full size of the on-server entity.
+-#                 fsize = end - int(start)
+-# 
+-#             request.setHeader('content-length', str(fsize))
+-#         except:
+-#             traceback.print_exc(file=log.logfile)
++        # set the stop byte, and content-length
++        content_length = stop = self.getFileSize()
+ 
+-        request.setHeader('content-length', str(fsize))
++        if request.getHeader('range') is not None:
++            try:
++                content_length, stop = self._doRangeRequest(request, f)
++            except error.MalformedHeader, e:
++                log.msg("Warning: ignoring malformed Range-Header due to:\n" +
++                        "\t" + str(e) + "\n\tProceed without this header field")
++                request.setResponseCode(http.OK)
++                content_length = stop = self.getFileSize()
++
++        request.setHeader('content-length', str(content_length))
+         if request.method == 'HEAD':
+             return ''
+ 
+         # return data
+-        FileTransfer(f, size, request)
++        FileTransfer(f, stop, request)
+         # and make sure the connection doesn't get closed
+         return server.NOT_DONE_YET
+ 
++
+     def redirect(self, request):
+         return redirectTo(addSlash(request), request)
+ 

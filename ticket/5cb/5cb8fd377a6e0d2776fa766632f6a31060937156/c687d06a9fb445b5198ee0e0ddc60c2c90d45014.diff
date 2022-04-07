@@ -1,0 +1,157 @@
+diff --git a/twisted/protocols/ftp.py b/twisted/protocols/ftp.py
+index b035f04..997b8d3 100644
+--- a/twisted/protocols/ftp.py
++++ b/twisted/protocols/ftp.py
+@@ -220,6 +220,24 @@ def errnoToFailure(e, path):
+         return defer.fail()
+ 
+ 
++def isGlobbingExpression(segments=None):
++    """
++    Returns True if `expression` is a globbing expression.
++
++    It will try to translate the globabing expression in regex and
++    checks that the resulting regular expression is the same
++    as the original text.
++    """
++    if not segments:
++        return False
++
++    globCandidate = segments[-1]
++    emtpyTranslations = fnmatch.translate('')
++    globTranslations = fnmatch.translate(globCandidate)
++    if globCandidate + emtpyTranslations == globTranslations:
++        return False
++    return True
++
+ 
+ class FTPCmdError(Exception):
+     """
+@@ -946,7 +964,7 @@ class FTP(object, basic.LineReceiver, policies.TimeoutMixin):
+         except InvalidPath:
+             return defer.fail(FileNotFoundError(path))
+ 
+-        def cbList(results):
++        def cbList(results, glob=None):
+             """
+             Send, line by line, each file in the directory listing, and then
+             close the connection.
+@@ -961,18 +979,12 @@ class FTP(object, basic.LineReceiver, policies.TimeoutMixin):
+             """
+             self.reply(DATA_CNX_ALREADY_OPEN_START_XFR)
+             for (name, ignored) in results:
+-                self.dtpInstance.sendLine(name)
+-            self.dtpInstance.transport.loseConnection()
+-            return (TXFR_COMPLETE_OK,)
+-
+-        def cbGlob(results):
+-            self.reply(DATA_CNX_ALREADY_OPEN_START_XFR)
+-            for (name, ignored) in results:
+-                if fnmatch.fnmatch(name, segments[-1]):
++                if not glob or (glob and fnmatch.fnmatch(name, glob)):
+                     self.dtpInstance.sendLine(name)
+             self.dtpInstance.transport.loseConnection()
+             return (TXFR_COMPLETE_OK,)
+ 
++
+         def listErr(results):
+             """
+             RFC 959 specifies that an NLST request may only return directory
+@@ -990,17 +1002,14 @@ class FTP(object, basic.LineReceiver, policies.TimeoutMixin):
+             self.dtpInstance.transport.loseConnection()
+             return (TXFR_COMPLETE_OK,)
+ 
+-        # XXX This globbing may be incomplete: see #4181
+-        if segments and (
+-            '*' in segments[-1] or '?' in segments[-1] or
+-            ('[' in segments[-1] and ']' in segments[-1])):
+-            d = self.shell.list(segments[:-1])
+-            d.addCallback(cbGlob)
+-        else:
+-            d = self.shell.list(segments)
+-            d.addCallback(cbList)
+-            # self.shell.list will generate an error if the path is invalid
+-            d.addErrback(listErr)
++        glob = None
++        if isGlobbingExpression(segments):
++            glob = segments.pop()
++
++        d = self.shell.list(segments)
++        d.addCallback(cbList, glob)
++        # self.shell.list will generate an error if the path is invalid
++        d.addErrback(listErr)
+         return d
+ 
+ 
+diff --git a/twisted/test/test_ftp.py b/twisted/test/test_ftp.py
+index 23ffcba..bcc2446 100644
+--- a/twisted/test/test_ftp.py
++++ b/twisted/test/test_ftp.py
+@@ -776,6 +776,22 @@ class FTPServerPortDataConnectionTestCase(FTPServerPasvDataConnectionTestCase):
+                 ["425 Can't open data connection."])
+         return d.addCallback(gotPortNum)
+ 
++    def test_NLSTGlobbing(self):
++        """
++        NLST can use Unix shell globbing for matching file patterns.
++        """
++        self.dirPath.child('test.txt').touch()
++        self.dirPath.child('ceva.txt').touch()
++        d = self._anonymousLogin()
++
++        self._download('NLST *.txt', chainDeferred=d)
++
++        def checkDownload(download):
++            filenames = download[:-2].split('\r\n')
++            filenames.sort()
++            self.assertEqual(['ceva.txt', 'test.txt'], filenames)
++
++        return d.addCallback(checkDownload)
+ 
+ 
+ class DTPFactoryTests(unittest.TestCase):
+@@ -2239,6 +2255,44 @@ class PathHandling(unittest.TestCase):
+             self.assertRaises(ftp.InvalidPath, ftp.toSegments, ['x'], inp)
+ 
+ 
++
++class IsGlobbingExpressionTests(unittest.TestCase):
++    """
++    Tests for isGlobbingExpression utility function.
++    """
++
++    def test_isGlobbingExpressionEmptySegments(self):
++        """
++        isGlobbingExpression will return False for None, or empty
++        segments.
++        """
++        self.assertFalse(ftp.isGlobbingExpression())
++        self.assertFalse(ftp.isGlobbingExpression([]))
++        self.assertFalse(ftp.isGlobbingExpression(None))
++
++
++    def test_isGlobbingExpressionNoGlob(self):
++        """
++        isGlobbingExpression will return False for plain segments.
++
++        Also, it only checks the last segment part (filename) and will not
++        check the path name.
++        """
++        self.assertFalse(ftp.isGlobbingExpression(['ignore', 'expression']))
++        self.assertFalse(ftp.isGlobbingExpression(['*.txt', 'expression']))
++
++
++    def test_isGlobbingExpressionGlob(self):
++        """
++        isGlobbingExpression will return True for segments which contains
++        globbing characters in the last segment part (filename).
++        """
++        self.assertTrue(ftp.isGlobbingExpression(['ignore', '*.txt']))
++        self.assertTrue(ftp.isGlobbingExpression(['ignore', '[a-b].txt']))
++        self.assertTrue(ftp.isGlobbingExpression(['ignore', 'fil?.txt']))
++
++
++
+ class BaseFTPRealmTests(unittest.TestCase):
+     """
+     Tests for L{ftp.BaseFTPRealm}, a base class to help define L{IFTPShell}

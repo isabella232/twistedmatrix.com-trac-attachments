@@ -1,0 +1,356 @@
+Index: twisted/test/test_iutils.py
+===================================================================
+--- twisted/test/test_iutils.py	(revision 37370)
++++ twisted/test/test_iutils.py	(working copy)
+@@ -5,11 +5,15 @@
+ Test running processes with the APIs in L{twisted.internet.utils}.
+ """
+ 
++from __future__ import division, absolute_import
++
+ import warnings, os, stat, sys, signal
+ 
+ from twisted.python.runtime import platform
+ from twisted.trial import unittest
+ from twisted.internet import error, reactor, utils, interfaces
++from twisted.internet.defer import Deferred
++from twisted.python.test.test_util import SuppressedWarningsTests
+ 
+ 
+ class ProcessUtilsTests(unittest.TestCase):
+@@ -115,7 +119,8 @@
+             "sys.exit(1)"
+             ])
+ 
+-        def gotOutputAndValue((out, err, code)):
++        def gotOutputAndValue(out_err_code):
++            out, err, code = out_err_code
+             self.assertEqual(out, "hello world!\n")
+             self.assertEqual(err, "goodbye world!" + os.linesep)
+             self.assertEqual(code, 1)
+@@ -141,7 +146,8 @@
+             "sys.stderr.flush()",
+             "os.kill(os.getpid(), signal.SIGKILL)"])
+ 
+-        def gotOutputAndValue((out, err, sig)):
++        def gotOutputAndValue(out_err_sig):
++            out, err, sig = out_err_sig
+             self.assertEqual(out, "stdout bytes\n")
+             self.assertEqual(err, "stderr bytes\n")
+             self.assertEqual(sig, signal.SIGKILL)
+@@ -188,7 +194,8 @@
+         L{getProcessOutputAndValue} runs the given command with the working
+         directory given by the C{path} parameter.
+         """
+-        def check((out, err, status), dir):
++        def check(out_err_status, dir):
++            out, err, status = out_err_status
+             self.assertEqual(out, dir)
+             self.assertEqual(status, 0)
+         return self._pathTest(utils.getProcessOutputAndValue, check)
+@@ -252,8 +259,88 @@
+         directory as the parent process and succeeds even if the current
+         working directory is not accessible.
+         """
+-        def check((out, err, status), dir):
++        def check(out_err_status, dir):
++            out, err, status = out_err_status
+             self.assertEqual(out, dir)
+             self.assertEqual(status, 0)
+         return self._defaultPathTest(
+             utils.getProcessOutputAndValue, check)
++
++
++
++class SuppressWarningsTests(unittest.SynchronousTestCase):
++    """
++    Tests for L{utils.suppressWarnings}.
++    """
++    def test_suppressWarnings(self):
++        """
++        L{utils.suppressWarnings} decorates a function so that the given
++        warnings are suppressed.
++        """
++        result = []
++        def showwarning(self, *a, **kw):
++            result.append((a, kw))
++        self.patch(warnings, "showwarning", showwarning)
++
++        def f(msg):
++            warnings.warn(msg)
++        g = utils.suppressWarnings(f, (('ignore',), dict(message="This is message")))
++
++        # Start off with a sanity check - calling the original function
++        # should emit the warning.
++        f("Sanity check message")
++        self.assertEqual(len(result), 1)
++
++        # Now that that's out of the way, call the wrapped function, and
++        # make sure no new warnings show up.
++        g("This is message")
++        self.assertEqual(len(result), 1)
++
++        # Finally, emit another warning which should not be ignored, and
++        # make sure it is not.
++        g("Unignored message")
++        self.assertEqual(len(result), 2)
++
++
++
++class DeferredSuppressedWarningsTests(SuppressedWarningsTests):
++    """
++    Tests for L{utils.runWithWarningsSuppressed}, the version that supports
++    Deferreds.
++    """
++    # Override the non-Deferred-supporting function from the base class with
++    # the function we are testing in this class:
++    runWithWarningsSuppressed = staticmethod(utils.runWithWarningsSuppressed)
++
++    def test_deferredCallback(self):
++        """
++        If the function called by L{utils.runWithWarningsSuppressed} returns a
++        C{Deferred}, the warning filters aren't removed until the Deferred
++        fires.
++        """
++        filters = [(("ignore", ".*foo.*"), {}),
++                   (("ignore", ".*bar.*"), {})]
++        result = Deferred()
++        self.runWithWarningsSuppressed(filters, lambda: result)
++        warnings.warn("ignore foo")
++        result.callback(3)
++        warnings.warn("ignore foo 2")
++        self.assertEqual(
++            ["ignore foo 2"], [w['message'] for w in self.flushWarnings()])
++
++    def test_deferredErrback(self):
++        """
++        If the function called by L{utils.runWithWarningsSuppressed} returns a
++        C{Deferred}, the warning filters aren't removed until the Deferred
++        fires with an errback.
++        """
++        filters = [(("ignore", ".*foo.*"), {}),
++                   (("ignore", ".*bar.*"), {})]
++        result = Deferred()
++        d = self.runWithWarningsSuppressed(filters, lambda: result)
++        warnings.warn("ignore foo")
++        result.errback(ZeroDivisionError())
++        d.addErrback(lambda f: f.trap(ZeroDivisionError))
++        warnings.warn("ignore foo 2")
++        self.assertEqual(
++            ["ignore foo 2"], [w['message'] for w in self.flushWarnings()])
+Index: twisted/internet/utils.py
+===================================================================
+--- twisted/internet/utils.py	(revision 37370)
++++ twisted/internet/utils.py	(working copy)
+@@ -6,17 +6,15 @@
+ Utility methods.
+ """
+ 
++from __future__ import division, absolute_import
++
+ import sys, warnings
++from functools import wraps
+ 
+ from twisted.internet import protocol, defer
+-from twisted.internet._utilspy3 import runWithWarningsSuppressed
+-from twisted.internet._utilspy3 import suppressWarnings
+ from twisted.python import failure
++from twisted.python.compat import NativeStringIO, reraise
+ 
+-try:
+-    import cStringIO as StringIO
+-except ImportError:
+-    import StringIO
+ 
+ def _callProtocolWithDeferred(protocol, executable, args, env, path, reactor=None):
+     if reactor is None:
+@@ -28,7 +26,6 @@
+     return d
+ 
+ 
+-
+ class _UnexpectedErrorOutput(IOError):
+     """
+     Standard error data was received where it was not expected.  This is a
+@@ -39,6 +36,7 @@
+         produced the data on stderr has ended (exited and all file descriptors
+         closed).
+     """
++
+     def __init__(self, text, processEnded):
+         IOError.__init__(self, "got stderr: %r" % (text,))
+         self.processEnded = processEnded
+@@ -66,7 +64,7 @@
+ 
+     def __init__(self, deferred, errortoo=0):
+         self.deferred = deferred
+-        self.s = StringIO.StringIO()
++        self.s = NativeStringIO()
+         if errortoo:
+             self.errReceived = self.errReceivedIsGood
+         else:
+@@ -145,8 +143,8 @@
+ 
+     def __init__(self, deferred):
+         self.deferred = deferred
+-        self.outBuf = StringIO.StringIO()
+-        self.errBuf = StringIO.StringIO()
++        self.outBuf = Native.StringIO()
++        self.errBuf = Native.StringIO()
+         self.outReceived = self.outBuf.write
+         self.errReceived = self.errBuf.write
+ 
+@@ -160,6 +158,7 @@
+         else:
+             self.deferred.callback((out, err, code))
+ 
++
+ def getProcessOutputAndValue(executable, args=(), env={}, path=None,
+                              reactor=None):
+     """Spawn a process and returns a Deferred that will be called back with
+@@ -171,8 +170,52 @@
+                                     reactor)
+ 
+ 
++def _resetWarningFilters(passthrough, addedFilters):
++    for f in addedFilters:
++        try:
++            warnings.filters.remove(f)
++        except ValueError:
++            pass
++    return passthrough
++
++
++def runWithWarningsSuppressed(suppressedWarnings, f, *a, **kw):
++    """Run the function C{f}, but with some warnings suppressed.
++
++    @param suppressedWarnings: A list of arguments to pass to filterwarnings.
++                               Must be a sequence of 2-tuples (args, kwargs).
++    @param f: A callable, followed by its arguments and keyword arguments
++    """
++    for args, kwargs in suppressedWarnings:
++        warnings.filterwarnings(*args, **kwargs)
++    addedFilters = warnings.filters[:len(suppressedWarnings)]
++    try:
++        result = f(*a, **kw)
++    except:
++        exc_info = sys.exc_info()
++        _resetWarningFilters(None, addedFilters)
++        reraise(exc_info[1], exc_info[2])
++    else:
++        if isinstance(result, defer.Deferred):
++            result.addBoth(_resetWarningFilters, addedFilters)
++        else:
++            _resetWarningFilters(None, addedFilters)
++        return result
++
++
++def suppressWarnings(f, *suppressedWarnings):
++    """
++    Wrap C{f} in a callable which suppresses the indicated warnings before
++    invoking C{f} and unsuppresses them afterwards.  If f returns a Deferred,
++    warnings will remain suppressed until the Deferred fires.
++    """
++    @wraps(f)
++    def warningSuppressingWrapper(*a, **kw):
++        return runWithWarningsSuppressed(suppressedWarnings, f, *a, **kw)
++    return warningSuppressingWrapper
++
++
+ __all__ = [
+     "runWithWarningsSuppressed", "suppressWarnings",
+-
+     "getProcessOutput", "getProcessValue", "getProcessOutputAndValue",
+     ]
+Index: twisted/trial/test/test_reporter.py
+===================================================================
+--- twisted/trial/test/test_reporter.py	(revision 37370)
++++ twisted/trial/test/test_reporter.py	(working copy)
+@@ -289,7 +289,7 @@
+     def test_exception(self):
+         """
+         C{_trimFrames} removes traces of C{runWithWarningsSuppressed} from
+-        C{_utilspy3} when a synchronous exception happens in a C{TestCase}
++        C{utils} when a synchronous exception happens in a C{TestCase}
+         based test.
+         """
+         test = erroneous.TestAsynchronousFail('test_exception')
+Index: twisted/trial/reporter.py
+===================================================================
+--- twisted/trial/reporter.py	(revision 37370)
++++ twisted/trial/reporter.py	(working copy)
+@@ -492,8 +492,8 @@
+         When a C{TestCase} method fails synchronously, the stack looks like
+         this:
+          - [0]: C{defer.maybeDeferred}
+-         - [1]: C{_utilspy3.runWithWarningsSuppressed}
+-         - [2]: C{_utilspy3.runWithWarningsSuppressed}
++         - [1]: C{utils.runWithWarningsSuppressed}
++         - [2]: C{utils.runWithWarningsSuppressed}
+          - [3:-2]: code in the test method which failed
+          - [-1]: C{_synctest.fail}
+ 
+@@ -532,7 +532,7 @@
+         syncCase = (("_run", "_synctest"),
+                     ("runWithWarningsSuppressed", "util"))
+         asyncCase = (("maybeDeferred", "defer"),
+-                     ("runWithWarningsSuppressed", "_utilspy3"))
++                     ("runWithWarningsSuppressed", "utils"))
+ 
+         twoFrames = ((firstMethod, firstFile), (secondMethod, secondFile))
+         if twoFrames == syncCase:
+Index: twisted/trial/_asynctest.py
+===================================================================
+--- twisted/trial/_asynctest.py	(revision 37370)
++++ twisted/trial/_asynctest.py	(working copy)
+@@ -17,7 +17,7 @@
+ # We can't import reactor at module-level because this code runs before trial
+ # installs a user-specified reactor, installing the default reactor and
+ # breaking reactor installation. See also #6047.
+-from twisted.internet import defer, _utilspy3 as utils
++from twisted.internet import defer, utils
+ from twisted.python import failure
+ 
+ from twisted.trial import itrial, util
+Index: twisted/trial/util.py
+===================================================================
+--- twisted/trial/util.py	(revision 37370)
++++ twisted/trial/util.py	(working copy)
+@@ -24,7 +24,7 @@
+ from random import randrange
+ 
+ from twisted.python.compat import _PY3
+-from twisted.internet import defer, _utilspy3 as utils, interfaces
++from twisted.internet import defer, utils, interfaces
+ from twisted.python.failure import Failure
+ from twisted.python import deprecate, versions
+ from twisted.python.filepath import FilePath
+Index: admin/_twistedpython3.py
+===================================================================
+--- admin/_twistedpython3.py	(revision 37370)
++++ admin/_twistedpython3.py	(working copy)
+@@ -52,7 +52,7 @@
+     "twisted.internet.test.reactormixins",
+     "twisted.internet.threads",
+     "twisted.internet.udp",
+-    "twisted.internet._utilspy3",
++    "twisted.internet.utils",
+     "twisted.names",
+     "twisted.names.cache",
+     "twisted.names.client",
+@@ -140,7 +140,6 @@
+     "twisted.internet.test.test_tls",
+     "twisted.internet.test.test_udp",
+     "twisted.internet.test.test_udp_internals",
+-    "twisted.internet.test.test_utilspy3",
+     "twisted.names.test.test_cache",
+     "twisted.names.test.test_client",
+     "twisted.names.test.test_common",
+@@ -165,6 +164,7 @@
+     "twisted.test.test_failure",
+     "twisted.test.test_fdesc",
+     "twisted.test.test_internet",
++    "twisted.test.test_iutils",
+     "twisted.test.test_log",
+     "twisted.test.test_loopback",
+     "twisted.test.test_monkey",

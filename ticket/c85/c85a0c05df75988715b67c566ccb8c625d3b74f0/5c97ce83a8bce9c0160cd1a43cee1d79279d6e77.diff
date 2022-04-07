@@ -1,0 +1,382 @@
+=== modified file 'twisted/protocols/basic.py'
+--- twisted/protocols/basic.py	2008-12-14 21:41:04 +0000
++++ twisted/protocols/basic.py	2009-04-28 00:06:49 +0000
+@@ -13,6 +13,19 @@
+ import re
+ import struct
+ 
++try:
++    from collections import deque
++    deque # shut up pyflakes
++except ImportError:
++    class deque(list):
++        def popleft(self):
++            return self.pop(0)
++
++# cStringIO and io.BytesIO as of CPython 2.6.1 are much slower than StringIO
++# for many appends.  StringIO in CPython 2.3.7 is even faster for many
++# appends than in CPython 2.6.1, so it's probably safe to use StringIO
++# everywhere.
++from StringIO import StringIO
+ from zope.interface import implements
+ 
+ # Twisted imports
+@@ -184,7 +197,8 @@
+ 
+ 
+ class LineReceiver(protocol.Protocol, _PauseableMixin):
+-    """A protocol that receives lines and/or raw data, depending on mode.
++    r"""
++    A protocol that receives lines and/or raw data, depending on mode.
+ 
+     In line mode, each line that's received becomes a callback to
+     L{lineReceived}.  In raw data mode, each chunk of raw data becomes a
+@@ -193,17 +207,50 @@
+ 
+     This is useful for line-oriented protocols such as IRC, HTTP, POP, etc.
+ 
++    LineReceiver
++        does not rely on string concatenation optimizations available in
++        CPython 2.5+ and other implementations.
++
++        stays fast when `data' contains many lines delivered at once, unless
++        there is excess toggling between line mode and raw mode, with a large
++        `extra' being passed to setLineMode each time.
++            (note: many lines at once may be slow if Python is missing
++            collections.dequeue, available since CPython 2.4)
++
++        searches for the delimiter only in recently-received data, preventing
++        unnecessary searching of the delimiter in a long buffer.
++
++    XXX TODO: Why is this here?
++    Fixed:
++        #3277 - LineReceiver may drop a delimiter (newline) when calling ...
++        #3050 - t.p.basic.LineReceiver StackOverflow
++    Probably fixed: (TODO: add tests to make sure)
++        #3353 - lineLengthExceeded behaviour varies between LineReceiver and
++            LineOnlyReceiver
++    Not fixed (old behavior kept):
++        #2215 - If lineReceived returns true value, the connection is shut down
++            and this value used as an error message
++        #3542 - twisted.protocols.basic.LineReceiver's lineLengthExceeded
++            should not cause transport to shut down without reporting an error ...
++
+     @cvar delimiter: The line-ending delimiter to use. By default this is
+-                     '\\r\\n'.
+-    @cvar MAX_LENGTH: The maximum length of a line to allow (If a
+-                      sent line is longer than this, the connection is dropped).
+-                      Default is 16384.
++        '\r\n'.
++    @cvar MAX_LENGTH: The maximum length of a line to allow, excluding
++        the delimiter. If a received line is longer than this,
++        L{lineLengthExceeded} is called, which by default drops the connection.
++        Default is 16384.
+     """
+     line_mode = 1
+-    __buffer = ''
++    _lineBuffer = None
++    _buffer = None
+     delimiter = '\r\n'
+     MAX_LENGTH = 16384
+ 
++    # When clearing _buffer, the implementation should always create new
++    # StringIO objects instead of truncate(0), because truncate(0) does not
++    # free any memory with cStringIO.StringIO, and doesn't free much memory in
++    # StringIO.StringIO (tested CPython 2.6.1).
++
+     def clearLineBuffer(self):
+         """
+         Clear buffered data.
+@@ -211,39 +258,106 @@
+         @return: All of the cleared buffered data.
+         @rtype: C{str}
+         """
+-        b = self.__buffer
+-        self.__buffer = ""
++
++        if self._buffer is None:
++            self._buffer = StringIO()
++        if self._lineBuffer is None:
++            self._lineBuffer = deque()
++
++        # This temporarily appends _buffer into _lineBuffer to avoid creating
++        # an extra temporary list or string.
++        self._buffer.seek(0, 0)
++        self._lineBuffer.append(self._buffer.read())
++        b = self.delimiter.join(self._lineBuffer)
++        self._lineBuffer = deque()
++        self._buffer = StringIO()
++        
+         return b
+ 
++    def _addToBuffer(self, data):
++        """
++        Append L{data} to the internal buffer.
++        """
++
++        # When in line mode, this will convert data in L{_buffer} into lines in
++        # L{_lineBuffer}.
++
++        # _addToBuffer is called internally even when paused, so that the
++        # delimiter search optimization doesn't break.
++
++        if self._buffer is None:
++            self._buffer = StringIO()
++        if self._lineBuffer is None:
++            self._lineBuffer = deque()
++
++        self._buffer.write(data)
++
++        if self.line_mode:
++            # The idea is to look for the delimiter in a subset of the buffer.
++            # This prevents slowdown if the line length is long and the bytes
++            # are being received slowly.
++            self._buffer.seek(-(len(data)+len(self.delimiter)), 2)
++
++            # This does two things: get up to len(self.delimiter) bytes,
++            # and always seek to the very end.
++            searchArea = self._buffer.read()
++
++            if self.delimiter in searchArea:
++                self._buffer.seek(0, 0)
++                splitted = self._buffer.read().split(self.delimiter)
++                self._buffer = StringIO()
++                self._buffer.write(splitted.pop())
++                self._lineBuffer.extend(splitted)
++
+     def dataReceived(self, data):
+-        """Protocol.dataReceived.
++        """
+         Translates bytes into lines, and calls lineReceived (or
+         rawDataReceived, depending on mode.)
+         """
+-        self.__buffer = self.__buffer+data
+-        while self.line_mode and not self.paused:
+-            try:
+-                line, self.__buffer = self.__buffer.split(self.delimiter, 1)
+-            except ValueError:
+-                if len(self.__buffer) > self.MAX_LENGTH:
+-                    line, self.__buffer = self.__buffer, ''
+-                    return self.lineLengthExceeded(line)
+-                break
+-            else:
+-                linelength = len(line)
+-                if linelength > self.MAX_LENGTH:
+-                    exceeded = line + self.__buffer
+-                    self.__buffer = ''
++
++        self._addToBuffer(data)
++
++        while not self.paused:
++            if self.line_mode:
++                if not self._lineBuffer: # no more lines
++                    # Only *after* there are no more lines is it appropriate to
++                    # return with lineLengthExceeded due to the _buffer's
++                    # unsplittable excess size.
++
++                    # The old LineReceiver would reject a line smaller than the
++                    # MAX_LENGTH if only part of the delimeter had arrived.
++                    # This bug is fixed. `minus one' because if the end of
++                    # delimiter came, it would have been split and handled already.
++                    if self._buffer.tell() > self.MAX_LENGTH + len(self.delimiter) - 1:
++                        return self.lineLengthExceeded(self.clearLineBuffer())
++                    break
++
++                line = self._lineBuffer.popleft()
++                if len(line) > self.MAX_LENGTH:
++                    exceeded = line + self.delimiter + self.clearLineBuffer()
+                     return self.lineLengthExceeded(exceeded)
+                 why = self.lineReceived(line)
+                 if why or self.transport and self.transport.disconnecting:
++                    # disconnect.
++
++                    # "The original reason for this behavior is a micro-optimization
++                    # to avoid the necessity of raising exceptions in order to drop the
++                    # connection. It's very old, and probably not terribly effective as an
++                    # optimization. However, I certainly don't care enough about this to
++                    # change it, especially given that it might break existing code that
++                    # relied upon this bizarre convention. For what it's worth, it's a mirror
++                    # of the same convention in dataReceived."
++                    #   - glyph, http://twistedmatrix.com/trac/ticket/2215
+                     return why
+-        else:
+-            if not self.paused:
+-                data=self.__buffer
+-                self.__buffer=''
++            else:
++                data = self.clearLineBuffer()
+                 if data:
+-                    return self.rawDataReceived(data)
++                    why = self.rawDataReceived(data)
++                    if why or self.transport and self.transport.disconnecting:
++                        # disconnect. (see above comment)
++                        return why
++                else:
++                    break         
+ 
+     def setLineMode(self, extra=''):
+         """Sets the line-mode of this receiver.
+@@ -257,8 +371,7 @@
+         within a lineReceived callback.
+         """
+         self.line_mode = 1
+-        if extra:
+-            return self.dataReceived(extra)
++        self._addToBuffer(extra)
+ 
+     def setRawMode(self):
+         """Sets the raw mode of this receiver.
+
+=== modified file 'twisted/test/test_protocols.py'
+--- twisted/test/test_protocols.py	2009-02-14 21:04:19 +0000
++++ twisted/test/test_protocols.py	2009-04-28 00:09:57 +0000
+@@ -13,6 +13,33 @@
+ from twisted.test import proto_helpers
+ 
+ 
++class FlippingLineTester(basic.LineReceiver):
++    """
++    A line receiver that flips between line and raw data modes after one byte.
++    """
++
++    delimiter = '\n'
++
++    lines = None
++    raws = 0
++
++    def lineReceived(self, line):
++        """
++        Set the mode to raw.
++        """
++        if self.lines is None:
++            self.lines = []
++        self.lines.append(line)            
++        self.setRawMode()
++
++    def rawDataReceived(self, data):
++        """
++        Set the mode back to line.
++        """
++        self.raws += 1
++        self.setLineMode(data[1:])
++
++
+ class LineTester(basic.LineReceiver):
+     """
+     A line receiver that parses data received and make actions on some tokens.
+@@ -229,6 +256,27 @@
+     rawpause_output2 = ['twiddle1', 'twiddle2', 'len 5', 'rawpause', '12345',
+                         'twiddle3']
+ 
++    def test_pausing2(self):
++        """
++        Pausing doesn't interfere with the StringIO seek (delimiter search) optimizations.
++        """
++
++        t = proto_helpers.StringTransport()
++
++        class Rec1(basic.LineReceiver):
++            lines = []
++            def lineReceived(self, line):
++                self.lines.append(line)
++        lr = Rec1()
++        lr.makeConnection(t)
++
++        lr.dataReceived('hello1')
++        lr.pauseProducing()
++        lr.dataReceived('hello2\r\n')
++        lr.dataReceived('hello3')
++        lr.resumeProducing()
++        self.assertEqual(lr.lines, ['hello1hello2'])
++
+     def test_rawPausing(self):
+         """
+         Test pause inside raw date receiving.
+@@ -275,6 +323,36 @@
+                           ['produce', 'hello world', 'unproduce', 'goodbye'])
+ 
+ 
++    def test_longLineWithDelimiter(self):
++        """
++        When MAX_LENGTH is exceeded *and* a delimiter has been received,
++        lineLengthExceeded is called with the right bytes.
++
++        See http://twistedmatrix.com/trac/ticket/3277
++        """
++        # Set up a line receiver with a short MAX_LENGTH that logs
++        # lineLengthExceeded events.
++        class LineReceiverThatRecords(basic.LineReceiver):
++            MAX_LENGTH = 10
++            def connectionMade(self):
++                self.calls = []
++            def lineReceived(self, line):
++                self.calls.append(('lineReceived', line))
++            def lineLengthExceeded(self, line):
++                self.calls.append(('lineLengthExceeded', line))
++        lineReceiver = LineReceiverThatRecords()
++        t = proto_helpers.StringIOWithoutClosing()
++        lineReceiver.makeConnection(protocol.FileWrapper(t))
++        # Call dataReceived with two lines, the first longer than MAX_LENGTH.
++        longLine = ('x' * 11) + '\r\n'
++        nextLine = 'next line\r\n'
++        lineReceiver.dataReceived(longLine + nextLine)
++        # We expect lineLengthExceeded to be called with exactly what we just
++        # passed dataReceived.  lineReceived is not called.
++        expectedCalls = [('lineLengthExceeded', longLine + nextLine)]
++        self.assertEqual(expectedCalls, lineReceiver.calls)
++
++
+     def test_clearLineBuffer(self):
+         """
+         L{LineReceiver.clearLineBuffer} removes all buffered data and returns
+@@ -297,6 +375,49 @@
+         self.assertEqual(protocol.rest, '')
+ 
+ 
++    def test_clearLineBuffer2(self):
++        """
++        L{LineReceiver.clearLineBuffer} removes all buffered data and returns
++        it as a C{str} and can be called from beneath C{dataReceived}.
++
++        (without a non-re-entrant clearLineBuffer call)
++        """
++        class ClearingReceiver(basic.LineReceiver):
++            lines = []
++            def lineReceived(self, line):
++                #print 'lines was', self.lines
++                self.lines.append(line)
++
++        protocol = ClearingReceiver()
++        protocol.dataReceived('foo\r\nbar\r\nbaz')
++        self.assertEqual(protocol.lines, ['foo', 'bar'])
++        rest = protocol.clearLineBuffer()
++        self.assertEqual(rest, 'baz')
++
++        # Deliver another line to make sure the previously buffered data is
++        # really gone.
++        protocol.dataReceived('quux\r\n')
++        self.assertEqual(protocol.lines, ['foo', 'bar', 'quux'])
++        rest = protocol.clearLineBuffer()
++        self.assertEqual(rest, '')
++
++
++    def testStackRecursion(self):
++        """
++        Switch modes many times on the same data, and make sure the stack
++        does not overflow.
++        """
++        import sys
++
++        a = FlippingLineTester()
++        t = proto_helpers.StringIOWithoutClosing()
++        a.makeConnection(protocol.FileWrapper(t))
++        limit = sys.getrecursionlimit()
++        a.dataReceived('x\nx' * limit)
++        self.assertEqual(a.lines, ['x'] * limit)
++        self.assertEqual(a.raws, limit)
++
++
+ 
+ class LineOnlyReceiverTestCase(unittest.TestCase):
+     """
+

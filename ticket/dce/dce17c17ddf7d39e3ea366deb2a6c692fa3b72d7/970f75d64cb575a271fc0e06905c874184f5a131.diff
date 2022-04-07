@@ -1,0 +1,200 @@
+Index: twisted/lore/test/test_lore.py
+===================================================================
+--- twisted/lore/test/test_lore.py	(revision 20984)
++++ twisted/lore/test/test_lore.py	(working copy)
+@@ -350,3 +350,22 @@
+         spitter = LatexSpitter(out.write)
+         spitter.visitNode(dom)
+         self.assertEqual(out.getvalue(), u'\\index{name}\n')
++
++
++
++
++class CrunchyTestCase(unittest.TestCase):
++    """
++    Tests for the Crunchy output plugin.
++    """
++    def test_fontifyPythonNode(self):
++        """
++        Test that fontifyPythonNode keeps attributes for crunchy
++        """
++        paren = microdom.Element('body')
++        node = microdom.Element('pre', None, paren)
++        paren.appendChild(node)
++        node.setAttribute('class','python')
++        node.setAttribute('title','editor')
++        tree.PythonCodePrettify_crunchy().fontifyPythonNode(node)
++        self.assertEquals(node.getAttribute('title'), 'editor')
+Index: twisted/lore/tree.py
+===================================================================
+--- twisted/lore/tree.py	(revision 20984)
++++ twisted/lore/tree.py	(working copy)
+@@ -115,8 +115,56 @@
+ 
+ 
+ 
+-def fontifyPython(document):
++class PythonCodePrettify(object) :
+     """
++    Default for making <pre class="python"> nice and pretty.
++    """
++    def fontifyPythonNode(self, node):
++        """
++        Syntax color the given node containing Python source code.
++
++        @return: C{None}
++        """
++        oldio = cStringIO.StringIO()
++        latex.getLatexText(node, oldio.write,
++                           entities={'lt': '<', 'gt': '>', 'amp': '&'})
++        oldio = cStringIO.StringIO(oldio.getvalue().strip()+'\n')
++        newio = cStringIO.StringIO()
++        htmlizer.filter(oldio, newio, writer=htmlizer.SmallerHTMLWriter)
++        newio.seek(0)
++        newel = microdom.parse(newio).documentElement
++        newel.setAttribute("class", "python")
++        node.parentNode.replaceChild(newel, node)
++
++
++
++class PythonCodePrettify_crunchy(object) :
++   """
++   Alternative prettifier for crunchy output which needs to use other
++   attributes of the pre tag.
++   """
++   def fontifyPythonNode(self, node):
++        """
++        Syntax color the given node containing Python source code.
++
++        @return: C{None}
++        """
++        oldio = cStringIO.StringIO()
++        latex.getLatexText(node, oldio.write,
++                           entities={'lt': '<', 'gt': '>', 'amp': '&'})
++        oldio = cStringIO.StringIO(oldio.getvalue().strip()+'\n')
++        newio = cStringIO.StringIO()
++        htmlizer.filter(oldio, newio, writer=htmlizer.SmallerHTMLWriter)
++        newio.seek(0)
++        newel = microdom.parse(newio).documentElement
++        newel.attributes = node.attributes
++        node.parentNode.replaceChild(newel, node)
++
++
++
++
++def fontifyPython(document, pythonPrettifier=PythonCodePrettify()):
++    """
+     Syntax color any node in the given document which contains a Python source
+     listing.
+ 
+@@ -130,29 +178,11 @@
+         return (node.nodeName == 'pre' and node.hasAttribute('class') and
+                 node.getAttribute('class') == 'python')
+     for node in domhelpers.findElements(document, matcher):
+-        fontifyPythonNode(node)
++        pythonPrettifier.fontifyPythonNode(node)
+ 
+ 
+ 
+-def fontifyPythonNode(node):
+-    """
+-    Syntax color the given node containing Python source code.
+ 
+-    @return: C{None}
+-    """
+-    oldio = cStringIO.StringIO()
+-    latex.getLatexText(node, oldio.write,
+-                       entities={'lt': '<', 'gt': '>', 'amp': '&'})
+-    oldio = cStringIO.StringIO(oldio.getvalue().strip()+'\n')
+-    newio = cStringIO.StringIO()
+-    htmlizer.filter(oldio, newio, writer=htmlizer.SmallerHTMLWriter)
+-    newio.seek(0)
+-    newel = microdom.parse(newio).documentElement
+-    newel.setAttribute("class", "python")
+-    node.parentNode.replaceChild(newel, node)
+-
+-
+-
+ def addPyListings(document, dir):
+     """
+     Insert Python source listings into the given document from files in the
+@@ -728,7 +758,9 @@
+ 
+ 
+ 
+-def munge(document, template, linkrel, dir, fullpath, ext, url, config, outfileGenerator=getOutputFileName):
++def munge(document, template, linkrel, dir, fullpath, ext, url, config,
++          outfileGenerator=getOutputFileName,
++          pythonPrettifier=PythonCodePrettify()):
+     """
+     Mutate C{template} until it resembles C{document}.
+ 
+@@ -783,7 +815,7 @@
+     removeH1(document)
+     if not config.get('noapi', False):
+         fixAPI(document, url)
+-    fontifyPython(document)
++    fontifyPython(document, pythonPrettifier)
+     fixLinks(document, ext)
+     addPyListings(document, dir)
+     addHTMLListings(document, dir)
+@@ -849,7 +881,9 @@
+     if (not os.path.exists(dirname)):
+         os.makedirs(dirname)
+ 
+-def doFile(filename, linkrel, ext, url, templ, options={}, outfileGenerator=getOutputFileName):
++def doFile(filename, linkrel, ext, url, templ, options={},
++           outfileGenerator=getOutputFileName,
++           pythonPrettifier=PythonCodePrettify()):
+     """
+     Process the input document at C{filename} and write an output document.
+ 
+@@ -895,7 +929,7 @@
+     doc = parseFileAndReport(filename)
+     clonedNode = templ.cloneNode(1)
+     munge(doc, clonedNode, linkrel, os.path.dirname(filename), filename, ext,
+-          url, options, outfileGenerator)
++          url, options, outfileGenerator, pythonPrettifier)
+     newFilename = outfileGenerator(filename, ext)
+     makeSureDirectoryExists(newFilename)
+     clonedNode.writexml(open(newFilename, 'wb'))
+Index: twisted/lore/default.py
+===================================================================
+--- twisted/lore/default.py	(revision 20984)
++++ twisted/lore/default.py	(working copy)
+@@ -14,7 +14,19 @@
+     def getDoFile(self):
+         return tree.doFile
+ 
+-    def generate_html(self, options, filenameGenerator=tree.getOutputFileName):
++    def generate_crunchy(self, options,
++                         filenameGenerator=tree.getOutputFileName):
++        """
++	Generates html output with crunchy extensions.
++	"""
++	return self.generate_html(options, filenameGenerator,
++	                          tree.PythonCodePrettify_crunchy())
++
++    def generate_html(self, options, filenameGenerator=tree.getOutputFileName,
++                      pythonPrettifier=tree.PythonCodePrettify()):
++        """
++        Generates html output.
++        """
+         n = htmlDefault.copy()
+         n.update(options)
+         options = n
+@@ -25,8 +37,12 @@
+             raise process.NoProcessorError(e.filename+": "+e.strerror)
+         except sux.ParseError, e:
+             raise process.NoProcessorError(str(e))
+-        df = lambda file, linkrel: self.getDoFile()(file, linkrel, options['ext'],
+-                                                    options['baseurl'], templ, options, filenameGenerator)
++        df = lambda file, linkrel: self.getDoFile()(file, linkrel,
++	                                            options['ext'],
++                                                    options['baseurl'],
++                                                    templ, options,
++                                                    filenameGenerator,
++                                                    pythonPrettifier)
+         return df
+ 
+     latexSpitters = {None: latex.LatexSpitter,

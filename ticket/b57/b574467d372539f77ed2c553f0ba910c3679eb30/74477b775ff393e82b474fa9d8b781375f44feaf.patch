@@ -1,0 +1,502 @@
+Index: /home/wolf/twisted-trunk/twisted/words/protocols/irc.py
+===================================================================
+--- /home/wolf/twisted-trunk/twisted/words/protocols/irc.py	(revision 23912)
++++ /home/wolf/twisted-trunk/twisted/words/protocols/irc.py	(working copy)
+@@ -60,12 +60,61 @@
+ 
+ CHANNEL_PREFIXES = '&#!+'
+ 
++# irc_RPL_ISUPPORT should send to parse_isupport_prefix the value of the
++# PREFIX parameter in order to overwrite the default values of these constants
++# with the real values supported by the server.
++# USERPREFIX is a dict with the user prefixes as keys and the modes as values,
++# USERMODES is a dict with the user modes as keys and the prefixes as values.
++USERPREFIX = {'@': 'o', '%': 'h', '+': 'v'}
++USERMODES = {'o': '@', 'h': '%', 'v': '+'}
++
++
+ class IRCBadMessage(Exception):
+     pass
+ 
+ class IRCPasswordMismatch(Exception):
+     pass
+ 
++class InvalidUser(ValueError):
++    pass
++
++class InvalidPrefix(ValueError):
++    """
++    Raised when the PREFIX value of the ISUPPORT message is not in the form
++    '(xxx)yyy' where 'xxx' are the modes (e.g. 'ohv') and 'yyy' the prefixes
++    (e.g. '@%+').
++    """
++    pass
++
++
++def parse_isupport_prefix(prefix):
++    """
++    Parse the PREFIX value of the ISUPPORT message and set the USERPREFIX and
++    USERMODES constants. The prefix has to be in the form '(xxx)yyy' where
++    'xxx' are the modes (e.g. 'ohv') and 'yyy' the prefixes (e.g. '@%+').
++    """
++    if not prefix:
++        return
++    res = re.match('^\(([^)]*)\)(\S*)$', prefix.strip())
++    if not res:
++        raise InvalidPrefix(
++            "'%s' has to be in the form '(xxx)yyy' where 'xxx' are the "
++            "modes (e.g. 'ohv') and 'yyy' the prefixes (e.g. '@%%+')." % prefix)
++    modes, prefixes = res.groups()
++    if len(modes) != len(prefixes):
++        modlen, preflen = len(modes), len(prefixes)
++        raise InvalidPrefix(
++            "the number of modes (%d, '%s') is not equal to the number of "
++            "prefixes (%d, '%s')." % (modlen, modes, preflen, prefixes))
++    if not prefixes and not modes:
++        # the prefix string is well-formed but it is empty, the message is
++        # ignored and the default prefixes/modes are used
++        return
++    global USERPREFIX, USERMODES
++    USERMODES = dict(zip(modes, prefixes))
++    USERPREFIX = dict(zip(prefixes, modes))
++
++
+ def parsemsg(s):
+     """Breaks a message from an IRC server into its prefix, command, and arguments.
+     """
+@@ -85,6 +134,49 @@
+     return prefix, command, args
+ 
+ 
++def parseuser(user):
++    """
++    Parse a user or a list of users and return a tuple or a list of tuples.
++    The user has to be in one of the following forms:
++    1. 'nick!realname@host' -> ('nick', 'realname', 'host')
++    2. '@nick' -> ('@', 'nick')  and  'nick' -> ('', 'nick')
++    The valid prefixes are listed in the global constant L{USERPREFIX}.
++    """
++    if isinstance(user, (list, tuple)):
++        userlist = user
++        return [_parseuser(user) for user in userlist if user]
++    else:
++        return _parseuser(user)
++
++def _parseuser(user):
++    """
++    See L{parseuser}.
++    """
++    if not user:
++        raise InvalidUser('empty user name')
++    errormsg = ('"%s" has to be "nick!realname@host" or "nick", possibly '
++                'preceded by a prefix like "@", "+", etc.' % user)
++    if '!' in user and '@' in user:
++        # if everything is ok the user is like 'nick!realname@host'
++        parts = user.split('!', 1)
++        nick = parts[0]
++        try:
++            realname, host = parts[1].split('@', 1)
++            return nick, realname, host
++        except (IndexError, ValueError):
++            # there was something wrong
++            raise InvalidUser(errormsg)
++    elif '!' in user[1:] or '@' in user[1:]:
++        # you can't have a '!' without a '@' or vice versa!
++        raise InvalidUser(errormsg)
++    else:
++        # the user should be a plain nickname, possibly preceded by a prefix
++        if user[0] in USERPREFIX:
++            return (user[0], user[1:])
++        else:
++            return ('', user)
++
++
+ def split(str, length = 80):
+     """I break a message into multiple lines.
+ 
+@@ -1017,7 +1109,7 @@
+         self.signedOn()
+ 
+     def irc_JOIN(self, prefix, params):
+-        nick = string.split(prefix,'!')[0]
++        nick = parseuser(prefix)[0]
+         channel = params[-1]
+         if nick == self.nickname:
+             self.joined(channel)
+@@ -1025,7 +1117,7 @@
+             self.userJoined(nick, channel)
+ 
+     def irc_PART(self, prefix, params):
+-        nick = string.split(prefix,'!')[0]
++        nick = parseuser(prefix)[0]
+         channel = params[0]
+         if nick == self.nickname:
+             self.left(channel)
+@@ -1033,7 +1125,7 @@
+             self.userLeft(nick, channel)
+ 
+     def irc_QUIT(self, prefix, params):
+-        nick = string.split(prefix,'!')[0]
++        nick = parseuser(prefix)[0]
+         self.userQuit(nick, params[0])
+ 
+ 
+@@ -1113,7 +1205,7 @@
+         self.noticed(user, channel, message)
+ 
+     def irc_NICK(self, prefix, params):
+-        nick = string.split(prefix,'!', 1)[0]
++        nick = parseuser(prefix)[0]
+         if nick == self.nickname:
+             self.nickChanged(params[0])
+         else:
+@@ -1122,7 +1214,7 @@
+     def irc_KICK(self, prefix, params):
+         """Kicked?  Who?  Not me, I hope.
+         """
+-        kicker = string.split(prefix,'!')[0]
++        kicker = parseuser(prefix)[0]
+         channel = params[0]
+         kicked = params[1]
+         message = params[-1]
+@@ -1135,7 +1227,7 @@
+     def irc_TOPIC(self, prefix, params):
+         """Someone in the channel set the topic.
+         """
+-        user = string.split(prefix, '!')[0]
++        user = parseuser(prefix)[0]
+         channel = params[0]
+         newtopic = params[1]
+         self.topicUpdated(user, channel, newtopic)
+@@ -1143,13 +1235,13 @@
+     def irc_RPL_TOPIC(self, prefix, params):
+         """I just joined the channel, and the server is telling me the current topic.
+         """
+-        user = string.split(prefix, '!')[0]
++        user = parseuser(prefix)[0]
+         channel = params[1]
+         newtopic = params[2]
+         self.topicUpdated(user, channel, newtopic)
+ 
+     def irc_RPL_NOTOPIC(self, prefix, params):
+-        user = string.split(prefix, '!')[0]
++        user = parseuser(prefix)[0]
+         channel = params[1]
+         newtopic = ""
+         self.topicUpdated(user, channel, newtopic)
+@@ -1224,7 +1316,7 @@
+         self.action(user, channel, data)
+ 
+     def ctcpQuery_PING(self, user, channel, data):
+-        nick = string.split(user,"!")[0]
++        nick = parseuser(user)[0]
+         self.ctcpMakeReply(nick, [("PING", data)])
+ 
+     def ctcpQuery_FINGER(self, user, channel, data):
+@@ -1239,7 +1331,7 @@
+         else:
+             reply = str(self.fingerReply)
+ 
+-        nick = string.split(user,"!")[0]
++        nick = parseuser(user)[0]
+         self.ctcpMakeReply(nick, [('FINGER', reply)])
+ 
+     def ctcpQuery_VERSION(self, user, channel, data):
+@@ -1248,7 +1340,7 @@
+                                % (user, data))
+ 
+         if self.versionName:
+-            nick = string.split(user,"!")[0]
++            nick = parseuser(user)[0]
+             self.ctcpMakeReply(nick, [('VERSION', '%s:%s:%s' %
+                                        (self.versionName,
+                                         self.versionNum,
+@@ -1259,7 +1351,7 @@
+             self.quirkyMessage("Why did %s send '%s' with a SOURCE query?"
+                                % (user, data))
+         if self.sourceURL:
+-            nick = string.split(user,"!")[0]
++            nick = parseuser(user)[0]
+             # The CTCP document (Zeuge, Rollo, Mesander 1994) says that SOURCE
+             # replies should be responded to with the location of an anonymous
+             # FTP server in host:directory:file format.  I'm taking the liberty
+@@ -1272,7 +1364,7 @@
+             self.quirkyMessage("Why did %s send '%s' with a USERINFO query?"
+                                % (user, data))
+         if self.userinfo:
+-            nick = string.split(user,"!")[0]
++            nick = parseuser(user)[0]
+             self.ctcpMakeReply(nick, [('USERINFO', self.userinfo)])
+ 
+     def ctcpQuery_CLIENTINFO(self, user, channel, data):
+@@ -1283,7 +1375,7 @@
+         the usage of that tag.
+         """
+ 
+-        nick = string.split(user,"!")[0]
++        nick = parseuser(user)[0]
+         if not data:
+             # XXX: prefixedMethodNames gets methods from my *class*,
+             # but it's entirely possible that this *instance* has more
+@@ -1309,7 +1401,7 @@
+     def ctcpQuery_ERRMSG(self, user, channel, data):
+         # Yeah, this seems strange, but that's what the spec says to do
+         # when faced with an ERRMSG query (not a reply).
+-        nick = string.split(user,"!")[0]
++        nick = parseuser(user)[0]
+         self.ctcpMakeReply(nick, [('ERRMSG',
+                                    "%s :No error has occoured." % data)])
+ 
+@@ -1317,7 +1409,7 @@
+         if data is not None:
+             self.quirkyMessage("Why did %s send '%s' with a TIME query?"
+                                % (user, data))
+-        nick = string.split(user,"!")[0]
++        nick = parseuser(user)[0]
+         self.ctcpMakeReply(nick,
+                            [('TIME', ':%s' %
+                              time.asctime(time.localtime(time.time())))])
+@@ -1335,7 +1427,7 @@
+             data = data[len(dcctype)+1:]
+             handler(user, channel, data)
+         else:
+-            nick = string.split(user,"!")[0]
++            nick = parseuser(user)[0]
+             self.ctcpMakeReply(nick, [('ERRMSG',
+                                        "DCC %s :Unknown DCC type '%s'"
+                                        % (data, dcctype))])
+@@ -1445,7 +1537,7 @@
+     #    raise NotImplementedError
+ 
+     def ctcpUnknownQuery(self, user, channel, tag, data):
+-        nick = string.split(user,"!")[0]
++        nick = parseuser(user)[0]
+         self.ctcpMakeReply(nick, [('ERRMSG',
+                                    "%s %s: Unknown query '%s'"
+                                    % (tag, data, tag))])
+@@ -1485,7 +1577,7 @@
+                 self.ctcpUnknownReply(user, channel, m[0], m[1])
+ 
+     def ctcpReply_PING(self, user, channel, data):
+-        nick = user.split('!', 1)[0]
++        nick = parseuser(user)[0]
+         if (not self._pings) or (not self._pings.has_key((nick, data))):
+             raise IRCBadMessage,\
+                   "Bogus PING response from %s: %s" % (user, data)
+Index: /home/wolf/twisted-trunk/twisted/words/test/test_irc.py
+===================================================================
+--- /home/wolf/twisted-trunk/twisted/words/test/test_irc.py	(revision 23912)
++++ /home/wolf/twisted-trunk/twisted/words/test/test_irc.py	(working copy)
+@@ -37,6 +37,212 @@
+             self.failUnlessEqual(s, irc.ctcpDequote(irc.ctcpQuote(s)))
+ 
+ 
++
++class ParseUser(unittest.TestCase):
++    def test_emptyUser(self):
++        """
++        The user can't be an empty string, an InvalidUser error is raised.
++        """
++        err = self.assertRaises(irc.InvalidUser, irc.parseuser, user='')
++        self.assertEquals(str(err), 'empty user name')
++
++
++    def test_emptyListOfUsers(self):
++        """
++        An empty list of users is allowed, and an empty list is returned.
++        """
++        self.assertEquals(irc.parseuser([]), [])
++
++
++    def test_listOfUsersWithSomeEmptyUser(self):
++        """
++        The empty users are ignored and removed from the list, no errors are
++        raised.
++        """
++        res = irc.parseuser(['', '@Wolf', '', 'Taggnostr', ''])
++        self.assertEquals(res, [('@', 'Wolf'), ('', 'Taggnostr')])
++
++
++    def test_userWithoutHost(self):
++        """
++        The host is missing, an InvalidUser error is raised.
++        """
++        err = self.assertRaises(
++            irc.InvalidUser, irc.parseuser, user='Wolf!~wolf')
++        self.assertEquals(
++            str(err),
++            '"Wolf!~wolf" has to be "nick!realname@host" or "nick", '
++            'possibly preceded by a prefix like "@", "+", etc.')
++
++
++    def test_userWithoutRealname(self):
++        """
++        The realname is missing, an InvalidUser error is raised.
++        """
++        err = self.assertRaises(
++            irc.InvalidUser, irc.parseuser, user='Wolf@yok.utu.fi')
++        self.assertEquals(
++            str(err),
++            '"Wolf@yok.utu.fi" has to be "nick!realname@host" or "nick", '
++            'possibly preceded by a prefix like "@", "+", etc.')
++
++
++    def test_userWithRealnameAndHostSwapped(self):
++        """
++        The realname and the host are swapped, an InvalidUser error is raised.
++        """
++        err = self.assertRaises(
++            irc.InvalidUser, irc.parseuser, user='Wolf@yok.utu.fi!~wolf')
++        self.assertEquals(
++            str(err),
++            '"Wolf@yok.utu.fi!~wolf" has to be "nick!realname@host" or "nick", '
++            'possibly preceded by a prefix like "@", "+", etc.')
++
++
++    def test_nickWithoutPrefix(self):
++        """
++        A plain nick without prefix.
++        """
++        res = irc.parseuser('Wolf')
++        self.assertEquals(res, ('', 'Wolf'))
++
++
++    def test_nickWithPrefix(self):
++        """
++        A plain nick with a prefix.
++        """
++        res = irc.parseuser('@Wolf')
++        self.assertEquals(res, ('@', 'Wolf'))
++
++
++    def test_nickWithUnknownPrefix(self):
++        """
++        A plain nick with prefix not listed in the default value of the
++        L{PREFIX} variable. The prefix will be included with the nick.
++        """
++        res = irc.parseuser('$Wolf')
++        self.assertEquals(res, ('', '$Wolf'))
++
++
++    def test_correctUser(self):
++        """
++        A user in the form 'nick!realname@host'.
++        """
++        res = irc.parseuser('Wolf!~wolf@yok.utu.fi')
++        self.assertEquals(res, ('Wolf', '~wolf', 'yok.utu.fi'))
++
++
++    def test_listOfCorrectUsers(self):
++        """
++        A list of correct users in the form 'nick!realname@host'.
++        """
++        users = 'Wolf!~wolf@yok.utu.fi Sigfodr!Odin@valhalla'
++        self.assertEquals(
++            irc.parseuser(users.split()),
++            [('Wolf', '~wolf', 'yok.utu.fi'), ('Sigfodr', 'Odin', 'valhalla')])
++
++
++    def test_listOfCorrectNicks(self):
++        """
++        A list of correct nicks with and without prefixes.
++        """
++        nicks = '@Wolf %Taggnostr +Sleipnir Tyr'
++        self.assertEquals(
++            irc.parseuser(nicks.split()),
++            [('@', 'Wolf'), ('%', 'Taggnostr'), ('+', 'Sleipnir'), ('', 'Tyr')])
++
++
++
++class ParseISUPPORTPrefix(unittest.TestCase):
++    PREFIXES = {'@': 'o', '%': 'h', '+': 'v'}
++    MODES = {'o': '@', 'h': '%', 'v': '+'}
++
++    def setUp(self):
++        """
++        Set the default values of USERPREFIX and USERMODES.
++        """
++        irc.USERPREFIX = self.PREFIXES
++        irc.USERMODES = self.MODES
++
++
++    def tearDown(self):
++        """
++        Set the default values of USERPREFIX and USERMODES.
++        """
++        irc.USERPREFIX = self.PREFIXES
++        irc.USERMODES = self.MODES
++
++
++    def checkModesAndPrefixes(self, modes=None, prefixes=None):
++        """
++        Check if the values of USERPREFIX and USERMODES are correct.
++        If modes and prefixes are None check with the default values.
++        """
++        if modes and prefixes:
++            mod = dict(zip(modes, prefixes))
++            pref = dict(zip(prefixes, modes))
++        else:
++            mod, pref = self.MODES, self.PREFIXES
++        self.assertEquals(irc.USERMODES, mod)
++        self.assertEquals(irc.USERPREFIX, pref)
++
++
++    def test_wellFormedPrefix(self):
++        """
++        A well-formed prefix.
++        """
++        irc.parse_isupport_prefix('(ab)*+')
++        self.checkModesAndPrefixes('ab', '*+')
++
++
++    def test_emptyPrefix(self):
++        """
++        When the function receives an empty prefix it should ignore it and
++        leave the default values unchanged.
++        """
++        irc.parse_isupport_prefix('()')
++        self.checkModesAndPrefixes()
++
++
++    def test_emptyString(self):
++        """
++        When the function receives an empty string it should ignore it and
++        leave the default values unchanged.
++        """
++        irc.parse_isupport_prefix('')
++        self.checkModesAndPrefixes()
++
++
++    def test_wrongPrefix(self):
++        """
++        The prefix is not in the correct form and InvalidPrefix is raised.
++        """
++        err = self.assertRaises(
++                irc.InvalidPrefix, irc.parse_isupport_prefix, 'abc-123')
++        self.assertEquals(
++            str(err),
++            "'abc-123' has to be in the form '(xxx)yyy' where 'xxx' are the "
++            "modes (e.g. 'ohv') and 'yyy' the prefixes (e.g. '@%+').")
++        # the default modes/prefixes have to be unchanged
++        self.checkModesAndPrefixes()
++
++
++    def test_prefixWithWrongLength(self):
++        """
++        The prefix is well-formed, but the number of modes is not equal to the
++        number of prefixes.
++        """
++        err = self.assertRaises(
++                irc.InvalidPrefix, irc.parse_isupport_prefix, '(xyz)@+')
++        self.assertEquals(
++            str(err),
++            "the number of modes (3, 'xyz') is not equal to the number of "
++            "prefixes (2, '@+').")
++        # the default modes/prefixes have to be unchanged
++        self.checkModesAndPrefixes()
++
++
++
+ class IRCClientWithoutLogin(irc.IRCClient):
+     performLogin = 0
+ 

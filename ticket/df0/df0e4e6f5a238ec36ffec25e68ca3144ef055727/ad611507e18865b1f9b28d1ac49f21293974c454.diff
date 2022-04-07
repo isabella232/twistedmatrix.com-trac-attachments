@@ -1,0 +1,132 @@
+diff --git docs/projects/web/howto/web-in-60/session-basics.rst docs/projects/web/howto/web-in-60/session-basics.rst
+index 17c0d10..5931b79 100644
+--- docs/projects/web/howto/web-in-60/session-basics.rst
++++ docs/projects/web/howto/web-in-60/session-basics.rst
+@@ -29,8 +29,11 @@ because they are explicitly expired). Each time after the first that a
+ particular session's ``Session`` object is requested, it is
+ retrieved from the ``Site`` .
+ 
++..  note::
++    Session ID is stored in a cookie named by default: `TWISTED_SESSION`.
+ 
+-
++    When used over HTTPS protocol, default :api:`twisted.web.server.Request <Request>`
++    implementation will set the `Secure <https://en.wikipedia.org/wiki/HTTP_cookie#Secure_and_HttpOnly>`_ flag for the session cookie.
+ 
+ With the conceptual underpinnings of the upcoming API in place, here comes
+ the example. This will be a very simple :doc:`rpy script <rpy-scripts>` which tells a user what its unique session identifier is and lets it
+diff --git twisted/web/server.py twisted/web/server.py
+index a71eda4..016fa93 100644
+--- twisted/web/server.py
++++ twisted/web/server.py
+@@ -393,13 +393,31 @@ class Request(Copyable, http.Request, components.Componentized):
+                     pass
+             # if it still hasn't been set, fix it up.
+             if not self.session:
+-                self.session = self.site.makeSession()
+-                self.addCookie(cookiename, self.session.uid, path=b'/')
++                self.session = self.createSession(cookiename)
+         self.session.touch()
+         if sessionInterface:
+             return self.session.getComponent(sessionInterface)
+         return self.session
+ 
++    def createSession(self, cookiename):
++        """
++        Create a new session and set session cookie.
++
++        When used over HTTPS it will set I{Secure} cookie flag.
++
++        See: https://en.wikipedia.org/wiki/HTTP_cookie#Secure_and_HttpOnly
++
++        @param cookiename: Name of the cookies used to store session ID.
++        """
++        session = self.site.makeSession()
++        self.addCookie(
++                    cookiename,
++                    session.uid,
++                    path=b'/',
++                    secure=self.isSecure(),
++                    )
++        return session
++
+     def _prePathURL(self, prepath):
+         port = self.getHost().port
+         if self.isSecure():
+diff --git twisted/web/test/test_web.py twisted/web/test/test_web.py
+index 3c80595..7951375 100644
+--- twisted/web/test/test_web.py
++++ twisted/web/test/test_web.py
+@@ -467,6 +467,65 @@ class RequestTests(unittest.TestCase):
+         request.requestReceived(b'GET', b'/foo%2Fbar', b'HTTP/1.0')
+         self.assertEqual(request.prePathURL(), b'http://example.com/foo%2Fbar')
+ 
++    def makeRequest(self, channel):
++        """
++        Return a request instance attached to `channel`.
++        """
++        request = server.Request(channel, 1)
++        request.sitepath = []
++        request.site = channel.site
++        return request
++
++    def makeRawCookie(self, key, value, path, secure):
++        """
++        Return the serialization of a cookie.
++        """
++        securePart = ''
++        if secure:
++            securePart = '; Secure'
++        return '%s=%s; Path=%s%s' % (key, value, path, securePart)
++
++
++    def test_createSessionHTTP(self):
++        """
++        When request is using HTTP (not secured) transport, new session
++        cookies are set without `Secure` flag.
++        """
++        request = self.makeRequest(channel=DummyChannel())
++        cookieName = b'SESSION_NAME'
++
++        session = request.createSession(cookieName)
++        self.addCleanup(lambda: session.expire())
++
++        cookie = self.makeRawCookie(
++            key=cookieName,
++            value=session.uid,
++            path=b'/',
++            secure=False,
++            )
++        self.assertEqual([cookie], request.cookies)
++
++
++    def test_createSessionHTTPS(self):
++        """
++        When request is using HTTPS (secured) transport, new session
++        cookies are created with `Secure` flag.
++        """
++        channel = DummyChannel()
++        channel.transport = DummyChannel.SSL()
++        request = self.makeRequest(channel=channel)
++        cookieName = b'SESSION_NAME'
++
++        session = request.createSession(cookieName)
++        self.addCleanup(lambda: session.expire())
++
++        cookie = self.makeRawCookie(
++            key=cookieName,
++            value=session.uid,
++            path=b'/',
++            secure=True,
++            )
++        self.assertEqual([cookie], request.cookies)
+ 
+ 
+ class GzipEncoderTests(unittest.TestCase):
+diff --git twisted/web/topfiles/6932.feature twisted/web/topfiles/6932.feature
+new file mode 100644
+index 0000000..792495c
+--- /dev/null
++++ twisted/web/topfiles/6932.feature
+@@ -0,0 +1 @@
++* twisted.web.server.Request will create new session cookies with `secure` flag, when HTTPS transport is used.

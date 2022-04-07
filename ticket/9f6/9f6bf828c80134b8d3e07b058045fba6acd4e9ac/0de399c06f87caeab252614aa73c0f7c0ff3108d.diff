@@ -1,0 +1,447 @@
+diff --exclude=.svn --exclude=words --exclude=xish --exclude='*.cache' --exclude='*.pyc' --exclude='*~' --exclude='*.orig' -ru /home/michael/zope/TwistedClean/twisted/protocols/ftp.py ./twisted/protocols/ftp.py
+--- /home/michael/zope/TwistedClean/twisted/protocols/ftp.py	2005-04-26 12:04:31.393177384 +0000
++++ ./twisted/protocols/ftp.py	2005-04-26 11:44:27.000000000 +0000
+@@ -70,6 +70,8 @@
+ GUEST_LOGGED_IN_PROCEED                 = "230.2"     # v2 of code 230
+ REQ_FILE_ACTN_COMPLETED_OK              = "250"
+ PWD_REPLY                               = "257"
++MKD_REPLY                               = "257.1"
++RMD_REPLY                               = "257.2"
+ 
+ USR_NAME_OK_NEED_PASS                   = "331.1"     # v1 of Code 331
+ GUEST_NAME_OK_NEED_EMAIL                = "331.2"     # v2 of code 331
+@@ -92,6 +94,7 @@
+ NOT_LOGGED_IN                           = "530.1"     # v1 of code 530 - please log in
+ AUTH_FAILURE                            = "530.2"     # v2 of code 530 - authorization failure
+ NEED_ACCT_FOR_STOR                      = "532"
++REQUESTED_ACTION_NOT_TAKEN              = "550"
+ FILE_NOT_FOUND                          = "550.1"     # no such file or directory
+ PERMISSION_DENIED                       = "550.2"     # permission denied
+ ANON_USER_DENIED                        = "550.3"     # anonymous users can't alter filesystem
+@@ -100,6 +103,8 @@
+ PAGE_TYPE_UNK                           = "551"
+ EXCEEDED_STORAGE_ALLOC                  = "552"
+ FILENAME_NOT_ALLOWED                    = "553"
++FILE_ERR_OPEN_READ                      = "553.1"
++FILE_ERR_OPEN_WRITE                     = "553.2"
+ 
+ 
+ RESPONSE = {
+@@ -131,6 +136,8 @@
+     GUEST_LOGGED_IN_PROCEED:            '230 Anonymous login ok, access restrictions apply.',
+     REQ_FILE_ACTN_COMPLETED_OK:         '250 Requested File Action Completed OK', #i.e. CWD completed ok
+     PWD_REPLY:                          '257 "%s" is current directory.',
++    MKD_REPLY:                          '257 "%s" created.',
++    RMD_REPLY:                          '257 "%s" deleted.',
+ 
+     # -- 300's --
+     'userotp':                          '331 Response to %s.',  # ???
+@@ -158,7 +165,10 @@
+     IS_NOT_A_DIR:                       '550 Cannot rmd, %s is not a directory',
+     REQ_ACTN_NOT_TAKEN:                 '550 Requested action not taken: %s',
+     EXCEEDED_STORAGE_ALLOC:             '552 Requested file action aborted, exceeded file storage allocation',
+-    FILENAME_NOT_ALLOWED:               '553 Requested action not taken, file name not allowed'
++    FILENAME_NOT_ALLOWED:               '553 Requested action not taken, file name not allowed',
++    FILE_ERR_OPEN_READ:                 '553 Could not open file for reading: %s',
++    FILE_ERR_OPEN_WRITE:                '553 Cound not open file for writing: %s',
++    REQUESTED_ACTION_NOT_TAKEN:         '553 Error: %s' # general problem.
+ }
+ 
+    
+@@ -168,7 +178,7 @@
+ class FTPCmdError(Exception):
+     errorCode = None
+     errorMessage = None
+-    def __init__(self, msg):
++    def __init__(self, msg = ''):
+         Exception.__init__(self, msg)
+         self.errorMessage = msg
+ 
+@@ -215,6 +225,18 @@
+ class CmdNotImplementedForArgError(FTPCmdError):
+     errorCode = CMD_NOT_IMPLMNTD_FOR_PARAM
+ 
++class CmdActionNotTaken(FTPCmdError):
++    errorCode = REQUESTED_ACTION_NOT_TAKEN
++
++class CmdFileActionError(FTPCmdError):
++    errorCode = FILENAME_NOT_ALLOWED
++
++class CmdOpenReadError(FTPCmdError):
++    errorCode = FILE_ERR_OPEN_READ
++
++class CmdOpenWriteError(FTPCmdError):
++    errorCode = FILE_ERR_OPEN_WRITE
++
+ class FTPError(Exception):
+     pass
+ 
+@@ -293,6 +315,8 @@
+     isConnected = False 
+     reTransform = re.compile(r'(?<!\r)\n') # says, match an \n that's not immediately preceeded by a \r
+ 
++    deferred = None
++
+     def connectionMade(self):
+         """Will start an transfer, if one is queued up, 
+         when the client connects"""
+@@ -307,6 +331,7 @@
+             return
+ 
+         log.debug('firing dtpFactory deferred')
++        ## causes unblock to be called which calls ftp_LIST, ftp_STOR, etc.
+         self.factory.deferred.callback(None)
+ 
+     def transformChunk(self, chunk):
+@@ -315,6 +340,31 @@
+         log.msg('transformChunk: after = %s' % newChunk)
+         return newChunk
+ 
++    def dataReceived(self, data):
++        self.pi.fp.write(data)
++        self.pi.fpsize += len(data)
++        log.debug('receiving data from client %d to %d' % (len(data), self.pi.fpsize))
++
++    def dtp_STOR(self, args): # STOR = receiveFile
++        """
++        """
++        path = args[0]
++        log.debug('receiving a file %s' % path)
++
++        if self.pi.binary:
++            transform = None
++        else:
++            transform = self.transformChunk
++
++        self.deferred = deferred = defer.Deferred()
++
++        deferred.addCallback(debugDeferred, 'saving file to')
++        deferred.addCallback(self.pi.finishedFileUpload, path)
++        deferred.addCallback(debugDeferred, 'firing at end of file upload')
++        deferred.addCallback(self._dtpPostTransferCleanup)
++
++        return deferred
++
+     def dtp_RETR(self): # RETR = sendFile
+         """sends a file object out the wire
+         @param fpSizeTuple a tuple of a file object and that file's size
+@@ -331,7 +381,7 @@
+         # lets set self.pi.fp file pointer to 0 just to 
+         # make sure the avatar didn't forget, hmm?
+         self.pi.fp.seek(0)
+-        
++
+         return fs.beginFileTransfer(self.pi.fp, self.transport, transform
+                 ).addCallback(debugDeferred,'firing at end of file transfer'
+                 ).addCallback(self._dtpPostTransferCleanup
+@@ -343,7 +393,11 @@
+ 
+     def connectionLost(self, reason):
+         log.debug('dtp.connectionLost: %s' % reason)
+-        self.pi.finishedFileTransfer()
++        if self.deferred is not None:
++            self.deferred.callback(None)
++            self.deferred = None
++        else:
++            self.pi.finishedFileTransfer()
+         self.isConnected = False
+ 
+ class DTPFactory(protocol.ClientFactory): 
+@@ -452,7 +506,8 @@
+     dtpPort     = None     # object returned from listenTCP
+ 
+     binary      = True     # binary transfers? False implies ASCII. defaults to True
+-
++    fp          = None
++    fpsize      = 0
+ 
+     def connectionMade(self):
+         log.debug('ftp-pi connectionMade: instance %s' % self)
+@@ -620,7 +675,7 @@
+         if self.dtpInstance is not None:
+             self.dtpInstance = None
+ 
+-    def _doDTPCommand(self, cmd, *arg): 
++    def _doDTPCommand(self, cmd, *arg):
+         self.setTimeout(None)               # don't Time out when waiting for DTP Connection
+         log.debug('FTP._doDTPCommand: self.blocked: %s' % self.blocked)
+         if self.blocked is None:
+@@ -647,6 +702,18 @@
+             d.addCallback(lambda _: self._unblock())
+             d.addErrback(self._ebDTP)
+ 
++    def finishedFileUpload(self, dummy, *arg):
++        log.debug('finishedFileUpload!')
++        try:
++            path = arg[0]
++            self.fp.seek(0)
++            self.shell.writefile(path, self.fp)
++            self.reply(TXFR_COMPLETE_OK)
++        except FTPCmdError, e:
++            self.reply(CNX_CLOSED_TXFR_ABORTED)
++        self.fp = None
++        self.fpsize = 0
++
+     def finishedFileTransfer(self, *arg):
+         """called back when a file transfer has been completed by the dtp"""
+         log.debug('finishedFileTransfer! cleaning up DTP')
+@@ -658,6 +725,8 @@
+                 log.debug("uh-oh there was an error...must have been the client's fault")
+                 self.reply(CNX_CLOSED_TXFR_ABORTED)
+             self.fp.close()
++            self.fp = None
++            self.fpsize = 0
+ 
+     def _cbDTPCommand(self):
+         """called back when any DTP command has completed successfully"""
+@@ -772,20 +841,30 @@
+         if params == "-a": params = ''  # bug in konqueror
+         if params == "-aL": params = '' # bug in gFTP 2.0.15
+ 
+-        self.fp, self.fpsize = self.shell.list(cleanPath(params))    # returns a StringIO object
+-        if self.dtpInstance and self.dtpInstance.isConnected:
+-            self.reply(DATA_CNX_ALREADY_OPEN_START_XFR)
++        try:
++            self.fp, self.fpsize = self.shell.list(cleanPath(params))    # returns a StringIO object
++        except FTPCmdError, err:
++            self.reply(err.errorCode, err.errorMessage)
++##             if self.dtpInstance and self.dtpInstance.isConnected:
++##                 self.dtpInstance.cleanupDTP() ## should be a defered.
+         else:
+-            self.reply(FILE_STATUS_OK_OPEN_DATA_CNX)
+-        self._doDTPCommand('RETR')
++            if self.dtpInstance and self.dtpInstance.isConnected:
++                self.reply(DATA_CNX_ALREADY_OPEN_START_XFR)
++            else:
++                self.reply(FILE_STATUS_OK_OPEN_DATA_CNX)
++            self._doDTPCommand('RETR')
+ 
+     def ftp_NLST(self, params):
+-        self.fp, self.fpsize = self.shell.nlst(cleanPath(params))
+-        if self.dtpInstance and self.dtpInstance.isConnected:
+-            self.reply(DATA_CNX_ALREADY_OPEN_START_XFR)
++        try:
++            self.fp, self.fpsize = self.shell.nlst(cleanPath(params))
++        except FTPCmdError, err:
++            self.reply(err.errorCode, err.errorMessage)
+         else:
+-            self.reply(FILE_STATUS_OK_OPEN_DATA_CNX)
+-        self._doDTPCommand('RETR')
++            if self.dtpInstance and self.dtpInstance.isConnected:
++                self.reply(DATA_CNX_ALREADY_OPEN_START_XFR)
++            else:
++                self.reply(FILE_STATUS_OK_OPEN_DATA_CNX)
++            self._doDTPCommand('RETR')
+         
+     
+     def ftp_SIZE(self, params):
+@@ -876,6 +955,21 @@
+             self.reply(FILE_STATUS_OK_OPEN_DATA_CNX)
+         self._doDTPCommand('RETR')
+ 
++    def ftp_STOR(self, params):
++        ## needs check if writable
++        if len(params) == '':
++            raise CmdSyntaxError("STOR requires argumeent")
++        if self.dtpInstance is None:
++            raise BadCmdSequenceError('must send PORT or PASV before STOR')
++        self.shell.stor(cleanPath(params))
++        self.fp = StringIO()
++        self.fpsize = 0
++        if self.dtpInstance and self.dtpInstance.isConnected:
++            self.reply(DATA_CNX_ALREADY_OPEN_START_XFR)
++        else:
++            self.reply(FILE_STATUS_OK_OPEN_DATA_CNX)
++        self._doDTPCommand('STOR', params)
++
+     def ftp_STRU(self, params):
+         p = params.upper()
+         if params == 'F':
+@@ -892,6 +986,23 @@
+         self.transport.loseConnection()
+         log.debug("Client Quit")
+ 
++    def ftp_MKD(self, params):
++        path = cleanPath(params)
++        log.debug("mkdir %s" % path)
++        self.shell.mkd(path)
++        self.reply(MKD_REPLY, path)
++
++    def ftp_RMD(self, params):
++        path = cleanPath(params)
++        log.debug("rmdir %s" % path)
++        self.shell.rmd(path)
++        self.reply(RMD_REPLY, path)
++
++    def ftp_DELE(self, params):
++        path = cleanPath(params)
++        self.shell.dele(path)
++        self.reply(REQ_FILE_ACTN_COMPLETED_OK, path)
++
+ components.backwardsCompatImplements(FTP)
+ 
+ 
+diff --exclude=.svn --exclude=words --exclude=xish --exclude='*.cache' --exclude='*.pyc' --exclude='*~' --exclude='*.orig' -ru /home/michael/zope/TwistedClean/twisted/test/test_ftp.py ./twisted/test/test_ftp.py
+--- /home/michael/zope/TwistedClean/twisted/test/test_ftp.py	2005-04-26 12:04:40.019865928 +0000
++++ ./twisted/test/test_ftp.py	2005-04-26 11:24:44.000000000 +0000
+@@ -32,6 +32,69 @@
+ 
+ StringIOWithoutClosing = NonClosingStringIO
+ 
++class FTPAuthShell(ftp.FTPAnonymousShell):
++    def mapCPathToSPath(self, rpath):
++        if not rpath or rpath[0] != '/':      # if this is not an absolute path
++            # add the clients working directory to the requested path
++            mappedClientPath = self.myjoin(self.clientwd, rpath) 
++        else:
++            mappedClientPath = rpath
++        # next add the client's top level directory to the requested path
++        mappedServerPath = self.myjoin(self.tld, mappedClientPath)
++        ncpath, nspath = os.path.normpath(mappedClientPath), os.path.normpath(mappedServerPath)
++        common = os.path.commonprefix([self.tld, nspath])
++        if common != self.tld:
++            raise ftp.PathBelowTLDError('Cannot access below / directory')
++        ## not all paths exist
++##         if not os.path.exists(nspath):
++##             raise FileNotFoundError(nspath)
++        return (mappedClientPath, mappedServerPath)
++
++    def stor(self, path):
++        cpath, spath = self.mapCPathToSPath(path)
++        log.debug('stor', cpath, spath)
++        print "*** spath: %s ***" % path
++        if os.path.exists(spath):
++            raise ftp.CmdActionNotTaken('file already exists')
++
++    def writefile(self, path, data):
++        print "*** writing file ***"
++
++    def dele(self, path):
++        cpath, spath = self.mapCPathToSPath(path)
++        log.debug('dele', cpath, spath)
++        if not os.path.exists(spath) and not os.path.isfile(spath):
++            raise ftp.FileNotFoundError(path)
++        os.remove(spath)
++    
++    def mkd(self, path):
++        cpath, spath = self.mapCPathToSPath(path)
++        log.debug('mkd', cpath, spath)
++        if os.path.exists(spath):
++            raise ftp.CmdActionNotTaken('%s already exists.' % cpath)
++        os.mkdir(spath)
++
++    def rmd(self, path):
++        cpath, spath = self.mapCPathToSPath(path)
++        log.debug('rmd', cpath, spath)
++        if os.path.exists(spath) and os.path.isdir(spath):
++            try:
++                os.rmdir(spath)
++            except OSError, e:
++                raise ftp.CmdActionNotTaken(e.args[1])
++        else:
++            raise ftp.CmdActionNotTaken('%s not a directory' % cpath)
++
++class FTPRealm(ftp.FTPRealm):
++    def requestAvatar(self, avatarId, mind, *interfaces):
++        if ftp.IFTPShell in interfaces:
++            if self.tld is None:
++                raise ftp.TLDNotSetInRealmError("you must set FTPRealm's tld to a non-None value before creating avatars!!!")
++            avatar = FTPAuthShell(user=self.user, tld=self.tld)
++            avatar.clientwd = self.clientwd
++            avatar.logout = self.logout
++            return ftp.IFTPShell, avatar, avatar.logout
++        raise NotImplementedError("Only IFTPShell interface is supported by this realm")
+ 
+ def getPortal():
+     anonPortal = portal.Portal(ftp.FTPRealm())
+@@ -87,9 +150,9 @@
+         os.mkdir(self.directory)
+ 
+         # Start the server
+-        portal = getPortal()
+-        portal.realm.tld = self.directory
+-        self.factory = ftp.FTPFactory(portal=portal)
++        p = getPortal()
++        p.realm.tld = self.directory
++        self.factory = ftp.FTPFactory(portal = p)
+         self.port = reactor.listenTCP(0, self.factory, interface="127.0.0.1")
+ 
+         # Hook the server's buildProtocol to make the protocol instance
+@@ -149,7 +212,8 @@
+         get NOT_LOGGED_IN errors.
+         """
+         commandList = ['CDUP', 'CWD', 'LIST', 'MODE', 'PASV', 
+-                       'PWD', 'RETR', 'STRU', 'SYST', 'TYPE']
++                       'PWD', 'RETR', 'STRU', 'SYST', 'TYPE',
++                       'STOR', 'MKD', 'RMD', 'DELE']
+ 
+         # Issue commands, check responses
+         for command in commandList:
+@@ -266,6 +330,67 @@
+         responseLines = wait(self.client.queueStringCommand('SYST'))
+         self.assertEqual(["215 UNIX Type: L8"], responseLines)
+ 
++class FTPServerTestModificationCommands(FTPServerTestCase):
++    def setUp(self):
++        # all this so I can change the shell used on the user and to make the server
++        # allowAnonymous = False.
++        # Create a directory
++        self.directory = self.mktemp()
++        os.mkdir(self.directory)
++
++        # Start the server
++        ## portal = getPortal()
++        adminChecker = checkers.InMemoryUsernamePasswordDatabaseDontUse(**{'admin': 'admin'})
++        p = portal.Portal(FTPRealm())
++        p.registerChecker(adminChecker, credentials.IUsernamePassword)
++        p.realm.tld = self.directory
++        self.factory = ftp.FTPFactory(portal = p)
++        self.factory.allowAnonymous = False
++        self.port = reactor.listenTCP(0, self.factory, interface="127.0.0.1")
++
++        # Hook the server's buildProtocol to make the protocol instance
++        # accessible to tests.
++        buildProtocol = self.factory.buildProtocol
++        def _rememberProtocolInstance(addr):
++            protocol = buildProtocol(addr)
++            self.serverProtocol = protocol.wrappedProtocol
++            return protocol
++        self.factory.buildProtocol = _rememberProtocolInstance
++
++        # Connect a client to it
++        portNum = self.port.getHost().port
++        clientCreator = protocol.ClientCreator(reactor, ftp.FTPClientBasic)
++        self.client = wait(clientCreator.connectTCP("127.0.0.1", portNum))
++    
++    def _authLogin(self, shell = ftp.FTPAnonymousShell):
++        # Reconfigure the server to disallow anonymous access.
++        responseLines = wait(self.client.queueStringCommand('USER admin'))
++        self.assertEqual(['331 Password required for admin.'], responseLines)
++
++        responseLines = wait(self.client.queueStringCommand('PASS admin'))
++        self.assertEqual(['230 User logged in, proceed'], responseLines)    
++
++    def testMKD(self):
++        self._authLogin()
++        responseLines = wait(self.client.queueStringCommand('MKD /newdir'))
++        self.assertEqual(['257 "/newdir" created.'], responseLines)
++
++    def testRMD(self):
++        self._authLogin()
++        os.mkdir(os.path.join(self.directory, 'newdir'))
++        responseLines = wait(self.client.queueStringCommand('RMD /newdir'))
++        self.assertEqual(['257 "/newdir" deleted.'], responseLines)
++
++    def testDELE(self):
++        self._authLogin()
++
++        filename = os.path.join(self.directory, 'testfile')
++        fp = open(filename, 'w')
++        fp.close()
++
++        responseLines = wait(self.client.queueStringCommand('DELE /testfile'))
++        self.assertEqual(['250 Requested File Action Completed OK'], responseLines)
++
+ class FTPServerPasvDataConnectionTestCase(FTPServerTestCase):
+     def _makeDataConnection(self):
+         # Establish a passive data connection (i.e. client connecting to

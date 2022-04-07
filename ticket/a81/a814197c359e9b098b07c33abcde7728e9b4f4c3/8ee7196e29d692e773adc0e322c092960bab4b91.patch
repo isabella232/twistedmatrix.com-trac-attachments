@@ -1,0 +1,145 @@
+commit 1a15f94c8388c27bb1801283a3d5906f5f89d03d
+Author: Dustin J. Mitchell <dustin@zmanda.com>
+Date:   Sat Jun 25 21:18:48 2011 -0500
+
+    proposed patch, r3
+
+diff --git a/doc/core/howto/defer.xhtml b/doc/core/howto/defer.xhtml
+index 2444010..afaa48a 100644
+--- a/doc/core/howto/defer.xhtml
++++ b/doc/core/howto/defer.xhtml
+@@ -550,6 +550,35 @@ but as we've already noted, adding callbacks to a Deferred after its used in a
+ DeferredList is confusing and usually avoided.</span>.  Passing a true value
+ for the <code>consumeErrors</code> parameter will not change the behavior of <code>fireOnOneCallback</code> or <code>fireOnOneErrback</code>.</p>
+ 
++<h3>gatherResults</h3>
++
++<p>A common use for DeferredList is to "join" a number of parallel asynchronous
++operations, finishing successfully if all of the operations were successful, or
++failing if any one of the operations fails.  In this case, <code
++class="API">twisted.internet.defer.gatherResults</code> is a useful
++shortcut:</p>
++
++<pre class="python">
++from twisted.internet import defer
++d1 = defer.Deferred()
++d2 = defer.Deferred()
++d = defer.gatherResults([d1, d2], consumeErrors=True)
++def printResult(result):
++    print result
++d.addCallback(printResult)
++d1.callback("one")
++# nothing is printed yet; d is still awaiting completion of d2
++d2.callback("two")
++# printResult prints ["one", "two"]
++</pre>
++
++<p>The <code>consumeErrors</code> argument, if true, causes
++<code>gatherResults</code> to consume any errors in the passed-in Deferreds.
++Always use this argument unless you are adding further callbacks or errbacks to
++the passed-in Deferreds, or unless you know that they will not fail.
++Otherwise, a failure will result in an unhandled error being logged by Twisted.
++Note that this argument only available in versions of Twisted after 11.0.0.</p>
++
+ <a name="class"></a>
+ 
+ <h2>Class Overview</h2>
+diff --git a/twisted/internet/defer.py b/twisted/internet/defer.py
+index 5231673..e7e7e66 100644
+--- a/twisted/internet/defer.py
++++ b/twisted/internet/defer.py
+@@ -708,7 +708,7 @@ class DeferredList(Deferred):
+     L{DeferredList} is implemented by adding callbacks and errbacks to each
+     L{Deferred} in the list passed to it.  This means callbacks and errbacks
+     added to the Deferreds before they are passed to L{DeferredList} will change
+-    the result that L{DeferredList} sees (ie, L{DeferredList} is not special).
++    the result that L{DeferredList} sees (i.e., L{DeferredList} is not special).
+     Callbacks and errbacks can also be added to the Deferreds after they are
+     passed to L{DeferredList} and L{DeferredList} may change the result that
+     they see.
+@@ -805,16 +805,32 @@ def _parseDListResult(l, fireOnOneErrback=False):
+ 
+ 
+ 
+-def gatherResults(deferredList):
++def gatherResults(deferredList, consumeErrors=False):
+     """
+-    Returns list with result of given L{Deferred}s.
++    Returns, via a L{Deferred}, a list with the results of the given
++    L{Deferred}s - in effect, a "join" of multiple deferred operations.
+ 
+-    This builds on L{DeferredList} but is useful since you don't
+-    need to parse the result for success/failure.
++    The returned L{Deferred} will fire when I{all} of the provided L{Deferred}s
++    have fired, or when any one of them has failed.
++
++    This differs from L{DeferredList} in that you don't need to parse
++    the result for success/failure.
+ 
+     @type deferredList:  C{list} of L{Deferred}s
++
++    @param consumeErrors: (keyword param) a flag, defaulting to False,
++        indicating that failures in any of the given L{Deferreds} should not be
++        propagated to errbacks added to the individual L{Deferreds} after this
++        L{gatherResults} invocation.  Any such errors in the individual
++        L{Deferred}s will be converted to a callback result of C{None}.  This
++        is useful to prevent spurious 'Unhandled error in Deferred' messages
++        from being logged.  This parameter is only available in versions after
++        11.0.0.
++
++    @type consumeErrors: C{bool}
+     """
+-    d = DeferredList(deferredList, fireOnOneErrback=True)
++    d = DeferredList(deferredList, fireOnOneErrback=True,
++                                   consumeErrors=consumeErrors)
+     d.addCallback(_parseDListResult)
+     return d
+ 
+diff --git a/twisted/test/test_defer.py b/twisted/test/test_defer.py
+index 2404c31..3cebc79 100644
+--- a/twisted/test/test_defer.py
++++ b/twisted/test/test_defer.py
+@@ -305,7 +305,7 @@ class DeferredTestCase(unittest.TestCase):
+         self.assertEquals(result, [None])
+ 
+ 
+-    def testGatherResults(self):
++    def test_gatherResults(self):
+         # test successful list of deferreds
+         l = []
+         defer.gatherResults([defer.succeed(1), defer.succeed(2)]).addCallback(l.append)
+@@ -320,6 +320,27 @@ class DeferredTestCase(unittest.TestCase):
+         dl[1].addErrback(lambda e: 1)
+ 
+ 
++    def test_gatherResultsWithConsumeErrors(self):
++        """Test that L{gatherResults}' C{consumeErrors} parameter is
++        successfully communicated to L{DeferredList}."""
++        # test successful list of deferreds
++        dgood = defer.succeed(1)
++        dbad = defer.fail(RuntimeError("oh noes"))
++        d = defer.gatherResults([dgood, dbad], consumeErrors=True)
++        unconsumed_errors = []
++        dbad.addErrback(unconsumed_errors.append)
++        gathered_errors = []
++        d.addErrback(gathered_errors.append)
++        def check(_):
++            self.assertEqual((len(unconsumed_errors), len(gathered_errors)),
++                             (0, 1))
++            self.failUnless(gathered_errors[0].check(defer.FirstError))
++            firsterror = gathered_errors[0].value.subFailure
++            self.failUnless(firsterror.check(RuntimeError))
++        d.addCallback(check)
++        return d
++
++
+     def test_maybeDeferredSync(self):
+         """
+         L{defer.maybeDeferred} should retrieve the result of a synchronous
+diff --git a/twisted/topfiles/5159.feature b/twisted/topfiles/5159.feature
+new file mode 100644
+index 0000000..c2068fd
+--- /dev/null
++++ b/twisted/topfiles/5159.feature
+@@ -0,0 +1 @@
++Added a 'consumeErrors' parameter to 'twisted.internet.defer.gatherResults', with the same behavior as the corresponding argument for 'DeferredList'.

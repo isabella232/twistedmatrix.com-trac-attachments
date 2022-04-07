@@ -1,0 +1,150 @@
+Index: twisted/test/test_task.py
+===================================================================
+--- twisted/test/test_task.py	(revision 12882)
++++ twisted/test/test_task.py	(working copy)
+@@ -6,6 +6,8 @@
+ 
+ from twisted.internet import task, reactor, defer
+ 
++from twisted.python import failure
++
+ class TestException(Exception):
+     pass
+ 
+@@ -44,11 +46,13 @@
+         d.addCallbacks(self._testFailure_nofailure,
+                        self._testFailure_yesfailure)
+         return d
++
+     def _testFailure_nofailure(self, res):
+         # NOTE: this branch does not work. I think it's a trial bug. Replace
+         # the 'raise TestException' above with a 'return 12' and this test
+         # will hang.
+         self.fail("test did not raise an exception when it was supposed to")
++
+     def _testFailure_yesfailure(self, err):
+         err.trap(TestException)
+ 
+@@ -89,3 +93,61 @@
+         d = lc.start(0)
+         x = unittest.wait(d)
+         self.assertEquals(len(ran), 6)
++
++    def testStopAtOnce(self):
++        ran = []
++
++        def foo():
++            ran.append(None)
++
++        lc = task.LoopingCall(foo)
++        lc.start(0)
++        lc.stop()
++        self.failUnless(len(ran) == 0)
++
++    def testStopAtOnceThen(self):
++        ran = []
++        def foo():
++            ran.append(None)
++        self._lc = task.LoopingCall(foo)
++        self._lc.start(0)
++        d = defer.Deferred()
++        reactor.callLater(0, self._callback_for_testStopAtOnceThen, ran, d)
++        return d
++
++    def _callback_for_testStopAtOnceThen(self, ran, d):
++        if len(ran) != 1:
++            d.errback(failed.DefaultException("The looping task ought to have been called once already."))
++            return
++        self._lc.stop()
++        reactor.callLater(0, self._callback_2_for_testStopAtOnceThen, ran, d)
++
++    def _callback_2_for_testStopAtOnceThen(self, ran, d):
++        if len(ran) != 1:
++            d.errback(failed.DefaultException("The looping task ought not to have been called after the LoopingCall.stop()."))
++            return
++        try:
++            d.callback("success")
++        except defer.AlreadyCalledError:
++            pass
++        
++    def testStopAtOnce2(self):
++        d = defer.Deferred()
++        def foo():
++            d.errback(failure.DefaultException("This task also should never get called."))
++        self._lc = task.LoopingCall(foo)
++        self._lc.start(1, now=False)
++        reactor.callLater(0, self._callback_for_testStopAtOnce2, d)
++        return d
++
++    def _callback_for_testStopAtOnce2(self, d):
++        self._lc.stop()
++        reactor.callLater(0, self._callback_2_for_testStopAtOnce2, d)
++
++    def _callback_2_for_testStopAtOnce2(self, d):
++        try:
++            d.callback("success")
++        except defer.AlreadyCalledError:
++            pass
++        
++
+Index: twisted/internet/task.py
+===================================================================
+--- twisted/internet/task.py	(revision 12882)
++++ twisted/internet/task.py	(working copy)
+@@ -42,8 +42,10 @@
+         one.  Precision will depend on the underlying platform, the available
+         hardware, and the load on the system.
+         
+-        @param now: If True, run this call right now.  Otherwise, wait until the
+-        interval has elapsed before beginning.
++        @param now: If True, run this call right now, via callLater(0, self).
++        Otherwise, wait until the interval has elapsed before beginning, via
++        callLater(interval, self).  Note that the first call will not occur in
++        the current reactor tick, but in a subsequent one.
+ 
+         @return: A Deferred whose callback will be invoked with C{self} when
+         C{self.stop} is called, or whose errback will be invoked if the function
+@@ -58,7 +60,7 @@
+         self.count = 0
+         self.interval = interval
+         if now:
+-            self()
++            reactor.callLater(0, self)
+         else:
+             self._reschedule()
+         return d
+@@ -66,18 +68,17 @@
+     def stop(self):
+         """Stop running function."""
+         assert self.running
+-        reactor.callLater(0, self._reallyStop)
+-    
+-    def _reallyStop(self):
+-        if not self.running:
+-            return
+         self.running = False
+         if self.call is not None:
+             self.call.cancel()
+             self.call = None
++        reactor.callLater(0, self._callback)
++
++    def _callback(self):
+         d, self.deferred = self.deferred, None
+-        d.callback(self)
+-
++        if d:
++            d.callback(self)
++        
+     def __call__(self):
+         self.call = None
+         try:
+@@ -87,7 +88,8 @@
+             d, self.deferred = self.deferred, None
+             d.errback()
+         else:
+-            self._reschedule()
++            if self.running:
++                self._reschedule()
+     
+     def _reschedule(self):
+         if self.interval == 0:

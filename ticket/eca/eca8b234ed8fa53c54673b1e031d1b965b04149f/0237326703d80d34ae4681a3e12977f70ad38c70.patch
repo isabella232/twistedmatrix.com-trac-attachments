@@ -1,0 +1,112 @@
+Index: twisted/python/log.py
+===================================================================
+--- twisted/python/log.py	(revision 32317)
++++ twisted/python/log.py	(working copy)
+@@ -279,17 +279,17 @@
+         actualEventDict.update(kw)
+         actualEventDict['message'] = message
+         actualEventDict['time'] = time.time()
+-        for i in xrange(len(self.observers) - 1, -1, -1):
++        for observer in reversed(self.observers):
+             try:
+-                self.observers[i](actualEventDict)
++                observer(actualEventDict)
+             except KeyboardInterrupt:
+                 # Don't swallow keyboard interrupt!
+                 raise
+             except UnicodeEncodeError:
+                 raise
+             except:
+-                observer = self.observers[i]
+-                self.observers[i] = lambda event: None
++                replacement = lambda event: None
++                self._tryReplacingObserver(observer, replacement)
+                 try:
+                     err(failure.Failure(),
+                         "Log observer %s failed." % (observer,))
+@@ -298,9 +298,23 @@
+                     # e.g. RuntimeError due to blowing the stack; if that
+                     # happens, there's not much we can do...
+                     pass
+-                self.observers[i] = observer
++                self._tryReplacingObserver(replacement, observer)
+ 
+ 
++    def _tryReplacingObserver(self, original, replacement):
++        """
++        Try to replace the C{original} log observer with C{replacement}.
++
++        If C{original} observer is not registered with this publisher, do
++        nothing.
++        """
++        try:
++            i = self.observers.index(original)
++        except ValueError:
++            return
++        self.observers[i] = replacement
++
++
+     def showwarning(self, message, category, filename, lineno, file=None,
+                     line=None):
+         """
+Index: twisted/test/test_log.py
+===================================================================
+--- twisted/test/test_log.py	(revision 32317)
++++ twisted/test/test_log.py	(working copy)
+@@ -231,6 +231,50 @@
+                                        line))
+ 
+ 
++    def test_removeObserver(self):
++        """
++        Removing an observer during C{log.msg} call has no ill effects.
++        """
++        observers = []
++        def cleanup():
++            for observer in observers:
++                log.removeObserver(observer)
++
++        self.addCleanup(cleanup)
++
++        def dummyObserver(eventDict):
++            pass
++
++        def evilObserver(eventdict):
++            for i in range(2):
++                log.removeObserver(dummyObserver)
++                observers.remove(dummyObserver)
++
++        for i in range(2):
++            log.addObserver(dummyObserver)
++            observers.append(dummyObserver)
++        log.addObserver(evilObserver)
++        observers.append(evilObserver)
++
++        log.msg("Hello!")
++        self.assertEqual(observers, [evilObserver])
++
++
++    def test_removeObserverAndRaise(self):
++        """
++        An observer that removes itself by calling C{log.removeObserver} and
++        then raises an error has no ill effect on L{log.msg}.
++        """
++        def stupidObserver(eventDict):
++            log.removeObserver(stupidObserver)
++            raise RuntimeError("test_removeObserverAndRaise")
++
++        log.addObserver(stupidObserver)
++        log.msg("Hello!")
++        self.assertEqual(len(self.flushLoggedErrors(RuntimeError)), 1)
++
++
++
+ class FakeFile(list):
+     def write(self, bytes):
+         self.append(bytes)
+Index: twisted/topfiles/5194.bugfix
+===================================================================
+--- twisted/topfiles/5194.bugfix	(revision 0)
++++ twisted/topfiles/5194.bugfix	(revision 0)
+@@ -0,0 +1 @@
++twisted.python.log now copes with log observers that are removed during log.msg calls.

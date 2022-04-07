@@ -1,0 +1,83 @@
+Index: twisted/web/_newclient.py
+===================================================================
+--- twisted/web/_newclient.py    (revision 35878)
++++ twisted/web/_newclient.py    (working copy)
+@@ -144,6 +144,15 @@ class ResponseDone(Exception):
+ 
+ 
+ 
++class NoBodyResponseDone(ResponseDone):
++    """
++    L{NoBodyResponseDone} may be passed to L{IProtocol.connectionLost} on the
++    protocol passed to L{Response.deliverBody} and indicates that a response with
++    no body (such as 204) has been delivered.
++    """
++
++
++
+ class ResponseFailed(_WrapperException):
+     """
+     L{ResponseFailed} indicates that all of the response to a request was not
+@@ -453,7 +462,8 @@ class HTTPClientParser(HTTPParser):
+             or self.request.method == 'HEAD'):
+             self.response.length = 0
+             self._finished(self.clearLineBuffer())
+-            self.response._bodyDataFinished()
++            self.response._bodyDataFinished(
++                Failure(NoBodyResponseDone("Response with no body fully received")))
+         else:
+             transferEncodingHeaders = self.connHeaders.getRawHeaders(
+                 'transfer-encoding')
+Index: twisted/web/test/test_newclient.py
+===================================================================
+--- twisted/web/test/test_newclient.py    (revision 35878)
++++ twisted/web/test/test_newclient.py    (working copy)
+@@ -27,6 +27,7 @@ from twisted.web._newclient import WrongBodyLength, RequestNotSent
+ from twisted.web._newclient import ConnectionAborted, ResponseNeverReceived
+ from twisted.web._newclient import BadHeaders, ResponseDone, PotentialDataLoss, ExcessWrite
+ from twisted.web._newclient import TransportProxyProducer, LengthEnforcingConsumer, makeStatefulDispatcher
++from twisted.web._newclient import NoBodyResponseDone
+ from twisted.web.http_headers import Headers
+ from twisted.web.http import _DataLoss
+ from twisted.web.iweb import IBodyProducer, IResponse
+@@ -410,22 +411,36 @@ class HTTPClientParserTests(TestCase):
+         """
+         header = {}
+         finished = []
+-        bodyDataFinished = []
++        reason = []
+         protocol = HTTPClientParser(request, finished.append)
+         protocol.headerReceived = header.__setitem__
+         body = []
+         transport = StringTransport()
+         protocol.makeConnection(transport)
+         protocol.dataReceived(status)
++
++        class StubConsumer(Protocol):
++            def __init__(self, reason):
++                self.reason = reason
++
++            def dataReceived(self, data):
++                pass
++
++            def connectionLost(self, failure=None):
++                if failure:
++                    self.reason.append(failure.value)
++
++        consumer = StubConsumer(reason)
++        protocol.response.deliverBody(consumer)
+         protocol.response._bodyDataReceived = body.append
+-        protocol.response._bodyDataFinished = (
+-            lambda: bodyDataFinished.append(True))
++
+         protocol.dataReceived(response)
+         self.assertEqual(transport.producerState, 'producing')
+         self.assertEqual(protocol.state, DONE)
+         self.assertEqual(body, [])
+         self.assertEqual(finished, [''])
+-        self.assertEquals(bodyDataFinished, [True])
++        self.assertEqual(len(reason), 1)
++        self.assertIsInstance(reason[0], NoBodyResponseDone)
+         self.assertEqual(protocol.response.length, 0)
+         return header
+ 

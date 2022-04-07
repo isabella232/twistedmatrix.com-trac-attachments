@@ -1,0 +1,315 @@
+diff --git c/twisted/python/dist.py w/twisted/python/dist.py
+index 0d358ee..9b0af2c 100644
+--- c/twisted/python/dist.py
++++ w/twisted/python/dist.py
+@@ -6,17 +6,22 @@ Don't use this outside of Twisted.
+ Maintainer: Christopher Armstrong
+ """
+ 
+-import sys, os
+ from distutils.command import build_scripts, install_data, build_ext, build_py
+ from distutils.errors import CompileError
+ from distutils import core
+ from distutils.core import Extension
++import fnmatch
++import os
++import platform
++import sys
++
+ 
+ twisted_subprojects = ["conch", "lore", "mail", "names",
+                        "news", "pair", "runner", "web",
+                        "words"]
+ 
+ 
++
+ class ConditionalExtension(Extension):
+     """
+     An extension module that will only be compiled if certain conditions are
+@@ -46,6 +51,7 @@ def setup(**kw):
+     """
+     return core.setup(**get_setup_args(**kw))
+ 
++
+ def get_setup_args(**kw):
+     if 'twisted_subproject' in kw:
+         if 'twisted' not in os.listdir('.'):
+@@ -100,6 +106,7 @@ def get_setup_args(**kw):
+         kw.setdefault('cmdclass', {})['build_ext'] = my_build_ext
+     return kw
+ 
++
+ def getVersion(proj, base="twisted"):
+     """
+     Extract the version number for a given project.
+@@ -125,10 +132,10 @@ EXCLUDE_NAMES = ["{arch}", "CVS", ".cvsignore", "_darcs",
+                  "RCS", "SCCS", ".svn"]
+ EXCLUDE_PATTERNS = ["*.py[cdo]", "*.s[ol]", ".#*", "*~", "*.py"]
+ 
+-import fnmatch
+ 
+ def _filterNames(names):
+-    """Given a list of file names, return those names that should be copied.
++    """
++    Given a list of file names, return those names that should be copied.
+     """
+     names = [n for n in names
+              if n not in EXCLUDE_NAMES]
+@@ -140,6 +147,7 @@ def _filterNames(names):
+                  and (not n.endswith('.py'))]
+     return names
+ 
++
+ def relativeTo(base, relativee):
+     """
+     Gets 'relativee' relative to 'basepath'.
+@@ -201,6 +209,7 @@ def getDataFiles(dname, ignore=None, parent=None):
+                             for filename in resultfiles]))
+     return result
+ 
++
+ def getPackages(dname, pkgname=None, results=None, ignore=None, parent=None):
+     """
+     Get all packages which are under dname. This is necessary for
+@@ -231,7 +240,6 @@ def getPackages(dname, pkgname=None, results=None, ignore=None, parent=None):
+     return res
+ 
+ 
+-
+ def getScripts(projname, basedir=''):
+     """
+     Returns a list of scripts for a Twisted subproject; this works in
+@@ -360,3 +368,50 @@ class build_ext_twisted(build_ext.build_ext):
+         self.compiler.announce("checking for %s ..." % header_name, 0)
+         return self._compile_helper("#include <%s>\n" % header_name)
+ 
++
++
++def _checkCPython(sys=sys, platform=platform):
++    """
++    Checks if this implementation is CPython.
++
++    On recent versions of Python, will use L{platform.python_implementation}.
++    On 2.5, it will try to extract the implementation from sys.subversion. On
++    older versions (currently the only supported older version is 2.4), checks
++    if C{__pypy__} is in L{sys.modules}, since PyPy is the implementation we
++    really care about. If it isn't, assumes CPython.
++
++    This takes C{sys} and C{platform} kwargs that by default use the real
++    modules. You shouldn't care about these -- they are for testing purposes
++    only.
++
++    @return: C{False} if the implementation is definitely not CPython, C{True}
++        otherwise.
++    """
++    try:
++        return platform.python_implementation() == "CPython"
++    except AttributeError:
++        # For 2.5:
++        try:
++            implementation, _, _ = sys.subversion
++            return implementation == "CPython"
++        except AttributeError:
++            pass
++
++        # Are we on Pypy?
++        if "__pypy__" in sys.modules:
++            return False
++
++        # No? Well, then we're *probably* on CPython.
++        return True
++
++
++_isCPython = _checkCPython()
++
++
++def _hasEpoll(builder):
++    """
++    Checks if the header for building epoll (C{sys/epoll.h}) is available.
++
++    @return: C{True} if the header is available, C{False} otherwise.
++    """
++    return builder._check_header("sys/epoll.h")
+diff --git c/twisted/python/test/test_dist.py w/twisted/python/test/test_dist.py
+index a27ff94..39f4438 100644
+--- c/twisted/python/test/test_dist.py
++++ w/twisted/python/test/test_dist.py
+@@ -190,3 +190,128 @@ class GetScriptsTest(TestCase):
+         os.mkdir(basedir)
+         scripts = dist.getScripts('noscripts', basedir=basedir)
+         self.assertEqual(scripts, [])
++
++
++
++class FakeModule(object):
++    """
++    A fake module, suitable for dependency injection in testing.
++    """
++    def __init__(self, attrs):
++        """
++        Initializes a fake module.
++
++        @param attrs: The attrs that will be accessible on the module.
++        @type attrs: C{dict} of C{str} (Python names) to objects
++        """
++        self._attrs = attrs
++
++    def __getattr__(self, name):
++        """
++        Gets an attribute of this fake module from its attrs.
++
++        @raise AttributeError: When the requested attribute is missing.
++        """
++        try:
++            return self._attrs[name]
++        except KeyError:
++            raise AttributeError()
++
++
++
++fakeCPythonPlatform = FakeModule({"python_implementation": lambda: "CPython"})
++fakeOtherPlatform = FakeModule({"python_implementation": lambda: "lvhpy"})
++emptyPlatform = FakeModule({})
++
++
++
++class WithPlatformTest(TestCase):
++    """
++    Tests if L{_checkCPython} works correctly with (fake) recent
++    C{platform} modules.
++    """
++    def test_cpython(self):
++        """
++        Tests that L{_checkCPython} returns C{True} when
++        C{platform.python_implementation} says we're running on CPython.
++        """
++        self.assertTrue(dist._checkCPython(platform=fakeCPythonPlatform))
++
++
++    def test_other(self):
++        """
++        Tests that L{_checkCPython} returns C{True} when
++        C{platform.python_implementation} says we're not running on CPython.
++        """
++        self.assertFalse(dist._checkCPython(platform=fakeOtherPlatform))
++
++
++
++fakeCPythonSys = FakeModule({"subversion": ("CPython", None, None)})
++fakeOtherSys = FakeModule({"subversion": ("lvhpy", None, None)})
++
++
++def _checkCPythonWithEmptyPlatform(sys):
++    """
++    A partially applied L{_checkCPython} that uses an empty C{platform}
++    module (otherwise the code this test case is supposed to test won't
++    even be called).
++    """
++    return dist._checkCPython(platform=emptyPlatform, sys=sys)
++
++
++
++class WithSubversionTest(TestCase):
++    """
++    Tests if L{_checkCPython} works correctly with (fake) recent (2.5+)
++    C{sys.subversion}. This is effectively only relevant for 2.5, since 2.6
++    and beyond have L{platform.python_implementation}, which is tried first.
++    """
++    def test_cpython(self):
++        """
++        Tests that L{_checkCPython} returns C{True} when
++        C{platform.python_implementation} is unavailable and C{sys.subversion}
++        says we're running on CPython.
++        """
++        isCPython = _checkCPythonWithEmptyPlatform(fakeCPythonSys)
++        self.assertTrue(isCPython)
++
++
++    def test_other(self):
++        """
++        Tests that L{_checkCPython} returns C{False} when
++        C{platform.python_implementation} is unavailable and C{sys.subversion}
++        says we're not running on CPython.
++        """
++        isCPython = _checkCPythonWithEmptyPlatform(fakeOtherSys)
++        self.assertFalse(isCPython)
++
++
++
++oldCPythonSys = FakeModule({"modules": {}})
++oldPypySys = FakeModule({"modules": {"__pypy__": None}})
++
++
++class OldPythonsFallbackTest(TestCase):
++    """
++    Tests if L{_checkCPython} correctly recognizes PyPy on 2.4, when neither
++    C{platform.python_implementation} or C{sys.subversion} is available.
++    """
++    def test_cpython(self):
++        """
++        Tests that L{_checkCPython} returns C{True} when both
++        C{platform.python_implementation} and C{sys.subversion} are
++        unavailable and there is no C{__pypy__} module in C{sys.modules}.
++        """
++        isCPython = _checkCPythonWithEmptyPlatform(oldCPythonSys)
++        self.assertTrue(isCPython)
++
++
++    def test_pypy(self):
++        """
++        Tests that L{_checkCPython} returns C{False} when both
++        C{platform.python_implementation} and C{sys.subversion} are
++        unavailable and there is a C{__pypy__} module in C{sys.modules}.
++        """
++        isCPython = _checkCPythonWithEmptyPlatform(oldPypySys)
++        self.assertFalse(isCPython)
+diff --git c/twisted/topfiles/setup.py w/twisted/topfiles/setup.py
+index a1e0ae7..807dde2 100644
+--- c/twisted/topfiles/setup.py
++++ w/twisted/topfiles/setup.py
+@@ -6,7 +6,8 @@
+ Distutils installer for Twisted.
+ """
+ 
+-import os, sys
++import os
++import sys
+ 
+ if sys.version_info < (2,3):
+     print >>sys.stderr, "You must use at least Python 2.3 for Twisted"
+@@ -17,29 +18,29 @@ if os.path.exists('twisted'):
+ from twisted import copyright
+ from twisted.python.dist import setup, ConditionalExtension as Extension
+ from twisted.python.dist import getPackages, getDataFiles, getScripts
+-from twisted.python.dist import twisted_subprojects
+-
++from twisted.python.dist import twisted_subprojects, _isCPython, _hasEpoll
+ 
+ 
+ extensions = [
+     Extension("twisted.test.raiser",
+-              ["twisted/test/raiser.c"]),
++              ["twisted/test/raiser.c"],
++              condition=lambda _: _isCPython),
+ 
+     Extension("twisted.python._epoll",
+               ["twisted/python/_epoll.c"],
+-              condition=lambda builder: builder._check_header("sys/epoll.h")),
++              condition=lambda builder: _isCPython and _hasEpoll(builder)),
+ 
+     Extension("twisted.internet.iocpreactor.iocpsupport",
+               ["twisted/internet/iocpreactor/iocpsupport/iocpsupport.c",
+                "twisted/internet/iocpreactor/iocpsupport/winsock_pointers.c"],
+               libraries=["ws2_32"],
+-              condition=lambda builder: sys.platform == "win32"),
++              condition=lambda _: _isCPython and sys.platform == "win32"),
+ 
+     Extension("twisted.python._initgroups",
+               ["twisted/python/_initgroups.c"]),
+     Extension("twisted.internet._sigchld",
+               ["twisted/internet/_sigchld.c"],
+-              condition=lambda builder: sys.platform != "win32"),
++              condition=lambda _: sys.platform != "win32"),
+ ]
+ 
+ # Figure out which plugins to include: all plugins except subproject ones

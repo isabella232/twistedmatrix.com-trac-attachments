@@ -1,0 +1,178 @@
+Index: twisted/mail/test/test_imap.py
+===================================================================
+--- twisted/mail/test/test_imap.py	(revision 31058)
++++ twisted/mail/test/test_imap.py	(working copy)
+@@ -12,9 +12,10 @@
+ except ImportError:
+     from StringIO import StringIO
+ 
++import codecs
++import locale
+ import os
+ import types
+-import codecs
+ 
+ from zope.interface import implements
+ 
+@@ -3461,6 +3462,23 @@
+     def testFetchInternalDateUID(self):
+         return self.testFetchInternalDate(1)
+ 
++    def testFetchInternalDateLocaleIndependent(self):
++        """
++        The month name in the date should be locale independent.
++        """
++        current_locale = locale.getlocale()
++        locale.setlocale(locale.LC_ALL, "es_AR.UTF8")
++        self.addCleanup(locale.setlocale, locale.LC_ALL, current_locale)
++        return self.testFetchInternalDate(1)
++
++    current_locale = locale.getlocale()
++    try:
++        locale.setlocale(locale.LC_ALL, "es_AR.UTF8")
++    except locale.Error:
++        testFetchInternalDateLocaleIndependent.skip = ("The es_AR.UTF8 locale "
++                                                       "is not installed.")
++    locale.setlocale(locale.LC_ALL, current_locale)
++
+     def testFetchEnvelope(self, uid=0):
+         self.function = self.client.fetchEnvelope
+         self.messages = '15'
+Index: twisted/mail/imap4.py
+===================================================================
+--- twisted/mail/imap4.py	(revision 31058)
++++ twisted/mail/imap4.py	(working copy)
+@@ -49,6 +49,9 @@
+ import twisted.cred.credentials
+ 
+ 
++# locale-independent month names to use instead of strftime's
++MONTH_NAMES = dict(zip(range(1, 13),
++                   "Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec".split()))
+ 
+ class MessageSet(object):
+     """
+@@ -1904,7 +1907,9 @@
+             log.msg("%d:%r: unpareseable internaldate: %r" % (id, msg, idate))
+             raise IMAP4Exception("Internal failure generating INTERNALDATE")
+ 
+-        odate = time.strftime("%d-%b-%Y %H:%M:%S ", ttup[:9])
++        # need to specify the month manually, as strftime depends on locale
++        strdate = time.strftime("%d-%%s-%Y %H:%M:%S ", ttup[:9])
++        odate = strdate % (MONTH_NAMES[ttup[1]],)
+         if ttup[9] is None:
+             odate = odate + "+0000"
+         else:
+Index: twisted/conch/test/test_cftp.py
+===================================================================
+--- twisted/conch/test/test_cftp.py	(revision 31058)
++++ twisted/conch/test/test_cftp.py	(working copy)
+@@ -6,6 +6,7 @@
+ Tests for L{twisted.conch.scripts.cftp}.
+ """
+ 
++import locale
+ import time, sys, os, operator, getpass, struct
+ from StringIO import StringIO
+ 
+@@ -142,6 +143,32 @@
+             '!---------    0 0        0               0 Aug 29 09:33 foo')
+ 
+ 
++    def test_localeIndependent(self):
++        """
++        The month name in the date should be locale independent.
++        """
++        # A point about three months in the past.
++        then = self.now - (60 * 60 * 24 * 31 * 3)
++        stat = os.stat_result((0, 0, 0, 0, 0, 0, 0, 0, then, 0))
++
++        current_locale = locale.getlocale()
++        locale.setlocale(locale.LC_ALL, "es_AR.UTF8")
++        self.addCleanup(locale.setlocale, locale.LC_ALL, current_locale)
++
++        self.assertEqual(
++            self._lsInTimezone('America/New_York', stat),
++            '!---------    0 0        0               0 Aug 28 17:33 foo')
++        self.assertEqual(
++            self._lsInTimezone('Pacific/Auckland', stat),
++            '!---------    0 0        0               0 Aug 29 09:33 foo')
++
++    current_locale = locale.getlocale()
++    try:
++        locale.setlocale(locale.LC_ALL, "es_AR.UTF8")
++    except locale.Error:
++        test_localeIndependent.skip = "The es_AR.UTF8 locale is not installed."
++    locale.setlocale(locale.LC_ALL, current_locale)
++
+     def test_newSingleDigitDayOfMonth(self):
+         """
+         A file with a high-resolution timestamp which falls on a day of the
+@@ -161,7 +188,6 @@
+             '!---------    0 0        0               0 Sep 02 09:33 foo')
+ 
+ 
+-
+ class StdioClientTests(TestCase):
+     """
+     Tests for L{cftp.StdioClient}.
+Index: twisted/conch/ls.py
+===================================================================
+--- twisted/conch/ls.py	(revision 31058)
++++ twisted/conch/ls.py	(working copy)
+@@ -7,7 +7,11 @@
+ 
+ from time import time, strftime, localtime
+ 
++# locale-independent month names to use instead of strftime's
++MONTH_NAMES = dict(zip(range(1, 13),
++                   "Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec".split()))
+ 
++
+ def lsLine(name, s):
+     mode = s.st_mode
+     perms = array.array('c', '-'*10)
+@@ -39,22 +43,28 @@
+     if mode&stat.S_ISGID:
+         if perms[6] == 'x': perms[6] = 's'
+         else: perms[6] = 'S'
+-    l = perms.tostring()
+-    l += str(s.st_nlink).rjust(5) + ' '
+-    un = str(s.st_uid)
+-    l += un.ljust(9)
+-    gr = str(s.st_gid)
+-    l += gr.ljust(9)
+-    sz = str(s.st_size)
+-    l += sz.rjust(8)
+-    l += ' '
+-    sixmo = 60 * 60 * 24 * 7 * 26
+-    if s.st_mtime + sixmo < time(): # last edited more than 6mo ago
+-        l += strftime("%b %d  %Y ", localtime(s.st_mtime))
++
++    lsresult = [
++        perms.tostring(),
++        str(s.st_nlink).rjust(5),
++        ' ',
++        str(s.st_uid).ljust(9),
++        str(s.st_gid).ljust(9),
++        str(s.st_size).rjust(8),
++        ' ',
++    ]
++
++    # need to specify the month manually, as strftime depends on locale
++    ttup = localtime(s.st_mtime)
++    sixmonths = 60 * 60 * 24 * 7 * 26
++    if s.st_mtime + sixmonths < time(): # last edited more than 6mo ago
++        strtime = strftime("%%s %d  %Y ", ttup)
+     else:
+-        l += strftime("%b %d %H:%M ", localtime(s.st_mtime))
+-    l += name
+-    return l
++        strtime = strftime("%%s %d %H:%M ", ttup)
++    lsresult.append(strtime % (MONTH_NAMES[ttup[1]],))
+ 
++    lsresult.append(name)
++    return ''.join(lsresult)
+ 
++
+ __all__ = ['lsLine']

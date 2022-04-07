@@ -1,0 +1,136 @@
+Index: internet/ssl.py
+===================================================================
+RCS file: /cvs/Twisted/twisted/internet/ssl.py,v
+retrieving revision 1.44
+diff -u -r1.44 ssl.py
+--- internet/ssl.py	28 Sep 2003 03:30:04 -0000	1.44
++++ internet/ssl.py	6 Feb 2004 19:01:20 -0000
+@@ -157,16 +207,10 @@
+         tcp.Port.__init__(self, port, factory, backlog, interface, reactor)
+         self.ctxFactory = ctxFactory
+     
+-    def createInternetSocket(self):
+-        """(internal) create an SSL socket
+-        """
+-        sock = tcp.Port.createInternetSocket(self)
+-        return SSL.Connection(self.ctxFactory.getContext(), sock)
+-
+     def _preMakeConnection(self, transport):
+-        # *Don't* call startTLS here
+-        # The transport already has the SSL.Connection object from above
+-        transport._startTLS()
++        # *Don't* call startTLS here, don't need to stop&start reading.
++        transport._startTLS(self.ctxFactory)
++        transport.socket.set_accept_state()
+         return tcp.Port._preMakeConnection(self, transport)
+ 
+ 
+Index: internet/tcp.py
+===================================================================
+RCS file: /cvs/Twisted/twisted/internet/tcp.py,v
+retrieving revision 1.143
+diff -u -r1.143 tcp.py
+--- internet/tcp.py	9 Nov 2003 02:22:16 -0000	1.143
++++ internet/tcp.py	6 Feb 2004 19:01:21 -0000
+@@ -82,6 +82,45 @@
+ import interfaces
+ import error
+ 
++class _HackTLSHTTPError:
++    """This is mixed into the Connection when OpenSSL returns
++    the "http request" error, indicating that someone sent
++    a HTTP (not HTTPS) request to an SSL port. 
++    
++    OpenSSL eats some of the GET line, so this class ignores
++    all data up till the first \n, and then inserts a fake
++    GET line into the beginning of the datastream.
++    
++    Whatahack!
++    """
++
++    gotRequestLine = 0
++    def doRead(self):
++        if self.gotRequestLine:
++            return Connection.doRead(self)
++        
++        # oooo nasty. Intercept the dataReceived callback.
++        # There's *GOT* to be a better way to do this...but...
++        # i don't see it.
++        try:
++            self._realProtocol = self.protocol
++            self.protocol = self
++            return Connection.doRead(self)
++        finally:
++            self.protocol = self._realProtocol
++            del self._realProtocol
++
++    def dataReceived(self, data):
++        # called from Connection.doRead above.
++        if not self.gotRequestLine:
++            eol = data.find('\n')
++            if eol == -1:
++                return # CHOMP, yummy data
++            data = "GET /ssl_error:HTTP-request HTTP/1.0\r\n"+data[eol+1:]
++            self.gotRequestLine = 1
++        self.protocol = self._realProtocol
++        self.protocol.dataReceived(data)
++        
+ class _TLSMixin:
+     writeBlockedOnRead = 0
+     readBlockedOnWrite = 0
+@@ -111,7 +150,17 @@
+             self.readBlockedOnWrite = 1
+             self.startWriting()
+             return
+-        except SSL.Error:
++        except SSL.Error, e:
++            if len(e.args[0]) == 1:
++                lib, function, reason = e.args[0][0]
++                if lib == 'SSL routines' and reason == 'http request':
++                    # dump SSL 
++                    self._abortTLS()
++                    class HackHTTPConnection(_HackTLSHTTPError, self.__class__):
++                        pass
++                    self.__class__ = HackHTTPConnection
++                    return
++                
+             log.err()
+             return main.CONNECTION_LOST
+ 
+@@ -146,6 +195,7 @@
+                 # and can be ignored
+                 return 0
+             else:
++                log.msg(e)
+                 return main.CONNECTION_LOST
+         except SSL.Error:
+             log.err()
+@@ -211,17 +261,24 @@
+             assert not self.TLS
+             self.stopReading()
+             self.stopWriting()
+-            self._startTLS()
+-            self.socket = SSL.Connection(ctx.getContext(), self.socket)
+-            self.fileno = self.socket.fileno
++            self._startTLS(ctx)
+             self.startReading()
+ 
+-        def _startTLS(self):
++        def _startTLS(self, ctx):
+             self.TLS = 1
+             class TLSConnection(_TLSMixin, self.__class__):
+                 pass
+             self.__class__ = TLSConnection
++            self.rawsocket = self.socket
++            self.socket = SSL.Connection(ctx.getContext(), self.socket)
++            self.fileno = self.socket.fileno
+ 
++        def _abortTLS(self):
++            assert self.TLS
++            self.__class__ = self.__class__.__bases__[1]
++            self.socket = self.rawsocket
++            self.fileno = self.socket.fileno
++            
+     def doRead(self):
+         """Calls self.protocol.dataReceived with all available data.
+ 

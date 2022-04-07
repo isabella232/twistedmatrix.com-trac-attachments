@@ -1,0 +1,406 @@
+diff --git twisted/names/edns.py twisted/names/edns.py
+new file mode 100644
+index 0000000..9dd4085
+--- /dev/null
++++ twisted/names/edns.py
+@@ -0,0 +1,249 @@
++# -*- test-case-name: twisted.names.test.test_dns -*-
++# Copyright (c) Twisted Matrix Laboratories.
++# See LICENSE for details.
++
++"""
++EDNS protocol implementation.
++"""
++import struct
++from twisted.internet.defer import succeed, Deferred
++from twisted.internet.interfaces import IProtocol
++from twisted.internet.endpoints import TCP4ClientEndpoint, connectProtocol
++from twisted.internet.protocol import Protocol
++from twisted.python.components import proxyForInterface
++from twisted.names.dns import _EDNSMessage, Query
++
++import attr
++from zope.interface import implementer, Interface
++
++
++class EDNSMessage(_EDNSMessage):
++    """
++    """
++
++
++class IEDNSMessage(Interface):
++    """
++    """
++
++
++class IEDNSMessageDecoder(Interface):
++    """
++    """
++    def decode(message_bytes):
++        """
++        :param bytes message_bytes: The bytes of an encoded message.
++        :rtype: IEDNSMessage
++        """
++
++
++class IEDNSMessageEncoder(Interface):
++    """
++    """
++    def encode(message):
++        """
++        :param bytes message: An IEDNSMessage.
++        :rtype: bytes of the encoded message.
++        """
++
++
++class IEDNSTransmitter(Interface):
++    """
++    """
++    def transmit(message):
++        """
++        :param IEDNSMessage message: A message to transmit.
++        :returns: A Deferred firing with the IEDNSMessage response for ``message``.
++        """
++
++    def for_destination(reactor, destination):
++        """
++        """
++
++
++class IEDNSResponseHandler(Interface):
++    """
++    """
++    def expect(message):
++        """
++        :param IEDNSMessage message: A message expected.
++        """
++
++    def receive(message):
++        """
++        :param IEDNSMessage message: A message received.
++        """
++
++
++class IEDNSResponder(Interface):
++    """
++    """
++    def respond(message):
++        """
++        :param IEDNSMessage message: The received message.
++        :returns: A Deferred that fires with IEDNSMessage.
++        """
++
++
++class IEDNSClient(Interface):
++    """
++    """
++    def query():
++        """
++
++        :returns: A Deferred that fires with IEDNSMessage
++        """
++
++
++@implementer(IProtocol)
++class EDNSStreamProtocol(Protocol, object):
++    """
++    """
++    buffer = b''
++    length = None
++
++    def __init__(self, receiver):
++        self.receiver = receiver
++
++    def dataReceived(self, data):
++        self.buffer += data
++
++        while self.buffer:
++            if self.length is None and len(self.buffer) >= 2:
++                self.length = struct.unpack('!H', self.buffer[:2])[0]
++                self.buffer = self.buffer[2:]
++
++            if len(self.buffer) >= self.length:
++                chunk = self.buffer[:self.length]
++                m = EDNSMessage()
++                m.fromStr(chunk)
++                self.receiver(m)
++                self.buffer = self.buffer[self.length:]
++                self.length = None
++            else:
++                break
++
++
++@implementer(IEDNSTransmitter)
++@attr.s
++class EDNSDatagramTransmitter(object):
++    reactor = attr.ib()
++    receiver = attr.ib()
++    destination = attr.ib()
++
++    def transmit(self, message):
++        """
++        """
++        proto = EDNSDatagramProtocol(receiver=self._receiver.receive)
++        self.reactor.listenUDP(0, proto)
++        proto.transport.write(message.toStr(), self.destination)
++        d = self.receiver.expect(message)
++        return d
++
++    @classmethod
++    def for_destination(cls, reactor, destination):
++        """
++        """
++        receiver = EDNSResponseHandler()
++        return succeed(cls(reactor, destination, receiver))
++
++
++@implementer(IEDNSTransmitter)
++@attr.s
++class EDNSStreamTransmitter(object):
++    reactor = attr.ib()
++    receiver = attr.ib()
++    protocol = attr.ib()
++
++    def transmit(self, message):
++        """
++        """
++        d = self.receiver.expect(message)
++        s = message.toStr()
++        self.protocol.transport.write(struct.pack('!H', len(s)) + s)
++        return d
++
++    @classmethod
++    def for_destination(cls, reactor, destination):
++        """
++        """
++        receiver = EDNSResponseHandler()
++        client_endpoint = TCP4ClientEndpoint(
++            reactor=reactor,
++            host=destination.host,
++            port=destination.port,
++            timeout=1,
++        )
++        d = connectProtocol(client_endpoint, EDNSStreamProtocol(receiver=receiver.receive))
++        d.addCallback(
++            lambda protocol: cls(
++                reactor=reactor,
++                receiver=receiver,
++                protocol=protocol
++            )
++        )
++        return d
++
++
++
++@implementer(IEDNSResponseHandler)
++class EDNSResponseHandler(object):
++    def __init__(self):
++        self._expected = {}
++
++    def expect(self, message):
++        d = Deferred()
++        self._expected[message.id] = d
++        return d
++
++    def receive(self, message):
++        try:
++            d = self._expected.pop(message.id)
++        except KeyError as e:
++            raise
++            # log.err("unexpected message", message)
++        else:
++            d.callback(message)
++
++
++def query():
++    return EDNSMessage(
++        id=1234,
++        recDes=True,
++        queries=[
++            Query(name=b"www.example.com")
++        ]
++    )
++
++
++@implementer(IEDNSClient)
++@attr.s
++class EDNSClient(object):
++    """
++    """
++    transmitter = attr.ib()
++
++    def query(self, **kwargs):
++        """
++        """
++        message = query(**kwargs)
++        d = self.transmitter.transmit(message)
++
++        def examine_response(message):
++            import pdb; pdb.set_trace()
++            if message.errors:
++                return failure(message)
++            else:
++                return message
++        d.addCallback(examine_response)
++
++        return d
++
++
++def dig():
++    pass
++
++
++class EDNSServerFactory(object):
++    """
++    """
+diff --git twisted/names/test/test_edns.py twisted/names/test/test_edns.py
+new file mode 100644
+index 0000000..efd156f
+--- /dev/null
++++ twisted/names/test/test_edns.py
+@@ -0,0 +1,145 @@
++# test-case-name: twisted.names.test.test_dns
++# Copyright (c) Twisted Matrix Laboratories.
++# See LICENSE for details.
++
++"""
++Tests for twisted.names.edns.
++"""
++
++from twisted.internet import reactor
++from twisted.internet.address import IPv4Address
++from twisted.internet.endpoints import (
++    TCP4ServerEndpoint, TCP4ClientEndpoint, connectProtocol
++)
++from twisted.internet.protocol import ServerFactory
++from twisted.trial.unittest import TestCase, SynchronousTestCase
++
++from zope.interface.verify import verifyObject
++
++from twisted.names.dns import (
++    _EDNSMessage, DNSProtocol
++)
++from twisted.names.edns import (
++    EDNSStreamProtocol, EDNSClient, EDNSServerFactory,
++    IEDNSClient, EDNSDatagramTransmitter, EDNSStreamTransmitter,
++)
++
++
++def server_for_test(test, reactor, server_factory):
++    server_starting = TCP4ServerEndpoint(
++        reactor=reactor,
++        port=0,
++        interface=u"127.0.0.1"
++    ).listen(
++        protocolFactory=server_factory
++    )
++
++    def started(listening_port):
++        test.addCleanup(listening_port.stopListening)
++        return listening_port.getHost()
++    return server_starting.addCallback(started)
++
++
++def client_for_test(test, reactor, client_protocol, server_address):
++    def connect(server_address):
++        client_endpoint = TCP4ClientEndpoint(
++            reactor=reactor,
++            host=server_address.host,
++            port=server_address.port,
++            timeout=1,
++        )
++        return connectProtocol(client_endpoint, client_protocol())
++    connecting = connect(server_address)
++
++    def connected(client_protocol):
++        test.addCleanup(client_protocol.transport.loseConnection)
++        return client_protocol
++    return connecting.addCallback(connected)
++
++
++class EDNSRoundTripTests(TestCase):
++    """
++    Tests client server interaction.
++    """
++    def test_roundtrip(self):
++        """
++        """
++        class Controller(object):
++            def connectionMade(self, protocol):
++                pass
++
++            def connectionLost(self, protocol):
++                pass
++
++        starting = server_for_test(
++            test=self,
++            reactor=reactor,
++            server_factory=ServerFactory.forProtocol(
++                lambda: EDNSStreamProtocol(
++                    receiver=lambda message: None
++                )
++            )
++        )
++
++        def started(server_address):
++            return client_for_test(
++                test=self,
++                reactor=reactor,
++                client_protocol=lambda: DNSProtocol(
++                    controller=Controller(),
++                    reactor=reactor,
++                ),
++                server_address=server_address,
++            )
++        connecting = starting.addCallback(started)
++
++        def query(dns_protocol):
++            dns_protocol.transport.write(b'x')
++        return connecting.addCallback(query)
++
++    test_roundtrip.timeout = 2
++
++
++class IEDNSClientTestsMixin(object):
++    """
++    """
++    def test_interface(self):
++        """
++        The ``client`` provides ``IEDNSClient``.
++        """
++        self.assertTrue(
++            verifyObject(IEDNSClient, self.client)
++        )
++    test_interface.timeout = 2
++
++    def test_happy(self):
++        """
++        ``query`` returns a deferred that fires with the ``IEDNSMessage``
++        """
++        d = self.client.query()
++        return d
++    test_happy.timeout = 2
++
++
++def make_iedns_client_tests(edns_client):
++    class Tests(IEDNSClientTestsMixin, TestCase):
++        def setUp(self):
++            d = edns_client()
++            d.addCallback(lambda client: setattr(self, 'client', client))
++            return d
++    return Tests
++
++
++class EDNSClientInterfaceTests(
++        make_iedns_client_tests(
++            edns_client=lambda: EDNSStreamTransmitter.for_destination(
++                    reactor=reactor,
++                    destination=IPv4Address('TCP', '8.8.8.8', 53)
++                ).addCallback(lambda transmitter: EDNSClient(
++                    transmitter=transmitter
++                )
++            )
++        )
++):
++    """
++    """

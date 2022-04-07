@@ -1,0 +1,56 @@
+Index: twisted/test/test_process.py
+===================================================================
+--- twisted/test/test_process.py	(revision 27948)
++++ twisted/test/test_process.py	(working copy)
+@@ -1957,7 +1957,27 @@
+             self.assertEquals(gf.read(), s)
+         return d.addCallback(processEnded)
+ 
++    def testChildSignalHandling(self):
++        """
++        Spawn a child process and make sure that its signal handlers
++        have been restored to their defaults. The child (/bin/sleep)
++        should quit on receiving SIGINT.
++        """
++        class ProcessExitCode(Accumulator):
++            def processExited(self, reason):
++                self.exitsignal = reason.value.signal
+ 
++        cmd = self.getCommand('sleep')
++        p = ProcessExitCode()
++        d = p.endedDeferred = defer.Deferred()
++        oldhandler = signal.signal(signal.SIGINT, signal.SIG_IGN)
++        reactor.spawnProcess(p, cmd, [cmd, '20'], env=None, path='/tmp',
++                             usePTY=self.usePTY)
++        signal.signal(signal.SIGINT, oldhandler)
++        reactor.callLater(3, p.transport.signalProcess, 'INT')
++        def processEnded(ign):
++            self.assertEquals(p.exitsignal, signal.SIGINT)
++        return d.addCallback(processEnded)
+ 
+ class PosixProcessTestCasePTY(unittest.TestCase, PosixProcessBase):
+     """
+Index: twisted/internet/process.py
+===================================================================
+--- twisted/internet/process.py	(revision 27948)
++++ twisted/internet/process.py	(working copy)
+@@ -665,6 +665,19 @@
+         for fd in old:
+             os.close(fd)
+ 
++        # The Python interpreter ignores some signals, and our child process 
++        # will inherit that behaviour. To have a child process that responds
++        # to signals normally, we need to reset our child process's signal 
++        # handling (just) after we fork and before we execvpe
++        for signalnum in range(1, signal.NSIG):
++            if signalnum in (signal.SIGKILL, signal.SIGSTOP):
++                # These two signals (commonly 9 & 19) can't be caught or ignored
++                continue
++
++            if signal.getsignal(signalnum) == signal.SIG_IGN:
++                # Reset signal handling to the default
++                signal.signal(signalnum, signal.SIG_DFL)
++
+     def writeToChild(self, childFD, data):
+         self.pipes[childFD].write(data)
+ 

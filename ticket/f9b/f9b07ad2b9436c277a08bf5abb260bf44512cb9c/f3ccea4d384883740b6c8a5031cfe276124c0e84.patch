@@ -1,0 +1,143 @@
+diff --git a/twisted/web/http.py b/twisted/web/http.py
+index 8a8e2de..08c52de 100644
+--- a/twisted/web/http.py
++++ b/twisted/web/http.py
+@@ -922,15 +922,29 @@ class Request:
+                         [datetimeToString(self.lastModified)])
+ 
+             if self.etag is not None:
+-                self.responseHeaders.setRawHeaders('ETag', [self.etag])
++                try:
++                    self.responseHeaders.setRawHeaders('ETag', [self.etag])
++                except (TypeError, ValueError), e:
++                    log.msg("Sent error 500 to %s because request.etag "
++                            "was invalid: %s" % (self.transport.getPeer(), e))
++                    self._sendError(500, RESPONSES[500])
++                    return
++
++            # Note that responseHeaders may already contain some cookies.
++            for n, cookie in enumerate(self.cookies):
++                try:
++                    self.responseHeaders.addRawHeader('Set-Cookie', cookie)
++                except (TypeError, ValueError), e:
++                    log.msg("Sent error 500 to %s because "
++                            "request.cookies[%d] was invalid: %s" % (
++                                self.transport.getPeer(), n, e))
++                    self._sendError(500, RESPONSES[500])
++                    return
+ 
+             for name, values in self.responseHeaders.getAllRawHeaders():
+                 for value in values:
+                     l.append("%s: %s\r\n" % (name, value))
+ 
+-            for cookie in self.cookies:
+-                l.append('%s: %s\r\n' % ("Set-Cookie", cookie))
+-
+             l.append("\r\n")
+ 
+             self.transport.writeSequence(l)
+diff --git a/twisted/web/http_headers.py b/twisted/web/http_headers.py
+index 9663ac6..08d4c6e 100644
+--- a/twisted/web/http_headers.py
++++ b/twisted/web/http_headers.py
+@@ -120,6 +120,31 @@ class _DictHeaders(DictMixin):
+ 
+ 
+ 
++def _isValidHeaderValue(value):
++    """
++    Checks whether the input string is a valid HTTP header value (i.e. does
++    not cause a message header to split into multiple message headers).
++
++    @type value: C{str}
++    @param value: HTTP header value
++
++    @rtype: bool
++    @return: Whether the header value is valid.
++    """
++    # The common case
++    if '\n' not in value:
++        return True
++
++    for i, c in enumerate(value):
++        if c == '\n':
++            # next byte or ""
++            next = value[i + 1:i + 2]
++            if next not in ("\t", " "):
++                return False
++
++    return True
++
++
+ class Headers(object):
+     """
+     This class stores the HTTP headers as both a parsed representation
+@@ -190,6 +215,21 @@ class Headers(object):
+         self._rawHeaders.pop(name.lower(), None)
+ 
+ 
++    def _checkHeaderValue(self, value):
++        """
++        Throws an exception if C{value} is not a valid header value.
++
++        @type value: C{str}
++        @param value: HTTP header value
++        """
++        if not isinstance(value, str):
++            raise TypeError("Header value %r should be a str but found "
++                            "instance of %r instead" % (value, type(value)))
++        if not _isValidHeaderValue(value):
++            raise ValueError("Header value %r splits into multiple message "
++                             "headers" % (value,))
++
++
+     def setRawHeaders(self, name, values):
+         """
+         Sets the raw representation of the given header.
+@@ -201,11 +241,19 @@ class Headers(object):
+         @param values: A list of strings each one being a header value of
+             the given name.
+ 
++        @raise TypeError: If C{values} is not a C{list}, or if any item in
++            C{values} is not a C{str}.
++
++        @raise ValueError: If any item in C{values} is not a valid HTTP header
++            value (i.e. splits into multiple message headers).
++
+         @return: C{None}
+         """
+         if not isinstance(values, list):
+             raise TypeError("Header entry %r should be list but found "
+                             "instance of %r instead" % (name, type(values)))
++        for value in values:
++            self._checkHeaderValue(value)
+         self._rawHeaders[name.lower()] = values
+ 
+ 
+@@ -218,7 +266,13 @@ class Headers(object):
+ 
+         @type value: C{str}
+         @param value: The value to set for the named header.
++
++        @raise TypeError: If C{value} is not a C{str}.
++
++        @raise ValueError: If C{value} is not a valid HTTP header value (i.e.
++            splits into multiple message headers).
+         """
++        self._checkHeaderValue(value)
+         values = self.getRawHeaders(name)
+         if values is None:
+             self.setRawHeaders(name, [value])
+diff --git a/twisted/web/test/test_http.py b/twisted/web/test/test_http.py
+index d4009ac..64da6a0 100644
+--- a/twisted/web/test/test_http.py
++++ b/twisted/web/test/test_http.py
+@@ -45,7 +45,7 @@ class DummyHTTPHandler(http.Request):
+         self.setHeader("Request", self.uri)
+         self.setHeader("Command", self.method)
+         self.setHeader("Version", self.clientproto)
+-        self.setHeader("Content-Length", len(request))
++        self.setHeader("Content-Length", str(len(request)))
+         self.write(request)
+         self.finish()
+ 

@@ -1,0 +1,100 @@
+commit c32b2b6a7b6e9be45ca3815633500790b122f5f3
+Author: Ximin Luo <infinity0@pwned.gg>
+Date:   Thu Apr 10 21:57:57 2014 +0100
+
+    portforward.py: make the ProxyFactory accept an endpointFactory for more flexible behaviour
+
+diff --git NEWS NEWS
+index 697bf87..b7f2986 100644
+--- NEWS
++++ NEWS
+@@ -6,6 +6,8 @@ Twisted Core 13.2.0 (2013-10-29)
+ 
+ Features
+ --------
++ - twisted.protocols.portforward.ProxyFactory now allows users to
++   specify a custom endpointFactory instead of assuming TCP. (#7057)
+  - twistd now waits for the application to start successfully before
+    exiting after daemonization. (#823)
+  - twisted.internet.endpoints now provides HostnameEndpoint, a TCP
+diff --git twisted/protocols/portforward.py twisted/protocols/portforward.py
+index 626d5aa..293ce44 100644
+--- twisted/protocols/portforward.py
++++ twisted/protocols/portforward.py
+@@ -7,6 +7,7 @@ A simple port forwarder.
+ """
+ 
+ # Twisted imports
++from twisted.internet import endpoints
+ from twisted.internet import protocol
+ from twisted.python import log
+ 
+@@ -74,7 +75,10 @@ class ProxyServer(Proxy):
+         if self.reactor is None:
+             from twisted.internet import reactor
+             self.reactor = reactor
+-        self.reactor.connectTCP(self.factory.host, self.factory.port, client)
++
++        endpoint = self.factory.endpointFactory(
++            self.reactor, self.factory.host, self.factory.port)
++        return endpoint.connect(client)
+ 
+ 
+ class ProxyFactory(protocol.Factory):
+@@ -82,6 +86,20 @@ class ProxyFactory(protocol.Factory):
+ 
+     protocol = ProxyServer
+ 
+-    def __init__(self, host, port):
++    def __init__(self, host, port, endpointFactory=endpoints.HostnameEndpoint):
++        """A simple proxy that opens one outgoing connection for each incoming
++        connection.
++
++        @param host: host to connect to, for each incoming connection.
++        @type host: L{str}
++        @param port: port to connect to, for each incoming connection.
++        @type port: L{int}
++        @param endpointFactory: A factory that creates an outgoing endpoint,
++            for each incoming connection. By default, this is
++            L{twisted.internet.endpoints.HostnameEndpoint}.
++        @type endpointFactory: A L{callable} that takes a (reactor, host, port)
++            and outputs a L{twisted.internet.interfaces.IStreamClientEndpoint}.
++        """
+         self.host = host
+         self.port = port
++        self.endpointFactory = endpointFactory
+diff --git twisted/test/test_protocols.py twisted/test/test_protocols.py
+index e2915d9..c9abd20 100644
+--- twisted/test/test_protocols.py
++++ twisted/test/test_protocols.py
+@@ -7,7 +7,7 @@ Test cases for twisted.protocols package.
+ 
+ from twisted.trial import unittest
+ from twisted.protocols import wire, portforward
+-from twisted.internet import reactor, defer, address, protocol
++from twisted.internet import endpoints, reactor, defer, address, protocol
+ from twisted.test import proto_helpers
+ 
+ 
+@@ -193,7 +193,10 @@ class Portforwarding(unittest.TestCase):
+         """
+         # create a ProxyServer instance
+         addr = address.IPv4Address('TCP', '127.0.0.1', 0)
+-        server = portforward.ProxyFactory('127.0.0.1', 0).buildProtocol(addr)
++        # use TCP4ClientEndpoint, since the default HostnameEndpoint does an
++        # async resolve which makes testing a bit more awkward
++        server = portforward.ProxyFactory(
++            '127.0.0.1', 0, endpoints.TCP4ClientEndpoint).buildProtocol(addr)
+ 
+         # set the reactor for this test
+         reactor = proto_helpers.MemoryReactor()
+@@ -207,7 +210,8 @@ class Portforwarding(unittest.TestCase):
+         self.assertEqual(len(reactor.tcpClients), 1)
+         # get the factory instance and check it's the one we expect
+         host, port, clientFactory, timeout, _ = reactor.tcpClients[0]
+-        self.assertIsInstance(clientFactory, portforward.ProxyClientFactory)
++        self.assertIsInstance(
++            clientFactory._wrappedFactory, portforward.ProxyClientFactory)
+ 
+         # Connect it
+         client = clientFactory.buildProtocol(addr)

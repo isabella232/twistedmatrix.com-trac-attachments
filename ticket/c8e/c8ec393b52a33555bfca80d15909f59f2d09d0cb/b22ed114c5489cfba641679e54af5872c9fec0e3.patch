@@ -1,0 +1,299 @@
+diff --git a/doc/core/man/trial.1 b/doc/core/man/trial.1
+index 1bbdd58..086b401 100644
+--- a/doc/core/man/trial.1
++++ b/doc/core/man/trial.1
+@@ -154,6 +154,10 @@ Set Python's recursion limit. See sys.setrecursionlimit().
+ Select the reporter to use for trial's output.  Use the --help-reporters
+ option to see a list of valid reporters.
+ .TP
++\fB-x\fR, \fB--exitfirst\fR
++Stop the test run after the first test which does not succeed. This includes
++failures, errors, or unexpected successes.
++.TP
+ \fB--spew\fR
+ Print an insanely verbose log of everything that happens. Useful when
+ debugging freezes or locks in complex code.
+diff --git a/twisted/scripts/trial.py b/twisted/scripts/trial.py
+index 46859d5..9a3c31c 100644
+--- a/twisted/scripts/trial.py
++++ b/twisted/scripts/trial.py
+@@ -114,6 +114,8 @@ class _BasicOptions(object):
+                  "Turn dirty reactor errors into warnings"],
+                 ["force-gc", None, "Have Trial run gc.collect() before and "
+                  "after each test case."],
++                ["exitfirst", "x",
++                 "Exit after the first non-successful result."],
+                 ]
+ 
+     optParameters = [
+@@ -375,7 +377,8 @@ class Options(_BasicOptions, usage.Options, app.ReactorSelectionMixin):
+     def postOptions(self):
+         _BasicOptions.postOptions(self)
+         if self['jobs']:
+-            for option in ['debug', 'profile', 'debug-stacktraces']:
++            conflicts = ['debug', 'profile', 'debug-stacktraces', 'exitfirst']
++            for option in conflicts:
+                 if self[option]:
+                     raise usage.UsageError(
+                         "You can't specify --%s when using --jobs" % option)
+@@ -485,6 +488,7 @@ def _makeRunner(config):
+             else:
+                 args['debugger'] = _wrappedPdb()
+ 
++        args['exitFirst'] = config['exitfirst']
+         args['profile'] = config['profile']
+         args['forceGarbageCollection'] = config['force-gc']
+ 
+diff --git a/twisted/topfiles/1518.feature b/twisted/topfiles/1518.feature
+new file mode 100644
+index 0000000..0628b66
+--- /dev/null
++++ b/twisted/topfiles/1518.feature
+@@ -0,0 +1 @@
++trial now has --stop and --stop-failed flags which stop the test run after the first non-success or first failure respectively.
+diff --git a/twisted/trial/reporter.py b/twisted/trial/reporter.py
+index fe5a832..c57cb86 100644
+--- a/twisted/trial/reporter.py
++++ b/twisted/trial/reporter.py
+@@ -234,6 +234,38 @@ class UncleanWarningsReporterWrapper(TestResultDecorator):
+ 
+ 
+ 
++@implementer(itrial.IReporter)
++class _ExitWrapper(TestResultDecorator):
++    """
++    A wrapper for a reporter that causes the reporter to stop after
++    unsuccessful tests.
++    """
++
++    def addError(self, *args, **kwargs):
++        """
++        See L{itrial.IReporter}.
++        """
++        self.shouldStop = True
++        return self._originalReporter.addError(*args, **kwargs)
++
++
++    def addFailure(self, *args, **kwargs):
++        """
++        See L{itrial.IReporter}.
++        """
++        self.shouldStop = True
++        return self._originalReporter.addFailure(*args, **kwargs)
++
++
++    def addUnexpectedSuccess(self, *args, **kwargs):
++        """
++        See L{itrial.IReporter}.
++        """
++        self.shouldStop = True
++        return self._originalReporter.addUnexpectedSuccess(*args, **kwargs)
++
++
++
+ class _AdaptedReporter(TestResultDecorator):
+     """
+     TestResult decorator that makes sure that addError only gets tests that
+diff --git a/twisted/trial/runner.py b/twisted/trial/runner.py
+index be06d5a..37c5f2b 100644
+--- a/twisted/trial/runner.py
++++ b/twisted/trial/runner.py
+@@ -28,7 +28,7 @@ from twisted.python.versions import Version
+ from twisted.internet import defer
+ from twisted.trial import util, unittest
+ from twisted.trial.itrial import ITestCase
+-from twisted.trial.reporter import UncleanWarningsReporterWrapper
++from twisted.trial.reporter import _ExitWrapper, UncleanWarningsReporterWrapper
+ 
+ # These are imported so that they remain in the public API for t.trial.runner
+ from twisted.trial.unittest import TestSuite
+@@ -669,6 +669,8 @@ class TrialRunner(object):
+     def _makeResult(self):
+         reporter = self.reporterFactory(self.stream, self.tbformat,
+                                         self.rterrors, self._log)
++        if self._exitFirst:
++            reporter = _ExitWrapper(reporter)
+         if self.uncleanWarnings:
+             reporter = UncleanWarningsReporterWrapper(reporter)
+         return reporter
+@@ -683,7 +685,8 @@ class TrialRunner(object):
+                  uncleanWarnings=False,
+                  workingDirectory=None,
+                  forceGarbageCollection=False,
+-                 debugger=None):
++                 debugger=None,
++                 exitFirst=False):
+         self.reporterFactory = reporterFactory
+         self.logfile = logfile
+         self.mode = mode
+@@ -697,6 +700,7 @@ class TrialRunner(object):
+         self._logFileObject = None
+         self._forceGarbageCollection = forceGarbageCollection
+         self.debugger = debugger
++        self._exitFirst = exitFirst
+         if profile:
+             self.run = util.profiled(self.run, 'profile.data')
+ 
+diff --git a/twisted/trial/test/test_reporter.py b/twisted/trial/test/test_reporter.py
+index c9b33e8..cc0fa06 100644
+--- a/twisted/trial/test/test_reporter.py
++++ b/twisted/trial/test/test_reporter.py
+@@ -15,7 +15,7 @@ from twisted.internet.utils import suppressWarnings
+ from twisted.python import log
+ from twisted.python.failure import Failure
+ from twisted.trial import itrial, unittest, runner, reporter, util
+-from twisted.trial.reporter import UncleanWarningsReporterWrapper
++from twisted.trial.reporter import _ExitWrapper, UncleanWarningsReporterWrapper
+ from twisted.trial.test import erroneous
+ from twisted.trial.unittest import makeTodo, SkipTest, Todo
+ from twisted.trial.test import sample
+@@ -1674,3 +1674,51 @@ class AnsiColorizerTests(unittest.SynchronousTestCase):
+         sys.modules['curses'] = fakecurses()
+         self.assertFalse(reporter._AnsiColorizer.supported(FakeStream()))
+         self.assertEqual(sys.modules['curses'].setUp, 1)
++
++
++
++class ExitWrapperTests(unittest.SynchronousTestCase):
++    """
++    Tests for L{reporter._ExitWrapper}.
++    """
++
++    def setUp(self):
++        self.failure = Failure(Exception("I am a Failure"))
++        self.test = sample.FooTest('test_foo')
++        self.result = reporter.TestResult()
++        self.wrapped = _ExitWrapper(self.result)
++        self.assertFalse(self.wrapped.shouldStop)
++
++
++    def test_stopOnFailure(self):
++        """
++        L{reporter._ExitWrapper} causes a wrapped reporter to stop after its
++        first failure.
++        """
++
++        self.wrapped.addFailure(self.test, self.failure)
++        self.assertTrue(self.wrapped.shouldStop)
++        self.assertEqual(self.result.failures, [(self.test, self.failure)])
++
++
++    def test_stopOnError(self):
++        """
++        L{reporter._ExitWrapper} causes a wrapped reporter to stop after its
++        first error.
++        """
++
++        self.wrapped.addError(self.test, self.failure)
++        self.assertTrue(self.wrapped.shouldStop)
++        self.assertEqual(self.result.errors, [(self.test, self.failure)])
++
++
++    def test_stopOnUnexpectedSuccess(self):
++        """
++        L{reporter._StopWrapper} causes a wrapped reporter to stop after an
++        unexpected success if C{onlyAfterFailure} is C{False}.
++        """
++
++        self.wrapped.addUnexpectedSuccess(self.test, self.failure)
++        self.assertTrue(self.wrapped.shouldStop)
++        self.assertEqual(
++            self.result.unexpectedSuccesses, [(self.test, self.failure)])
+diff --git a/twisted/trial/test/test_runner.py b/twisted/trial/test/test_runner.py
+index f0a2fef..985e7b1 100644
+--- a/twisted/trial/test/test_runner.py
++++ b/twisted/trial/test/test_runner.py
+@@ -562,6 +562,18 @@ class TestRunner(unittest.SynchronousTestCase):
+         self.assertEqual(['runcall'], my_runner.debugger._calls)
+ 
+ 
++    def test_exitfirst(self):
++        """
++        If trial was passed the C{--exitfirst} option, the constructed test
++        result object is wrapped with L{reporter._ExitWrapper}.
++        """
++
++        self.parseOptions(["--exitfirst"])
++        runner = self.getRunner()
++        result = runner._makeResult()
++        self.assertIsInstance(result, reporter._ExitWrapper)
++
++
+ 
+ class TestTrialSuite(unittest.SynchronousTestCase):
+ 
+diff --git a/twisted/trial/test/test_script.py b/twisted/trial/test/test_script.py
+index 45a254b..60bdb9e 100644
+--- a/twisted/trial/test/test_script.py
++++ b/twisted/trial/test/test_script.py
+@@ -518,21 +518,38 @@ class OptionsTestCase(unittest.TestCase):
+             str(error))
+ 
+ 
++    def test_jobsConflictWithExitFirst(self):
++        """
++        C{parseOptions} raises a C{UsageError} when C{--exitfirst} is passed
++        along C{--jobs} as it's not supported yet.
++
++        @see: U{http://twistedmatrix.com/trac/ticket/6436}
++        """
++        error = self.assertRaises(
++            UsageError, self.options.parseOptions,
++            ["--jobs", "4", "--exitfirst"])
++        self.assertEqual(
++            "You can't specify --exitfirst when using --jobs",
++            str(error))
++
++
+ 
+ class MakeRunnerTestCase(unittest.TestCase):
+     """
+     Tests for the L{_makeRunner} helper.
+     """
+ 
++    def setUp(self):
++        self.options = trial.Options()
++
+     def test_jobs(self):
+         """
+         L{_makeRunner} returns a L{DistTrialRunner} instance when the C{--jobs}
+         option is passed, and passes the C{workerNumber} and C{workerArguments}
+         parameters to it.
+         """
+-        options = trial.Options()
+-        options.parseOptions(["--jobs", "4", "--force-gc"])
+-        runner = trial._makeRunner(options)
++        self.options.parseOptions(["--jobs", "4", "--force-gc"])
++        runner = trial._makeRunner(self.options)
+         self.assertIsInstance(runner, DistTrialRunner)
+         self.assertEqual(4, runner._workerNumber)
+         self.assertEqual(["--force-gc"], runner._workerArguments)
+@@ -543,9 +560,8 @@ class MakeRunnerTestCase(unittest.TestCase):
+         L{_makeRunner} returns a L{TrialRunner} instance in C{DRY_RUN} mode
+         when the C{--dry-run} option is passed, even if C{--jobs} is set.
+         """
+-        options = trial.Options()
+-        options.parseOptions(["--jobs", "4", "--dry-run"])
+-        runner = trial._makeRunner(options)
++        self.options.parseOptions(["--jobs", "4", "--dry-run"])
++        runner = trial._makeRunner(self.options)
+         self.assertIsInstance(runner, TrialRunner)
+         self.assertEqual(TrialRunner.DRY_RUN, runner.mode)
+ 
+@@ -566,6 +582,16 @@ class MakeRunnerTestCase(unittest.TestCase):
+         self.assertRaises(trial._DebuggerNotFound, trial._makeRunner, options)
+ 
+ 
++    def test_exitfirst(self):
++        """
++        Passing C{--exitfirst} wraps the reporter with a
++        L{reporter._ExitWrapper} that stops on any non-success.
++        """
++        self.options.parseOptions(["--exitfirst"])
++        runner = trial._makeRunner(self.options)
++        self.assertTrue(runner._exitFirst)
++
++
+ class TestRun(unittest.TestCase):
+     """
+     Tests for the L{run} function.

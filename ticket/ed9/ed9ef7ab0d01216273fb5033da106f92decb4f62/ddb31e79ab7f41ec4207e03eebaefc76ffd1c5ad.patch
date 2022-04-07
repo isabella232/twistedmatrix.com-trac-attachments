@@ -1,0 +1,122 @@
+Index: twisted/python/logfile.py
+===================================================================
+--- twisted/python/logfile.py	(wersja 44349)
++++ twisted/python/logfile.py	(kopia robocza)
+@@ -8,7 +8,7 @@
+ """
+ 
+ # System Imports
+-import os, glob, time, stat
++import os, glob, time, stat, re
+ 
+ from twisted.python import threadable
+ 
+@@ -133,7 +133,6 @@
+         """
+         return LogReader(self.path)
+ 
+-
+ class LogFile(BaseLogFile):
+     """
+     A log file that can be rotated.
+@@ -234,6 +233,15 @@
+ class DailyLogFile(BaseLogFile):
+     """A log file that is rotated daily (at or after midnight localtime)
+     """
++    
++    def __init__(self, name, directory, defaultMode=None, maxRotatedFiles=None):
++        """
++        Create a log file rotating on date
++        @type maxRotatedFiles: C{int}
++        """
++        BaseLogFile.__init__(self, name, directory, defaultMode)
++        self.maxRotatedFiles = maxRotatedFiles
++    
+     def _openFile(self):
+         BaseLogFile._openFile(self)
+         self.lastDate = self.toDate(os.stat(self.path)[8])
+@@ -285,12 +293,38 @@
+         """
+         if not (os.access(self.directory, os.W_OK) and os.access(self.path, os.W_OK)):
+             return
++        
++        if self.maxRotatedFiles is not None:
++            logs_files = self.listLogs()
++            counter = len(logs_files)
++            
++            for log_file in logs_files:
++                if counter > self.maxRotatedFiles:
++                    os.remove(log_file)
++                    counter -= 1
++                    
+         newpath = "%s.%s" % (self.path, self.suffix(self.lastDate))
+         if os.path.exists(newpath):
+             return
+         self._file.close()
+         os.rename(self.path, newpath)
++        
++        
+         self._openFile()
++        
++    def listLogs(self):
++        """
++        Return sorted list of integers - the old logs' identifiers.
++        """
++        result = []
++        for name in glob.glob("%s.*" % self.path):
++            try:
++                if re.match(r"%s.\d{4}_\d{1,2}_\d{1,2}" % self.path, name):
++                    result.append(name)
++            except ValueError:
++                pass
++        result.sort()
++        return result
+ 
+     def __getstate__(self):
+         state = BaseLogFile.__getstate__(self)
+Index: twisted/test/test_logfile.py
+===================================================================
+--- twisted/test/test_logfile.py	(wersja 44349)
++++ twisted/test/test_logfile.py	(kopia robocza)
+@@ -1,7 +1,7 @@
+ # Copyright (c) Twisted Matrix Laboratories.
+ # See LICENSE for details.
+ 
+-import os, time, stat, errno
++import os, time, stat, errno, tempfile, datetime
+ 
+ from twisted.trial import unittest
+ from twisted.python import logfile, runtime
+@@ -318,3 +318,32 @@
+         log.write("3")
+         self.assert_(not os.path.exists(days[2]))
+ 
++    def test_maxNumberOfLog(self):
++        """
++        Test it respect the limit on the number of files when maxRotatedFiles
++        is not None.
++        """
++        filename = os.path.join(tempfile.gettempdir(), self.name)
++        now = datetime.datetime.now()
++        
++        
++        f = now - datetime.timedelta(3)
++        open("%s.%d_%d_%d" % (filename, f.year, f.month, f.day), 'w').close()
++        self.assertTrue(os.path.exists("%s.%d_%d_%d" % (filename, f.year, f.month, f.day)))
++        
++        f = f + datetime.timedelta(1)
++        open("%s.%d_%d_%d" % (filename, f.year, f.month, f.day), 'w').close()
++        self.assertTrue(os.path.exists("%s.%d_%d_%d" % (filename, f.year, f.month, f.day)))
++        
++        f = f + datetime.timedelta(1)
++        open("%s.%d_%d_%d" % (filename, f.year, f.month, f.day), 'w').close()
++        self.assertTrue(os.path.exists("%s.%d_%d_%d" % (filename, f.year, f.month, f.day)))
++        
++        log = logfile.DailyLogFile(self.name, tempfile.gettempdir(), maxRotatedFiles=3)
++        log.rotate()
++        self.assertTrue(os.path.exists("%s.%d_%d_%d" % (filename, now.year, now.month, now.day)))
++        
++        log.rotate()
++        f = now - datetime.timedelta(3)
++        self.assertTrue(os.path.exists("%s.%d_%d_%d" % (filename, now.year, now.month, now.day)))
++        self.assertTrue(not os.path.exists("%s.%d_%d_%d" % (filename, f.year, f.month, f.day)))

@@ -1,0 +1,123 @@
+Index: twisted/internet/_pollingfile.py
+===================================================================
+--- twisted/internet/_pollingfile.py	(revision 38381)
++++ twisted/internet/_pollingfile.py	(working copy)
+@@ -227,6 +227,9 @@
+ 
+     def writeConnectionLost(self):
+         self.deactivate()
++        if self.producer:
++            self.producer.stopProducing()
++            self.producer = None
+         try:
+             win32api.CloseHandle(self.writePipe)
+         except pywintypes.error:
+Index: twisted/internet/test/test_pollingfile.py
+===================================================================
+--- twisted/internet/test/test_pollingfile.py	(revision 38381)
++++ twisted/internet/test/test_pollingfile.py	(working copy)
+@@ -4,17 +4,93 @@
+ """
+ Tests for L{twisted.internet._pollingfile}.
+ """
++import os
+ 
+ from twisted.python.runtime import platform
+ from twisted.trial.unittest import TestCase
++from twisted.protocols import basic
++from twisted.internet.test.reactormixins import ReactorBuilder
+ 
++
++
+ if platform.isWindows():
++    import win32pipe
++    import win32security
++
+     from twisted.internet import _pollingfile
++
++    from twisted.internet._pollingfile import _PollingTimer
++    _skipNotWindows = None
+ else:
+-    _pollingfile = None
++    _skipNotWindows = "Test will run only on Windows."
++    _PollingTimer = object
++ 
+ 
++ 
++class PipeRunner(_PollingTimer):
++    """
++    Builds, initializes and runs a pair of read/write pipes.
++    """
++    def __init__(self, pipeSize, doneReadCB, doneWriteCB, receivedCB, reactor):
++        _PollingTimer.__init__(self, reactor)
++        sAttrs = win32security.SECURITY_ATTRIBUTES()
++        sAttrs.bInheritHandle = 1
++        hRead, hWrite = win32pipe.CreatePipe(sAttrs, pipeSize)
++        self.reader = _pollingfile._PollableReadPipe(hRead, receivedCB, doneReadCB)
++        self.writer = _pollingfile._PollableWritePipe(hWrite, doneWriteCB)
++        self._addPollableResource(self.reader)
++        self._addPollableResource(self.writer)
+ 
+ 
++
++class TestPollablePipes(ReactorBuilder):
++    """
++    Tests for L{_pollingfile._PollableWritePipe} and
++    L{_pollingfile._PollableReadPipe}.
++    """
++    def test_callStopProducingWhenDisconnected(self):
++        """
++        Test write pipe as a consumer using a push producer when the 
++        connection is forcibly disconnected.
++        
++        When a consumer is forcibly disconnected it should call the
++        stopProducing() method on the producer.
++
++        See Ticket #2839: stopProducing() not called.
++        """
++        pipeSize = 4096
++        testMessage = '01234'
++
++        class TestProtocol(basic.LineReceiver):
++            def lineReceived(self, line):
++                self.testResponse = line
++                transport.reader.close()
++
++        class TestProducer(object):
++            stopCount = 0
++            def resumeProducing(self):
++                transport.writer.write(testMessage+"\r\n")
++
++            def pauseProducing(self):
++                pass
++
++            def stopProducing(self):
++                self.stopCount += 1
++
++        reactor = self.buildReactor()
++        r, w = lambda: None, lambda: reactor.stop()
++        protocol, producer = TestProtocol(), TestProducer()
++        transport = PipeRunner(pipeSize, r, w, protocol.dataReceived, reactor)
++        transport.writer.registerProducer(producer, True)
++        producer.resumeProducing()
++        self.runReactor(reactor)
++        self.assertEqual(testMessage, protocol.testResponse)
++        self.assertEqual(1, producer.stopCount)
++
++
++globals().update(TestPollablePipes.makeTestCaseClasses())
++
++
+ class TestPollableWritePipe(TestCase):
+     """
+     Tests for L{_pollingfile._PollableWritePipe}.
+@@ -41,6 +117,7 @@
+ 
+ 
+ 
++if _skipNotWindows:
++    TestPollablePipes.skip = skipMessage
++    TestPollableWritePipeUnicode.skip = skipMessage
+ 
+-if _pollingfile is None:
+-    TestPollableWritePipe.skip = "Test will run only on Windows."

@@ -1,0 +1,109 @@
+Index: twisted/test/test_udp.py
+===================================================================
+--- twisted/test/test_udp.py	(revision 38491)
++++ twisted/test/test_udp.py	(working copy)
+@@ -314,17 +314,39 @@
+         """
+         A call to the transport's connect method fails with a L{ValueError}
+         when a non-IP address is passed as the host value.
+-
+-        A call to a transport's connect method fails with a L{RuntimeError}
+-        when the transport is already connected.
+         """
+         client = GoodClient()
+         port = reactor.listenUDP(0, client, interface="127.0.0.1")
+         self.assertRaises(ValueError, client.transport.connect,
+                           "localhost", 80)
++        
++        return port.stopListening()
++
++    def test_disconnect(self):
++        """
++        A call to the transport's disconnect method before connecting raises
++        a L{RuntimeError}, because we're not connected yet.
++
++        When connected to a remote server we can disconnect.
++        Note: optional test(if extensions are built it will run).
++        """
++        client = GoodClient()
++        port = reactor.listenUDP(0, client, interface="127.0.0.1")
++        self.assertRaises(RuntimeError, client.transport.disconnect)
++
+         client.transport.connect("127.0.0.1", 80)
+-        self.assertRaises(RuntimeError, client.transport.connect,
+-                          "127.0.0.1", 80)
++        try:
++            res = client.transport.disconnect()
++        except NameError as e:
++            if "disconnect" in e.message:
++                port.stopListening()
++                raise unittest.SkipTest("cannot test without "+\
++                                            "disconnect extension")
++            raise
++        else:
++            self.assertEqual(client.transport._connectedAddr, None)
++            self.assertEqual(res, 0)
++
+         return port.stopListening()
+ 
+ 
+Index: twisted/topfiles/setup.py
+===================================================================
+--- twisted/topfiles/setup.py	(revision 38491)
++++ twisted/topfiles/setup.py	(working copy)
+@@ -35,6 +35,10 @@
+     Extension("twisted.python.sendmsg",
+               sources=["twisted/python/sendmsg.c"],
+               condition=lambda _: sys.platform != "win32"),
++
++    Extension("twisted.python.disconnect",
++              sources=["twisted/python/disconnect.c"],
++              condition=lambda _: sys.platform != "win32"),
+ ]
+ 
+ if sys.version_info[:2] <= (2, 6):
+Index: twisted/internet/udp.py
+===================================================================
+--- twisted/internet/udp.py	(revision 38491)
++++ twisted/internet/udp.py	(working copy)
+@@ -24,8 +24,14 @@
+ import warnings
+ 
+ from zope.interface import implementer
++from twisted.python.runtime import platformType
+ 
+-from twisted.python.runtime import platformType
++#Try to import C extension, if not disconnect will not work
++try:
++    from twisted.python.disconnect import disconnect_udp_sock
++except ImportError:
++    pass
++
+ if platformType == 'win32':
+     from errno import WSAEWOULDBLOCK
+     from errno import WSAEINTR, WSAEMSGSIZE, WSAETIMEDOUT
+@@ -205,13 +211,22 @@
+         """
+         'Connect' to remote server.
+         """
+-        if self._connectedAddr:
+-            raise RuntimeError("already connected, reconnecting is not currently supported")
+         if not abstract.isIPAddress(host):
+             raise ValueError("please pass only IP addresses, not domain names")
+         self._connectedAddr = (host, port)
+         self.socket.connect((host, port))
+ 
++    def disconnect(self):
++        """
++        'Disconnect' from remote server.
++        Not to be confused with loseConnection. It will NOT call connectionLost.
++        @returns: the result from the underlying syscall.
++        """
++        if not self._connectedAddr:
++            raise RuntimeError("not connected, connect the socket first")
++        self._connectedAddr = None
++        return disconnect_udp_sock(self.fileno())
++
+     def _loseConnection(self):
+         self.stopReading()
+         if self.connected: # actually means if we are *listening*

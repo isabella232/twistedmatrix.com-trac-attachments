@@ -1,0 +1,503 @@
+=== modified file 'twisted/web/http.py'
+--- twisted/web/http.py	2009-04-21 12:41:39 +0000
++++ twisted/web/http.py	2009-04-24 19:21:26 +0000
+@@ -9,7 +9,6 @@
+ 
+ Future Plans:
+  - HTTP client support will at some point be refactored to support HTTP/1.1.
+- - Accept chunked data from clients in server.
+  - Other missing HTTP features from the RFC.
+ 
+ Maintainer: Itamar Shtull-Trauring
+@@ -36,6 +35,7 @@
+ from twisted.python import log
+ try: # try importing the fast, C version
+     from twisted.protocols._c_urlarg import unquote
++    unquote # shut up pyflakes
+ except ImportError:
+     from urllib import unquote
+ 
+@@ -1279,7 +1279,7 @@
+     Protocol for decoding I{chunked} Transfer-Encoding, as defined by RFC 2616,
+     section 3.6.1.  This protocol can interpret the contents of a request or
+     response body which uses the I{chunked} Transfer-Encoding.  It cannot
+-    interpret any of the rest of the HTTP protocol.
++    interpret any of the rest of the HTTP protocol.  It ignores trailers.
+ 
+     It may make sense for _ChunkedTransferDecoder to be an actual IProtocol
+     implementation.  Currently, the only user of this class will only ever
+@@ -1298,29 +1298,38 @@
+     @ivar finishCallback: A one-argument callable which will be invoked when
+         the terminal chunk is received.  It will be invoked with all bytes
+         which were delivered to this protocol which came after the terminal
+-        chunk.
++        chunk.  These bytes are I{not} the trailer; they might be the beginning
++        of the next request or response.
+ 
+     @ivar length: Counter keeping track of how many more bytes in a chunk there
+         are to receive.
+ 
+     @ivar state: One of C{'chunk-length'}, C{'trailer'}, C{'body'}, or
+         C{'finished'}.  For C{'chunk-length'}, data for the chunk length line
+-        is currently being read.  For C{'trailer'}, the CR LF pair which
+-        follows each chunk is being read.  For C{'body'}, the contents of a
+-        chunk are being read.  For C{'finished'}, the last chunk has been
+-        completely read and no more input is valid.
++        is currently being read.  For C{'body'}, the contents of a chunk are
++        being read.  For C{'crlf'}, the CR LF pair which follows each chunk is
++        being read.  For C{'trailer'}, the trailer is being read and ignored.
++        For C{'finished'}, the last chunk has been completely read and no more
++        input is valid.
+ 
+-    @ivar finish: A flag indicating that the last chunk has been started.  When
+-        it finishes, the state will change to C{'finished'} and no more data
+-        will be accepted.
++    @ivar _bodyEndsWith: One of I{CR LF} or I{CR LF CR LF}.  When I{CR LF}, the
++        parser is still searching for the end of an empty trailer.  When
++        I{CR LF CR LF}, the parser is searching for the end of a non-empty
++        trailer.
+     """
+     state = 'chunk-length'
+-    finish = False
+ 
+     def __init__(self, dataCallback, finishCallback):
+         self.dataCallback = dataCallback
+         self.finishCallback = finishCallback
+         self._buffer = ''
++        self._bodyEndsWith = '\r\n'
++
++        # While an HTTP/1.1 chunk has no size limit in the specification, a
++        # reasonable limit must be established to prevent untrusted input from
++        # causing excessive string concatenation in the parser. A limit of 17 bytes
++        # (max FFFFFFFFFFFFFFFFF) can support chunks up to 2**68-1 bytes.
++        self._maximumChunkSizeStringLength = 17
+ 
+ 
+     def dataReceived(self, data):
+@@ -1334,38 +1343,99 @@
+             if self.state == 'chunk-length':
+                 if '\r\n' in data:
+                     line, rest = data.split('\r\n', 1)
+-                    parts = line.split(';')
+-                    self.length = int(parts[0], 16)
++                    parts = line.split(';', 1)
++                    chunkSizeString = parts[0]
++                    if len(chunkSizeString) > self._maximumChunkSizeStringLength:
++                        raise RuntimeError(
++                            "_ChunkedTransferDecoder.dataReceived received "
++                            "too-long chunk length in parts %s" % (parts,))
++                    # HEX in RFC 2616 section 2.2 does not include the minus
++                    # sign, but int('-0', 16) == 0, so 'negative zero' chunks
++                    # are accepted here.
++                    # Spaces around the HEX are not allowed, but int(..., 16)
++                    # will still parse it, so padded HEX is accepted here.
++                    try:
++                        self.length = int(chunkSizeString, 16)
++                    except ValueError:
++                        raise RuntimeError(
++                            "_ChunkedTransferDecoder.dataReceived received "
++                            "unparsable chunk length in parts %s" % (parts,))
++                    if self.length < 0:
++                        raise RuntimeError(
++                            "_ChunkedTransferDecoder.dataReceived received "
++                            "negative chunk length in parts %s" % (parts,))
+                     if self.length == 0:
+                         self.state = 'trailer'
+-                        self.finish = True
+                     else:
+                         self.state = 'body'
+                     data = rest
+                 else:
+-                    self._buffer = data
+-                    data = ''
+-            elif self.state == 'trailer':
+-                if data.startswith('\r\n'):
+-                    data = data[2:]
+-                    if self.finish:
+-                        self.state = 'finished'
+-                        self.finishCallback(data)
+-                        data = ''
++                    # Throw away HTTP/1.1 chunk-extensions every time, but keep
++                    # the semicolon so that additional chunk-extension data
++                    # doesn't get interpreted as part of the chunk-length.
++                    if ';' in data:
++                        reattachCR = (data[-1] == '\r')
++                        data = data[:data.find(';') + 1]
++                        if reattachCR:
++                            data += '\r'
++                        extraByte = 1
+                     else:
+-                        self.state = 'chunk-length'
+-                else:
++                        extraByte = 0
++
++                    if len(data) > (self._maximumChunkSizeStringLength + extraByte):
++                        raise RuntimeError(
++                            "_ChunkedTransferDecoder.dataReceived buffered "
++                            "too-long chunk length %s" % (repr(data),))
+                     self._buffer = data
+                     data = ''
+             elif self.state == 'body':
+                 if len(data) >= self.length:
+                     chunk, data = data[:self.length], data[self.length:]
+                     self.dataCallback(chunk)
+-                    self.state = 'trailer'
++                    self.state = 'crlf'
+                 elif len(data) < self.length:
+                     self.length -= len(data)
+                     self.dataCallback(data)
+                     data = ''
++            elif self.state == 'crlf':
++                if data.startswith('\r\n'):
++                    data = data[2:]
++                    self.state = 'chunk-length'
++                elif data == '\r':
++                    self._buffer = data
++                    data = ''
++                else:
++                    raise RuntimeError(
++                        "_ChunkedTransferDecoder.dataReceived was looking for "
++                        "CRLF, not %s" % (repr(data),))
++            elif self.state == 'trailer':
++                # The goal is to throw away as much of the trailer as possible
++                # every time, while hoping to get the end-of-trailer.
++                
++                if self._bodyEndsWith == '\r\n' and data == '\r':
++                    # This case is ambiguous until dataReceived gets another byte.
++                    # `data' could be the CR in the CRLF to terminate an empty
++                    # trailer, or the beginning of an non-empty trailer
++                    # starting with \r.
++                    self._buffer = data
++                    data = ''
++                    return
++                
++                trailerEnd = data.find(self._bodyEndsWith)
++                if self._bodyEndsWith == '\r\n' and trailerEnd != 0:
++                    self._bodyEndsWith = '\r\n\r\n'
++                    trailerEnd = data.find(self._bodyEndsWith)
++
++                if trailerEnd != -1:
++                    data = data[trailerEnd + len(self._bodyEndsWith):]
++                    self.state = 'finished'
++                    self.finishCallback(data)
++                else:
++                    for ending in ('\r\n\r', '\r\n', '\r'):
++                        if data.endswith(ending):
++                            self._buffer = ending
++                            break
++                data = ''
+             elif self.state == 'finished':
+                 raise RuntimeError(
+                     "_ChunkedTransferDecoder.dataReceived called after last "
+
+=== modified file 'twisted/web/test/test_http.py'
+--- twisted/web/test/test_http.py	2009-01-26 00:53:09 +0000
++++ twisted/web/test/test_http.py	2009-04-24 19:30:14 +0000
+@@ -497,6 +497,20 @@
+         self.assertEqual(L, ['abc'])
+ 
+ 
++    def test_extensionsShort(self):
++        """
++        L{_ChunkedTransferDecoder.dataReceived} disregards chunk-extension
++        fields, even when the data is delivered with multiple calls.
++
++        This should exercise the reattachCR condition in the parser.
++        """
++        L = []
++        p = http._ChunkedTransferDecoder(L.append, None)
++        for s in '3; x-foo=bar\r\nabc\r\n':
++            p.dataReceived(s)
++        self.assertEqual(L, ['a', 'b', 'c'])
++
++
+     def test_finish(self):
+         """
+         L{_ChunkedTransferDecoder.dataReceived} interprets a zero-length
+@@ -520,6 +534,41 @@
+         self.assertEqual(finished, ['hello'])
+ 
+ 
++    def test_extraTrailer(self):
++        """
++
++        """
++        finished = []
++        p = http._ChunkedTransferDecoder(None, finished.append)
++        p.dataReceived('0\r\nLINE 1\r\n\r\nhello')
++        self.assertEqual(finished, ['hello'])
++
++
++    def test_extraTrailerMultiline(self):
++        """
++        L{_ChunkedTransferDecoder.dataReceived} understands the trailers can
++        span multiple entity-headers. But since the parser ignores trailers, it
++        can treat entity-headers as lines.
++        """
++        finished = []
++        p = http._ChunkedTransferDecoder(None, finished.append)
++        p.dataReceived('0\r\nLINE 1\r\nLINE 2\r\n\r\nhello')
++        self.assertEqual(finished, ['hello'])
++
++
++    def test_extraTrailerMultilineShort(self):
++        """
++        L{_ChunkedTransferDecoder.dataReceived} understands the trailers can
++        span multiple entity-headers, when delivered with multiple calls.
++        """
++        finished = []
++        p = http._ChunkedTransferDecoder(None, finished.append)
++        for s in '0\r\nLINE 1\r\nLINE 2\r\n\r':
++            p.dataReceived(s)
++        p.dataReceived('\nhello')
++        self.assertEqual(finished, ['hello'])
++
++
+     def test_afterFinished(self):
+         """
+         L{_ChunkedTransferDecoder.dataReceived} raises L{RuntimeError} if it
+@@ -527,8 +576,12 @@
+         """
+         p = http._ChunkedTransferDecoder(None, lambda bytes: None)
+         p.dataReceived('0\r\n\r\n')
+-        self.assertRaises(RuntimeError, p.dataReceived, 'hello')
+-
++        exc = self.assertRaises(RuntimeError, p.dataReceived, 'hello')
++        self.assertEqual(
++            str(exc),
++            "_ChunkedTransferDecoder.dataReceived called after last "
++            "chunk was processed")
++            
+ 
+     def test_earlyConnectionLose(self):
+         """
+@@ -574,6 +627,228 @@
+         self.assertEqual(successes, [True])
+ 
+ 
++    def test_trailerUsesNoMemory(self):
++        """
++        L{_ChunkedTransferDecoder.dataReceived} does not waste memory
++        buffering pieces of the trailer, which is always ignored anyway.
++
++        This test is very implementation-specific because the parser exhibits
++        no public behavior while ignoring the trailer.
++        """
++        L = []
++        p = http._ChunkedTransferDecoder(L.append, lambda bytes: None)
++        p.dataReceived('3\r\nabc\r\n0\r\nTrailer')
++        self.assertEqual(len(p._buffer), 0)
++        p.dataReceived('More trailer')
++        self.assertEqual(len(p._buffer), 0)
++        p.dataReceived('Here comes a CR: \r')
++        self.assertEqual(len(p._buffer), 1)
++        p.dataReceived('But no newline!')
++        self.assertEqual(len(p._buffer), 0)
++        p.dataReceived('Make it think it might end: \r\n\r')
++        self.assertEqual(len(p._buffer), 3)
++        p.dataReceived("But it didn't!")
++        self.assertEqual(len(p._buffer), 0)
++        p.dataReceived('Really finish the trailer now: \r\n\r\n')
++        self.assertEqual(len(p._buffer), 0)
++        self.assertEqual(L, ['abc'])
++
++
++    def test_chunkExtensionsUseNoMemory(self):
++        """
++        L{_ChunkedTransferDecoder.dataReceived} does not waste memory
++        buffering pieces of chunk extensions, which are always ignored anyway.
++
++        This test is very implementation-specific because the parser exhibits
++        no public behavior while ignoring the chunk extensions.
++        """
++        L = []
++        finished = []
++        p = http._ChunkedTransferDecoder(L.append, finished.append)
++        p.dataReceived('3\r\nabc\r\n4; hello=yes')
++        originalLength = len(p._buffer)
++        # feed it some more ignored chunk-extension
++        p.dataReceived('-still-ignored')
++        self.assertEqual(len(p._buffer), originalLength)
++
++
++    def test_limitedChunkLengthBuffering(self):
++        """
++        L{_ChunkedTransferDecoder.dataReceived} does not allow input
++        to endlessly fill its buffer with a chunk length string.
++        """
++        L = []
++        p = http._ChunkedTransferDecoder(L.append, None)
++        max = p._maximumChunkSizeStringLength
++
++        p.dataReceived('2\r\nab\r\n')
++        exc = self.assertRaises(RuntimeError, p.dataReceived, '3' * (max + 1))
++        self.assertEqual(
++            str(exc),
++            "_ChunkedTransferDecoder.dataReceived buffered too-long "
++            "chunk length '333333333333333333'")
++
++
++    def test_limitedChunkLengthBufferingShort(self):
++        """
++        L{_ChunkedTransferDecoder.dataReceived} does not allow input
++        to endlessly fill its buffer with a chunk length string, even when
++        the data is delivered with multiple calls.
++        """
++        L = []
++        p = http._ChunkedTransferDecoder(L.append, None)
++        max = p._maximumChunkSizeStringLength
++
++        p.dataReceived('2\r\nab\r\n')
++        for s in '3' * max:
++            p.dataReceived(s)
++        exc = self.assertRaises(RuntimeError, p.dataReceived, '3' * 1)
++        self.assertEqual(
++            str(exc),
++            "_ChunkedTransferDecoder.dataReceived buffered too-long "
++            "chunk length '333333333333333333'")
++
++
++    def test_chunkLengthNotTooLong(self):
++        """
++
++        """
++        L = []
++        p = http._ChunkedTransferDecoder(L.append, None)
++        max = p._maximumChunkSizeStringLength
++
++        p.dataReceived('2\r\nab\r\n')
++
++        chunkLenString = ('3' * (max+1))
++        exc = self.assertRaises(
++            RuntimeError, p.dataReceived, chunkLenString + '\r\n')
++            
++        self.assertEqual(
++            str(exc),
++            "_ChunkedTransferDecoder.dataReceived received "
++            "too-long chunk length in parts %s" % (repr([chunkLenString]),))
++
++
++    def test_chunkLengthSemicolonMath(self):
++        """
++        L{_ChunkedTransferDecoder.dataReceived} doesn't include
++        the length of the semicolon or chunk-extension data when
++        determining the length of the chunk-length bytes.
++        """
++        L = []
++        p = http._ChunkedTransferDecoder(L.append, None)
++        max = p._maximumChunkSizeStringLength
++
++        p.dataReceived((('3' * (max)) + '; long-extension-completely-ignored=yes'))
++
++
++    def test_chunkLengthNotUnparsable(self):
++        """
++
++        """
++        L = []
++        p = http._ChunkedTransferDecoder(L.append, None)
++
++        p.dataReceived('2\r\nab\r\n')
++
++        chunkLenString = ('G')
++        exc = self.assertRaises(
++            RuntimeError, p.dataReceived, chunkLenString + '\r\n')
++
++        self.assertEqual(
++            str(exc),
++            "_ChunkedTransferDecoder.dataReceived received "
++            "unparsable chunk length in parts %s" % (repr([chunkLenString]),))
++
++
++    def test_chunkLengthNotNegative(self):
++        """
++
++        """
++        L = []
++        p = http._ChunkedTransferDecoder(L.append, None)
++
++        p.dataReceived('2\r\nab\r\n')
++        exc = self.assertRaises(RuntimeError, p.dataReceived, '-1\r\n')
++        self.assertEqual(
++            str(exc),
++            "_ChunkedTransferDecoder.dataReceived received "
++            "negative chunk length in parts %s" % (repr(['-1']),))
++
++
++    def test_chunkLengthNotNegativeWithPadding(self):
++        """
++
++        """
++        L = []
++        p = http._ChunkedTransferDecoder(L.append, None)
++
++        p.dataReceived('2\r\nab\r\n')
++        exc = self.assertRaises(RuntimeError, p.dataReceived, ' -1\r\n')
++        self.assertEqual(
++            str(exc),
++            "_ChunkedTransferDecoder.dataReceived received "
++            "negative chunk length in parts %s" % (repr([' -1']),))
++
++
++    def test_afterChunkNotCRLFErrorByte1(self):
++        """
++
++        """
++        L = []
++        p = http._ChunkedTransferDecoder(L.append, None)
++
++        p.dataReceived('2\r\nab')
++        exc = self.assertRaises(RuntimeError, p.dataReceived, 'X')
++        self.assertEqual(
++            str(exc),
++            "_ChunkedTransferDecoder.dataReceived was looking for "
++            "CRLF, not %s" % (repr('X'),))
++
++
++    def test_afterChunkNotCRLFErrorTwoBytes(self):
++        """
++
++        """
++        L = []
++        p = http._ChunkedTransferDecoder(L.append, None)
++
++        p.dataReceived('2\r\nab')
++        exc = self.assertRaises(RuntimeError, p.dataReceived, '\rX')
++        self.assertEqual(
++            str(exc),
++            "_ChunkedTransferDecoder.dataReceived was looking for "
++            "CRLF, not %s" % (repr('\rX'),))
++
++
++    def test_afterChunkNotCRLFErrorByte2(self):
++        """
++
++        """
++        L = []
++        p = http._ChunkedTransferDecoder(L.append, None)
++
++        p.dataReceived('2\r\nab')
++        p.dataReceived('\r')
++        exc = self.assertRaises(RuntimeError, p.dataReceived, 'X')
++        self.assertEqual(
++            str(exc),
++            "_ChunkedTransferDecoder.dataReceived was looking for "
++            "CRLF, not %s" % (repr('\rX'),))
++
++
++
++    def test_chunkLengthNegativeZeroOkay(self):
++        """
++
++        """
++        L = []
++        p = http._ChunkedTransferDecoder(L.append, None)
++
++        p.dataReceived('2\r\nab\r\n')
++        p.dataReceived('-0\r\n')
++
++
+ 
+ class ChunkingTestCase(unittest.TestCase):
+ 
+

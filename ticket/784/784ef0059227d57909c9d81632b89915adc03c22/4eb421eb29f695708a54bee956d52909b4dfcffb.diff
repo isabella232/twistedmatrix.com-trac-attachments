@@ -1,0 +1,136 @@
+Index: twisted/internet/process.py
+===================================================================
+RCS file: /cvs/Twisted/twisted/internet/process.py,v
+retrieving revision 1.60
+diff -u -r1.60 process.py
+--- twisted/internet/process.py	11 Dec 2003 10:33:27 -0000	1.60
++++ twisted/internet/process.py	16 Dec 2003 10:16:30 -0000
+@@ -85,7 +85,8 @@
+     try:
+         aux_pid, status = os.waitpid(pid, os.WNOHANG)
+     except:
+-        log.deferr()
++        log.msg('Failed to reap %d:' % pid)
++        log.err()
+         aux_pid = None
+     if aux_pid:
+         process.processEnded(status)
+@@ -204,7 +205,7 @@
+     """
+ 
+     def __init__(self, reactor, command, args, environment, path, proto,
+-                 uid=None, gid=None):
++                 uid=None, gid=None, childFDs=None):
+         """Spawn an operating-system process.
+ 
+         This is where the hard work of disconnecting all currently open
+@@ -215,6 +216,10 @@
+         specified.  (Implementation Note: this doesn't support all the arcane
+         nuances of setXXuid on UNIX: it will assume that either your effective
+         or real UID is 0.)
++
++        @param childFDs: a dictionary mapping 
++            fd_in_child -> current_fd_in_parent.  If not passed, the default
++            behaviour is to create stdin/stdout/stderr pipes.
+         """
+         abstract.FileDescriptor.__init__(self, reactor)
+         settingUID = (uid is not None) or (gid is not None)
+@@ -230,27 +235,41 @@
+             # prepare to change UID in subprocess
+             os.setuid(0)
+             os.setgid(0)
+-        stdout_read, stdout_write = os.pipe()
+-        stderr_read, stderr_write = os.pipe()
+-        stdin_read,  stdin_write  = os.pipe()
++        stdChildFDs = 0
++        if childFDs is None:
++            stdout_read, stdout_write = os.pipe()
++            stderr_read, stderr_write = os.pipe()
++            stdin_read,  stdin_write  = os.pipe()
++            childFDs = {0: stdin_read, 1: stdout_write, 2: stderr_write}
++            stdChildFDs = 1
+         self.pid = os.fork()
+         if self.pid == 0: # pid is 0 in the child process
+             # stop debugging, if I am!  I don't care anymore!
+             sys.settrace(None)
+-            # Destroy my stdin / stdout / stderr (in that order)
+             try:
+-                os.dup2(stdin_read, 0)
+-                os.dup2(stdout_write, 1)
+-                os.dup2(stderr_write, 2)
+-                # XXX TODO FIXME: 256 is a magic number here; really we need a
+-                # way of saying "close all open FDs except 0, 1, 2".  This will
+-                # fail in a surprising and subtle way if the current process
+-                # has more than 256 FDs open.  On linux this would be
+-                # "[os.close(int(fd)) for fd in os.listdir('/proc/self/fd')]"
+-                # but I seriously doubt that's portable.
+-                for fd in range(3, 256):
+-                    try:    os.close(fd)
+-                    except: pass
++                # XXX: This fd duping code needs comments and tests
++                parentFDs = dict([(v, 1) for v in childFDs.itervalues()])
++                destList = childFDs.keys()
++                while childFDs:
++                    destFD, currFD = childFDs.popitem()
++                    del parentFDs[currFD]
++                    if destFD not in parentFDs:
++                        os.dup2(currFD, destFD)
++                    else:
++                        currFD = os.dup(currFD)
++                        childFDs[destFD] = currFD
++                        parentFDs[currFD] = 1
++
++                try:
++                    import resource
++                    maxfds = resource.getrlimit(resource.RLIMIT_NOFILE)[1] + 1
++                except:
++                    maxfds = 256
++
++                for fd in range(maxfds):
++                    if fd not in destList:
++                        try:    os.close(fd)
++                        except: pass
+                 if path:
+                     os.chdir(path)
+                 # set the UID before I actually exec the process
+@@ -260,6 +279,8 @@
+             except:
+                 # If there are errors, bail and try to write something
+                 # descriptive to stderr.
++                # XXX: The parent's stderr isn't necessarily fd 2 anymore, or
++                #      even still available
+                 try:
+                     stderr = os.fdopen(2,'w')
+                     stderr.write("Upon execvpe %s %s in environment %s\n:" %
+@@ -276,13 +297,14 @@
+             os.setregid(currgid, curegid)
+             os.setreuid(curruid, cureuid)
+         self.status = -1
+-        for fd in stdout_write, stderr_write, stdin_read:
+-            os.close(fd)
+-        for fd in (stdout_read, stderr_read, stdin_write):
+-            fdesc.setNonBlocking(fd)
+-        self.stdout = stdout_read # os.fdopen(stdout_read, 'r')
+-        self.stderr = stderr_read # os.fdopen(stderr_read, 'r')
+-        self.stdin = stdin_write
++        if stdChildFDs:
++            for fd in stdout_write, stderr_write, stdin_read:
++                os.close(fd)
++            for fd in (stdout_read, stderr_read, stdin_write):
++                fdesc.setNonBlocking(fd)
++            self.stdout = stdout_read # os.fdopen(stdout_read, 'r')
++            self.stderr = stderr_read # os.fdopen(stderr_read, 'r')
++            self.stdin = stdin_write
+         # ok now I really have a fileno()
+         self.writer = ProcessWriter(self)
+         self.writer.startReading()
+@@ -312,7 +334,8 @@
+         try:
+             pid, status = os.waitpid(self.pid, os.WNOHANG)
+         except:
+-            log.deferr()
++            log.msg('Failed to reap %d:' % self.pid)
++            log.err()
+             pid = None
+         if pid:
+             self.processEnded(status)

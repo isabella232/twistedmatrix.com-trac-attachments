@@ -1,0 +1,540 @@
+diff -ru ../Twisted-11.0.0/twisted/internet/abstract.py ./twisted/internet/abstract.py
+--- ../Twisted-11.0.0/twisted/internet/abstract.py	2011-02-14 05:45:15.000000000 +0100
++++ ./twisted/internet/abstract.py	2011-10-11 13:11:35.150036709 +0200
+@@ -9,6 +9,8 @@
+ Maintainer: Itamar Shtull-Trauring
+ """
+ 
++import socket
++
+ from zope.interface import implements
+ 
+ # Twisted Imports
+@@ -412,7 +414,27 @@
+         return -1
+ 
+ 
+-def isIPAddress(addr):
++def isIPv6Address(addr):
++    """
++    Determine whether the given string represents an IPv6 address.
++
++	@param addr: A string which may or may not be the hexadecimal
++	representation of an IPv6 address.
++
++	@rtype: C{bool}
++	@return: C{True} if C{addr} represents an IPv6 address, C{False}
++    otherwise.
++    """
++    if addr.find(":") != 1:
++        try:
++            socket.getaddrinfo(addr, 0, socket.AF_INET6, 0, 0, socket.AI_NUMERICHOST)
++        except socket.gaierror:
++            pass
++        else:
++            return True
++    return False
++
++def isIPv4Address(addr):
+     """
+     Determine whether the given string represents an IPv4 address.
+ 
+@@ -437,5 +459,17 @@
+         return True
+     return False
+ 
++def isIPAddress(addr):
++    """
++    Determine whether the given string represents an IPv4 or IPv6 address.
++    
++    @type addr: C{str}
++    @param addr: A string which may or may not be the decimal dotted
++    representation of an IPv4 address.
++
++    @rtype: C{bool}
++    @return: C{True} if C{addr} represents an IPv4 address, C{False}
++    """
++    return isIPv4Address(addr) or isIPv6Address(addr)
+ 
+ __all__ = ["FileDescriptor"]
+diff -ru ../Twisted-11.0.0/twisted/internet/address.py ./twisted/internet/address.py
+--- ../Twisted-11.0.0/twisted/internet/address.py	2011-02-14 05:45:15.000000000 +0100
++++ ./twisted/internet/address.py	2011-10-11 12:33:24.003345341 +0200
+@@ -5,7 +5,7 @@
+ Address objects for network connections.
+ """
+ 
+-import warnings, os
++import warnings, os, socket
+ 
+ from zope.interface import implements
+ 
+@@ -13,9 +13,9 @@
+ from twisted.python import util
+ 
+ 
+-class IPv4Address(object, util.FancyEqMixin):
++class IPAddress(object, util.FancyEqMixin):
+     """
+-    Object representing an IPv4 socket endpoint.
++    Object representing an IP socket endpoint.
+ 
+     @ivar type: A string describing the type of transport, either 'TCP' or
+         'UDP'.
+@@ -25,11 +25,12 @@
+ 
+     implements(IAddress)
+ 
+-    compareAttributes = ('type', 'host', 'port')
++    compareAttributes = ('type', 'family', 'host', 'port')
+ 
+-    def __init__(self, type, host, port, _bwHack = None):
++    def __init__(self, type, family, host, port, _bwHack = None):
+         assert type in ('TCP', 'UDP')
+         self.type = type
++        self.family = family
+         self.host = host
+         self.port = port
+         if _bwHack is not None:
+@@ -37,13 +38,19 @@
+                     DeprecationWarning, stacklevel=2)
+ 
+     def __repr__(self):
+-        return 'IPv4Address(%s, %r, %d)' % (self.type, self.host, self.port)
++        family_str = "IPv4" if self.family == socket.AF_INET else "IPv6"
++        return 'IPAddress(%s, %s, %r, %d)' % (self.type, family_str, self.host, self.port)
+ 
+ 
+     def __hash__(self):
+-        return hash((self.type, self.host, self.port))
+-
++        return hash((self.type, self.family, self.host, self.port))
+ 
++class IPv4Address(IPAddress):
++    """
++    Generic version of IPv4Address.
++    """
++    def __init(self, type, host, port):
++        IPAddress.__init__(type, socket.AF_INET, host, port, None)        
+ 
+ class UNIXAddress(object, util.FancyEqMixin):
+     """
+@@ -92,6 +99,14 @@
+ 
+ 
+ 
++class _ServerFactoryIPAddress(IPAddress):
++    def __eq__(self, other):
++        if isinstance(other, IPAddress):
++            a = (self.type, self.family, self.host, self.port)
++            b = (other.type, other.family, other.host, other.port)
++            return a == b
++        return False
++
+ # These are for buildFactory backwards compatability due to
+ # stupidity-induced inconsistency.
+ 
+diff -ru ../Twisted-11.0.0/twisted/internet/base.py ./twisted/internet/base.py
+--- ../Twisted-11.0.0/twisted/internet/base.py	2011-03-14 08:49:02.000000000 +0100
++++ ./twisted/internet/base.py	2011-10-11 12:33:24.013345275 +0200
+@@ -249,6 +249,18 @@
+             else:
+                 userDeferred.callback(result)
+ 
++    def _lookup(self, name):
++        """
++        Replacement for gethostbyname.
++        """
++        ai = socket.getaddrinfo(name, 0)
++        assert len(ai) > 0 and len(ai[0]) >= 5
++        
++        # Sort the result. IPv4 addresses should be preferred over
++        # IPv6 addresses to keep legacy applications working.
++        ai = sorted(ai, key=lambda fields: fields[0])
++        
++        return ai[0][4][0]
+ 
+     def getHostByName(self, name, timeout = (1, 3, 11, 45)):
+         """
+@@ -265,7 +277,7 @@
+         userDeferred = defer.Deferred()
+         lookupDeferred = threads.deferToThreadPool(
+             self.reactor, self.reactor.getThreadPool(),
+-            socket.gethostbyname, name)
++            self._lookup, name)
+         cancelCall = self.reactor.callLater(
+             timeoutDelay, self._cleanup, name, lookupDeferred)
+         self._runningQueries[lookupDeferred] = (userDeferred, cancelCall)
+diff -ru ../Twisted-11.0.0/twisted/internet/endpoints.py ./twisted/internet/endpoints.py
+--- ../Twisted-11.0.0/twisted/internet/endpoints.py	2011-02-14 05:45:15.000000000 +0100
++++ ./twisted/internet/endpoints.py	2011-10-11 12:33:24.063344996 +0200
+@@ -145,9 +145,9 @@
+ 
+ 
+ 
+-class TCP4ServerEndpoint(object):
++class TCPServerEndpoint(object):
+     """
+-    TCP server endpoint with an IPv4 configuration
++    TCP server endpoint with an IP configuration
+ 
+     @ivar _reactor: An L{IReactorTCP} provider.
+ 
+@@ -186,11 +186,13 @@
+                              backlog=self._backlog,
+                              interface=self._interface)
+ 
++""" Legacy: TCP4ServerEndpoint """
++class TCP4ServerEndpoint(TCPServerEndpoint):
++    pass
+ 
+-
+-class TCP4ClientEndpoint(object):
++class TCPClientEndpoint(object):
+     """
+-    TCP client endpoint with an IPv4 configuration.
++    TCP client endpoint with an IP configuration.
+ 
+     @ivar _reactor: An L{IReactorTCP} provider.
+ 
+@@ -245,11 +247,13 @@
+         except:
+             return defer.fail()
+ 
++""" Legacy: TCP4ClientEndpoint """
++class TCP4ClientEndpoint(TCPClientEndpoint):
++    pass
+ 
+-
+-class SSL4ServerEndpoint(object):
++class SSLServerEndpoint(object):
+     """
+-    SSL secured TCP server endpoint with an IPv4 configuration.
++    SSL secured TCP server endpoint with an IP configuration.
+ 
+     @ivar _reactor: An L{IReactorSSL} provider.
+ 
+@@ -301,11 +305,13 @@
+                              backlog=self._backlog,
+                              interface=self._interface)
+ 
++""" Legacy: SSL4ServerEndpoint """
++class SSL4ServerEndpoint(SSLServerEndpoint):
++    pass
+ 
+-
+-class SSL4ClientEndpoint(object):
++class SSLClientEndpoint(object):
+     """
+-    SSL secured TCP client endpoint with an IPv4 configuration
++    SSL secured TCP client endpoint with an IP configuration
+ 
+     @ivar _reactor: An L{IReactorSSL} provider.
+ 
+@@ -369,7 +375,9 @@
+         except:
+             return defer.fail()
+ 
+-
++""" Legacy: SSL4ClientEndpoint """
++class SSL4ClientEndpoint(SSLClientEndpoint):
++    pass
+ 
+ class UNIXServerEndpoint(object):
+     """
+@@ -652,14 +660,14 @@
+ 
+ # Mappings from description "names" to endpoint constructors.
+ _endpointServerFactories = {
+-    'TCP': TCP4ServerEndpoint,
+-    'SSL': SSL4ServerEndpoint,
++    'TCP': TCPServerEndpoint,
++    'SSL': SSLServerEndpoint,
+     'UNIX': UNIXServerEndpoint,
+     }
+ 
+ _endpointClientFactories = {
+-    'TCP': TCP4ClientEndpoint,
+-    'SSL': SSL4ClientEndpoint,
++    'TCP': TCPClientEndpoint,
++    'SSL': SSLClientEndpoint,
+     'UNIX': UNIXClientEndpoint,
+     }
+ 
+diff -ru ../Twisted-11.0.0/twisted/internet/iocpreactor/tcp.py ./twisted/internet/iocpreactor/tcp.py
+--- ../Twisted-11.0.0/twisted/internet/iocpreactor/tcp.py	2011-03-17 04:34:22.000000000 +0100
++++ ./twisted/internet/iocpreactor/tcp.py	2011-10-11 13:15:10.058723899 +0200
+@@ -261,6 +261,7 @@
+     def __init__(self, host, port, bindAddress, connector, reactor):
+         self.connector = connector
+         self.addr = (host, port)
++        self.addressFamily = connector.family
+         self.reactor = reactor
+         # ConnectEx documentation says socket _has_ to be bound
+         if bindAddress is None:
+@@ -352,20 +353,20 @@
+ 
+     def getHost(self):
+         """
+-        Returns an IPv4Address.
++        Returns an IPAddress.
+ 
+         This indicates the address from which I am connecting.
+         """
+-        return address.IPv4Address('TCP', *self.socket.getsockname())
++        return address.IPAddress('TCP', self.socket.family, *self.socket.getsockname())
+ 
+ 
+     def getPeer(self):
+         """
+-        Returns an IPv4Address.
++        Returns an IPAddress.
+ 
+         This indicates the address that I am connected to.
+         """
+-        return address.IPv4Address('TCP', *self.realAddress)
++        return address.IPv4Address('TCP', self.addressFamily, *self.realAddress)
+ 
+ 
+     def __repr__(self):
+@@ -423,7 +424,7 @@
+ 
+     def getHost(self):
+         """
+-        Returns an IPv4Address.
++        Returns an IPAddress.
+ 
+         This indicates the server's address.
+         """
+@@ -432,7 +433,7 @@
+ 
+     def getPeer(self):
+         """
+-        Returns an IPv4Address.
++        Returns an IPAddress.
+ 
+         This indicates the client's address.
+         """
+@@ -482,6 +483,10 @@
+ 
+ 
+     def startListening(self):
++        # Get the correct address family by using getaddrinfo() on the interface address
++        ai = socket.getaddrinfo(self.interface, self.port)
++        self.addressFamily = ai[0][0]
++        
+         try:
+             skt = self.reactor.createSocket(self.addressFamily,
+                                             self.socketType)
+@@ -574,11 +579,11 @@
+ 
+     def getHost(self):
+         """
+-        Returns an IPv4Address.
++        Returns an IPAddress.
+ 
+         This indicates the server's address.
+         """
+-        return address.IPv4Address('TCP', *self.socket.getsockname())
++        return address.IPAddress('TCP', self.socket.family, *self.socket.getsockname())
+ 
+ 
+     def cbAccept(self, rc, bytes, evt):
+@@ -605,15 +610,15 @@
+             assert family == self.addressFamily
+ 
+             protocol = self.factory.buildProtocol(
+-                address._ServerFactoryIPv4Address('TCP', rAddr[0], rAddr[1]))
++                address._ServerFactoryIPAddress('TCP', family, rAddr[0], rAddr[1]))
+             if protocol is None:
+                 evt.newskt.close()
+             else:
+                 s = self.sessionno
+                 self.sessionno = s+1
+                 transport = Server(evt.newskt, protocol,
+-                        address.IPv4Address('TCP', rAddr[0], rAddr[1]),
+-                        address.IPv4Address('TCP', lAddr[0], lAddr[1]),
++                        address.IPAddress('TCP', family, rAddr[0], rAddr[1]),
++                        address.IPAddress('TCP', family, lAddr[0], lAddr[1]),
+                         s, self.reactor)
+                 protocol.makeConnection(transport)
+             return True
+diff -ru ../Twisted-11.0.0/twisted/internet/iocpreactor/udp.py ./twisted/internet/iocpreactor/udp.py
+--- ../Twisted-11.0.0/twisted/internet/iocpreactor/udp.py	2011-03-17 04:34:22.000000000 +0100
++++ ./twisted/internet/iocpreactor/udp.py	2011-10-11 13:11:37.060025041 +0200
+@@ -51,6 +51,10 @@
+ 
+         abstract.FileHandle.__init__(self, reactor)
+ 
++        # Get the correct address family by using getaddrinfo() on the interface address
++        ai = socket.getaddrinfo(self.interface, self.port)
++        self.addressFamily = ai[0][0]
++        
+         skt = socket.socket(self.addressFamily, self.socketType)
+         addrLen = _iocp.maxAddrLen(skt.fileno())
+         self.addressBuffer = _iocp.AllocateReadBuffer(addrLen)
+@@ -269,11 +273,11 @@
+ 
+     def getHost(self):
+         """
+-        Returns an IPv4Address.
++        Returns an IPAddress.
+ 
+         This indicates the address from which I am connecting.
+         """
+-        return address.IPv4Address('UDP', *self.socket.getsockname())
++        return address.IPAddress('UDP', self.socket.family, *self.socket.getsockname())
+ 
+ 
+ 
+diff -ru ../Twisted-11.0.0/twisted/internet/tcp.py ./twisted/internet/tcp.py
+--- ../Twisted-11.0.0/twisted/internet/tcp.py	2011-03-17 00:12:27.000000000 +0100
++++ ./twisted/internet/tcp.py	2011-10-11 12:33:24.283343686 +0200
+@@ -695,7 +695,8 @@
+         # BaseClient.__init__ is invoked later
+         self.connector = connector
+         self.addr = (host, port)
+-
++        self.addressFamily = connector.family
++        
+         whenDone = self.resolveAddress
+         err = None
+         skt = None
+@@ -714,18 +715,18 @@
+         self._finishInit(whenDone, skt, err, reactor)
+ 
+     def getHost(self):
+-        """Returns an IPv4Address.
++        """Returns an IPAddress.
+ 
+         This indicates the address from which I am connecting.
+         """
+-        return address.IPv4Address('TCP', *self.socket.getsockname())
++        return address.IPAddress('TCP', self.socket.family, *self.socket.getsockname())
+ 
+     def getPeer(self):
+-        """Returns an IPv4Address.
++        """Returns an IPAddress.
+ 
+         This indicates the address that I am connected to.
+         """
+-        return address.IPv4Address('TCP', *self.realAddress)
++        return address.IPAddress('TCP', self.addressFamily, *self.realAddress)
+ 
+     def __repr__(self):
+         s = '<%s to %s at %x>' % (self.__class__, self.addr, unsignedID(self))
+@@ -776,18 +777,18 @@
+ 
+ 
+     def getHost(self):
+-        """Returns an IPv4Address.
++        """Returns an IPAddress.
+ 
+         This indicates the server's address.
+         """
+-        return address.IPv4Address('TCP', *self.socket.getsockname())
++        return address.IPAddress('TCP', self.socket.family, *self.socket.getsockname())
+ 
+     def getPeer(self):
+-        """Returns an IPv4Address.
++        """Returns an IPAddress.
+ 
+         This indicates the client's address.
+         """
+-        return address.IPv4Address('TCP', *self.client)
++        return address.IPAddress('TCP', self.socket.family, *self.client)
+ 
+ 
+ 
+@@ -848,6 +849,9 @@
+             return "<%s of %s (not listening)>" % (self.__class__, self.factory.__class__)
+ 
+     def createInternetSocket(self):
++        # Get the correct address family by using getaddrinfo() on the interface address
++        ai = socket.getaddrinfo(self.interface, self.port)
++        self.addressFamily = ai[0][0]
+         s = base.BasePort.createInternetSocket(self)
+         if platformType == "posix" and sys.platform != "cygwin":
+             s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+@@ -863,6 +867,7 @@
+         try:
+             skt = self.createInternetSocket()
+             skt.bind((self.interface, self.port))
++            pass
+         except socket.error, le:
+             raise CannotListenError, (self.interface, self.port, le)
+ 
+@@ -885,7 +890,7 @@
+ 
+ 
+     def _buildAddr(self, (host, port)):
+-        return address._ServerFactoryIPv4Address('TCP', host, port)
++        return address._ServerFactoryIPAddress('TCP', self.addressFamily, host, port)
+ 
+ 
+     def doRead(self):
+@@ -939,6 +944,11 @@
+                     raise
+ 
+                 fdesc._setCloseOnExec(skt.fileno())
++                
++                # IPv6 addresses have usually more than two fields, reduce them.
++                if len(addr) > 2:
++                    addr = addr[0:2]
++                
+                 protocol = self.factory.buildProtocol(self._buildAddr(addr))
+                 if protocol is None:
+                     skt.close()
+@@ -1009,14 +1019,16 @@
+         return reflect.qual(self.factory.__class__)
+ 
+     def getHost(self):
+-        """Returns an IPv4Address.
++        """Returns an IPAddress.
+ 
+         This indicates the server's address.
+         """
+-        return address.IPv4Address('TCP', *self.socket.getsockname())
++        return address.IPAddress('TCP', self.socket.family, *self.socket.getsockname())
+ 
+ class Connector(base.BaseConnector):
+     def __init__(self, host, port, factory, timeout, bindAddress, reactor=None):
++        ai = socket.getaddrinfo(host, port)
++        self.family = ai[0][0]
+         self.host = host
+         if isinstance(port, types.StringTypes):
+             try:
+@@ -1031,4 +1043,4 @@
+         return Client(self.host, self.port, self.bindAddress, self, self.reactor)
+ 
+     def getDestination(self):
+-        return address.IPv4Address('TCP', self.host, self.port)
++        return address.IPAddress('TCP', self.family, self.host, self.port)
+diff -ru ../Twisted-11.0.0/twisted/internet/udp.py ./twisted/internet/udp.py
+--- ../Twisted-11.0.0/twisted/internet/udp.py	2011-02-14 05:45:15.000000000 +0100
++++ ./twisted/internet/udp.py	2011-10-11 13:11:35.310035730 +0200
+@@ -86,6 +86,10 @@
+         self._connectToProtocol()
+ 
+     def _bindSocket(self):
++        # Get the correct address family by using getaddrinfo() on the interface address
++        ai = socket.getaddrinfo(self.interface, self.port)
++        self.addressFamily = ai[0][0]
++        
+         try:
+             skt = self.createInternetSocket()
+             skt.bind((self.interface, self.port))
+@@ -238,11 +242,11 @@
+ 
+     def getHost(self):
+         """
+-        Returns an IPv4Address.
++        Returns an IPAddress.
+ 
+         This indicates the address from which I am connecting.
+         """
+-        return address.IPv4Address('UDP', *self.socket.getsockname())
++        return address.IPAddress('UDP', self.socket.family, *self.socket.getsockname())
+ 
+ 
+ 

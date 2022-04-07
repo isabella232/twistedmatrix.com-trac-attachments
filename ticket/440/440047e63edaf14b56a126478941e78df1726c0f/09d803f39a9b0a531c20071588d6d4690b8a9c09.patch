@@ -1,0 +1,262 @@
+Index: twisted/web/test/requesthelper.py
+===================================================================
+--- twisted/web/test/requesthelper.py	(revision 38290)
++++ twisted/web/test/requesthelper.py	(working copy)
+@@ -17,42 +17,21 @@
+ from twisted.internet.address import IPv4Address
+ from twisted.internet.interfaces import ISSLTransport
+ 
++from twisted.test.proto_helpers import StringTransport
++
+ from twisted.web.http_headers import Headers
+ from twisted.web.resource import Resource
+ from twisted.web.server import NOT_DONE_YET, Session, Site
+ 
+ 
+ class DummyChannel:
+-    class TCP:
++    class TCP(StringTransport):
+         port = 80
+-        disconnected = False
+ 
+-        def __init__(self):
+-            self.written = BytesIO()
+-            self.producers = []
+-
+-        def getPeer(self):
+-            return IPv4Address("TCP", '192.168.1.1', 12344)
+-
+-        def write(self, data):
+-            if not isinstance(data, bytes):
+-                raise TypeError("Can only write bytes to a transport, not %r" % (data,))
+-            self.written.write(data)
+-
+-        def writeSequence(self, iovec):
+-            for data in iovec:
+-                self.write(data)
+-
+         def getHost(self):
+             return IPv4Address("TCP", '10.0.0.1', self.port)
+ 
+-        def registerProducer(self, producer, streaming):
+-            self.producers.append((producer, streaming))
+ 
+-        def loseConnection(self):
+-            self.disconnected = True
+-
+-
+     @implementer(ISSLTransport)
+     class SSL(TCP):
+         pass
+Index: twisted/web/test/test_wsgi.py
+===================================================================
+--- twisted/web/test/test_wsgi.py	(revision 38290)
++++ twisted/web/test/test_wsgi.py	(working copy)
+@@ -907,7 +907,7 @@
+         d, requestFactory = self.requestFactoryFactory()
+         def cbRendered(ignored):
+             self.assertTrue(
+-                channel.transport.written.getvalue().startswith(
++                channel.transport.value().startswith(
+                     'HTTP/1.1 107 Strange message'))
+         d.addCallback(cbRendered)
+ 
+@@ -938,7 +938,7 @@
+ 
+         d, requestFactory = self.requestFactoryFactory()
+         def cbRendered(ignored):
+-            response = channel.transport.written.getvalue()
++            response = channel.transport.value()
+             headers, rest = response.split('\r\n\r\n', 1)
+             headerLines = headers.split('\r\n')[1:]
+             headerLines.sort()
+@@ -1001,7 +1001,7 @@
+ 
+         intermediateValues = []
+         def record():
+-            intermediateValues.append(channel.transport.written.getvalue())
++            intermediateValues.append(channel.transport.value())
+ 
+         def applicationFactory():
+             def application(environ, startResponse):
+@@ -1033,7 +1033,7 @@
+ 
+         intermediateValues = []
+         def record():
+-            intermediateValues.append(channel.transport.written.getvalue())
++            intermediateValues.append(channel.transport.value())
+ 
+         def applicationFactory():
+             def application(environ, startResponse):
+@@ -1066,7 +1066,7 @@
+ 
+         intermediateValues = []
+         def record():
+-            intermediateValues.append(channel.transport.written.getvalue())
++            intermediateValues.append(channel.transport.value())
+ 
+         def applicationFactory():
+             def application(environ, startResponse):
+@@ -1112,7 +1112,7 @@
+         d, requestFactory = self.requestFactoryFactory()
+         def cbRendered(ignored):
+             self.assertTrue(
+-                channel.transport.written.getvalue().startswith(
++                channel.transport.value().startswith(
+                     'HTTP/1.1 200 Bar\r\n'))
+         d.addCallback(cbRendered)
+ 
+@@ -1140,7 +1140,7 @@
+         d, requestFactory = self.requestFactoryFactory()
+         def cbRendered(ignored):
+             self.assertTrue(
+-                channel.transport.written.getvalue().startswith(
++                channel.transport.value().startswith(
+                     'HTTP/1.1 100 Foo\r\n'))
+         d.addCallback(cbRendered)
+ 
+@@ -1183,7 +1183,7 @@
+         d, requestFactory = self.requestFactoryFactory()
+         def cbRendered(ignored):
+             self.assertTrue(
+-                channel.transport.written.getvalue().startswith(
++                channel.transport.value().startswith(
+                     'HTTP/1.1 200 OK\r\n'))
+             self.assertEqual(reraised[0][0], excInfo[0])
+             self.assertEqual(reraised[0][1], excInfo[1])
+@@ -1207,7 +1207,7 @@
+ 
+         intermediateValues = []
+         def record():
+-            intermediateValues.append(channel.transport.written.getvalue())
++            intermediateValues.append(channel.transport.value())
+ 
+         def applicationFactory():
+             def application(environ, startResponse):
+@@ -1279,7 +1279,7 @@
+         def cbRendered(ignored):
+             self.assertEqual(
+                 self.getContentFromResponse(
+-                    channel.transport.written.getvalue()),
++                    channel.transport.value()),
+                 '012')
+             self.assertFalse(result.open)
+         d.addCallback(cbRendered)
+@@ -1465,7 +1465,7 @@
+             self.assertEqual(len(errors), 1)
+ 
+             self.assertTrue(
+-                channel.transport.written.getvalue().startswith(
++                channel.transport.value().startswith(
+                     'HTTP/1.1 500 Internal Server Error'))
+         d.addCallback(cbRendered)
+ 
+@@ -1516,7 +1516,7 @@
+             errors = self.flushLoggedErrors(RuntimeError)
+             self.assertEqual(len(errors), 1)
+ 
+-            response = channel.transport.written.getvalue()
++            response = channel.transport.value()
+             self.assertTrue(response.startswith('HTTP/1.1 200 OK'))
+             # Chunked transfer-encoding makes this a little messy.
+             self.assertIn(responseContent, response)
+@@ -1527,7 +1527,7 @@
+             lambda: channel, 'GET', '1.1', [], [''], None, [])
+ 
+         # By now the connection should be closed.
+-        self.assertTrue(channel.transport.disconnected)
++        self.assertTrue(channel.transport.disconnecting)
+         # Give it a little push to go the rest of the way.
+         requests[0].connectionLost(Failure(ConnectionLost("All gone")))
+ 
+Index: twisted/web/test/test_web.py
+===================================================================
+--- twisted/web/test/test_web.py	(revision 38290)
++++ twisted/web/test/test_web.py	(working copy)
+@@ -538,7 +538,7 @@
+         request.requestHeaders.setRawHeaders(b"Accept-Encoding",
+                                              [b"gzip,deflate"])
+         request.requestReceived(b'GET', b'/foo', b'HTTP/1.0')
+-        data = self.channel.transport.written.getvalue()
++        data = self.channel.transport.value()
+         self.assertNotIn(b"Content-Length", data)
+         self.assertIn(b"Content-Encoding: gzip\r\n", data)
+         body = data[data.find(b"\r\n\r\n") + 4:]
+@@ -556,7 +556,7 @@
+         request.requestHeaders.setRawHeaders(b"Accept-Encoding",
+                                              [b"foo,bar"])
+         request.requestReceived(b'GET', b'/foo', b'HTTP/1.0')
+-        data = self.channel.transport.written.getvalue()
++        data = self.channel.transport.value()
+         self.assertIn(b"Content-Length", data)
+         self.assertNotIn(b"Content-Encoding: gzip\r\n", data)
+         body = data[data.find(b"\r\n\r\n") + 4:]
+@@ -574,7 +574,7 @@
+         request.requestHeaders.setRawHeaders(b"Accept-Encoding",
+                                              [b"deflate", b"gzip"])
+         request.requestReceived(b'GET', b'/foo', b'HTTP/1.0')
+-        data = self.channel.transport.written.getvalue()
++        data = self.channel.transport.value()
+         self.assertNotIn(b"Content-Length", data)
+         self.assertIn(b"Content-Encoding: gzip\r\n", data)
+         body = data[data.find(b"\r\n\r\n") + 4:]
+@@ -594,7 +594,7 @@
+         request.responseHeaders.setRawHeaders(b"Content-Encoding",
+                                              [b"deflate"])
+         request.requestReceived(b'GET', b'/foo', b'HTTP/1.0')
+-        data = self.channel.transport.written.getvalue()
++        data = self.channel.transport.value()
+         self.assertNotIn(b"Content-Length", data)
+         self.assertIn(b"Content-Encoding: deflate,gzip\r\n", data)
+         body = data[data.find(b"\r\n\r\n") + 4:]
+@@ -615,7 +615,7 @@
+         request.responseHeaders.setRawHeaders(b"Content-Encoding",
+                                              [b"foo", b"bar"])
+         request.requestReceived(b'GET', b'/foo', b'HTTP/1.0')
+-        data = self.channel.transport.written.getvalue()
++        data = self.channel.transport.value()
+         self.assertNotIn(b"Content-Length", data)
+         self.assertIn(b"Content-Encoding: foo,bar,gzip\r\n", data)
+         body = data[data.find(b"\r\n\r\n") + 4:]
+Index: twisted/web/test/test_http.py
+===================================================================
+--- twisted/web/test/test_http.py	(revision 38290)
++++ twisted/web/test/test_http.py	(working copy)
+@@ -1256,7 +1256,7 @@
+         req.setResponseCode(201)
+         req.write(b'')
+         self.assertEqual(
+-            channel.transport.written.getvalue().splitlines()[0],
++            channel.transport.value().splitlines()[0],
+             b"(no clientproto yet) 201 Created")
+ 
+ 
+@@ -1270,7 +1270,7 @@
+         req.setResponseCode(202, "happily accepted")
+         req.write(b'')
+         self.assertEqual(
+-            channel.transport.written.getvalue().splitlines()[0],
++            channel.transport.value().splitlines()[0],
+             b'(no clientproto yet) 202 happily accepted')
+ 
+ 
+@@ -1585,7 +1585,8 @@
+         req = http.Request(DummyChannel(), False)
+         producer = DummyProducer()
+         req.registerProducer(producer, True)
+-        self.assertEqual([(producer, True)], req.transport.producers)
++        self.assertEqual(producer, req.transport.producer)
++        self.assertEqual(True, req.transport.streaming)
+ 
+ 
+     def test_registerProducerWhenNotQueuedRegistersPullProducer(self):
+@@ -1597,7 +1598,8 @@
+         req = http.Request(DummyChannel(), False)
+         producer = DummyProducer()
+         req.registerProducer(producer, False)
+-        self.assertEqual([(producer, False)], req.transport.producers)
++        self.assertEqual(producer, req.transport.producer)
++        self.assertEqual(False, req.transport.streaming)
+ 
+ 
+     def test_connectionLostNotification(self):

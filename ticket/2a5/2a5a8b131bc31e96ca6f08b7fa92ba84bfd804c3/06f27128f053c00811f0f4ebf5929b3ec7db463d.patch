@@ -1,0 +1,387 @@
+diff --git a/twisted/python/failure.py b/twisted/python/failure.py
+index e79862d..90d0afc 100644
+--- a/twisted/python/failure.py
++++ b/twisted/python/failure.py
+@@ -18,6 +18,7 @@ import sys
+ import linecache
+ import inspect
+ import opcode
++import pdb
+ from inspect import getmro
+ 
+ from twisted.python.compat import _PY3, NativeStringIO as StringIO
+@@ -629,26 +630,39 @@ def _safeReprVars(varsDictItems):
+ # slyphon: make post-morteming exceptions tweakable
+ 
+ DO_POST_MORTEM = True
++_Failure__init__ = Failure.__init__
+ 
+-def _debuginit(self, exc_value=None, exc_type=None, exc_tb=None,
+-               captureVars=False,
+-               Failure__init__=Failure.__init__):
++
++def startDebugMode(debugger=None):
+     """
+-    Initialize failure object, possibly spawning pdb.
++    Enable debug hooks for L{Failure}s.
+     """
+-    if (exc_value, exc_type, exc_tb) == (None, None, None):
+-        exc = sys.exc_info()
+-        if not exc[0] == self.__class__ and DO_POST_MORTEM:
+-            try:
+-                strrepr = str(exc[1])
+-            except:
+-                strrepr = "broken str"
+-            print("Jumping into debugger for post-mortem of exception '%s':" % (strrepr,))
+-            import pdb
+-            pdb.post_mortem(exc[2])
+-    Failure__init__(self, exc_value, exc_type, exc_tb, captureVars)
+-
+-
+-def startDebugMode():
+-    """Enable debug hooks for Failures."""
++
++    if debugger is None:
++        debugger = pdb
++    post_mortem = getattr(debugger, "post_mortem", pdb.post_mortem)
++
++    def _debuginit(self, exc_value=None, exc_type=None, exc_tb=None,
++                   captureVars=False):
++        """
++        Initialize failure object, possibly spawning the debugger.
++        """
++        if (exc_value, exc_type, exc_tb) == (None, None, None):
++            exc = sys.exc_info()
++            if not exc[0] == self.__class__ and DO_POST_MORTEM:
++                try:
++                    strrepr = str(exc[1])
++                except:
++                    strrepr = "broken str"
++                print("Jumping into debugger for post-mortem of exception '%s':" % (strrepr,))
++                post_mortem(exc[2])
++        _Failure__init__(self, exc_value, exc_type, exc_tb, captureVars)
++
+     Failure.__init__ = _debuginit
++
++
++def stopDebugMode():
++    """
++    Disable debug hooks for L{Failure}s.
++    """
++    Failure.__init__ = _Failure__init__
+diff --git a/twisted/scripts/trial.py b/twisted/scripts/trial.py
+index 46859d5..c4ea5eb 100644
+--- a/twisted/scripts/trial.py
++++ b/twisted/scripts/trial.py
+@@ -207,6 +207,21 @@ class _BasicOptions(object):
+         sys.exit(0)
+ 
+ 
++    def opt_debugger(self, debugger):
++        """
++        Load a debugger.
++        """
++        if debugger == 'pdb':
++            self["debugger"] = _wrappedPdb()
++            return
++
++        try:
++            self["debugger"] = reflect.namedAny(debugger)
++        except reflect.ModuleNotFound:
++            raise usage.UsageError(
++                "%r debugger could not be found." % (debugger,))
++
++
+     def opt_disablegc(self):
+         """
+         Disable the garbage collector
+@@ -390,7 +405,7 @@ class Options(_BasicOptions, usage.Options, app.ReactorSelectionMixin):
+ def _initialDebugSetup(config):
+     # do this part of debug setup first for easy debugging of import failures
+     if config['debug']:
+-        failure.startDebugMode()
++        failure.startDebugMode(debugger=config["debugger"])
+     if config['debug'] or config['debug-stacktraces']:
+         defer.setDebugging(True)
+ 
+@@ -438,16 +453,6 @@ def _wrappedPdb():
+     return dbg
+ 
+ 
+-class _DebuggerNotFound(Exception):
+-    """
+-    A debugger import failed.
+-
+-    Used to allow translating these errors into usage error messages.
+-
+-    """
+-
+-
+-
+ def _makeRunner(config):
+     """
+     Return a trial runner class set up with the parameters extracted from
+@@ -474,17 +479,7 @@ def _makeRunner(config):
+     else:
+         if config['debug']:
+             args['mode'] = runner.TrialRunner.DEBUG
+-            debugger = config['debugger']
+-
+-            if debugger != 'pdb':
+-                try:
+-                    args['debugger'] = reflect.namedAny(debugger)
+-                except reflect.ModuleNotFound:
+-                    raise _DebuggerNotFound(
+-                        '%r debugger could not be found.' % (debugger,))
+-            else:
+-                args['debugger'] = _wrappedPdb()
+-
++            args['debugger'] = config['debugger']
+         args['profile'] = config['profile']
+         args['forceGarbageCollection'] = config['force-gc']
+ 
+@@ -500,14 +495,11 @@ def run():
+         config.parseOptions()
+     except usage.error, ue:
+         raise SystemExit, "%s: %s" % (sys.argv[0], ue)
+-    _initialDebugSetup(config)
+-
+-    try:
+-        trialRunner = _makeRunner(config)
+-    except _DebuggerNotFound as e:
+-        raise SystemExit('%s: %s' % (sys.argv[0], str(e)))
+ 
++    _initialDebugSetup(config)
++    trialRunner = _makeRunner(config)
+     suite = _getSuite(config)
++
+     if config['until-failure']:
+         test_result = trialRunner.runUntilFailure(suite)
+     else:
+diff --git a/twisted/test/test_failure.py b/twisted/test/test_failure.py
+index cbcda41..c7aece7 100644
+--- a/twisted/test/test_failure.py
++++ b/twisted/test/test_failure.py
+@@ -752,60 +752,89 @@ class TestFrameAttributes(SynchronousTestCase):
+ 
+ 
+ 
++class StubDebugger(object):
++    """
++    Used to test L{Failure.startDebugMode}.
++    """
++    def __init__(self):
++        self.mortems = []
++        self.post_mortem = self.mortems.append
++
++
++
+ class TestDebugMode(SynchronousTestCase):
+     """
+-    Failure's debug mode should allow jumping into the debugger.
++    Failure's debug mode should allow jumping into a debugger.
+     """
+ 
+     def setUp(self):
+-        """
+-        Override pdb.post_mortem so we can make sure it's called.
+-        """
+-        # Make sure any changes we make are reversed:
+-        post_mortem = pdb.post_mortem
+-        if _PY3:
+-            origInit = failure.Failure.__init__
+-        else:
+-            origInit = failure.Failure.__dict__['__init__']
+-        def restore():
+-            pdb.post_mortem = post_mortem
+-            if _PY3:
+-                failure.Failure.__init__ = origInit
+-            else:
+-                failure.Failure.__dict__['__init__'] = origInit
+-        self.addCleanup(restore)
+-
+-        self.result = []
+-        pdb.post_mortem = self.result.append
+-        failure.startDebugMode()
++        self.debugger = StubDebugger()
+ 
++    def tearDown(self):
++        failure.stopDebugMode()
+ 
+     def test_regularFailure(self):
+         """
+-        If startDebugMode() is called, calling Failure() will first call
+-        pdb.post_mortem with the traceback.
++        If L{Failure.startDebugMode} is called, instantiating L{Failure} will
++        first call the debugger's C{post_mortem} method with the traceback.
+         """
++        failure.startDebugMode(self.debugger)
++
+         try:
+-            1/0
++            raise ZeroDivisionError()
+         except:
+-            typ, exc, tb = sys.exc_info()
++            _, _, tb = sys.exc_info()
+             f = failure.Failure()
+-        self.assertEqual(self.result, [tb])
+-        self.assertEqual(f.captureVars, False)
++        self.assertEqual(self.debugger.mortems, [tb])
++        self.assertFalse(f.captureVars)
+ 
+ 
+     def test_captureVars(self):
+         """
+-        If startDebugMode() is called, passing captureVars to Failure() will
+-        not blow up.
++        If L{Failure.startDebugMode} is called, instantiating L{Failure} with
++        C{captureVars} still works.
+         """
++        failure.startDebugMode(self.debugger)
++
+         try:
+-            1/0
++            raise ZeroDivisionError()
+         except:
+-            typ, exc, tb = sys.exc_info()
++            _, _, tb = sys.exc_info()
+             f = failure.Failure(captureVars=True)
+-        self.assertEqual(self.result, [tb])
+-        self.assertEqual(f.captureVars, True)
++        self.assertEqual(self.debugger.mortems, [tb])
++        self.assertTrue(f.captureVars)
++
++
++    def test_defaultDebuggerIsPDB(self):
++        """
++        If L{Failure.startDebugMode} is called without a debugger, L{pdb} is
++        used.
++        """
++        self.patch(pdb, "post_mortem", self.debugger.post_mortem)
++        failure.startDebugMode()
++
++        try:
++            raise ZeroDivisionError()
++        except:
++            _, _, tb = sys.exc_info()
++            f = failure.Failure()
++        self.assertEqual(self.debugger.mortems, [tb])
++
++
++    def test_missingPostMortem(self):
++        """
++        If L{Failure.startDebugMode} is called with a debugger without a
++        C{post_mortem}, method L{pdb} is used.
++        """
++        self.patch(pdb, "post_mortem", self.debugger.post_mortem)
++        failure.startDebugMode(object())
++
++        try:
++            raise ZeroDivisionError()
++        except:
++            _, _, tb = sys.exc_info()
++            f = failure.Failure()
++        self.assertEqual(self.debugger.mortems, [tb])
+ 
+ 
+ 
+diff --git a/twisted/topfiles/5795.feature b/twisted/topfiles/5795.feature
+new file mode 100644
+index 0000000..7c99f32
+--- /dev/null
++++ b/twisted/topfiles/5795.feature
+@@ -0,0 +1 @@
++failure.startDebugMode now takes a debugger to drop into, and respects --debugger as provided on the command line.
+diff --git a/twisted/trial/test/test_script.py b/twisted/trial/test/test_script.py
+index 45a254b..e8280a5 100644
+--- a/twisted/trial/test/test_script.py
++++ b/twisted/trial/test/test_script.py
+@@ -9,7 +9,7 @@ from twisted.trial.runner import (
+     TrialRunner, TestSuite, DestructiveTestSuite, TestLoader)
+ from twisted.trial._dist.disttrial import DistTrialRunner
+ from twisted.scripts import trial
+-from twisted.python import util
++from twisted.python import failure, util
+ from twisted.python.usage import UsageError
+ from twisted.python.filepath import FilePath
+ 
+@@ -551,6 +551,10 @@ class MakeRunnerTestCase(unittest.TestCase):
+ 
+ 
+     def test_DebuggerNotFound(self):
++        """
++        If a debugger cannot be found using L{namedAny}, a L{UsageError} is
++        raised.
++        """
+         namedAny = trial.reflect.namedAny
+ 
+         def namedAnyExceptdoNotFind(fqn):
+@@ -561,9 +565,10 @@ class MakeRunnerTestCase(unittest.TestCase):
+         self.patch(trial.reflect, "namedAny", namedAnyExceptdoNotFind)
+ 
+         options = trial.Options()
+-        options.parseOptions(["--debug", "--debugger", "doNotFind"])
+-
+-        self.assertRaises(trial._DebuggerNotFound, trial._makeRunner, options)
++        self.assertRaises(
++            UsageError,
++            options.parseOptions,
++            ["--debug", "--debugger", "doNotFind"])
+ 
+ 
+ class TestRun(unittest.TestCase):
+@@ -572,9 +577,39 @@ class TestRun(unittest.TestCase):
+     """
+ 
+     def setUp(self):
+-        # don't re-parse cmdline options, because if --reactor was passed to
+-        # the test run trial will try to restart the (already running) reactor
+-        self.patch(trial.Options, "parseOptions", lambda self: None)
++        # Calling trial.run() will call usage.Options().parseOptions(), which
++        # grabs sys.argv. Patch it, so it doesn't get the arguments from the
++        # outer trial run.
++        self.argv = [sys.argv[0]]
++        self.patch(trial.sys, "argv", self.argv)
++
++
++    def test_setsUpFailureDebugMode(self):
++        """
++        When a debug mode is enabled, L{failure.startDebugMode} is called with
++        the provided debugger.
++
++        """
++
++        self.argv.extend(
++            [
++                "--debug",
++                "--debugger",
++                "twisted.trial.test.test_runner.TestRunner.cdebugger",
++            ],
++        )
++
++        def recordDebugger(debugger):
++            self.debugger = debugger
++        self.patch(failure, "startDebugMode", recordDebugger)
++
++        try:
++            trial.run()
++        except SystemExit:
++            pass
++
++        from twisted.trial.test.test_runner import TestRunner
++        self.assertEqual(self.debugger, TestRunner.cdebugger)
+ 
+ 
+     def test_debuggerNotFound(self):
+@@ -583,9 +618,8 @@ class TestRun(unittest.TestCase):
+ 
+         """
+ 
+-        def _makeRunner(*args, **kwargs):
+-            raise trial._DebuggerNotFound('foo')
+-        self.patch(trial, "_makeRunner", _makeRunner)
++        self.argv.extend(["--debug", "--debugger", "foo"])
++        self.addCleanup(trial.failure.stopDebugMode)
+ 
+         try:
+             trial.run()

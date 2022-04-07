@@ -1,0 +1,186 @@
+Index: twisted/mail/test/test_smtp.py
+===================================================================
+--- twisted/mail/test/test_smtp.py	(revision 38820)
++++ twisted/mail/test/test_smtp.py	(working copy)
+@@ -4,6 +4,7 @@
+ """
+ Test cases for twisted.mail.smtp module.
+ """
++import inspect
+ 
+ from zope.interface import implements, directlyProvides
+ 
+@@ -13,7 +14,7 @@
+ from twisted.mail import smtp
+ from twisted.internet import defer, protocol, reactor, interfaces
+ from twisted.internet import address, error, task
+-from twisted.test.proto_helpers import StringTransport
++from twisted.test.proto_helpers import MemoryReactor, StringTransport
+ 
+ from twisted import cred
+ import twisted.cred.error
+@@ -1649,3 +1650,80 @@
+             warningsShown[0]['message'],
+             "tlsMode attribute of twisted.mail.smtp.ESMTPClient "
+             "is deprecated since Twisted 13.0")
++
++
++
++class StringTransport(StringTransport):
++    """
++    A version of C{StringTransport} that supports C{abortConnection}.
++    """
++    aborting = False
++
++
++    def abortConnection(self):
++        """
++        A testable version of the C{ITCPTransport.abortConnection} method.
++
++        Since this is a special case of closing the connection,
++        C{loseConnection} is also called.
++        """
++        self.aborting = True
++        self.loseConnection()
++
++
++
++class SendmailTestCase(unittest.TestCase):
++    """
++    Tests for L{twisted.mail.smtp.sendmail}.
++    """
++    def test_defaultReactorIsGlobalReactor(self):
++        """
++        The default C{_reactor} parameter of L{twisted.mail.smtp.sendmail} is
++        L{twisted.internet.reactor}.
++        """
++        args, varArgs, keywords, defaults = inspect.getargspec(smtp.sendmail)
++        index = len(args)-args.index("_reactor")+1
++        self.assertEqual(reactor, defaults[index])
++
++
++    def test_cancelBeforeConnectionMade(self):
++        """
++        When a user cancels L{twisted.mail.smtp.sendmail} before the connection
++        is made, the connection is closed by
++        L{twisted.internet.interfaces.IConnector.disconnect}.
++
++        @rtype: C{Deferred}
++        @return: A C{Deferred} returned by L{twisted.mail.smtp.sendmail}.
++        """
++        reactor = MemoryReactor()
++        d = smtp.sendmail("localhost", "source@address", "recipient@address",
++                          "message", _reactor=reactor)
++        connector = reactor.connectors[0]
++        d.cancel()
++        self.assertEqual(connector._disconnected, True)
++        self.assertFailure(d, defer.CancelledError)
++        return d
++
++
++    def test_cancelAfterConnectionMade(self):
++        """
++        When a user cancels L{twisted.mail.smtp.sendmail} after the connection
++        is made, the connection is closed by
++        L{twisted.internet.interfaces.ITransport.abortConnection}.
++
++        @rtype: C{Deferred}
++        @return: A C{Deferred} returned by L{twisted.mail.smtp.sendmail}.
++        """
++        reactor = MemoryReactor()
++        transport = StringTransport()
++        d = smtp.sendmail("localhost", "source@address", "recipient@address",
++                          "message", _reactor=reactor)
++        factory = reactor.tcpClients[0][2]
++        connector = reactor.connectors[0]
++        p = factory.buildProtocol(None)
++        p.makeConnection(transport)
++        d.cancel()
++        self.assertEqual(transport.aborting, True)
++        self.assertEqual(transport.disconnecting, True)
++        self.assertFailure(d, defer.CancelledError)
++        return d
+Index: twisted/mail/smtp.py
+===================================================================
+--- twisted/mail/smtp.py	(revision 38820)
++++ twisted/mail/smtp.py	(working copy)
+@@ -1752,6 +1752,7 @@
+         self.result = deferred
+         self.result.addBoth(self._removeDeferred)
+         self.sendFinished = 0
++        self.p = None
+ 
+         self.retries = -retries
+         self.timeout = timeout
+@@ -1786,10 +1787,18 @@
+         p = self.protocol(self.domain, self.nEmails*2+2)
+         p.factory = self
+         p.timeout = self.timeout
++        self.p = p
++        self.result.addBoth(self._removeProtocol)
+         return p
+ 
++    def _removeProtocol(self, argh):
++        if self.p:
++            del self.p
++            self.p = None
++        return argh
+ 
+ 
++
+ from twisted.mail.imap4 import IClientAuthentication
+ from twisted.mail.imap4 import CramMD5ClientAuthenticator, LOGINAuthenticator
+ from twisted.mail.imap4 import LOGINCredentials as _lcredentials
+@@ -1894,7 +1903,8 @@
+         p.timeout = self.timeout
+         return p
+ 
+-def sendmail(smtphost, from_addr, to_addrs, msg, senderDomainName=None, port=25):
++def sendmail(smtphost, from_addr, to_addrs, msg,
++             senderDomainName=None, port=25, _reactor=reactor):
+     """Send an email
+ 
+     This interface is intended to be a direct replacement for
+@@ -1921,9 +1931,13 @@
+ 
+     @param port: Remote port to which to connect.
+ 
++    @param _reactor: The reactor used to make TCP connection.
++
+     @rtype: L{Deferred}
+-    @returns: A L{Deferred}, its callback will be called if a message is sent
+-        to ANY address, the errback if no message is sent.
++    @returns: A cancellable L{Deferred}, its callback will be called if a 
++        message is sent to ANY address, the errback if no message is sent. When
++        the C{cancel} method is called, it will stop retry and disconnect the
++        connection immediately.
+ 
+         The callback will be called with a tuple (numOk, addresses) where numOk
+         is the number of successful recipient addresses and addresses is a list
+@@ -1934,13 +1948,24 @@
+         # It's not a file
+         msg = StringIO(str(msg))
+ 
+-    d = defer.Deferred()
++    def cancel(d):
++        """
++        Cancel the L{twisted.mail.smtp.sendmail} call, tell the factory not to
++        retry and disconnect the connection.
++        """
++        factory.sendFinished = 1
++        if factory.p:
++            factory.p.transport.abortConnection()
++        else:
++            # Connection hasn't been made yet
++            connector.disconnect()
++    d = defer.Deferred(cancel)
+     factory = SMTPSenderFactory(from_addr, to_addrs, msg, d)
+ 
+     if senderDomainName is not None:
+         factory.domain = senderDomainName
+ 
+-    reactor.connectTCP(smtphost, port, factory)
++    connector = _reactor.connectTCP(smtphost, port, factory)
+ 
+     return d
+ 

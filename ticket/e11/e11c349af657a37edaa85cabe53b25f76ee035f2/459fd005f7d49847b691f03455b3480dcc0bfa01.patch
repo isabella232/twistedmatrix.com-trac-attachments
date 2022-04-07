@@ -1,0 +1,1543 @@
+diff --git a/twisted/internet/abstract.py b/twisted/internet/abstract.py
+index 4419d61..eea676a 100644
+--- a/twisted/internet/abstract.py
++++ b/twisted/internet/abstract.py
+@@ -1,5 +1,5 @@
+ # -*- test-case-name: twisted.test.test_abstract -*-
+-# Copyright (c) 2001-2007 Twisted Matrix Laboratories.
++# Copyright (c) 2001-2008 Twisted Matrix Laboratories.
+ # See LICENSE for details.
+ 
+ 
+@@ -10,6 +10,8 @@ API Stability: stable
+ Maintainer: U{Itamar Shtull-Trauring<mailto:twisted@itamarst.org>}
+ """
+ 
++import socket
++
+ from zope.interface import implements
+ 
+ # Twisted Imports
+@@ -366,4 +368,17 @@ def isIPAddress(addr):
+     return False
+ 
+ 
++def isIPv6Address(ip):
++    """
++    Return True iff ip is a valid bare IPv6 address.
++
++    Return False for 'enhanced' IPv6 addresses like '::1%lo' and '::1/128'
++    """
++    try:
++        socket.inet_pton(socket.AF_INET6, ip)
++    except (ValueError, socket.error):
++        return False
++    return True
++
++
+ __all__ = ["FileDescriptor"]
+diff --git a/twisted/internet/address.py b/twisted/internet/address.py
+index b349080..3f25770 100644
+--- a/twisted/internet/address.py
++++ b/twisted/internet/address.py
+@@ -21,14 +21,15 @@ class IPv4Address(object):
+     # _bwHack is given to old users who think we are a tuple. They expected
+     # addr[0] to define the socket type rather than the address family, so
+     # the value comes from a different namespace than the new .type value:
+-    
++
+     #  type = map[_bwHack]
+     # map = { 'SSL': 'TCP', 'INET': 'TCP', 'INET_UDP': 'UDP' }
+ 
+     implements(IAddress)
+-    
++
+     def __init__(self, type, host, port, _bwHack = None):
+-        assert type in ('TCP', 'UDP')
++        if type not in ('TCP', 'UDP'):
++            raise ValueError, "illegal transport type"
+         self.type = type
+         self.host = host
+         self.port = port
+@@ -56,6 +57,40 @@ class IPv4Address(object):
+     def __str__(self):
+         return 'IPv4Address(%s, %r, %d)' % (self.type, self.host, self.port)
+ 
++class IPv6Address(object):
++    """
++    Object representing an IPv6 socket endpoint.
++
++    @ivar type: A string describing the type of transport, either 'TCP' or 'UDP'.
++    @ivar host: A string containing the coloned-oct IP address.
++    @ivar port: An integer representing the port number.
++    @ivar flowinfo: An integer representing the sockaddr-in6 flowinfo
++    @ivar scopeid: An integer representing the sockaddr-in6 scopeid
++    """
++
++    implements(IAddress)
++
++    def __init__(self, type, host, port, flowinfo=0, scopeid=0):
++        if type not in ('TCP', 'UDP'):
++            raise ValueError, "illegal transport type"
++        self.type = type
++        self.host = host
++        self.port = port
++        self.flowinfo = flowinfo
++        self.scopeid = scopeid
++
++    def __eq__(self, other):
++        if isinstance(other, tuple):
++            return tuple(self) == other
++        elif isinstance(other, IPv6Address):
++            a = (self.type, self.host, self.port, self.flowinfo, self.scopeid)
++            b = (other.type, other.host, other.port, other.flowinfo, other.scopeid)
++            return a == b
++        return False
++
++    def __str__(self):
++        return 'IPv6Address(%s, %r, %d, %s, %s, %s)' % (self.type, self.host,
++          self.port, self.flowinfo, self.scopeid)
+ 
+ class UNIXAddress(object):
+     """
+@@ -66,11 +101,11 @@ class UNIXAddress(object):
+     """
+ 
+     implements(IAddress)
+-    
++
+     def __init__(self, name, _bwHack='UNIX'):
+         self.name = name
+         self._bwHack = _bwHack
+-    
++
+     def __getitem__(self, index):
+         warnings.warn("UNIXAddress.__getitem__ is deprecated.  Use attributes instead.",
+                       category=DeprecationWarning, stacklevel=2)
+@@ -100,7 +135,7 @@ class UNIXAddress(object):
+ 
+ class _ServerFactoryIPv4Address(IPv4Address):
+     """Backwards compatability hack. Just like IPv4Address in practice."""
+-    
++
+     def __eq__(self, other):
+         if isinstance(other, tuple):
+             warnings.warn("IPv4Address.__getitem__ is deprecated.  Use attributes instead.",
+diff --git a/twisted/internet/base.py b/twisted/internet/base.py
+index 3337fca..8f7e16c 100644
+--- a/twisted/internet/base.py
++++ b/twisted/internet/base.py
+@@ -194,6 +194,18 @@ class DelayedCall(styles.Ephemeral):
+         return "".join(L)
+ 
+ 
++def getHostByName(name):
++    """
++    Call socket.getaddrinfo, using the args and return value type of
++    socket.gethostbyname
++    """
++    lst = socket.getaddrinfo(name, None)
++    res = lst[0]
++    (family, socktype, proto, canonname, sockaddr) = res
++    address = sockaddr[0]
++    return address
++
++
+ class ThreadedResolver:
+     implements(IResolverSimple)
+ 
+@@ -224,13 +236,15 @@ class ThreadedResolver:
+             else:
+                 userDeferred.callback(result)
+ 
++
++
+     def getHostByName(self, name, timeout = (1, 3, 11, 45)):
+         if timeout:
+             timeoutDelay = reduce(operator.add, timeout)
+         else:
+             timeoutDelay = 60
+         userDeferred = defer.Deferred()
+-        lookupDeferred = threads.deferToThread(socket.gethostbyname, name)
++        lookupDeferred = threads.deferToThread(getHostByName, name)
+         cancelCall = self.reactor.callLater(
+             timeoutDelay, self._cleanup, name, lookupDeferred)
+         self._runningQueries[lookupDeferred] = (userDeferred, cancelCall)
+@@ -242,7 +256,7 @@ class BlockingResolver:
+ 
+     def getHostByName(self, name, timeout = (1, 3, 11, 45)):
+         try:
+-            address = socket.gethostbyname(name)
++            address = getHostByName(name)
+         except socket.error:
+             msg = "address %r not found" % (name,)
+             err = error.DNSLookupError(msg)
+diff --git a/twisted/internet/interfaces.py b/twisted/internet/interfaces.py
+index d9c2744..3d1b45a 100644
+--- a/twisted/internet/interfaces.py
++++ b/twisted/internet/interfaces.py
+@@ -209,6 +209,51 @@ class IReactorTCP(Interface):
+                  docs for details.
+         """
+ 
++class IReactorTCP6(Interface):
++
++    def listenTCP6(port, factory, backlog=50, interface=''):
++        """
++        Connects a given protocol factory to the given numeric TCP/IPv6 port.
++
++        @param port: a port number on which to listen
++
++        @param factory: a L{twisted.internet.protocol.ServerFactory} instance
++
++        @param backlog: size of the listen queue
++
++        @param interface: the hostname to bind to, defaults to '' (all)
++
++        @return: an object that provides L{IListeningPort}.
++
++        @raise CannotListenError: as defined here
++                                  L{twisted.internet.error.CannotListenError},
++                                  if it cannot listen on this port (e.g., it
++                                  cannot bind to the required port number)
++        """
++
++    def connectTCP6(host, port, factory, timeout=30, bindAddress=None):
++        """
++        Connect a TCPv6 client.
++
++        @param host: a host name
++
++        @param port: a port number
++
++        @param factory: a L{twisted.internet.protocol.ClientFactory} instance
++
++        @param timeout: number of seconds to wait before assuming the
++                        connection has failed.
++
++        @param bindAddress: a (host, port) tuple of local address to bind
++                            to, or None.
++
++        @return: An object which provides L{IConnector}. This connector will
++                 call various callbacks on the factory when a connection is
++                 made, failed, or lost - see
++                 L{ClientFactory<twisted.internet.protocol.ClientFactory>}
++                 docs for details.
++        """
++
+ class IReactorSSL(Interface):
+ 
+     def connectSSL(host, port, factory, contextFactory, timeout=30, bindAddress=None):
+diff --git a/twisted/internet/posixbase.py b/twisted/internet/posixbase.py
+index ab2d9b5..691f265 100644
+--- a/twisted/internet/posixbase.py
++++ b/twisted/internet/posixbase.py
+@@ -1,6 +1,6 @@
+ # -*- test-case-name: twisted.test.test_internet -*-
+ #
+-# Copyright (c) 2001-2007 Twisted Matrix Laboratories.
++# Copyright (c) 2001-2008 Twisted Matrix Laboratories.
+ # See LICENSE for details.
+ 
+ 
+@@ -22,6 +22,7 @@ from zope.interface import implements, classImplements
+ 
+ from twisted.internet.interfaces import IReactorUNIX, IReactorUNIXDatagram
+ from twisted.internet.interfaces import IReactorTCP, IReactorUDP, IReactorSSL, IReactorArbitrary
++from twisted.internet.interfaces import IReactorTCP6
+ from twisted.internet.interfaces import IReactorProcess, IReactorMulticast
+ from twisted.internet.interfaces import IHalfCloseableDescriptor
+ from twisted.internet import error
+@@ -167,7 +168,8 @@ class PosixReactorBase(ReactorBase):
+     """
+     A basis for reactors that use file descriptors.
+     """
+-    implements(IReactorArbitrary, IReactorTCP, IReactorUDP, IReactorMulticast)
++    implements(IReactorArbitrary, IReactorTCP, IReactorTCP6, IReactorUDP,
++               IReactorMulticast)
+ 
+     def __init__(self):
+         ReactorBase.__init__(self)
+@@ -481,6 +483,26 @@ class PosixReactorBase(ReactorBase):
+         c.connect()
+         return c
+ 
++    # IReactorTCP6
++
++    def listenTCP6(self, port, factory, backlog=50, interface=''):
++        """
++        @see: twisted.internet.interfaces.IReactorTCP.listenTCP6
++        """
++        p = tcp.Port6(port, factory, backlog, interface, self)
++        p.startListening()
++        return p
++
++    def connectTCP6(self, host, port, factory, timeout=30, bindAddress=None,
++                    flowinfo=0, scopeid=0):
++        """
++        @see: twisted.internet.interfaces.IReactorTCP.connectTCP6
++        """
++        c = tcp.Connector6(host, port, factory, timeout, bindAddress, self,
++                           flowinfo, scopeid)
++        c.connect()
++        return c
++
+     # IReactorSSL (sometimes, not implemented)
+ 
+     def connectSSL(self, host, port, factory, contextFactory, timeout=30, bindAddress=None):
+diff --git a/twisted/internet/protocol.py b/twisted/internet/protocol.py
+index 15e344c..5909d09 100644
+--- a/twisted/internet/protocol.py
++++ b/twisted/internet/protocol.py
+@@ -1,6 +1,6 @@
+ # -*- test-case-name: twisted.test.test_factories -*-
+ #
+-# Copyright (c) 2001-2004 Twisted Matrix Laboratories.
++# Copyright (c) 2001-2008 Twisted Matrix Laboratories.
+ # See LICENSE for details.
+ 
+ 
+@@ -137,7 +137,7 @@ class _InstanceFactory(ClientFactory):
+     """Factory used by ClientCreator."""
+ 
+     noisy = False
+-    
++
+     def __init__(self, reactor, instance, deferred):
+         self.reactor = reactor
+         self.instance = instance
+@@ -145,7 +145,7 @@ class _InstanceFactory(ClientFactory):
+ 
+     def __repr__(self):
+         return "<ClientCreator factory: %r>" % (self.instance, )
+-    
++
+     def buildProtocol(self, addr):
+         self.reactor.callLater(0, self.deferred.callback, self.instance)
+         del self.deferred
+@@ -162,7 +162,7 @@ class ClientCreator:
+     The various connect* methods create a protocol instance using the given
+     protocol class and arguments, and connect it, returning a Deferred of the
+     resulting protocol instance.
+-    
++
+     Useful for cases when we don't really need a factory.  Mainly this
+     is when there is no shared state between protocol instances, and no need
+     to reconnect.
+@@ -181,13 +181,25 @@ class ClientCreator:
+         self.reactor.connectTCP(host, port, f, timeout=timeout, bindAddress=bindAddress)
+         return d
+ 
++    def connectTCP6(self, host, port, timeout=30, bindAddress=None):
++        """
++        Connect to remote host, return Deferred of resulting protocol instance.
++        @see twisted.internet.interfaces.IReactorTCP6.connectTCP6
++        """
++        d = defer.Deferred()
++        f = _InstanceFactory(self.reactor, self.protocolClass(*self.args, 
++                                                    **self.kwargs), d)
++        self.reactor.connectTCP6(host, port, f, timeout=timeout, 
++                                 bindAddress=bindAddress)
++        return d
++
+     def connectUNIX(self, address, timeout = 30, checkPID=0):
+         """Connect to Unix socket, return Deferred of resulting protocol instance."""
+         d = defer.Deferred()
+         f = _InstanceFactory(self.reactor, self.protocolClass(*self.args, **self.kwargs), d)
+         self.reactor.connectUNIX(address, f, timeout = timeout, checkPID=checkPID)
+         return d
+-    
++
+     def connectSSL(self, host, port, contextFactory, timeout=30, bindAddress=None):
+         """Connect to SSL server, return Deferred of resulting protocol instance."""
+         d = defer.Deferred()
+@@ -630,12 +642,12 @@ class FileWrapper:
+     def pauseProducing(self):
+         # Never sends data anyways
+         pass
+-    
++
+     def stopProducing(self):
+         self.loseConnection()
+-        
+ 
+-__all__ = ["Factory", "ClientFactory", "ReconnectingClientFactory", "connectionDone", 
++
++__all__ = ["Factory", "ClientFactory", "ReconnectingClientFactory", "connectionDone",
+            "Protocol", "ProcessProtocol", "FileWrapper", "ServerFactory",
+            "AbstractDatagramProtocol", "DatagramProtocol", "ConnectedDatagramProtocol",
+            "ClientCreator"]
+diff --git a/twisted/internet/tcp.py b/twisted/internet/tcp.py
+index bbb7029..2a567eb 100644
+--- a/twisted/internet/tcp.py
++++ b/twisted/internet/tcp.py
+@@ -52,8 +52,8 @@ if platformType == 'win32':
+     ENOMEM = object()
+     EAGAIN = EWOULDBLOCK
+     from errno import WSAECONNRESET as ECONNABORTED
+-    
+-    from twisted.python.win32 import formatError as strerror    
++
++    from twisted.python.win32 import formatError as strerror
+ else:
+     from errno import EPERM
+     from errno import EINVAL
+@@ -70,7 +70,7 @@ else:
+     from errno import ENOMEM
+     from errno import EAGAIN
+     from errno import ECONNABORTED
+-    
++
+     from os import strerror
+ 
+ from errno import errorcode
+@@ -892,3 +892,145 @@ class Connector(base.BaseConnector):
+ 
+     def getDestination(self):
+         return address.IPv4Address('TCP', self.host, self.port, 'INET')
++
++
++class Client6(Client):
++    """
++    A TCP6 client.
++    """
++    addressFamily = socket.AF_INET6
++
++    def __init__(self, host, port, bindAddress, connector, reactor=None,
++                 flowinfo=0, scopeid=0):
++        Client.__init__(self, host, port, bindAddress, connector, reactor)
++        self.addr = (host, port, flowinfo, scopeid)
++
++    def resolveAddress(self):
++        """
++        Lookup the IPv6 address for self.addr[0] if necessary, then set
++        self.realAddress to that IPv6 address.
++        """
++        if abstract.isIPv6Address(self.addr[0]):
++            self._setRealAddress(self.addr[0])
++        else:
++            d = self.reactor.resolve(self.addr[0])
++            d.addCallbacks(self._setRealAddress, self.failIfNotConnected)
++
++    def _setRealAddress(self, address):
++        """
++        Set self.realAddress[0] to address.  Set the remaining parts of 
++        self.realAddress to the corresponding parts of self.addr.
++        """
++        self.realAddress = (address, self.addr[1], self.addr[2], self.addr[3])
++        self.doConnect()
++
++    def getHost(self):
++        """
++        Returns an IPv6Address.
++
++        This indicates the address from which I am connecting.
++        """
++        return address.IPv6Address('TCP', *(self.socket.getsockname()))
++
++    def getPeer(self):
++        """
++        Returns an IPv6Address.
++
++        This indicates the address that I am connected to.
++        """
++        return address.IPv6Address('TCP', *(self.addr))
++
++    def __repr__(self):
++        s = '<%s to %s at %x>' % (self.__class__, self.addr, unsignedID(self))
++        return s
++
++
++class Server6(Server):
++    """
++    IPv6 serverside socket-stream connection class.
++
++    This is a serverside network connection transport; a socket which came from
++    an accept() on a server.
++    """
++    def getHost(self):
++        """
++        Returns an IPv6Address.
++
++        This indicates the server's address.
++        """
++        return address.IPv6Address('TCP', *(self.socket.getsockname()))
++
++    def getPeer(self):
++        """
++        Returns an IPv6Address.
++
++        This indicates the client's address.
++        """
++        return address.IPv6Address('TCP', *(self.client))
++
++
++class Connector6(base.BaseConnector):
++    """
++    IPv6 implementation of connector
++
++    @ivar flowinfo An integer representing the sockaddr-in6 flowinfo
++    @ivar scopeid An integer representing the sockaddr-in6 scopeid
++    """
++
++    def __init__(self, host, port, factory, timeout, bindAddress,
++                 reactor=None, flowinfo=0, scopeid=0):
++        self.host = host
++        if isinstance(port, types.StringTypes):
++            try:
++                port = socket.getservbyname(port, 'tcp')
++            except socket.error, e:
++                raise error.ServiceNameUnknownError(string="%s (%r)" % (e, port))
++        self.port = port
++        self.bindAddress = bindAddress
++        self.flowinfo = flowinfo
++        self.scopeid = scopeid
++        base.BaseConnector.__init__(self, factory, timeout, reactor)
++
++    def _makeTransport(self):
++        """
++        Build and return a TCP6 client for the connector's transport.
++        """
++        return Client6(self.host, self.port, self.bindAddress, self,
++                      self.reactor, self.flowinfo, self.scopeid)
++
++    def getDestination(self):
++        """
++        @see twisted.internet.interfaces.IConnector.getDestination
++        """
++        return address.IPv6Address('TCP', self.host, self.port, self.flowinfo,
++                                   self.scopeid)
++
++
++class Port6(Port):
++    """
++    I am a TCP server port, listening for connections.
++
++    When a connection is accepted, I will call my factory's buildProtocol with
++    the incoming connection as an argument, according to the specification
++    described in twisted.internet.interfaces.IProtocolFactory.
++
++    If you wish to change the sort of transport that will be used, my
++    `transport' attribute will be called with the signature expected for
++    Server.__init__, so it can be replaced.
++    """
++    addressFamily = socket.AF_INET6
++    transport = Server6
++
++    def _buildAddr(self, (host, port, flowinfo, scopeid)):
++        """
++        Build and return an IPv6Address from the passed sockaddr-in6 tuple.
++        """
++        return address.IPv6Address('TCP', host, port, flowinfo, scopeid)
++
++    def getHost(self):
++        """
++        Returns an IPv6Address.
++
++        This indicates the server's address.
++        """
++        return address.IPv6Address('TCP', *(self.socket.getsockname()))
+diff --git a/twisted/test/test_abstract.py b/twisted/test/test_abstract.py
+index 44b4646..294a69e 100644
+--- a/twisted/test/test_abstract.py
++++ b/twisted/test/test_abstract.py
+@@ -1,4 +1,4 @@
+-# Copyright (c) 2007 Twisted Matrix Laboratories.
++# Copyright (c) 2007-2008 Twisted Matrix Laboratories.
+ # See LICENSE for details.
+ 
+ """
+@@ -8,6 +8,7 @@ Tests for generic file descriptor based reactor support code.
+ from twisted.trial.unittest import TestCase
+ 
+ from twisted.internet.abstract import isIPAddress
++from twisted.internet.abstract import isIPv6Address
+ 
+ 
+ class AddressTests(TestCase):
+@@ -81,3 +82,27 @@ class AddressTests(TestCase):
+         self.assertFalse(isIPAddress('0.0.256.0'))
+         self.assertFalse(isIPAddress('0.0.0.256'))
+         self.assertFalse(isIPAddress('256.256.256.256'))
++
++
++class IPv6AddressTests(TestCase):
++    """
++    Tests for IPv6 addresses.
++    """
++    def test_hexadecimalColoned(self):
++        """
++        L{isIPv6Address} should return C{True} for any valid colon-separated
++        hexadecimal representation of an IPv6 address.
++        """
++        self.assertTrue(isIPv6Address('::1'))
++        self.assertTrue(isIPv6Address('fe80::215:cbfe:feac:8888'))
++        self.assertTrue(isIPv6Address('fe80::215:cbfe:feac:8888'))
++        self.assertTrue(isIPv6Address('fe80:5:5:5:215:cbfe:feac:8888'))
++
++    def test_illegalHexadecimalColoned(self):
++        """
++        L{isIPv6Address} should return C{False} for any invalid colon-separated
++        hexadecimal representation of an IPv6 address.
++        """
++        self.assertFalse(isIPv6Address(':1::2'))
++        self.assertFalse(isIPv6Address('fe80:5:5:5:215:cbfe:feac:8888:5'))
++        self.assertFalse(isIPv6Address('g::h'))
+diff --git a/twisted/test/test_tcp.py b/twisted/test/test_tcp.py
+index ac7b8b9..d3cf433 100644
+--- a/twisted/test/test_tcp.py
++++ b/twisted/test/test_tcp.py
+@@ -14,7 +14,7 @@ from twisted.trial import unittest
+ from twisted.python.log import msg
+ from twisted.internet import protocol, reactor, defer, interfaces
+ from twisted.internet import error
+-from twisted.internet.address import IPv4Address
++from twisted.internet.address import IPv4Address, IPv6Address
+ from twisted.internet.interfaces import IHalfCloseableProtocol, IPullProducer
+ from twisted.protocols import policies
+ 
+@@ -179,22 +179,33 @@ class PortCleanerUpper(unittest.TestCase):
+ 
+ 
+ class ListeningTestCase(PortCleanerUpper):
++    """
++    Tests for listening on a port.
++
++    @ivar listenMethod Method used to listen
++    @ivar connectMethod Method used to connect
++    @ivar loopback Loopback interface to use for testing
++    """
++
++    listenMethod = reactor.listenTCP
++    connectMethod = reactor.connectTCP
++    loopback = "127.0.0.1"
+ 
+     def testListen(self):
+         f = MyServerFactory()
+-        p1 = reactor.listenTCP(0, f, interface="127.0.0.1")
++        p1 = self.listenMethod(0, f, interface=self.loopback)
+         self.failUnless(interfaces.IListeningPort.providedBy(p1))
+         return p1.stopListening()
+ 
+     def testStopListening(self):
+         f = MyServerFactory()
+-        port = reactor.listenTCP(0, f, interface="127.0.0.1")
++        port = self.listenMethod(0, f, interface=self.loopback)
+         n = port.getHost().port
+         self.ports.append(port)
+ 
+         def cbStopListening(ignored):
+             # Make sure we can rebind the port right away
+-            port = reactor.listenTCP(n, f, interface="127.0.0.1")
++            port = self.listenMethod(n, f, interface=self.loopback)
+             self.ports.append(port)
+ 
+         d = defer.maybeDeferred(port.stopListening)
+@@ -204,12 +215,12 @@ class ListeningTestCase(PortCleanerUpper):
+     def testNumberedInterface(self):
+         f = MyServerFactory()
+         # listen only on the loopback interface
+-        p1 = reactor.listenTCP(0, f, interface='127.0.0.1')
++        p1 = self.listenMethod(0, f, interface=self.loopback)
+         return p1.stopListening()
+ 
+     def testPortRepr(self):
+         f = MyServerFactory()
+-        p = reactor.listenTCP(0, f)
++        p = self.listenMethod(0, f)
+         portNo = str(p.getHost().port)
+         self.failIf(repr(p).find(portNo) == -1)
+         def stoppedListening(ign):
+@@ -225,13 +236,13 @@ class ListeningTestCase(PortCleanerUpper):
+         """
+         server = MyServerFactory()
+         serverConnMade = server.protocolConnectionMade = defer.Deferred()
+-        port = reactor.listenTCP(0, server)
++        port = self.listenMethod(0, server)
+         self.addCleanup(port.stopListening)
+ 
+         client = MyClientFactory()
+         clientConnMade = client.protocolConnectionMade = defer.Deferred()
+-        connector = reactor.connectTCP("127.0.0.1",
+-                                       port.getHost().port, client)
++        connector = self.connectMethod(self.loopback, port.getHost().port,
++                                       client)
+         self.addCleanup(connector.disconnect)
+         def check((serverProto, clientProto)):
+             portNumber = port.getHost().port
+@@ -242,6 +253,17 @@ class ListeningTestCase(PortCleanerUpper):
+         return defer.gatherResults([serverConnMade, clientConnMade]
+             ).addCallback(check)
+ 
++class ListeningIPv6TestCase(ListeningTestCase):
++    """
++    Tests for listening on a port using IPv6.
++
++    @ivar listenMethod Method used to listen
++    @ivar connectMethod Method used to connect
++    @ivar loopback Loopback interface to use for testing
++    """
++    listenMethod = reactor.listenTCP6
++    connectMethod = reactor.connectTCP6
++    loopback = "::1"
+ 
+ 
+ def callWithSpew(f):
+@@ -254,19 +276,30 @@ def callWithSpew(f):
+         sys.settrace(None)
+ 
+ class LoopbackTestCase(PortCleanerUpper):
+-    """Test loopback connections."""
++    """
++    Test loopback connections.
+ 
+-    n = 10081
++    @ivar listenMethod Method used to listen
++    @ivar connectMethod Method used to connect
++    @ivar loopback Loopback interface to use for testing
++    @ivar addressFamily Socket address family to use
++    """
+ 
++    listenMethod = reactor.listenTCP
++    connectMethod = reactor.connectTCP
++    creatorConnectMethod = protocol.ClientCreator.connectTCP
++    loopback = "127.0.0.1"
++    addressFamily = socket.AF_INET
++    n = 10081
+ 
+     def testClosePortInProtocolFactory(self):
+         f = ClosingFactory()
+-        port = reactor.listenTCP(0, f, interface="127.0.0.1")
++        port = self.listenMethod(0, f, interface=self.loopback)
+         self.n = port.getHost().port
+         self.ports.append(port)
+         f.port = port
+         clientF = MyClientFactory()
+-        reactor.connectTCP("127.0.0.1", self.n, clientF)
++        self.connectMethod(self.loopback, self.n, clientF)
+         def check(x):
+             self.assert_(clientF.protocol.made)
+             self.assert_(port.disconnected)
+@@ -278,12 +311,12 @@ class LoopbackTestCase(PortCleanerUpper):
+ 
+     def testTcpNoDelay(self):
+         f = MyServerFactory()
+-        port = reactor.listenTCP(0, f, interface="127.0.0.1")
++        port = self.listenMethod(0, f, interface=self.loopback)
+ 
+         self.n = port.getHost().port
+         self.ports.append(port)
+         clientF = MyClientFactory()
+-        reactor.connectTCP("127.0.0.1", self.n, clientF)
++        self.connectMethod(self.loopback, self.n, clientF)
+ 
+         d = loopUntil(lambda: (f.called > 0 and
+                                getattr(clientF, 'protocol', None) is not None))
+@@ -301,11 +334,11 @@ class LoopbackTestCase(PortCleanerUpper):
+ 
+     def testTcpKeepAlive(self):
+         f = MyServerFactory()
+-        port = reactor.listenTCP(0, f, interface="127.0.0.1")
++        port = self.listenMethod(0, f, interface=self.loopback)
+         self.n = port.getHost().port
+         self.ports.append(port)
+         clientF = MyClientFactory()
+-        reactor.connectTCP("127.0.0.1", self.n, clientF)
++        self.connectMethod(self.loopback, self.n, clientF)
+ 
+         d = loopUntil(lambda :(f.called > 0 and
+                                getattr(clientF, 'protocol', None) is not None))
+@@ -324,7 +357,7 @@ class LoopbackTestCase(PortCleanerUpper):
+     def testFailing(self):
+         clientF = MyClientFactory()
+         # XXX we assume no one is listening on TCP port 69
+-        reactor.connectTCP("127.0.0.1", 69, clientF, timeout=5)
++        self.connectMethod(self.loopback, 69, clientF, timeout=5)
+         def check(ignored):
+             clientF.reason.trap(error.ConnectionRefusedError)
+         return clientF.failDeferred.addCallback(check)
+@@ -357,8 +390,8 @@ class LoopbackTestCase(PortCleanerUpper):
+ 
+         serverSockets = []
+         for i in xrange(10):
+-            serverSocket = socket.socket()
+-            serverSocket.bind(('127.0.0.1', 0))
++            serverSocket = socket.socket(self.addressFamily)
++            serverSocket.bind((self.loopback, 0))
+             serverSocket.listen(1)
+             serverSockets.append(serverSocket)
+         random.shuffle(serverSockets)
+@@ -376,10 +409,11 @@ class LoopbackTestCase(PortCleanerUpper):
+                 self.fail("Could not fail to connect - could not test errno for that case.")
+ 
+             serverSocket = serverSockets.pop()
+-            serverHost, serverPort = serverSocket.getsockname()
++            serverHost, serverPort = serverSocket.getsockname()[:2]
+             serverSocket.close()
+ 
+-            connectDeferred = clientCreator.connectTCP(serverHost, serverPort)
++            connectDeferred = self.creatorConnectMethod(clientCreator, 
++                                                        serverHost, serverPort)
+             connectDeferred.addCallback(connected)
+             return connectDeferred
+ 
+@@ -398,7 +432,7 @@ class LoopbackTestCase(PortCleanerUpper):
+ 
+     def testConnectByServiceFail(self):
+         try:
+-            reactor.connectTCP("127.0.0.1", "thisbetternotexist",
++            self.connectMethod(self.loopback, "thisbetternotexist",
+                                MyClientFactory())
+         except error.ServiceNameUnknownError:
+             return
+@@ -409,14 +443,14 @@ class LoopbackTestCase(PortCleanerUpper):
+         d = defer.succeed(None)
+         try:
+             s = MyServerFactory()
+-            port = reactor.listenTCP(0, s, interface="127.0.0.1")
++            port = self.listenMethod(0, s, interface=self.loopback)
+             self.n = port.getHost().port
+             socket.getservbyname = (lambda s, p,n=self.n:
+                                     s == 'http' and p == 'tcp' and n or 10)
+             self.ports.append(port)
+             cf = MyClientFactory()
+             try:
+-                c = reactor.connectTCP('127.0.0.1', 'http', cf)
++                c = self.connectMethod(self.loopback, 'http', cf)
+             except:
+                 socket.getservbyname = serv
+                 raise
+@@ -432,6 +466,16 @@ class LoopbackTestCase(PortCleanerUpper):
+                                               '%s was not called' % (s,)))
+         return d
+ 
++class LoopbackIPv6TestCase(LoopbackTestCase):
++    """
++    Test IPv6 loopback connections.
++    """
++    listenMethod = reactor.listenTCP6
++    connectMethod = reactor.connectTCP6
++    creatorConnectMethod = protocol.ClientCreator.connectTCP6
++    loopback = "::1"
++    addressFamily = socket.AF_INET6
++
+ 
+ class StartStopFactory(protocol.Factory):
+ 
+@@ -466,13 +510,20 @@ class ClientStartStopFactory(MyClientFactory):
+ 
+ 
+ class FactoryTestCase(PortCleanerUpper):
+-    """Tests for factories."""
++    """
++    Tests for factories.
++
++    @ivar listenMethod Method used to listen
++    @ivar loopback Loopback interface to use for testing
++    """
++    listenMethod = reactor.listenTCP
++    loopback = "127.0.0.1"
+ 
+     def testServerStartStop(self):
+         f = StartStopFactory()
+ 
+         # listen on port
+-        p1 = reactor.listenTCP(0, f, interface='127.0.0.1')
++        p1 = self.listenMethod(0, f, interface=self.loopback)
+         self.n1 = p1.getHost().port
+         self.ports.append(p1)
+ 
+@@ -482,10 +533,10 @@ class FactoryTestCase(PortCleanerUpper):
+     def _testServerStartStop(self, ignored, f, p1):
+         self.assertEquals((f.started, f.stopped), (1,0))
+         # listen on two more ports
+-        p2 = reactor.listenTCP(0, f, interface='127.0.0.1')
++        p2 = self.listenMethod(0, f, interface=self.loopback)
+         self.n2 = p2.getHost().port
+         self.ports.append(p2)
+-        p3 = reactor.listenTCP(0, f, interface='127.0.0.1')
++        p3 = self.listenMethod(0, f, interface=self.loopback)
+         self.n3 = p3.getHost().port
+         self.ports.append(p3)
+         d = loopUntil(lambda :(p2.connected == 1 and p3.connected == 1))
+@@ -513,7 +564,7 @@ class FactoryTestCase(PortCleanerUpper):
+ 
+     def testClientStartStop(self):
+         f = ClosingFactory()
+-        p = reactor.listenTCP(0, f, interface="127.0.0.1")
++        p = self.listenMethod(0, f, interface=self.loopback)
+         self.n = p.getHost().port
+         self.ports.append(p)
+         f.port = p
+@@ -521,19 +572,39 @@ class FactoryTestCase(PortCleanerUpper):
+         d = loopUntil(lambda :p.connected)
+         def check(ignored):
+             factory = ClientStartStopFactory()
+-            reactor.connectTCP("127.0.0.1", self.n, factory)
++            self.connectMethod(self.loopback, self.n, factory)
+             self.assert_(factory.started)
+             return loopUntil(lambda :factory.stopped)
+         d.addCallback(check)
+         d.addBoth(lambda _: self.cleanPorts(*self.ports))
+         return d
+ 
++class FactoryIPv6TestCase(FactoryTestCase):
++    """
++    IPv6 Tests for factories.
++
++    @ivar listenMethod Method used to listen
++    @ivar loopback Loopback interface to use for testing
++    """
++    listenMethod = reactor.listenTCP6
++    loopback = "::1"
++
+ 
+ class ConnectorTestCase(PortCleanerUpper):
++    """
++    Tests for connectors.
++
++    @ivar listenMethod Method used to listen
++    @ivar connectMethod Method used to connect
++    @ivar loopback Loopback interface to use for testing
++    """
++    listenMethod = reactor.listenTCP
++    connectMethod = reactor.connectTCP
++    loopback = "127.0.0.1"
+ 
+     def testConnectorIdentity(self):
+         f = ClosingFactory()
+-        p = reactor.listenTCP(0, f, interface="127.0.0.1")
++        p = self.listenMethod(0, f, interface=self.loopback)
+         n = p.getHost().port
+         self.ports.append(p)
+         f.port = p
+@@ -547,11 +618,11 @@ class ConnectorTestCase(PortCleanerUpper):
+             factory.clientConnectionLost = lambda c, r: (l.append(c),
+                                                          m.append(r))
+             factory.startedConnecting = lambda c: l.append(c)
+-            connector = reactor.connectTCP("127.0.0.1", n, factory)
++            connector = self.connectMethod(self.loopback, n, factory)
+             self.failUnless(interfaces.IConnector.providedBy(connector))
+             dest = connector.getDestination()
+             self.assertEquals(dest.type, "TCP")
+-            self.assertEquals(dest.host, "127.0.0.1")
++            self.assertEquals(dest.host, self.loopback)
+             self.assertEquals(dest.port, n)
+ 
+             d = loopUntil(lambda :factory.stopped)
+@@ -564,7 +635,7 @@ class ConnectorTestCase(PortCleanerUpper):
+ 
+     def testUserFail(self):
+         f = MyServerFactory()
+-        p = reactor.listenTCP(0, f, interface="127.0.0.1")
++        p = self.listenMethod(0, f, interface=self.loopback)
+         n = p.getHost().port
+         self.ports.append(p)
+ 
+@@ -573,7 +644,7 @@ class ConnectorTestCase(PortCleanerUpper):
+ 
+         factory = ClientStartStopFactory()
+         factory.startedConnecting = startedConnecting
+-        reactor.connectTCP("127.0.0.1", n, factory)
++        self.connectMethod(self.loopback, n, factory)
+ 
+         d = loopUntil(lambda :factory.stopped)
+         def check(ignored):
+@@ -585,7 +656,7 @@ class ConnectorTestCase(PortCleanerUpper):
+ 
+     def testReconnect(self):
+         f = ClosingFactory()
+-        p = reactor.listenTCP(0, f, interface="127.0.0.1")
++        p = self.listenMethod(0, f, interface=self.loopback)
+         n = p.getHost().port
+         self.ports.append(p)
+         f.port = p
+@@ -596,7 +667,7 @@ class ConnectorTestCase(PortCleanerUpper):
+             def clientConnectionLost(c, reason):
+                 c.connect()
+             factory.clientConnectionLost = clientConnectionLost
+-            reactor.connectTCP("127.0.0.1", n, factory)
++            self.connectMethod(self.loopback, n, factory)
+             return loopUntil(lambda :factory.failed)
+ 
+         def step2(ignored):
+@@ -609,24 +680,43 @@ class ConnectorTestCase(PortCleanerUpper):
+         return d.addCallback(step1).addCallback(step2)
+ 
+ 
++class ConnectorIPv6TestCase(ConnectorTestCase):
++    """
++    Tests for IPv6 connectors.
++    """
++    listenMethod = reactor.listenTCP6
++    connectMethod = reactor.connectTCP6
++    loopback = "::1"
++
++
+ class CannotBindTestCase(PortCleanerUpper):
+-    """Tests for correct behavior when a reactor cannot bind to the required
+-    TCP port."""
++    """
++    Tests for correct behavior when a reactor cannot bind to the required
++    TCP port.
++
++    @ivar listenMethod Method used to listen
++    @ivar connectMethod Method used to connect
++    @ivar loopback Loopback interface to use for testing
++    """
++
++    listenMethod = reactor.listenTCP
++    connectMethod = reactor.connectTCP
++    loopback = "127.0.0.1"
+ 
+     def testCannotBind(self):
+         f = MyServerFactory()
+ 
+-        p1 = reactor.listenTCP(0, f, interface='127.0.0.1')
++        p1 = self.listenMethod(0, f, interface=self.loopback)
+         n = p1.getHost().port
+         self.ports.append(p1)
+         dest = p1.getHost()
+         self.assertEquals(dest.type, "TCP")
+-        self.assertEquals(dest.host, "127.0.0.1")
++        self.assertEquals(dest.host, self.loopback)
+         self.assertEquals(dest.port, n)
+ 
+         # make sure new listen raises error
+         self.assertRaises(error.CannotListenError,
+-                          reactor.listenTCP, n, f, interface='127.0.0.1')
++                          reactor.listenTCP, n, f, interface=self.loopback)
+ 
+         return self.cleanPorts(*self.ports)
+ 
+@@ -644,15 +734,15 @@ class CannotBindTestCase(PortCleanerUpper):
+         theDeferred = defer.Deferred()
+         sf = MyServerFactory()
+         sf.startFactory = self._fireWhenDoneFunc(theDeferred, sf.startFactory)
+-        p = reactor.listenTCP(0, sf, interface="127.0.0.1")
++        p = self.listenMethod(0, sf, interface=self.loopback)
+         self.ports.append(p)
+ 
+         def _connect1(results):
+             d = defer.Deferred()
+             cf1 = MyClientFactory()
+             cf1.buildProtocol = self._fireWhenDoneFunc(d, cf1.buildProtocol)
+-            reactor.connectTCP("127.0.0.1", p.getHost().port, cf1,
+-                               bindAddress=("127.0.0.1", 0))
++            self.connectMethod(self.loopback, p.getHost().port, cf1,
++                               bindAddress=(self.loopback, 0))
+             d.addCallback(_conmade, cf1)
+             return d
+ 
+@@ -673,8 +763,8 @@ class CannotBindTestCase(PortCleanerUpper):
+             cf2.clientConnectionFailed = self._fireWhenDoneFunc(
+                 d1, cf2.clientConnectionFailed)
+             cf2.stopFactory = self._fireWhenDoneFunc(d2, cf2.stopFactory)
+-            reactor.connectTCP("127.0.0.1", p.getHost().port, cf2,
+-                               bindAddress=("127.0.0.1", port))
++            self.connectMethod(self.loopback, p.getHost().port, cf2,
++                               bindAddress=(self.loopback, port))
+             d1.addCallback(_check2failed, cf1, cf2)
+             d2.addCallback(_check2stopped, cf1, cf2)
+             dl = defer.DeferredList([d1, d2])
+@@ -705,6 +795,17 @@ class CannotBindTestCase(PortCleanerUpper):
+         theDeferred.addCallback(_connect1)
+         return theDeferred
+ 
++
++class CannotBindIPv6TestCase(CannotBindTestCase):
++    """
++    Tests for correct behavior when a reactor cannot bind to the required
++    TCPv6 port.
++    """
++    listenMethod = reactor.listenTCP6
++    connectMethod = reactor.connectTCP6
++    loopback = "::1"
++
++
+ class MyOtherClientFactory(protocol.ClientFactory):
+     def buildProtocol(self, address):
+         self.address = address
+@@ -714,17 +815,27 @@ class MyOtherClientFactory(protocol.ClientFactory):
+ 
+ 
+ class LocalRemoteAddressTestCase(PortCleanerUpper):
+-    """Tests for correct getHost/getPeer values and that the correct address
++    """
++    Tests for correct getHost/getPeer values and that the correct address
+     is passed to buildProtocol.
++
++    @ivar listenMethod Method used to listen
++    @ivar connectMethod Method used to connect
++    @ivar loopback Loopback interface to use for testing
+     """
++
++    listenMethod = reactor.listenTCP
++    connectMethod = reactor.connectTCP
++    loopback = "127.0.0.1"
++
+     def testHostAddress(self):
+         f1 = MyServerFactory()
+-        p1 = reactor.listenTCP(0, f1, interface='127.0.0.1')
++        p1 = self.listenMethod(0, f1, interface=self.loopback)
+         n = p1.getHost().port
+         self.ports.append(p1)
+ 
+         f2 = MyOtherClientFactory()
+-        p2 = reactor.connectTCP('127.0.0.1', n, f2)
++        p2 = self.connectMethod(self.loopback, n, f2)
+ 
+         d = loopUntil(lambda :p2.state == "connected")
+         def check(ignored):
+@@ -737,6 +848,16 @@ class LocalRemoteAddressTestCase(PortCleanerUpper):
+         return d.addCallback(check).addCallback(cleanup)
+ 
+ 
++class LocalRemoteAddressIPv6TestCase(LocalRemoteAddressTestCase):
++    """
++    IPv6 tests for correct getHost/getPeer values and that the correct address
++    is passed to buildProtocol.
++    """
++    listenMethod = reactor.listenTCP6
++    connectMethod = reactor.connectTCP6
++    loopback = "::1"
++
++
+ class WriterProtocol(protocol.Protocol):
+     def connectionMade(self):
+         # use everything ITransport claims to provide. If something here
+@@ -778,7 +899,14 @@ class WriterClientFactory(protocol.ClientFactory):
+ class WriteDataTestCase(PortCleanerUpper):
+     """Test that connected TCP sockets can actually write data. Try to
+     exercise the entire ITransport interface.
++
++    @ivar listenMethod Method used to listen
++    @ivar connectMethod Method used to connect
++    @ivar loopback Loopback interface to use for testing
+     """
++    listenMethod = reactor.listenTCP
++    connectMethod = reactor.connectTCP
++    loopback = "127.0.0.1"
+ 
+     def testWriter(self):
+         f = protocol.Factory()
+@@ -786,12 +914,12 @@ class WriteDataTestCase(PortCleanerUpper):
+         f.done = 0
+         f.problem = 0
+         wrappedF = WiredFactory(f)
+-        p = reactor.listenTCP(0, wrappedF, interface="127.0.0.1")
++        p = self.listenMethod(0, wrappedF, interface=self.loopback)
+         n = p.getHost().port
+         self.ports.append(p)
+         clientF = WriterClientFactory()
+         wrappedClientF = WiredFactory(clientF)
+-        reactor.connectTCP("127.0.0.1", n, wrappedClientF)
++        self.connectMethod(self.loopback, n, wrappedClientF)
+ 
+         def check(ignored):
+             self.failUnless(f.done, "writer didn't finish, it probably died")
+@@ -820,7 +948,7 @@ class WriteDataTestCase(PortCleanerUpper):
+         # Gtk reactor cannot pass this test, though, because it fails to
+         # implement IReactorTCP entirely correctly.  Gtk is quite old at
+         # this point, so it's more likely that gtkreactor will be deprecated
+-        # and removed rather than fixed to handle this case correctly. 
++        # and removed rather than fixed to handle this case correctly.
+         # Since this is a pre-existing (and very long-standing) issue with
+         # the Gtk reactor, there's no reason for it to prevent this test
+         # being added to exercise the other reactors, for which the behavior
+@@ -872,7 +1000,7 @@ class WriteDataTestCase(PortCleanerUpper):
+         # Create the server port to which a connection will be made.
+         server = protocol.ServerFactory()
+         server.protocol = Disconnecter
+-        port = reactor.listenTCP(0, server, interface='127.0.0.1')
++        port = self.listenMethod(0, server, interface=self.loopback)
+         self.addCleanup(port.stopListening)
+         addr = port.getHost()
+ 
+@@ -942,13 +1070,22 @@ class WriteDataTestCase(PortCleanerUpper):
+             return client.lostReason
+         clientConnectionLost.addCallback(cbClientLost)
+         msg('Connecting to %s:%s' % (addr.host, addr.port))
+-        connector = reactor.connectTCP(addr.host, addr.port, client)
++        connector = self.connectMethod(addr.host, addr.port, client)
+ 
+         # By the end of the test, the client should have received notification
+         # of unclean disconnection.
+         msg('Returning Deferred')
+         return self.assertFailure(clientConnectionLost, error.ConnectionLost)
+ 
++class WriteDataIPv6TestCase(WriteDataTestCase):
++    """
++    Test that connected TCPv6 sockets can actually write data. Try to
++    exercise the entire ITransport interface.
++    """
++    listenMethod = reactor.listenTCP6
++    connectMethod = reactor.connectTCP6
++    loopback = "::1"
++
+ 
+ 
+ class ConnectionLosingProtocol(protocol.Protocol):
+@@ -1053,7 +1190,7 @@ class ProperlyCloseFilesMixin:
+         serverFactory = protocol.ServerFactory()
+         serverFactory.protocol = lambda: ConnectionLostNotifyingProtocol(
+             onServerConnectionLost)
+-        serverPort = self.createServer('127.0.0.1', 0, serverFactory)
++        serverPort = self.createServer(self.loopback, 0, serverFactory)
+ 
+         onClientConnectionLost = defer.Deferred()
+         serverAddr = serverPort.getHost()
+@@ -1098,17 +1235,34 @@ class ProperlyCloseFilesMixin:
+ 
+ 
+ class ProperlyCloseFilesTestCase(unittest.TestCase, ProperlyCloseFilesMixin):
+-    def createServer(self, address, portNumber, factory):
+-        return reactor.listenTCP(portNumber, factory, interface=address)
++    """
++    Test that we properly close files.
+ 
++    @ivar listenMethod Method used to listen
++    @ivar connectMethod Method used to connect
++    @ivar loopback Loopback interface to use for testing
++    """
+ 
+-    def connectClient(self, address, portNumber, clientCreator):
+-        return clientCreator.connectTCP(address, portNumber)
++    listenMethod = reactor.listenTCP
++    creatorConnectMethod = protocol.ClientCreator.connectTCP
++    loopback = "127.0.0.1"
+ 
++    def createServer(self, address, portNumber, factory):
++        return self.listenMethod(portNumber, factory, interface=address)
++
++    def connectClient(self, address, portNumber, clientCreator):
++        return self.creatorConnectMethod(clientCreator, address, portNumber)
+ 
+     def getHandleExceptionType(self):
+         return socket.error
+ 
++class ProperlyCloseFilesIPv6TestCase(ProperlyCloseFilesTestCase):
++    """
++    Test that we properly close files using IPv6
++    """
++    listenMethod = reactor.listenTCP6
++    creatorConnectMethod = protocol.ClientCreator.connectTCP6
++    loopback = "::1"
+ 
+ 
+ class WiredForDeferreds(policies.ProtocolWrapper):
+@@ -1138,7 +1292,18 @@ class WiredFactory(policies.WrappingFactory):
+ class AddressTestCase(unittest.TestCase):
+     """
+     Tests for address-related interactions with client and server protocols.
++
++    @ivar listenMethod Method used to listen
++    @ivar connectMethod Method used to connect
++    @ivar loopback Loopback interface to use for testing
++    @ivar addrType Type of address we expect to see
+     """
++
++    listenMethod = reactor.listenTCP
++    connectMethod = reactor.connectTCP
++    loopback = "127.0.0.1"
++    addrtype = IPv4Address
++
+     def setUp(self):
+         """
+         Create a port and connected client/server pair which can be used
+@@ -1189,8 +1354,8 @@ class AddressTestCase(unittest.TestCase):
+         self.clientConnLost = self.client.protocolConnectionLost = defer.Deferred()
+         self.clientWrapper = RememberingWrapper(self.client)
+ 
+-        self.port = reactor.listenTCP(0, self.serverWrapper, interface='127.0.0.1')
+-        self.connector = reactor.connectTCP(
++        self.port = self.listenMethod(0, self.serverWrapper, interface=self.loopback)
++        self.connector = self.connectMethod(
+             self.port.getHost().host, self.port.getHost().port, self.clientWrapper)
+ 
+         return defer.gatherResults([self.serverConnMade, self.clientConnMade])
+@@ -1220,10 +1385,10 @@ class AddressTestCase(unittest.TestCase):
+ 
+         self.assertEqual(
+             self.clientWrapper.addresses,
+-            [IPv4Address('TCP', serverHost.host, serverHost.port)])
++            [self.addrtype('TCP', serverHost.host, serverHost.port)])
+         self.assertEqual(
+             self.clientWrapper.addresses,
+-            [IPv4Address('TCP', clientPeer.host, clientPeer.port)])
++            [self.addrtype('TCP', clientPeer.host, clientPeer.port)])
+ 
+ 
+     def test_buildProtocolServer(self):
+@@ -1239,12 +1404,22 @@ class AddressTestCase(unittest.TestCase):
+ 
+         self.assertEqual(
+             self.serverWrapper.addresses,
+-            [IPv4Address('TCP', serverPeer.host, serverPeer.port)])
++            [self.addrtype('TCP', serverPeer.host, serverPeer.port)])
+         self.assertEqual(
+             self.serverWrapper.addresses,
+-            [IPv4Address('TCP', clientHost.host, clientHost.port)])
++            [self.addrtype('TCP', clientHost.host, clientHost.port)])
+ 
+ 
++class AddressIPv6TestCase(AddressTestCase):
++    """
++    Tests for address-related interactions with client and server IPv6 
++    protocols.
++    """
++    listenMethod = reactor.listenTCP6
++    connectMethod = reactor.connectTCP6
++    loopback = "::1"
++    addrtype = IPv6Address
++
+ 
+ class LargeBufferWriterProtocol(protocol.Protocol):
+ 
+@@ -1292,8 +1467,16 @@ class FireOnCloseFactory(policies.WrappingFactory):
+ 
+ 
+ class LargeBufferTestCase(PortCleanerUpper):
+-    """Test that buffering large amounts of data works.
+     """
++    Test that buffering large amounts of data works.
++
++    @ivar listenMethod Method used to listen
++    @ivar connectMethod Method used to connect
++    @ivar loopback Loopback interface to use for testing
++    """
++    listenMethod = reactor.listenTCP
++    connectMethod = reactor.connectTCP
++    loopback = "127.0.0.1"
+ 
+     datalen = 60*1024*1024
+     def testWriter(self):
+@@ -1303,12 +1486,12 @@ class LargeBufferTestCase(PortCleanerUpper):
+         f.problem = 0
+         f.len = self.datalen
+         wrappedF = FireOnCloseFactory(f)
+-        p = reactor.listenTCP(0, wrappedF, interface="127.0.0.1")
++        p = self.listenMethod(0, wrappedF, interface=self.loopback)
+         n = p.getHost().port
+         self.ports.append(p)
+         clientF = LargeBufferReaderClientFactory()
+         wrappedClientF = FireOnCloseFactory(clientF)
+-        reactor.connectTCP("127.0.0.1", n, wrappedClientF)
++        self.connectMethod(self.loopback, n, wrappedClientF)
+ 
+         d = defer.gatherResults([wrappedF.deferred, wrappedClientF.deferred])
+         def check(ignored):
+@@ -1320,6 +1503,14 @@ class LargeBufferTestCase(PortCleanerUpper):
+                             "client didn't see connection dropped")
+         return d.addCallback(check)
+ 
++class LargeBufferIPv6TestCase(LargeBufferTestCase):
++    """
++    Test that buffering large amounts of data works over IPv6
++    """
++    listenMethod = reactor.listenTCP6
++    connectMethod = reactor.connectTCP6
++    loopback = "::1"
++
+ 
+ class MyHCProtocol(MyProtocol):
+ 
+@@ -1355,19 +1546,31 @@ class MyHCFactory(protocol.ServerFactory):
+ 
+ 
+ class HalfCloseTestCase(PortCleanerUpper):
+-    """Test half-closing connections."""
++    """
++    Test half-closing connections.
++
++    @ivar listenMethod Method used to listen
++    @ivar connectMethod Method used to connect
++    @ivar creatorConnectMethod Method used to connect with a ClientCreator
++    @ivar loopback Loopback interface to use for testing
++    """
++    listenMethod = reactor.listenTCP
++    connectMethod = reactor.connectTCP
++    creatorConnectMethod = protocol.ClientCreator.connectTCP
++    loopback = "127.0.0.1"
+ 
+     def setUp(self):
+         PortCleanerUpper.setUp(self)
+         self.f = f = MyHCFactory()
+-        self.p = p = reactor.listenTCP(0, f, interface="127.0.0.1")
++        self.p = p = self.listenMethod(0, f, interface=self.loopback)
+         self.ports.append(p)
+         d = loopUntil(lambda :p.connected)
+ 
+         self.cf = protocol.ClientCreator(reactor, MyHCProtocol)
+ 
+-        d.addCallback(lambda _: self.cf.connectTCP(p.getHost().host,
+-                                                   p.getHost().port))
++        d.addCallback(lambda _: self.creatorConnectMethod(self.cf, 
++                                                          p.getHost().host, 
++                                                          p.getHost().port))
+         d.addCallback(self._setUp)
+         return d
+ 
+@@ -1436,17 +1639,37 @@ class HalfCloseTestCase(PortCleanerUpper):
+             f.protocol.readHalfClosed, False))
+         return d
+ 
++class HalfCloseIPv6TestCase(HalfCloseTestCase):
++    """
++    Test half-closing IPv6 connections.
++    """
++    listenMethod = reactor.listenTCP6
++    connectMethod = reactor.connectTCP6
++    creatorConnectMethod = protocol.ClientCreator.connectTCP6
++    loopback = "::1"
++
+ 
+ class HalfClose2TestCase(unittest.TestCase):
++    """
++    Test half-closing connections.
++
++    @ivar listenMethod Method used to listen
++    @ivar creatorConnectMethod Method used to connect with a ClientCreator
++    @ivar loopback Loopback interface to use for testing
++    """
++    listenMethod = reactor.listenTCP
++    creatorConnectMethod = protocol.ClientCreator.connectTCP
++    loopback = "127.0.0.1"
+ 
+     def setUp(self):
+         self.f = f = MyServerFactory()
+         self.f.protocolConnectionMade = defer.Deferred()
+-        self.p = p = reactor.listenTCP(0, f, interface="127.0.0.1")
++        self.p = p = self.listenMethod(0, f, interface=self.loopback)
+ 
+         # XXX we don't test server side yet since we don't do it yet
+-        d = protocol.ClientCreator(reactor, MyProtocol).connectTCP(
+-            p.getHost().host, p.getHost().port)
++        creator = protocol.ClientCreator(reactor, MyProtocol)
++        d = self.creatorConnectMethod(creator, p.getHost().host, 
++                                      p.getHost().port)
+         d.addCallback(self._gotClient)
+         return d
+ 
+@@ -1491,11 +1714,25 @@ class HalfClose2TestCase(unittest.TestCase):
+                       self.failUnlessEqual(self.f.protocol.closed, True))
+         return defer.gatherResults([d, d2])
+ 
++class HalfClose2IPv6TestCase(HalfClose2TestCase):
++    """
++    Test half-closing IPv6 connections.
++    """
++    listenMethod = reactor.listenTCP6
++    creatorConnectMethod = protocol.ClientCreator.connectTCP6
++    loopback = "::1"
+ 
+ class HalfCloseBuggyApplicationTests(unittest.TestCase):
+     """
+     Test half-closing connections where notification code has bugs.
++
++    @ivar listenMethod Method used to listen
++    @ivar creatorConnectMethod Method used to connect with a ClientCreator
++    @ivar loopback Loopback interface to use for testing
+     """
++    listenMethod = reactor.listenTCP
++    creatorConnectMethod = protocol.ClientCreator.connectTCP
++    loopback = "127.0.0.1"
+ 
+     def setUp(self):
+         """
+@@ -1504,12 +1741,12 @@ class HalfCloseBuggyApplicationTests(unittest.TestCase):
+         """
+         self.serverFactory = MyHCFactory()
+         self.serverFactory.protocolConnectionMade = defer.Deferred()
+-        self.port = reactor.listenTCP(
+-            0, self.serverFactory, interface="127.0.0.1")
++        self.port = self.listenMethod(
++            0, self.serverFactory, interface=self.loopback)
+         self.addCleanup(self.port.stopListening)
+         addr = self.port.getHost()
+         creator = protocol.ClientCreator(reactor, MyHCProtocol)
+-        clientDeferred = creator.connectTCP(addr.host, addr.port)
++        clientDeferred = self.creatorConnectMethod(creator, addr.host, addr.port)
+         def setClient(clientProtocol):
+             self.clientProtocol = clientProtocol
+         clientDeferred.addCallback(setClient)
+@@ -1559,12 +1796,26 @@ class HalfCloseBuggyApplicationTests(unittest.TestCase):
+         self.clientProtocol.writeConnectionLost = self.aBug
+         return self._notificationRaisesTest()
+ 
++class HalfCloseBuggyApplicationIPv6Tests(HalfCloseBuggyApplicationTests):
++    """
++    Test half-closing IPv6 connections where notification code has bugs.
++    """
++    listenMethod = reactor.listenTCP6
++    creatorConnectMethod = protocol.ClientCreator.connectTCP6
++    loopback = "::1"
+ 
+ 
+ class LogTestCase(unittest.TestCase):
+     """
+     Test logging facility of TCP base classes.
++
++    @ivar listenMethod Method used to listen
++    @ivar connectMethod Method used to connect
++    @ivar loopback Loopback interface to use for testing
+     """
++    listenMethod = reactor.listenTCP
++    connectMethod = reactor.connectTCP
++    loopback = "127.0.0.1"
+ 
+     def test_logstrClientSetup(self):
+         """
+@@ -1576,10 +1827,10 @@ class LogTestCase(unittest.TestCase):
+         client = MyClientFactory()
+         client.protocolConnectionMade = defer.Deferred()
+ 
+-        port = reactor.listenTCP(0, server, interface='127.0.0.1')
++        port = self.listenMethod(0, server, interface=self.loopback)
+         self.addCleanup(port.stopListening)
+ 
+-        connector = reactor.connectTCP(
++        connector = self.connectMethod(
+             port.getHost().host, port.getHost().port, client)
+         self.addCleanup(connector.disconnect)
+ 
+@@ -1593,6 +1844,13 @@ class LogTestCase(unittest.TestCase):
+         client.protocolConnectionMade.addCallback(cb)
+         return client.protocolConnectionMade
+ 
++class LogIPv6TestCase(LogTestCase):
++    """
++    Test logging facility of TCPv6 base classes.
++    """
++    listenMethod = reactor.listenTCP6
++    connectMethod = reactor.connectTCP6
++    loopback = "::1"
+ 
+ 
+ try:
+@@ -1602,3 +1860,25 @@ except ImportError:
+ else:
+     numRounds = resource.getrlimit(resource.RLIMIT_NOFILE)[0] + 10
+     ProperlyCloseFilesTestCase.numberRounds = numRounds
++
++try:
++    s = socket.socket(socket.AF_INET6)
++except socket.error:
++    for klass in [
++        "ListeningIPv6TestCase",
++        "LoopbackIPv6TestCase",
++        "FactoryIPv6TestCase",
++        "ConnectorIPv6TestCase",
++        "CannotBindIPv6TestCase",
++        "LocalRemoteAddressIPv6TestCase",
++        "WriteDataIPv6TestCase",
++        "ProperlyCloseFilesIPv6TestCase",
++        "AddressIPv6TestCase",
++        "LargeBufferIPv6TestCase",
++        "HalfCloseIPv6TestCase",
++        "HalfClose2IPv6TestCase",
++        "HalfCloseBuggyApplicationIPv6Tests",
++        "LogIPv6TestCase",
++    ]:
++        klass.skip = "IPv6 is not enabled"
++

@@ -1,0 +1,77 @@
+Index: twisted/topfiles/6216.bugfix
+===================================================================
+--- twisted/topfiles/6216.bugfix	(revision 0)
++++ twisted/topfiles/6216.bugfix	(revision 0)
+@@ -0,0 +1 @@
++Fixed problem where twisted.names.client.Resolver was not closing open file handles which can lead to an out of file descriptor error on PyPy.
+\ No newline at end of file
+Index: twisted/names/client.py
+===================================================================
+--- twisted/names/client.py	(revision 36730)
++++ twisted/names/client.py	(working copy)
+@@ -130,13 +130,21 @@
+         self.maybeParseConfig()
+ 
+ 
++    def _openFile(self, path):
++        """
++        Wrapper used for opening files in the class, exists primarily for unit
++        testing purposes.
++        """
++        return FilePath(path).open()
++
++
+     def maybeParseConfig(self):
+         if self.resolv is None:
+             # Don't try to parse it, don't set up a call loop
+             return
+ 
+         try:
+-            resolvConf = FilePath(self.resolv).open()
++            resolvConf = self._openFile(self.resolv)
+         except IOError as e:
+             if e.errno == errno.ENOENT:
+                 # Missing resolv.conf is treated the same as an empty resolv.conf
+@@ -149,6 +157,7 @@
+                 log.msg('%s changed, reparsing' % (self.resolv,))
+                 self._lastResolvTime = mtime
+                 self.parseConfig(resolvConf)
++            resolvConf.close()
+ 
+         # Check again in a little while
+         self._parseCall = self._reactor.callLater(
+Index: twisted/names/test/test_client.py
+===================================================================
+--- twisted/names/test/test_client.py	(revision 36730)
++++ twisted/names/test/test_client.py	(working copy)
+@@ -11,6 +11,7 @@
+ 
+ from twisted.python.compat import set
+ from twisted.python import failure
++from twisted.python.filepath import FilePath
+ from twisted.python.runtime import platform
+ 
+ from twisted.internet import defer
+@@ -287,6 +288,22 @@
+         self.assertEqual([("127.0.0.1", 53)], resolver.dynServers)
+ 
+ 
++    def test_closesResolvConf(self):
++        """
++        Ensures that L{client.Resolver} closes the resolvConf file when done.
++        """
++        handle = FilePath(self.mktemp())
++        resolvConf = handle.open(mode='w+')
++        self.addCleanup(handle.remove)
++
++        _openFile = lambda self, path: resolvConf
++        self.patch(client.Resolver, '_openFile', _openFile)
++        client.Resolver(servers=["example.com", 53], resolv='/etc/resolv.conf',
++            reactor=Clock())
++
++        self.assertTrue(resolvConf.closed)
++
++
+     def test_domainEmptyArgument(self):
+         """
+         L{client.Resolver.parseConfig} treats a I{domain} line without an

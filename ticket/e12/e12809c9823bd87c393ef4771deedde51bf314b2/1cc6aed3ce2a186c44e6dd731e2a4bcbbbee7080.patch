@@ -1,0 +1,206 @@
+commit 338abdd343dc80d4f3530fcb9901762e7cab25ef
+Author: Dustin J. Mitchell <dustin@zmanda.com>
+Date:   Sun Jun 12 21:01:18 2011 -0500
+
+    fix + tests for bug 5079
+
+diff --git a/twisted/spread/pb.py b/twisted/spread/pb.py
+index 9ea07cf..526853b 100644
+--- a/twisted/spread/pb.py
++++ b/twisted/spread/pb.py
+@@ -1278,17 +1278,18 @@ class _JellyableAvatarMixin:
+ 
+         puid = avatar.processUniqueID()
+ 
+-        def dereferenceLogout():
+-            self.broker.dontNotifyOnDisconnect(logout)
+-            logout()
+-
+-        self.broker._localCleanup[puid] = dereferenceLogout
+-        # No special helper function is necessary for notifyOnDisconnect
+-        # because dereference callbacks won't be invoked if the connection is
+-        # randomly dropped.  I'm not sure those are ideal semantics, but this
+-        # is the only user of the (private) API at the moment and it works just
+-        # fine as things are. -exarkun
+-        self.broker.notifyOnDisconnect(logout)
++        # only call logout once, whether the connection is dropped (disconnect)
++        # or a logout occurs (cleanup), and be careful to drop the reference to
++        # it in either case
++        logout = [ logout ]
++        def maybeLogout():
++            if not logout: return
++            fn = logout[0]
++            del logout[0]
++            fn()
++        self.broker._localCleanup[puid] = maybeLogout
++        self.broker.notifyOnDisconnect(maybeLogout)
++
+         return avatar
+ 
+ 
+diff --git a/twisted/test/proto_helpers.py b/twisted/test/proto_helpers.py
+index e74f98e..bf97218 100644
+--- a/twisted/test/proto_helpers.py
++++ b/twisted/test/proto_helpers.py
+@@ -261,6 +261,51 @@ class StringIOWithoutClosing(StringIO):
+         Do nothing.
+         """
+ 
++class StringTransportPipe(object):
++    """
++    A bi-directional connection of two string transports.
++
++    @ivar left: string transport at one end of the connection
++    @ivar right: string transport at the other end
++    """
++
++    def __init__(self, leftProtocol, rightProtocol):
++        self.leftProtocol = leftProtocol
++        self.leftTransport = StringTransport()
++        self.rightProtocol = rightProtocol
++        self.rightTransport = StringTransport()
++
++    def stop(self):
++        """
++        Stop an ongoing pump operation
++        """
++        self._stop = True
++
++    def pump(self):
++        """
++        Pump data between the transports until there's no more data to pump,
++        or until L{stop} is called.
++
++        This can be called repeatedly, once more data has arrived.
++        """
++
++        self._stop = False
++        while not self._stop:
++            # get any queued data from the transports
++            rightward = self.leftTransport.value()
++            self.leftTransport.clear()
++            leftward = self.rightTransport.value()
++            self.rightTransport.clear()
++
++            # stop looping if there's no data being transferred
++            if not rightward and not leftward:
++                break
++
++            # deliver it to the other side
++            if rightward:
++                self.rightProtocol.dataReceived(rightward)
++            if leftward:
++                self.leftProtocol.dataReceived(leftward)
+ 
+ 
+ class _FakePort(object):
+diff --git a/twisted/test/test_pb.py b/twisted/test/test_pb.py
+index 0063032..395d6aa 100644
+--- a/twisted/test/test_pb.py
++++ b/twisted/test/test_pb.py
+@@ -11,7 +11,7 @@ only specific tests for old API.
+ # issue1195 TODOs: replace pump.pump() with something involving Deferreds.
+ # Clean up warning suppression.
+ 
+-import sys, os, time, gc
++import sys, os, time, gc, weakref
+ 
+ from cStringIO import StringIO
+ from zope.interface import implements, Interface
+@@ -19,13 +19,14 @@ from zope.interface import implements, Interface
+ from twisted.python.versions import Version
+ from twisted.trial import unittest
+ from twisted.spread import pb, util, publish, jelly
+-from twisted.internet import protocol, main, reactor
++from twisted.internet import protocol, main, reactor, defer
+ from twisted.internet.error import ConnectionRefusedError
+ from twisted.internet.defer import Deferred, gatherResults, succeed
+ from twisted.protocols.policies import WrappingFactory
+ from twisted.python import failure, log
+ from twisted.cred.error import UnauthorizedLogin, UnhandledCredentials
+ from twisted.cred import portal, checkers, credentials
++from twisted.test import proto_helpers
+ 
+ 
+ class Dummy(pb.Viewable):
+@@ -1117,6 +1118,80 @@ class MyView(pb.Viewable):
+ 
+ 
+ 
++
++class NewCredLeakTests(unittest.TestCase):
++    """
++    Tests to try to trigger memory leaks.
++    """
++    class LeakyRealm(TestRealm):
++        """
++        A realm which hangs onto a reference to the mind object in its logout
++        function.
++        """
++        def __init__(self, testcase, logoutDeferred):
++            self.testcase = testcase
++            self.logoutDeferred = logoutDeferred
++
++        def requestAvatar(self, avatarId, mind, interface):
++            self.testcase.mind_ref = weakref.ref(mind)
++            persp = self.perspectiveFactory(avatarId)
++            persp.logoutDeferred = self.logoutDeferred
++            return (pb.IPerspective, persp, lambda : (mind, persp.logout()))
++
++    def test_logout_leak(self):
++        """
++        Test that the server does not leak a reference when the client
++        disconnects suddenly.  This leak occurs because the logout function
++        maintains a reference to the perspective, which maintains a reference
++        to the logout function.
++        """
++        # the function calls here ensure that various intermediary objects
++        # aren't left in local variables, which would keep refs around, making
++        # it hard to test a refleak
++        def makeServer():
++            d = defer.Deferred()
++            realm = self.LeakyRealm(self, d)
++            prtl = portal.Portal(realm)
++            prtl.registerChecker(
++                checkers.InMemoryUsernamePasswordDatabaseDontUse(u='p'))
++            factory = ConnectionNotifyServerFactory(prtl)
++            serverBroker = factory.buildProtocol(("99.99.99.99", ))
++            return serverBroker
++        serverBroker = makeServer()
++
++        clientBroker = pb.Broker(isClient=1)
++
++        pipe = proto_helpers.StringTransportPipe(clientBroker, serverBroker)
++        clientBroker.makeConnection(pipe.leftTransport)
++        serverBroker.makeConnection(pipe.rightTransport)
++
++        # run challenge-response authentication
++        pipe.pump()
++
++        # log in from the client
++        root = clientBroker.remoteForName("root")
++        d = root.callRemote("login", 'u')
++        def cbResponse((challenge, challenger)):
++            mind = SimpleRemote()
++            return challenger.callRemote("respond",
++                    pb.respond(challenge, 'p'), mind)
++        d.addCallback(cbResponse)
++        def connectionLost(_):
++            pipe.stop()
++            serverBroker.connectionLost(failure.Failure(RuntimeError("boom")))
++        d.addCallback(connectionLost)
++
++        # pump that through the system
++        pipe.pump()
++        assert d.called
++
++        # and check for lingering references - requestAvatar sets mind_ref to a
++        # weakref to the mind; this object should be gc'd, and thus the ref
++        # should return None
++        gc.collect()
++        self.assertEqual(self.mind_ref(), None)
++
++
+ class NewCredTestCase(unittest.TestCase):
+     """
+     Tests related to the L{twisted.cred} support in PB.

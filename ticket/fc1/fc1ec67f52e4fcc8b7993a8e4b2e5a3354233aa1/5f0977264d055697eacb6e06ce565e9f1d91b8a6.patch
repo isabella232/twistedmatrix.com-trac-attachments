@@ -1,0 +1,471 @@
+Index: /home/wolf/twisted-trunk/twisted/words/protocols/irc.py
+===================================================================
+--- /home/wolf/twisted-trunk/twisted/words/protocols/irc.py	(revision 23912)
++++ /home/wolf/twisted-trunk/twisted/words/protocols/irc.py	(working copy)
+@@ -34,6 +34,7 @@
+ from twisted.persisted import styles
+ from twisted.protocols import basic
+ from twisted.python import log, reflect, text
++from twisted.python.deprecate import getWarningMethod
+ 
+ # System Imports
+ 
+@@ -66,6 +67,7 @@
+ class IRCPasswordMismatch(Exception):
+     pass
+ 
++
+ def parsemsg(s):
+     """Breaks a message from an IRC server into its prefix, command, and arguments.
+     """
+@@ -569,6 +571,7 @@
+         'n': (False, False),  # no external messages
+     }
+ 
++
+     # If this is false, no attempt will be made to identify
+     # ourself to the server.
+     performLogin = 1
+@@ -654,14 +657,33 @@
+         connected to.
+         """
+ 
++
+     def isupport(self, options):
+-        """Called with various information about what the server supports.
++        """
++        B{Deprecated}: use L{serverSupports} instead.
++        Called with various information about what the server supports.
+ 
+         @type options: C{list} of C{str}
+-        @param options: Descriptions of features or limits of the server, possibly
+-        in the form "NAME=VALUE".
++        @param options: Descriptions of features or limits of the server,
++        possibly in the form "NAME=VALUE".
+         """
+ 
++
++    def serverSupports(self, options):
++        """
++        Called with various information about what the server supports.
++
++        @type options: C{dict}
++        @param options: A C{dict} with the parameters supported by the server
++        and their values if present, or C{True} if the parameter doesn't have
++        any value (e.g. NOQUIT).
++        @see: U{The 005 numeric: ISUPPORT<http://www.irc.org/tech_docs/005.html>}
++
++        Note: The server could send the ISUPPORT message in two or more
++        separated messages and this method could be called more than once.
++        """
++
++
+     def luserChannels(self, channels):
+         """Called with the number of channels existant on the server.
+ 
+@@ -1180,9 +1202,23 @@
+         self.myInfo(*info)
+ 
+     def irc_RPL_BOUNCE(self, prefix, params):
++        """
++        Check if the message is a BOUNCE or an ISUPPORT (005 numeric is doubly
++        assigned) and call L{bounce} or L{irc_RPL_ISUPPORT}.
++        """
+         # 005 is doubly assigned.  Piece of crap dirty trash protocol.
+-        if params[-1] == "are available on this server":
+-            self.isupport(params[1:-1])
++        if (params[-1] == 'are available on this server' or
++            params[-1] ==  'are supported by this server'):
++            self.irc_RPL_ISUPPORT(params[1:-1])
++            # isupport is deprecated, if someone has overridden it I'll call it
++            # for backward compatibility and I'll raise a Warning
++            if (not hasattr(self.isupport, 'im_func') or
++                self.isupport.im_func is not IRCClient.isupport.im_func):
++                self.isupport(params[1:-1])
++                getWarningMethod()(
++                    "'isupport' is deprecated, use 'serverSupports' instead.",
++                    DeprecationWarning
++                ) # irc_RPL_ISUPPORT will call serverSupports after some parsing
+         else:
+             self.bounce(params[1])
+ 
+@@ -1207,6 +1243,81 @@
+     def irc_unknown(self, prefix, command, params):
+         pass
+ 
++
++    def irc_RPL_ISUPPORT(self, args):
++        """
++        Parse the ISUPPORT message and save the data in the L{server_capab}
++        dict.
++
++        All the args with values will be saved as I{keys} and I{values} in the
++        dict; C{True} will be used as default I{value} for the "flag" args (e.g.
++        NOQUIT).
++
++        Some arguments (PREFIX, CHANMODES, CHANLIMIT, MAXLIST, LANGUAGE and
++        possibly others) will require additional parsing, provided by the
++        _parseISupport* methods.
++        """
++        isupport = {}
++        for arg in args:
++            if '=' not in arg:
++                # the arg doesn't have a value, so True is used by default
++                isupport[arg] = True
++            else:
++                key, value = self._parseISupportArg(arg)
++                isupport[key] = value
++                # check if a parser for this arg exists and send it the value
++                parser = '_parseISupport' + key.capitalize()
++                if hasattr(self, parser):
++                    getattr(self, parser)(value)
++        self.server_capab.update(isupport)
++        self.serverSupports(isupport)
++
++
++    def _parseISupportArg(self, param):
++        """
++        Split a param=value couple of the ISUPPORT message, converting to c{int}
++        the numeric values.
++        """
++        try:
++            key, value = param.split('=', 1)
++        except ValueError:
++            # if it's an empty value return the key and an empty string
++            return param.rstrip('='), ''
++        if value.isdigit():
++            value = int(value)
++        return key, value
++
++
++    def _parseISupportPrefix(self, prefix):
++        """
++        Parse the PREFIX value of the ISUPPORT message and set the L{userprefix}
++        and L{usermodes} attributes to the instance.
++
++        The prefix is in the form '(xxx)yyy' where 'xxx' are the modes
++        (e.g. 'ohv') and 'yyy' the prefixes (e.g. '@%+').
++
++        usermodes is a dict with the modes as keys and the prefixes as values.
++        userprefix is a dict with the prefixes as keys and the modes as values.
++        """
++        res = re.match('^\(([^)]*)\)(\S*)$', prefix)
++        if not res:
++            log.msg("Invalid PREFIX value in ISUPPORT message: '%s' has to be "
++                    "in the form '(xxx)yyy' where 'xxx' are the modes (e.g. "
++                    "'ohv') and 'yyy' the prefixes (e.g. '@%%+')." % prefix)
++            return
++        modes, prefixes = res.groups()
++        if len(modes) != len(prefixes):
++            log.msg("Invalid PREFIX value in ISUPPORT message: the number of "
++                    "modes (%d, '%s') is not equal to the number of prefixes "
++                    "(%d, '%s')." % (len(modes), modes, preflen, len(prefixes)))
++            return
++        if not prefixes and not modes:
++            log.msg("Empty PREFIX value in ISUPPORT message.")
++            return
++        self.usermodes = dict(zip(modes, prefixes))
++        self.userprefix = dict(zip(prefixes, modes))
++
++
+     ### Receiving a CTCP query from another party
+     ### It is safe to leave these alone.
+ 
+@@ -1522,11 +1633,45 @@
+ 
+     ### Protocool methods
+ 
++    #def __init__(self):
++
++        ##print self.isupport
++        #if (not hasattr(self.isupport, 'im_func') or
++            #self.isupport.im_func is not IRCClient.isupport.im_func):
++            #version = Version('Twisted.words.protocols.irc', 2, 5, 0)
++            #self.isupport = deprecated(version)(self.isupport)
++
+     def connectionMade(self):
++        """
++        Perform the login if L{performLogin} is C{True} and set some default
++        instance attribute:
++
++        @ivar server_cabap: A dictionary with various informations about what
++        the server supports. This value will be replaced by the data sent by
++        the server in the ISUPPORT (and possibly others) messages.
++
++        @ivar userprefix: a dict with the user modes (e.g. 'ohv') as keys and
++        the prefixes (e.g. '@%+') as values.
++        @ivar userprefix: a dict with the user prefixes as keys and the modes
++        as values.
++
++        userprefix and usermodes will be replaced if the server sends the
++        ISUPPORT message with the PREFIX paramater (see L{_parseISupportPrefix}
++        docstring).
++        """
+         self._queue = []
+         if self.performLogin:
+             self.register(self.nickname)
++        # Default data used if the server doesn't send the ISUPPORT message
++        self.server_capab = {
++            'PREFIX': '(ohv)@%+',
++            'CHANTYPES': '#&'
++        }
+ 
++        self.userprefix = {'@': 'o', '%': 'h', '+': 'v'}
++        self.usermodes = {'o': '@', 'h': '%', 'v': '+'}
++
++
+     def dataReceived(self, data):
+         basic.LineReceiver.dataReceived(self, data.replace('\r', ''))
+ 
+Index: /home/wolf/twisted-trunk/twisted/words/test/test_irc.py
+===================================================================
+--- /home/wolf/twisted-trunk/twisted/words/test/test_irc.py	(revision 23912)
++++ /home/wolf/twisted-trunk/twisted/words/test/test_irc.py	(working copy)
+@@ -84,7 +84,8 @@
+         'myInfo': ('servername', 'version', 'umodes', 'cmodes'),
+         'luserClient': ('info',),
+         'bounce': ('info',),
+-        'isupport': ('options',),
++        #'isupport': ('options',),
++        'serverSupports': ('options',),
+         'luserChannels': ('channels',),
+         'luserOp': ('ops',),
+         'luserMe': ('info',),
+@@ -325,6 +326,197 @@
+         ])
+ 
+ 
++    def _sendISupport(self, options, msg='are available on this server'):
++        """
++        Format the ISUPPORT message string and send it to the client.
++        """
++        message = ':irc.servername.org 005 Wolf %s :%s\r\n'
++        self.client.dataReceived(message % (options, msg))
++
++
++    def _checkServerSupports(self, expected):
++        """
++        Compare the expected result(s) with the one(s) received by the
++        L{serverSupport} method.
++        """
++        calls = self.client.calls
++        data = {}
++        for method, args in calls:
++            self.assertEquals(method, 'serverSupports')
++            data.update(args['options'])
++        self.assertEquals(data, expected)
++
++
++    def _checkPrefixAndServerCapab(self, expected, modes=None, prefixes=None):
++        """
++        Check the instance variabile userprefix, usermodes and server_capab.
++
++        If the server doesn't send the PREFIX and CHANTYPES values in the
++        ISUPPORT message, the default values should be used.
++        """
++        self.assertEquals(self.client.usermodes,
++                            modes or {'o': '@', 'h': '%', 'v': '+'})
++        self.assertEquals(self.client.userprefix,
++                            prefixes or {'@': 'o', '%': 'h', '+': 'v'})
++        if 'PREFIX' not in expected:
++            expected['PREFIX'] = '(ohv)@%+'
++        if 'CHANTYPES' not in expected:
++            expected['CHANTYPES'] = '#&'
++        self.assertEquals(self.client.server_capab, expected)
++
++
++    def test_serverSupportsWithSingleMessage(self):
++        """
++        Send to the client a single ISUPPORT message and check if serverSupports
++        receives the correct result.
++        """
++        self._sendISupport(
++            ('CMDS=KNOCK,MAP,DCCALLOW,USERIP NAMESX SAFELISTHCN MAXCHANNELS=20 '
++            'CHANLIMIT=#:20 MAXLIST=b:100,e:100,I:100 NICKLEN=20 CHANNELLEN=32 '
++            'TOPICLEN=307 KICKLEN=307 AWAYLEN=307 MAXTARGETS=20'),
++            'are supported by this server'
++        )
++        expected = {
++            'AWAYLEN': 307,
++            'CHANLIMIT': '#:20',
++            'CHANNELLEN': 32,
++            'CMDS': 'KNOCK,MAP,DCCALLOW,USERIP',
++            'KICKLEN': 307,
++            'MAXCHANNELS': 20,
++            'MAXLIST': 'b:100,e:100,I:100',
++            'MAXTARGETS': 20,
++            'NAMESX': True,
++            'NICKLEN': 20,
++            'SAFELISTHCN': True,
++            'TOPICLEN': 307
++        }
++        self._checkServerSupports(expected)
++        self._checkPrefixAndServerCapab(expected)
++
++
++    def test_serverSupportsWithMultipleMessages(self):
++        """
++        Send to the client two ISUPPORT messages and check if serverSupports
++        receives the correct result.
++        """
++        self._sendISupport((
++            'NOQUIT SAFELIST MODES=6 MAXCHANNELS=35 MAXBANS=100 NICKLEN=60 '
++            'TOPICLEN=800 KICKLEN=800 CHANTYPES=# PREFIX=(ov)@+ '
++            'NETWORK=UniLang SILENCE=10'
++        ))
++        self._sendISupport(( 
++            'WATCH=128 CASEMAPPING=ascii ELIST=cmntu CHARSET=utf-8,* '
++            'CHANMODES=beI,k,jl,AcHiLmMnOpPQrRsStUZ'
++        ))
++        expected = {
++            'CASEMAPPING': 'ascii',
++            'CHANMODES': 'beI,k,jl,AcHiLmMnOpPQrRsStUZ',
++            'CHANTYPES': '#',
++            'CHARSET': 'utf-8,*',
++            'ELIST': 'cmntu',
++            'KICKLEN': 800,
++            'MAXBANS': 100,
++            'MAXCHANNELS': 35,
++            'MODES': 6,
++            'NETWORK': 'UniLang',
++            'NICKLEN': 60,
++            'NOQUIT': True,
++            'PREFIX': '(ov)@+',
++            'SAFELIST': True,
++            'SILENCE': 10,
++            'TOPICLEN': 800,
++            'WATCH': 128
++        }
++        self._checkServerSupports(expected)
++        self._checkPrefixAndServerCapab(
++            expected, {'o': '@', 'v': '+'}, {'+': 'v', '@': 'o'})
++
++
++    def test_deprecatedISupportMethod(self):
++        """
++        Check if a deprecation warning is raised when someone has overridden the
++        isupport method and if the data are sent both to isupport and to
++        serverSupports.
++        """
++        #from twisted.python.deprecate import deprecated
++        #from twisted.python.versions import Version
++
++        #class ClientWithDeprecatedISupport(object, IRCClientWithoutLogin):
++        #class ClientWithDeprecatedISupport(NoticingClient):
++            #def isupport(self, data):
++                #print 'bar'
++                #self.calls.append(('isupport', data))
++
++        #oldclient = self.client
++        #file = StringIOWithoutClosing()
++        #transport = protocol.FileWrapper(file)
++        #self.client = ClientWithDeprecatedISupport()
++        #self.client.makeConnection(transport)
++        def isupport(data):
++            self.client.calls.append(('isupport', data))
++        self.client.isupport = isupport
++        def _delISupportFromClient(client):
++            del client.isupport
++        self.addCleanup(_delISupportFromClient, self.client)
++        options = (
++            'MODES=4 CHANLIMIT=#:20 NICKLEN=16 USERLEN=10 HOSTLEN=63 '
++            'TOPICLEN=450 KICKLEN=450 CHANNELLEN=30 KEYLEN=23 CHANTYPES=# '
++            'PREFIX=(ov)@+ CASEMAPPING=ascii CAPAB IRCD=dancer'
++        )
++        #self.assertWarns(
++            #DeprecationWarning,
++            #"'isupport' is deprecated, use 'serverSupports' instead.",
++            #irc.__file__,
++        #self.callDeprecated(
++            #Version('Twisted.words.protocols.irc', 2, 5, 0),
++            #self.client.isupport,
++            #options.split()
++        #)
++        #self._sendISupport(options)
++        #
++        #
++        #self.callDeprecated(
++            #Version('Twisted.words.protocols.irc', 2, 5, 0),
++            #self._sendISupport,
++            #options
++        #)
++        self.assertWarns(
++            DeprecationWarning,
++            "'isupport' is deprecated, use 'serverSupports' instead.",
++            irc.__file__,
++            self._sendISupport,
++            options
++        )
++        #print self.client.calls
++        isupportdata = self.client.calls.pop()
++        expected = {
++            'CAPAB': True,
++            'CASEMAPPING': 'ascii',
++            'CHANLIMIT': '#:20',
++            'CHANNELLEN': 30,
++            'CHANTYPES': '#',
++            'HOSTLEN': 63,
++            'IRCD': 'dancer',
++            'KEYLEN': 23,
++            'KICKLEN': 450,
++            'MODES': 4,
++            'NICKLEN': 16,
++            'PREFIX': '(ov)@+',
++            'TOPICLEN': 450,
++            'USERLEN': 10
++        }
++        self._checkServerSupports(expected)
++        self._checkPrefixAndServerCapab(
++            expected, {'o': '@', 'v': '+'}, {'+': 'v', '@': 'o'})
++        self.assertEquals(isupportdata, (('isupport', options.split())))
++        #transport.loseConnection()
++        #self.client.connectionLost()
++        #del file
++        #del transport
++        #self.client = oldclient
++
++
++
+     def _serverTestImpl(self, code, msg, func, **kw):
+         host = pop(kw, 'host', 'server.host')
+         nick = pop(kw, 'nick', 'nickname')
+@@ -363,26 +555,19 @@
+         self._serverTestImpl("251", msg, "luserClient",
+                              info=msg)
+ 
+-    def testISupport(self):
+-        args = ("MODES=4 CHANLIMIT=#:20 NICKLEN=16 USERLEN=10 HOSTLEN=63 "
+-                "TOPICLEN=450 KICKLEN=450 CHANNELLEN=30 KEYLEN=23 CHANTYPES=# "
+-                "PREFIX=(ov)@+ CASEMAPPING=ascii CAPAB IRCD=dancer")
+-        msg = "are available on this server"
+-        self._serverTestImpl("005", msg, "isupport", args=args,
+-                             options=['MODES=4',
+-                                      'CHANLIMIT=#:20',
+-                                      'NICKLEN=16',
+-                                      'USERLEN=10',
+-                                      'HOSTLEN=63',
+-                                      'TOPICLEN=450',
+-                                      'KICKLEN=450',
+-                                      'CHANNELLEN=30',
+-                                      'KEYLEN=23',
+-                                      'CHANTYPES=#',
+-                                      'PREFIX=(ov)@+',
+-                                      'CASEMAPPING=ascii',
+-                                      'CAPAB',
+-                                      'IRCD=dancer'])
++    #def testISupport(self):
++        #args = ("MODES=4 CHANLIMIT=#:20 NICKLEN=16 USERLEN=10 HOSTLEN=63 "
++                #"TOPICLEN=450 KICKLEN=450 CHANNELLEN=30 KEYLEN=23 CHANTYPES=# "
++                #"PREFIX=(ov)@+ CASEMAPPING=ascii CAPAB IRCD=dancer")
++        #msg = "are available on this server"
++        #self.assertWarns(
++            #DeprecationWarning,
++            #"'isupport' is deprecated, use 'serverSupports' instead.",
++            #'/home/wolf/twisted-trunk/twisted/words/protocols/irc.py',
++            #self._serverTestImpl,
++            #"005", msg, "isupport",
++            #args=args, options=args.split()
++        #)
+ 
+     def testBounce(self):
+         msg = "Try server some.host, port 321"

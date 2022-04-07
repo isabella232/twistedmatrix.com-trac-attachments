@@ -1,0 +1,137 @@
+Index: twisted/test/test_paths.py
+===================================================================
+--- twisted/test/test_paths.py	(revision 28820)
++++ twisted/test/test_paths.py	(working copy)
+@@ -327,7 +327,26 @@
+         self.assertEquals(repr(relpath), pathRepr)
+ 
+ 
++class ExplodingFile:
+ 
++    def read(self, n=0):
++        raise IOError
++
++    def write(self, what):
++        raise IOError
++
++    def close(self):
++        self.closed = True
++
++
++class ExplodingFilePath(filepath.FilePath):
++
++    def open(self, mode=None):
++        self.fp = ExplodingFile()
++        return self.fp
++
++
++
+ class FilePathTestCase(AbstractFilePathTestCase):
+     """
+     Test various L{FilePath} path manipulations.
+@@ -455,7 +474,16 @@
+         newcontent = self.path.child('new').getContent()
+         self.failUnlessEqual(content, newcontent)
+ 
++    def test_getAndSetFileClosing(self):
++        fp = ExplodingFilePath("")
++        self.assertRaises(IOError, fp.getContent)
++        self.assertTrue(fp.fp.closed)
++        fp = ExplodingFilePath("")
++        fp.siblingExtension = lambda filepath: fp
++        self.assertRaises(IOError, fp.setContent, "blah")
++        self.assertTrue(fp.fp.closed)
+ 
++
+     def test_symbolicLink(self):
+         """
+         Verify the behavior of the C{isLink} method against links and
+@@ -642,6 +670,21 @@
+         self.assertEquals(newPaths, oldPaths)
+ 
+ 
++    def test_copyToFileClosing(self):
++        fp = ExplodingFilePath("")
++        p = self.path.child("nothere")
++        p.isfile = lambda: True
++        self.assertRaises(IOError, p.copyTo, fp)
++        self.assertTrue(fp.fp.closed)
++        fp = ExplodingFilePath("")
++        p = ExplodingFilePath("")
++        p.isdir = lambda: False
++        p.isfile = lambda: True
++        self.assertRaises(IOError, p.copyTo, fp)
++        self.assertTrue(p.fp.closed)
++        self.assertTrue(fp.fp.closed)
++
++
+     def test_copyToWithSymlink(self):
+         """
+         Verify that copying with followLinks=True copies symlink targets
+Index: twisted/python/filepath.py
+===================================================================
+--- twisted/python/filepath.py	(revision 28820)
++++ twisted/python/filepath.py	(working copy)
+@@ -131,7 +131,11 @@
+     """
+ 
+     def getContent(self):
+-        return self.open().read()
++        fp = self.open()
++        try:
++            return fp.read()
++        finally:
++            fp.close()
+ 
+ 
+     def parents(self):
+@@ -662,8 +666,10 @@
+     def setContent(self, content, ext='.new'):
+         sib = self.siblingExtension(ext)
+         f = sib.open('w')
+-        f.write(content)
+-        f.close()
++        try:
++            f.write(content)
++        finally:
++            f.close()
+         if platform.isWindows() and exists(self.path):
+             os.unlink(self.path)
+         os.rename(sib.path, self.path)
+@@ -755,19 +761,23 @@
+                 child.copyTo(destChild, followLinks)
+         elif self.isfile():
+             writefile = destination.open('w')
+-            readfile = self.open()
+-            while 1:
+-                # XXX TODO: optionally use os.open, os.read and O_DIRECT and
+-                # use os.fstatvfs to determine chunk sizes and make
+-                # *****sure**** copy is page-atomic; the following is good
+-                # enough for 99.9% of everybody and won't take a week to audit
+-                # though.
+-                chunk = readfile.read(self._chunkSize)
+-                writefile.write(chunk)
+-                if len(chunk) < self._chunkSize:
+-                    break
+-            writefile.close()
+-            readfile.close()
++            try:
++                readfile = self.open()
++                try:
++                    while 1:
++                        # XXX TODO: optionally use os.open, os.read and O_DIRECT
++                        # and use os.fstatvfs to determine chunk sizes and make
++                        # *****sure**** copy is page-atomic; the following is
++                        # good enough for 99.9% of everybody and won't take a
++                        # week to audit though.
++                        chunk = readfile.read(self._chunkSize)
++                        writefile.write(chunk)
++                        if len(chunk) < self._chunkSize:
++                            break
++                finally:
++                    readfile.close()
++            finally:
++                writefile.close()
+         else:
+             # If you see the following message because you want to copy
+             # symlinks, fifos, block devices, character devices, or unix

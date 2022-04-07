@@ -1,0 +1,811 @@
+Index: twisted/test/test_udplite.py
+===================================================================
+--- twisted/test/test_udplite.py	(revisione 0)
++++ twisted/test/test_udplite.py	(revisione 0)
+@@ -0,0 +1,562 @@
++# -*- test-case-name: twisted.test.test_udplite -*-
++# Copyright (c) 2001-2004 Twisted Matrix Laboratories.
++# See LICENSE for details.
++
++# Heavly inspired by test_udp.py
++
++#
++from twisted.trial import unittest, util
++
++from twisted.internet.defer import Deferred, gatherResults, maybeDeferred
++from twisted.internet import protocol, reactor, error, defer, interfaces
++from twisted.python import runtime
++
++
++class Mixin:
++
++    started = 0
++    stopped = 0
++
++    startedDeferred = None
++
++    def __init__(self):
++        self.packets = []
++
++    def startProtocol(self):
++        self.started = 1
++        if self.startedDeferred is not None:
++            d, self.startedDeferred = self.startedDeferred, None
++            d.callback(None)
++
++    def stopProtocol(self):
++        self.stopped = 1
++
++
++class Server(Mixin, protocol.DatagramProtocol):
++    packetReceived = None
++    refused = 0
++
++
++    def datagramReceived(self, data, addr):
++        self.packets.append((data, addr))
++        if self.packetReceived is not None:
++            d, self.packetReceived = self.packetReceived, None
++            d.callback(None)
++
++
++
++class Client(Mixin, protocol.ConnectedDatagramProtocol):
++
++    packetReceived = None
++    refused = 0
++
++    def datagramReceived(self, data):
++        self.packets.append(data)
++        if self.packetReceived is not None:
++            d, self.packetReceived = self.packetReceived, None
++            d.callback(None)
++
++    def connectionFailed(self, failure):
++        if self.startedDeferred is not None:
++            d, self.startedDeferred = self.startedDeferred, None
++            d.errback(failure)
++        self.failure = failure
++
++    def connectionRefused(self):
++        if self.startedDeferred is not None:
++            d, self.startedDeferred = self.startedDeferred, None
++            d.errback(error.ConnectionRefusedError("yup"))
++        self.refused = 1
++
++
++class GoodClient(Server):
++
++    def connectionRefused(self):
++        if self.startedDeferred is not None:
++            d, self.startedDeferred = self.startedDeferred, None
++            d.errback(error.ConnectionRefusedError("yup"))
++        self.refused = 1
++
++
++
++class BadClientError(Exception):
++    """
++    Raised by BadClient at the end of every datagramReceived call to try and
++    screw stuff up.
++    """
++
++
++
++class BadClient(protocol.DatagramProtocol):
++    """
++    A DatagramProtocol which always raises an exception from datagramReceived.
++    Used to test error handling behavior in the reactor for that method.
++    """
++    d = None
++
++    def setDeferred(self, d):
++        """
++        Set the Deferred which will be called back when datagramReceived is
++        called.
++        """
++        self.d = d
++
++
++    def datagramReceived(self, bytes, addr):
++        if self.d is not None:
++            d, self.d = self.d, None
++            d.callback(bytes)
++        raise BadClientError("Application code is very buggy!")
++
++
++
++class PortCleanerUpper(unittest.TestCase):
++    callToLoseCnx = 'loseConnection'
++    def setUp(self):
++        self.ports = []
++
++    def tearDown(self):
++        return self.cleanPorts(*self.ports)
++
++    def _addPorts(self, *ports):
++        for p in ports:
++            self.ports.append(p)
++
++    def cleanPorts(self, *ports):
++        for p in ports:
++            if not hasattr(p, 'disconnected'):
++                raise RuntimeError(
++                    "You handed something to cleanPorts that"
++                    " doesn't have a disconnected attribute, dummy!")
++        ds = [ defer.maybeDeferred(getattr(p, self.callToLoseCnx))
++               for p in ports if not p.disconnected ]
++        return defer.gatherResults(ds)
++
++
++
++class UDPLiteTestCase(unittest.TestCase):
++
++    def testOldAddress(self):
++        server = Server()
++        d = server.startedDeferred = defer.Deferred()
++        p = reactor.listenUDPLite(0, server, interface="127.0.0.1")
++        def cbStarted(ignored):
++            addr = p.getHost()
++            self.assertEquals(addr, ('UDPLite', addr.host, addr.port))
++            return p.stopListening()
++        return d.addCallback(cbStarted)
++    testOldAddress.suppress = [
++        util.suppress(message='IPv4Address.__getitem__',
++                      category=DeprecationWarning)]
++
++
++    def testStartStop(self):
++        server = Server()
++        d = server.startedDeferred = defer.Deferred()
++        port1 = reactor.listenUDPLite(0, server, interface="127.0.0.1")
++        def cbStarted(ignored):
++            self.assertEquals(server.started, 1)
++            self.assertEquals(server.stopped, 0)
++            return port1.stopListening()
++        def cbStopped(ignored):
++            self.assertEquals(server.stopped, 1)
++        return d.addCallback(cbStarted).addCallback(cbStopped)
++
++    def testRebind(self):
++        # Ensure binding the same DatagramProtocol repeatedly invokes all
++        # the right callbacks.
++        server = Server()
++        d = server.startedDeferred = defer.Deferred()
++        p = reactor.listenUDPLite(0, server, interface="127.0.0.1")
++
++        def cbStarted(ignored, port):
++            return port.stopListening()
++
++        def cbStopped(ignored):
++            d = server.startedDeferred = defer.Deferred()
++            p = reactor.listenUDPLite(0, server, interface="127.0.0.1")
++            return d.addCallback(cbStarted, p)
++
++        return d.addCallback(cbStarted, p)
++
++
++    def testBindError(self):
++        server = Server()
++        d = server.startedDeferred = defer.Deferred()
++        port = reactor.listenUDPLite(0, server, interface='127.0.0.1')
++
++        def cbStarted(ignored):
++            self.assertEquals(port.getHost(), server.transport.getHost())
++
++            server2 = Server()
++            self.assertRaises(
++                error.CannotListenError,
++                reactor.listenUDPLite, port.getHost().port, server2,
++                interface='127.0.0.1')
++        d.addCallback(cbStarted)
++
++        def cbFinished(ignored):
++            return port.stopListening()
++        d.addCallback(cbFinished)
++        return d
++
++    def testSendPackets(self):
++        server = Server()
++        serverStarted = server.startedDeferred = defer.Deferred()
++        port1 = reactor.listenUDPLite(0, server, interface="127.0.0.1")
++
++        client = GoodClient()
++        clientStarted = client.startedDeferred = defer.Deferred()
++
++        def cbServerStarted(ignored):
++            self.port2 = reactor.listenUDPLite(0, client, interface="127.0.0.1")
++            return clientStarted
++
++        d = serverStarted.addCallback(cbServerStarted)
++
++        def cbClientStarted(ignored):
++            client.transport.connect("127.0.0.1",
++                                     server.transport.getHost().port)
++            cAddr = client.transport.getHost()
++            sAddr = server.transport.getHost()
++
++            serverSend = client.packetReceived = defer.Deferred()
++            server.transport.write("hello", (cAddr.host, cAddr.port))
++
++            clientWrites = [
++                ("a",),
++                ("b", None),
++                ("c", (sAddr.host, sAddr.port))]
++
++            def cbClientSend(ignored):
++                if clientWrites:
++                    nextClientWrite = server.packetReceived = defer.Deferred()
++                    nextClientWrite.addCallback(cbClientSend)
++                    client.transport.write(*clientWrites.pop(0))
++                    return nextClientWrite
++
++            # No one will ever call .errback on either of these Deferreds,
++            # but there is a non-trivial amount of test code which might
++            # cause them to fail somehow.  So fireOnOneErrback=True.
++            return defer.DeferredList([
++                cbClientSend(None),
++                serverSend],
++                fireOnOneErrback=True)
++
++        d.addCallback(cbClientStarted)
++
++        def cbSendsFinished(ignored):
++            cAddr = client.transport.getHost()
++            sAddr = server.transport.getHost()
++            self.assertEquals(
++                client.packets,
++                [("hello", (sAddr.host, sAddr.port))])
++            clientAddr = (cAddr.host, cAddr.port)
++            self.assertEquals(
++                server.packets,
++                [("a", clientAddr),
++                 ("b", clientAddr),
++                 ("c", clientAddr)])
++
++        d.addCallback(cbSendsFinished)
++
++        def cbFinished(ignored):
++            return defer.DeferredList([
++                defer.maybeDeferred(port1.stopListening),
++                defer.maybeDeferred(self.port2.stopListening)],
++                fireOnOneErrback=True)
++
++        d.addCallback(cbFinished)
++        return d
++
++
++    def testAcceptableCoverage(self):
++        server = Server()
++        serverStarted = server.startedDeferred = defer.Deferred()
++        port1 = reactor.listenUDPLite(0, server, interface="127.0.0.1")
++	port1.setCoverage(8)
++
++        client = GoodClient()
++        clientStarted = client.startedDeferred = defer.Deferred()
++
++        def cbServerStarted(ignored):
++            self.port2 = reactor.listenUDPLite(0, client, interface="127.0.0.1")
++	    self.port2.setAcceptableCoverage(12)
++            return clientStarted
++
++        d = serverStarted.addCallback(cbServerStarted)
++
++        def cbClientStarted(ignored):
++            client.transport.connect("127.0.0.1",
++                                     server.transport.getHost().port)
++            cAddr = client.transport.getHost()
++            sAddr = server.transport.getHost()
++
++            serverSend = client.packetReceived = defer.Deferred()
++            # Foobar should never reach the server because our coverage is less
++            # then required by the server.
++            server.transport.write("foobar", (cAddr.host, cAddr.port))
++            # Full packet checksum coverage. And now all packet will be accepted.
++	    port1.setCoverage(0)
++            server.transport.write("hello", (cAddr.host, cAddr.port))
++
++            clientWrites = [
++                ("a",),
++                ("b", None),
++                ("c", (sAddr.host, sAddr.port))]
++
++            def cbClientSend(ignored):
++                if clientWrites:
++                    nextClientWrite = server.packetReceived = defer.Deferred()
++                    nextClientWrite.addCallback(cbClientSend)
++                    client.transport.write(*clientWrites.pop(0))
++                    return nextClientWrite
++
++            # No one will ever call .errback on either of these Deferreds,
++            # but there is a non-trivial amount of test code which might
++            # cause them to fail somehow.  So fireOnOneErrback=True.
++            return defer.DeferredList([
++                cbClientSend(None),
++                serverSend],
++                fireOnOneErrback=True)
++
++        d.addCallback(cbClientStarted)
++
++        def cbSendsFinished(ignored):
++            cAddr = client.transport.getHost()
++            sAddr = server.transport.getHost()
++            self.assertEquals(
++                client.packets,
++                [("hello", (sAddr.host, sAddr.port))])
++            clientAddr = (cAddr.host, cAddr.port)
++            self.assertEquals(
++                server.packets,
++                [("a", clientAddr),
++                 ("b", clientAddr),
++                 ("c", clientAddr)])
++
++        d.addCallback(cbSendsFinished)
++
++        def cbFinished(ignored):
++            return defer.DeferredList([
++                defer.maybeDeferred(port1.stopListening),
++                defer.maybeDeferred(self.port2.stopListening)],
++                fireOnOneErrback=True)
++
++        d.addCallback(cbFinished)
++        return d
++
++
++    def testConnectionRefused(self):
++        # assume no one listening on port 80 UDP Lite
++        client = GoodClient()
++        clientStarted = client.startedDeferred = defer.Deferred()
++        port = reactor.listenUDPLite(0, client, interface="127.0.0.1")
++
++        server = Server()
++        serverStarted = server.startedDeferred = defer.Deferred()
++        port2 = reactor.listenUDPLite(0, server, interface="127.0.0.1")
++
++        d = defer.DeferredList(
++            [clientStarted, serverStarted],
++            fireOnOneErrback=True)
++
++        def cbStarted(ignored):
++            connectionRefused = client.startedDeferred = defer.Deferred()
++            client.transport.connect("127.0.0.1", 80)
++
++            for i in range(10):
++                client.transport.write(str(i))
++                server.transport.write(str(i), ("127.0.0.1", 80))
++
++            return self.assertFailure(
++                connectionRefused,
++                error.ConnectionRefusedError)
++
++        d.addCallback(cbStarted)
++
++        def cbFinished(ignored):
++            return defer.DeferredList([
++                defer.maybeDeferred(port.stopListening),
++                defer.maybeDeferred(port2.stopListening)],
++                fireOnOneErrback=True)
++
++        d.addCallback(cbFinished)
++        return d
++
++    def testBadConnect(self):
++        client = GoodClient()
++        port = reactor.listenUDPLite(0, client, interface="127.0.0.1")
++        self.assertRaises(ValueError, client.transport.connect,
++                          "localhost", 80)
++        client.transport.connect("127.0.0.1", 80)
++        self.assertRaises(RuntimeError, client.transport.connect,
++                          "127.0.0.1", 80)
++        return port.stopListening()
++
++
++
++    def testDatagramReceivedError(self):
++        """
++        Test that when datagramReceived raises an exception it is logged but
++        the port is not disconnected.
++        """
++        finalDeferred = defer.Deferred()
++
++        def cbCompleted(ign):
++            """
++            Flush the exceptions which the reactor should have logged and make
++            sure they're actually there.
++            """
++            errs = self.flushLoggedErrors(BadClientError)
++            self.assertEquals(len(errs), 2, "Incorrectly found %d errors, expected 2" % (len(errs),))
++        finalDeferred.addCallback(cbCompleted)
++
++        client = BadClient()
++        port = reactor.listenUDPLite(0, client, interface='127.0.0.1')
++
++        def cbCleanup(result):
++            """
++            Disconnect the port we started and pass on whatever was given to us
++            in case it was a Failure.
++            """
++            return defer.maybeDeferred(port.stopListening).addBoth(lambda ign: result)
++        finalDeferred.addBoth(cbCleanup)
++
++        addr = port.getHost()
++
++        # UDP Lite is not reliable.  Try to send as many as 60 packets before giving
++        # up.  Conceivably, all sixty could be lost, but they probably won't be
++        # unless all UDP Lite traffic is being dropped, and then the rest of these
++        # UDP Lite tests will likely fail as well.  Ideally, this test (and probably
++        # others) wouldn't even use actual UDP Lite traffic: instead, they would
++        # stub out the socket with a fake one which could be made to behave in
++        # whatever way the test desires.  Unfortunately, this is hard because
++        # of differences in various reactor implementations.
++        attempts = range(60)
++        succeededAttempts = []
++
++        def makeAttempt():
++            """
++            Send one packet to the listening BadClient.  Set up a 0.1 second
++            timeout to do re-transmits in case the packet is dropped.  When two
++            packets have been received by the BadClient, stop sending and let
++            the finalDeferred's callbacks do some assertions.
++            """
++            if not attempts:
++                try:
++                    self.fail("Not enough packets received")
++                except:
++                    finalDeferred.errback()
++
++            self.failIfIdentical(client.transport, None, "UDPLite Protocol lost its transport")
++
++            packet = str(attempts.pop(0))
++            packetDeferred = defer.Deferred()
++            client.setDeferred(packetDeferred)
++            client.transport.write(packet, (addr.host, addr.port))
++
++            def cbPacketReceived(packet):
++                """
++                A packet arrived.  Cancel the timeout for it, record it, and
++                maybe finish the test.
++                """
++                timeoutCall.cancel()
++                succeededAttempts.append(packet)
++                if len(succeededAttempts) == 2:
++                    # The second error has not yet been logged, since the
++                    # exception which causes it hasn't even been raised yet.
++                    # Give the datagramReceived call a chance to finish, then
++                    # let the test finish asserting things.
++                    reactor.callLater(0, finalDeferred.callback, None)
++                else:
++                    makeAttempt()
++
++            def ebPacketTimeout(err):
++                """
++                The packet wasn't received quickly enough.  Try sending another
++                one.  It doesn't matter if the packet for which this was the
++                timeout eventually arrives: makeAttempt throws away the
++                Deferred on which this function is the errback, so when
++                datagramReceived callbacks, so it won't be on this Deferred, so
++                it won't raise an AlreadyCalledError.
++                """
++                makeAttempt()
++
++            packetDeferred.addCallbacks(cbPacketReceived, ebPacketTimeout)
++            packetDeferred.addErrback(finalDeferred.errback)
++
++            timeoutCall = reactor.callLater(
++                0.1, packetDeferred.errback,
++                error.TimeoutError(
++                    "Timed out in testDatagramReceivedError"))
++
++        makeAttempt()
++        return finalDeferred
++
++
++    def testPortRepr(self):
++        client = GoodClient()
++        p = reactor.listenUDPLite(0, client)
++        portNo = str(p.getHost().port)
++        self.failIf(repr(p).find(portNo) == -1)
++        def stoppedListening(ign):
++            self.failIf(repr(p).find(portNo) != -1)
++        d = defer.maybeDeferred(p.stopListening)
++        d.addCallback(stoppedListening)
++        return d
++
++
++class ReactorShutdownInteraction(unittest.TestCase):
++    """Test reactor shutdown interaction"""
++
++    def setUp(self):
++        """Start a UDP Lite port"""
++        self.server = Server()
++        self.port = reactor.listenUDPLite(0, self.server, interface='127.0.0.1')
++
++    def tearDown(self):
++        """Stop the UDP Lite port"""
++        return self.port.stopListening()
++
++    def testShutdownFromDatagramReceived(self):
++        """Test reactor shutdown while in a recvfrom() loop"""
++
++        # udp.Port's doRead calls recvfrom() in a loop, as an optimization.
++        # It is important this loop terminate under various conditions.
++        # Previously, if datagramReceived synchronously invoked
++        # reactor.stop(), under certain reactors, the Port's socket would
++        # synchronously disappear, causing an AttributeError inside that
++        # loop.  This was mishandled, causing the loop to spin forever.
++        # This test is primarily to ensure that the loop never spins
++        # forever.
++
++        finished = defer.Deferred()
++        pr = self.server.packetReceived = defer.Deferred()
++
++        def pktRece(ignored):
++            # Simulate reactor.stop() behavior :(
++            self.server.transport.connectionLost()
++            # Then delay this Deferred chain until the protocol has been
++            # disconnected, as the reactor should do in an error condition
++            # such as we are inducing.  This is very much a whitebox test.
++            reactor.callLater(0, finished.callback, None)
++        pr.addCallback(pktRece)
++
++        def flushErrors(ignored):
++            # We are breaking abstraction and calling private APIs, any
++            # number of horrible errors might occur.  As long as the reactor
++            # doesn't hang, this test is satisfied.  (There may be room for
++            # another, stricter test.)
++            self.flushLoggedErrors()
++        finished.addCallback(flushErrors)
++        self.server.transport.write('\0' * 64, ('127.0.0.1',
++                                    self.server.transport.getHost().port))
++        return finished
++
++
++
++if not interfaces.IReactorUDPLite(reactor, None):
++    UDPLiteTestCase.skip = "This reactor does not support UDP Lite"
++    ReactorShutdownInteraction.skip = "This reactor does not support UDP Lite"
++
+Index: twisted/internet/posixbase.py
+===================================================================
+--- twisted/internet/posixbase.py	(revisione 19570)
++++ twisted/internet/posixbase.py	(copia locale)
+@@ -21,11 +21,11 @@
+ from zope.interface import implements, classImplements
+ 
+ from twisted.internet.interfaces import IReactorUNIX, IReactorUNIXDatagram
+-from twisted.internet.interfaces import IReactorTCP, IReactorUDP, IReactorSSL, IReactorArbitrary
++from twisted.internet.interfaces import IReactorTCP, IReactorUDP, IReactorUDPLite, IReactorSSL, IReactorArbitrary
+ from twisted.internet.interfaces import IReactorProcess, IReactorMulticast
+ from twisted.internet.interfaces import IHalfCloseableDescriptor
+ from twisted.internet import error
+-from twisted.internet import tcp, udp
++from twisted.internet import tcp, udp, udplite
+ 
+ from twisted.python import log, threadable, failure, util
+ from twisted.persisted import styles
+@@ -164,7 +164,7 @@
+ class PosixReactorBase(ReactorBase):
+     """A basis for reactors that use file descriptors.
+     """
+-    implements(IReactorArbitrary, IReactorTCP, IReactorUDP, IReactorMulticast)
++    implements(IReactorArbitrary, IReactorTCP, IReactorUDP, IReactorUDPLite, IReactorMulticast)
+ 
+     def __init__(self):
+         ReactorBase.__init__(self)
+@@ -399,7 +399,18 @@
+         p.startListening()
+         return p
+ 
++    # IReactorUDPLite
+ 
++    def listenUDPLite(self, port, protocol, interface='', maxPacketSize=8192, coverage=0):
++        """Connects a given L{DatagramProtocol} to the given numeric UDP port.
++
++        @returns: object conforming to L{IListeningPort}.
++        """
++        p = udplite.Port(port, protocol, interface, maxPacketSize, self)
++        p.startListening()
++        p.setCoverage(coverage)
++        return p
++
+     # IReactorMulticast
+ 
+     def listenMulticast(self, port, protocol, interface='', maxPacketSize=8192, listenMultiple=False):
+Index: twisted/internet/interfaces.py
+===================================================================
+--- twisted/internet/interfaces.py	(revisione 19570)
++++ twisted/internet/interfaces.py	(copia locale)
+@@ -341,6 +341,23 @@
+         """
+ 
+ 
++class IReactorUDPLite(Interface):
++    """UDP Lite socket methods.
++
++    IMPORTANT: This is an experimental new interface. It may change
++    without backwards compatability. Suggestions are welcome.
++    """
++
++    def listenUDPLite(port, protocol, interface='', maxPacketSize=8192, coverage=0):
++        """Connects a given DatagramProtocol to the given numeric UDP port.
++
++        @param coverage: number of bytes to cover with packet checksum.
++                         0 means all all bytes are covered.
++
++        @return: object which provides L{IListeningPort}.
++        """
++
++
+ class IReactorMulticast(Interface):
+     """UDP socket methods that support multicast.
+ 
+@@ -1243,6 +1260,64 @@
+         """
+ 
+ 
++class IUDPLiteTransport(Interface):
++    """Transport for UDPLite DatagramProtocols."""
++
++    def write(packet, addr=None):
++        """Write packet to given address.
++
++        @param addr: a tuple of (ip, port). For connected transports must
++                     be the address the transport is connected to, or None.
++                     In non-connected mode this is mandatory.
++
++        @raise twisted.internet.error.MessageLengthError: C{packet} was too
++        long.
++        """
++
++    def connect(host, port):
++        """Connect the transport to an address.
++
++        This changes it to connected mode. Datagrams can only be sent to
++        this address, and will only be received from this address. In addition
++        the protocol's connectionRefused method might get called if destination
++        is not receiving datagrams.
++
++        @param host: an IP address, not a domain name ('127.0.0.1', not 'localhost')
++        @param port: port to connect to.
++        """
++
++    def getHost():
++        """Returns IPv4Address."""
++
++    def stopListening():
++        """Stop listening on this port.
++
++        If it does not complete immediately, will return Deferred that fires
++        upon completion.
++        """
++
++    def setCoverage(len=0):
++        """Set checksum coverage.
++
++        UDP Lite checksum covers C{len} octets. Setting to 0 means all octets
++        are covered by checksum like UDP. Checksum coverage MUST be either 0 or
++        at least 8.
++        """
++
++    def getCoverage():
++        """Returns checksum coverage."""
++
++    def setAcceptableCoverage(len=0):
++        """Set minumum acceptable coverage.
++
++        Drop packet with checksum coverage less then C{len}.
++        """
++
++    def getAcceptableCoverage():
++        """Returns minumum acceptable coverage."""
++
++
++
+ class IUDPConnectedTransport(Interface):
+     """DEPRECATED. Transport for UDP ConnectedPacketProtocols."""
+ 
+Index: twisted/internet/address.py
+===================================================================
+--- twisted/internet/address.py	(revisione 19570)
++++ twisted/internet/address.py	(copia locale)
+@@ -28,7 +28,7 @@
+     implements(IAddress)
+     
+     def __init__(self, type, host, port, _bwHack = None):
+-        assert type in ('TCP', 'UDP')
++        assert type in ('TCP', 'UDP', 'UDPLite')
+         self.type = type
+         self.host = host
+         self.port = port
+Index: twisted/internet/udplite.py
+===================================================================
+--- twisted/internet/udplite.py	(revisione 0)
++++ twisted/internet/udplite.py	(revisione 0)
+@@ -0,0 +1,71 @@
++# -*- test-case-name: twisted.test.test_udplite -*-
++
++# Copyright (c) 2001-2004 Twisted Matrix Laboratories.
++# See LICENSE for details.
++
++
++"""Various asynchronous UDPLite classes.
++
++Please do not use this module directly.
++
++API Stability: semi-stable
++
++"""
++
++# System Imports
++import socket
++from zope.interface import implements
++
++# Twisted Imports
++from twisted.internet import udp, address
++
++# Sibling Imports
++import interfaces
++
++
++class Port(udp.Port):
++    """UDPLite port, listening for packets."""
++
++    implements(interfaces.IUDPLiteTransport, interfaces.ISystemHandle)
++
++    addressFamily = socket.AF_INET
++    socketType = socket.SOCK_DGRAM
++    # IANA assigned value for UDPLite
++    socketProtocol = 136
++
++    def getHost(self):
++        """
++        Returns an IPv4Address.
++
++        This indicates the address from which I am connecting.
++        """
++        return address.IPv4Address('UDPLite', *(self.socket.getsockname()))
++
++    def setCoverage(self, len=0):
++        """Set checksum coverage.
++
++        UDP Lite checksum covers C{len} octets. Setting to 0 means all octets
++        are covered like UDP. Checksum coverage MUST be either 0 or at least 8.
++        """
++	UDPLITE_SEND_CSCOV = 10
++        self.socket.setsockopt(self.socketProtocol, UDPLITE_SEND_CSCOV, len)
++
++    def getCoverage(self):
++        """Returns checksum coverage."""
++	UDPLITE_SEND_CSCOV = 10
++        self.socket.getsockopt(self.socketProtocol, UDPLITE_SEND_CSCOV)
++
++    def setAcceptableCoverage(self, len=0):
++        """Set minumum acceptable coverage.
++
++        Drop packet with checksum coverage less then C{len}.
++        """
++	UDPLITE_RECV_CSCOV = 11
++        self.socket.setsockopt(self.socketProtocol, UDPLITE_RECV_CSCOV, len)
++
++    def getAcceptableCoverage(self):
++	"""Returns minumum acceptable coverage."""
++	UDPLITE_RECV_CSCOV = 11
++        self.socket.getsockopt(self.socketProtocol, UDPLITE_RECV_CSCOV)
++
++
+Index: twisted/internet/base.py
+===================================================================
+--- twisted/internet/base.py	(revisione 19570)
++++ twisted/internet/base.py	(copia locale)
+@@ -719,9 +719,10 @@
+ 
+     addressFamily = None
+     socketType = None
++    socketProtocol = 0
+ 
+     def createInternetSocket(self):
+-        s = socket.socket(self.addressFamily, self.socketType)
++        s = socket.socket(self.addressFamily, self.socketType, self.socketProtocol)
+         s.setblocking(0)
+         if fcntl and hasattr(fcntl, 'FD_CLOEXEC'):
+             old = fcntl.fcntl(s.fileno(), fcntl.F_GETFD)

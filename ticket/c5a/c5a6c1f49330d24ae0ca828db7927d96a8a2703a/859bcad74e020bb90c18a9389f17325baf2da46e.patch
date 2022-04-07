@@ -1,0 +1,152 @@
+diff --git twisted/python/dist3.py twisted/python/dist3.py
+index 5735377..a5198ae 100644
+--- twisted/python/dist3.py
++++ twisted/python/dist3.py
+@@ -219,6 +219,7 @@ modules = [
+     "twisted.web.test.requesthelper",
+     "twisted.web.util",
+     "twisted.web.xmlrpc",
++    "twisted.web.wsgi"
+ ]
+ 
+ 
+@@ -381,6 +382,7 @@ testModules = [
+     "twisted.web.test.test_web__responses",
+     "twisted.web.test.test_webclient",
+     "twisted.web.test.test_xmlrpc",
++    "twisted.web.test.test_wsgi",
+ ]
+ 
+ 
+diff --git twisted/web/test/test_wsgi.py twisted/web/test/test_wsgi.py
+index 4e902e5..df86898 100644
+--- twisted/web/test/test_wsgi.py
++++ twisted/web/test/test_wsgi.py
+@@ -4,6 +4,7 @@
+ """
+ Tests for L{twisted.web.wsgi}.
+ """
++import traceback
+ 
+ __metaclass__ = type
+ 
+@@ -209,7 +210,8 @@ class EnvironTests(WSGITestsMixin, TestCase):
+     object by L{twisted.web.wsgi.WSGIResource}.
+     """
+     def environKeyEqual(self, key, value):
+-        def assertEnvironKeyEqual((environ, startResponse)):
++        def assertEnvironKeyEqual(wsgi_params):
++            environ, startResponse = wsgi_params
+             self.assertEqual(environ[key], value)
+         return assertEnvironKeyEqual
+ 
+@@ -220,7 +222,8 @@ class EnvironTests(WSGITestsMixin, TestCase):
+         parameter which is exactly of type C{dict}.
+         """
+         d = self.render('GET', '1.1', [], [''])
+-        def cbRendered((environ, startResponse)):
++        def cbRendered(wsgi_params):
++            environ, startResponse = wsgi_params
+             self.assertIdentical(type(environ), dict)
+         d.addCallback(cbRendered)
+         return d
+@@ -444,7 +447,8 @@ class EnvironTests(WSGITestsMixin, TestCase):
+         """
+         singleValue = self.render(
+             'GET', '1.1', [], [''], None, [('foo', 'bar'), ('baz', 'quux')])
+-        def cbRendered((environ, startResponse)):
++        def cbRendered(wsgi_params):
++            environ, startResponse = wsgi_params
+             self.assertEqual(environ['HTTP_FOO'], 'bar')
+             self.assertEqual(environ['HTTP_BAZ'], 'quux')
+         singleValue.addCallback(cbRendered)
+@@ -541,7 +545,8 @@ class EnvironTests(WSGITestsMixin, TestCase):
+         self.addCleanup(removeObserver, events.append)
+ 
+         errors = self.render('GET', '1.1', [], [''])
+-        def cbErrors((environ, startApplication)):
++        def cbErrors(wsgi_params):
++            environ, startResponse = wsgi_params
+             errors = environ['wsgi.errors']
+             errors.write('some message\n')
+             errors.writelines(['another\nmessage\n'])
+@@ -1187,7 +1192,15 @@ class StartResponseTests(WSGITestsMixin, TestCase):
+                     'HTTP/1.1 200 OK\r\n'))
+             self.assertEqual(reraised[0][0], excInfo[0])
+             self.assertEqual(reraised[0][1], excInfo[1])
+-            self.assertEqual(reraised[0][2].tb_next, excInfo[2])
++
++            # Show that the tracebacks end with the same stack frames.
++            tb1 = reraised[0][2].tb_next
++            tb2 = excInfo[2]
++            self.assertEqual(
++                traceback.extract_tb(tb1)[1],
++                traceback.extract_tb(tb2)[0]
++            )
++
+ 
+         d.addCallback(cbRendered)
+ 
+diff --git twisted/web/wsgi.py twisted/web/wsgi.py
+index 0918c4d..7a22f9a 100644
+--- twisted/web/wsgi.py
++++ twisted/web/wsgi.py
+@@ -5,12 +5,13 @@
+ An implementation of
+ U{Web Resource Gateway Interface<http://www.python.org/dev/peps/pep-0333/>}.
+ """
++from twisted.python.compat import iterbytes, reraise
+ 
+ __metaclass__ = type
+ 
+ from sys import exc_info
+ 
+-from zope.interface import implements
++from zope.interface import implementer
+ 
+ from twisted.python.log import msg, err
+ from twisted.python.failure import Failure
+@@ -183,7 +184,7 @@ class _WSGIResponse:
+         else:
+             pathInfo = ''
+ 
+-        parts = request.uri.split('?', 1)
++        parts = request.uri.split(b'?', 1)
+         if len(parts) == 1:
+             queryString = ''
+         else:
+@@ -254,7 +255,7 @@ class _WSGIResponse:
+         This will be called in a non-I/O thread.
+         """
+         if self.started and excInfo is not None:
+-            raise excInfo[0], excInfo[1], excInfo[2]
++            reraise(excInfo[1], excInfo[2])
+         self.status = status
+         self.headers = headers
+         return self.write
+@@ -313,7 +314,7 @@ class _WSGIResponse:
+         """
+         try:
+             appIterator = self.application(self.environ, self.startResponse)
+-            for elem in appIterator:
++            for elem in iterbytes(appIterator):
+                 if elem:
+                     self.write(elem)
+                 if self._requestFinished:
+@@ -340,7 +341,7 @@ class _WSGIResponse:
+         self.started = True
+ 
+ 
+-
++@implementer(IResource)
+ class WSGIResource:
+     """
+     An L{IResource} implementation which delegates responsibility for all
+@@ -354,7 +355,6 @@ class WSGIResource:
+ 
+     @ivar _application: The WSGI application object.
+     """
+-    implements(IResource)
+ 
+     # Further resource segments are left up to the WSGI application object to
+     # handle.

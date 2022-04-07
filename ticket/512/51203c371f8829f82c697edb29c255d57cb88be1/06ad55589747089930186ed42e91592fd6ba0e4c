@@ -1,0 +1,92 @@
+Index: twisted/topfiles/6287.bugfix
+===================================================================
+--- twisted/topfiles/6287.bugfix	(revision 0)
++++ twisted/topfiles/6287.bugfix	(working copy)
+@@ -0,0 +1 @@
++Epoll reactor calls connectionRefused on UDP after ICMP Destination unreachable
+\ No newline at end of file
+Index: twisted/internet/posixbase.py
+===================================================================
+--- twisted/internet/posixbase.py	(revision 38625)
++++ twisted/internet/posixbase.py	(working copy)
+@@ -597,9 +597,13 @@
+                     why = _NO_FILEDESC
+                 else:
+                     if event & self._POLL_IN:
+-                        # Handle a read event.
+-                        why = selectable.doRead()
+-                        inRead = True
++                        if hasattr(self, '_reads') and fd not in self._reads:
++                            why = CONNECTION_LOST
++                        else:
++                            #Handle a read even.
++                            why = selectable.doRead()
++                            inRead = True
++                            
+                     if not why and event & self._POLL_OUT:
+                         # Handle a write event, as long as doRead didn't
+                         # disconnect us.
+Index: twisted/internet/epollreactor.py
+===================================================================
+--- twisted/internet/epollreactor.py	(revision 38625)
++++ twisted/internet/epollreactor.py	(working copy)
+@@ -191,8 +191,8 @@
+     """
+ 
+     # Attributes for _PollLikeMixin
+-    _POLL_DISCONNECTED = (EPOLLHUP | EPOLLERR)
+-    _POLL_IN = EPOLLIN
++    _POLL_DISCONNECTED = EPOLLHUP
++    _POLL_IN = (EPOLLIN  | EPOLLERR)
+     _POLL_OUT = EPOLLOUT
+ 
+     def __init__(self):
+Index: twisted/internet/test/test_udp.py
+===================================================================
+--- twisted/internet/test/test_udp.py	(revision 38625)
++++ twisted/internet/test/test_udp.py	(working copy)
+@@ -25,8 +25,11 @@
+ 
+ from twisted.internet.test.connectionmixins import (LogObserverMixin,
+                                                     findFreePort)
++from twisted.internet.glib2reactor import Glib2Reactor
++from twisted.internet.gtk2reactor import Gtk2Reactor
++from twisted.internet.pollreactor import PollReactor
++from twisted.trial.unittest import SkipTest
+ 
+-
+ class UDPPortMixin(object):
+     def getListeningPort(self, reactor, protocol):
+         """
+@@ -215,4 +218,31 @@
+         port = reactor.listenUDP(0, DatagramProtocol())
+         self.assertIn(repr(port.getHost().port), str(port))
+ 
++    def test_connnectionRefusedAfterWrite(self):
++        class RefuseProtocol(DatagramProtocol):
++            refused = None
++            def startProtocol(self):
++                self.transport.connect('127.0.0.1', 8000)
++                self.sendDatagram()
++            def sendDatagram(self):
++                self.transport.write('a')
++            def connectionRefused(self):
++                reactor.callLater(0, self.refused.callback, None)
++            def datagramReceived(self, datagram, host):
++                pass
++
++        def cbClean(ignore):
++            reactor.stop()
++        reactor = self.buildReactor()
++        if type(reactor) in [Glib2Reactor, Gtk2Reactor, PollReactor]:
++            raise SkipTest("Reactor does not support refusing after writing")
++        protocol = RefuseProtocol()
++        protocol.refused = Deferred()
++        protocol.refused.addCallback(cbClean)
++        port = reactor.listenUDP(0, protocol)
++        self.runReactor(reactor)
++        return port.stopListening()
++
++
++
+ globals().update(UDPServerTestsBuilder.makeTestCaseClasses())

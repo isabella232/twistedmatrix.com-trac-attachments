@@ -1,0 +1,496 @@
+Index: twisted/conch/test/test_agent.py
+===================================================================
+--- twisted/conch/test/test_agent.py	(revision 0)
++++ twisted/conch/test/test_agent.py	(revision 0)
+@@ -0,0 +1,231 @@
++from zope.interface import implements
++
++from twisted.conch.ssh import agent, keys
++
++from twisted.trial import unittest
++from twisted.test import iosim
++from twisted.conch.test import keydata
++from twisted.conch.error import ConchError
++
++class MockFactory(object): 
++    keys = {}
++
++class AgentTestBase(unittest.TestCase):
++    """Tests for SSHAgentServer/Client."""
++
++    def setUp(self):
++        # wire up our client <-> server
++        self.client, self.server, self.pump = iosim.connectedServerAndClient(agent.SSHAgentServer, 
++                                                                             agent.SSHAgentClient)
++
++        # the server's end of the protocol is stateful and we store it on the factory, for which we
++        # only need a mock
++        self.server.factory = MockFactory()        
++
++        # pub/priv keys of each kind
++        self.rsa_priv = keys.Key.fromString(keydata.privateRSA_openssh)
++        self.dsa_priv = keys.Key.fromString(keydata.privateDSA_openssh)
++
++        self.rsa_pub = keys.Key.fromString(keydata.publicRSA_openssh)
++        self.dsa_pub = keys.Key.fromString(keydata.publicDSA_openssh)
++
++class TestUnimplementedVersionOneServer(AgentTestBase):
++    """Tests for methods with no-op implementations on the server. We need these
++       for clients, such as openssh, that try v1 methods before going to v2.
++
++       Because the client doesn't expose these operations with nice method names,
++       we invoke sendRequest directly with an op code.
++    """
++
++    def test_agentc_REQUEST_RSA_IDENTITIES(self):
++        d = self.client.sendRequest(agent.AGENTC_REQUEST_RSA_IDENTITIES, '')
++        self.pump.flush()
++        def _cb(packet):
++            self.assertEquals(agent.AGENT_RSA_IDENTITIES_ANSWER, ord(packet[0]))
++        return d.addCallback(_cb)
++
++    def test_agentc_REMOVE_RSA_IDENTITY(self):
++        d = self.client.sendRequest(agent.AGENTC_REMOVE_RSA_IDENTITY, '')
++        self.pump.flush()
++        def _cb(emptystr):
++            self.assertEquals('', emptystr)
++        return d.addCallback(_cb)
++
++    def test_agentc_REMOVE_ALL_RSA_IDENTITIES(self):
++        d = self.client.sendRequest(agent.AGENTC_REMOVE_ALL_RSA_IDENTITIES, '')
++        self.pump.flush()
++        def _cb(emptystr):
++            self.assertEquals('', emptystr)
++        return d.addCallback(_cb)
++
++class CorruptServer(agent.SSHAgentServer):
++    """A misbehaving server that returns bogus response op codes so that we can
++       verify that our callbacks that deal with these op codes handle such miscreants."""
++    def agentc_REQUEST_IDENTITIES(self, data):
++        self.sendResponse(254, '')
++
++    def agentc_SIGN_REQUEST(self, data):
++        self.sendResponse(254, '')
++
++class TestClientWithBrokenServer(AgentTestBase):
++    """verify error handling code in the client using a misbehaving server"""
++    def setUp(self):
++        AgentTestBase.setUp(self)
++        self.client, self.server, self.pump = iosim.connectedServerAndClient(CorruptServer,
++                                                                             agent.SSHAgentClient)
++        # the server's end of the protocol is stateful and we store it on the factory, for which we
++        # only need a mock
++        self.server.factory = MockFactory()        
++
++    def test_signDataCallbackErrorHandling(self):
++        d = self.client.signData(self.rsa_pub.blob(), "John Hancock")
++        self.pump.flush()
++        def _eb(f):
++            try:
++                f.trap(ConchError)
++            except:
++                self.fail("Expected ConchError on errback")
++        return d.addCallback(lambda x: self.fail("expected errback")).addErrback(_eb)
++
++    def test_requestIdentitiesCallbackErrorHandling(self):
++        d = self.client.requestIdentities()
++        self.pump.flush()
++        def _eb(f):
++            try:
++                f.trap(ConchError)
++            except:
++                self.fail("Expected ConchError on errback")
++        return d.addCallback(lambda x: self.fail("expected errback")).addErrback(_eb)
++
++class TestAgentKeyAddition(AgentTestBase):
++    """Test adding different flavors of keys to an agent."""
++    def test_addRSAIdentityNoComment(self):
++        d = self.client.addIdentity(self.rsa_priv.privateBlob())
++        self.pump.flush()
++        def _check(ignored):
++            servers_key_tuple = self.server.factory.keys[self.rsa_priv.blob()]
++            self.assertEquals(self.rsa_priv, servers_key_tuple[0])
++            self.assertEquals('', servers_key_tuple[1])
++        return d.addCallback(_check)
++
++    def test_addDSAIdentityNoComment(self):
++        d = self.client.addIdentity(self.dsa_priv.privateBlob())
++        self.pump.flush()
++        def _check(ignored):
++            servers_key_tuple = self.server.factory.keys[self.dsa_priv.blob()]
++            self.assertEquals(self.dsa_priv, servers_key_tuple[0])
++            self.assertEquals('', servers_key_tuple[1])
++        return d.addCallback(_check)
++
++    def test_addRSAIdentityWithComment(self):
++        d = self.client.addIdentity(self.rsa_priv.privateBlob(), comment='My special key')
++        self.pump.flush()
++        def _check(ignored):
++            servers_key_tuple = self.server.factory.keys[self.rsa_priv.blob()]
++            self.assertEquals(self.rsa_priv, servers_key_tuple[0])
++            self.assertEquals('My special key', servers_key_tuple[1])
++        return d.addCallback(_check)
++
++    def test_addDSAIdentityWithComment(self):
++        d = self.client.addIdentity(self.dsa_priv.privateBlob(), comment='My special key')
++        self.pump.flush()
++        def _check(ignored):
++            servers_key_tuple = self.server.factory.keys[self.dsa_priv.blob()]
++            self.assertEquals(self.dsa_priv, servers_key_tuple[0])
++            self.assertEquals('My special key', servers_key_tuple[1])
++        return d.addCallback(_check)
++
++class TestAgentClientFailure(AgentTestBase):
++    def test_agentFailure(self):
++        "verify that the client raises ConchError on AGENT_FAILURE"
++        d = self.client.sendRequest(254, '')        
++        self.pump.flush()
++        def _eb(f):
++            try:
++                f.trap(ConchError)
++            except:
++                self.fail("got something other than ConchError on AGENT_FAILURE")
++        return d.addCallback(lambda x: self.fail("expected ConchError")).addErrback(_eb)
++
++class TestAgentIdentityRequests(AgentTestBase):
++    """Test operations against a server with identities already loaded"""
++    def setUp(self):
++        AgentTestBase.setUp(self)
++        self.server.factory.keys[self.dsa_priv.blob()] = (self.dsa_priv, 'a comment')
++        self.server.factory.keys[self.rsa_priv.blob()] = (self.rsa_priv, 'another comment')
++
++    def test_signDataRSA(self):
++        d = self.client.signData(self.rsa_pub.blob(), "John Hancock")
++        self.pump.flush()
++        def _check(sig):
++            expected = self.rsa_priv.sign("John Hancock")
++            self.assertEquals(expected, sig)
++            self.assertTrue(self.rsa_pub.verify(sig, "John Hancock"))
++        return d.addCallback(_check)
++
++    def test_signDataDSA(self):
++        d = self.client.signData(self.dsa_pub.blob(), "John Hancock")
++        self.pump.flush()
++        def _check(sig):
++        #    expected = self.dsa_priv.sign("John Hancock")
++        #  Cannot do this b/c DSA uses random numbers when signing
++        #    self.assertEquals(expected, sig)
++             self.assertTrue(self.dsa_pub.verify(sig, "John Hancock"))
++        return d.addCallback(_check)
++
++    def test_signDataRSAErrbackOnUnknownBlob(self):
++        del self.server.factory.keys[self.rsa_pub.blob()]
++        d = self.client.signData(self.rsa_pub.blob(), "John Hancock")
++        self.pump.flush()
++        def _eb(f):
++            try:
++                f.trap(ConchError)
++            except:
++                self.fail("Expected ConchError on errback")
++        return d.addCallback(lambda x: self.fail("expected callback")).addErrback(_eb)
++
++    def test_requestIdentities(self):
++        d = self.client.requestIdentities()
++        self.pump.flush()
++        def _check(keyt):
++            expected = {}
++            expected[self.dsa_pub.blob()] = 'a comment'
++            expected[self.rsa_pub.blob()] = 'another comment'
++
++            received = dict((keys.Key.fromString(k[0], type='blob').blob(), k[1]) for k in keyt)
++            self.assertEquals(expected, received)
++        return d.addCallback(_check)
++
++class TestAgentKeyRemoval(AgentTestBase):
++    """Test support for removing keys in a remote server"""
++    def setUp(self):
++        AgentTestBase.setUp(self)
++        self.server.factory.keys[self.dsa_priv.blob()] = (self.dsa_priv, 'a comment')
++        self.server.factory.keys[self.rsa_priv.blob()] = (self.rsa_priv, 'another comment')
++
++    def test_removeRSAIdentity(self):
++        d = self.client.removeIdentity(self.rsa_priv.blob()) # only need public key for this
++        self.pump.flush()
++
++        def _check(ignored):
++            self.assertEquals(1, len(self.server.factory.keys))
++            self.assertTrue(self.server.factory.keys.has_key(self.dsa_priv.blob()))
++            self.assertFalse(self.server.factory.keys.has_key(self.rsa_priv.blob()))
++        return d.addCallback(_check)
++
++    def test_removeDSAIdentity(self):
++        d = self.client.removeIdentity(self.dsa_priv.blob()) # only need public key for this
++        self.pump.flush()
++
++        def _check(ignored):
++            self.assertEquals(1, len(self.server.factory.keys))
++            self.assertTrue(self.server.factory.keys.has_key(self.rsa_priv.blob()))
++        return d.addCallback(_check)
++
++    def test_removeAllIdentities(self):
++        d = self.client.removeAllIdentities()
++        self.pump.flush()
++
++        def _check(ignored):
++            self.assertEquals(0, len(self.server.factory.keys))
++        return d.addCallback(_check)
+Index: twisted/conch/test/test_keys.py
+===================================================================
+--- twisted/conch/test/test_keys.py	(revision 24258)
++++ twisted/conch/test/test_keys.py	(working copy)
+@@ -664,6 +664,23 @@
+         badKey = keys.Key(None)
+         self.assertRaises(RuntimeError, badKey.blob)
+ 
++    def test_privateBlob(self):
++        """
++        Test that the Key object generates private blobs correctly.
++        """
++        self.assertEquals(keys.Key(self.rsaObj).privateBlob(),
++                '\x00\x00\x00\x07ssh-rsa\x00\x00\x00\x01\x01'
++                '\x00\x00\x00\x01\x02\x00\x00\x00\x01\x03\x00'
++                '\x00\x00\x01\x04\x00\x00\x00\x01\x04\x00\x00'
++                '\x00\x01\x05')
++        self.assertEquals(keys.Key(self.dsaObj).privateBlob(),
++                '\x00\x00\x00\x07ssh-dss\x00\x00\x00\x01\x03'
++                '\x00\x00\x00\x01\x04\x00\x00\x00\x01\x02\x00'
++                '\x00\x00\x01\x01\x00\x00\x00\x01\x05')
++
++        badKey = keys.Key(None)
++        self.assertRaises(RuntimeError, badKey.privateBlob)
++
+     def test_toOpenSSH(self):
+         """
+         Test that the Key object generates OpenSSH keys correctly.
+Index: twisted/conch/ssh/agent.py
+===================================================================
+--- twisted/conch/ssh/agent.py	(revision 24258)
++++ twisted/conch/ssh/agent.py	(working copy)
+@@ -11,6 +11,7 @@
+ import struct
+ from common import NS, getNS
+ from twisted.conch.error import ConchError
++from twisted.conch.ssh import keys
+ from twisted.internet import defer, protocol
+ 
+ class SSHAgentClient(protocol.Protocol):
+@@ -47,22 +48,19 @@
+ 
+     def _cbRequestIdentities(self, data):
+         if ord(data[0]) != AGENT_IDENTITIES_ANSWER:
+-            return ConchError('unexpected respone: %i' % ord(data[0]))
++            raise ConchError('unexpected respone: %i' % ord(data[0]))
+         numKeys = struct.unpack('!L', data[1:5])[0]
+         keys = []
+         data = data[5:]
+         for i in range(numKeys):
+-            blobLen = struct.unpack('!L', data[:4])[0]
+-            blob, data = data[4:4+blobLen], data[4+blobLen:]
+-            commLen = struct.unpack('!L', data[:4])[0]
+-            comm, data = data[4:4+commLen], data[4+commLen:]
+-            keys.append((blob, comm))
++            blob, data = getNS(data)
++            comment, data = getNS(data)
++            keys.append((blob, comment))
+         return keys
+ 
+     def addIdentity(self, blob, comment = ''):
+         req = blob
+         req += NS(comment)
+-        co
+         return self.sendRequest(AGENTC_ADD_IDENTITY, req)
+ 
+     def signData(self, blob, data):
+@@ -72,8 +70,8 @@
+         return self.sendRequest(AGENTC_SIGN_REQUEST, req).addCallback(self._cbSignData)
+ 
+     def _cbSignData(self, data):
+-        if data[0] != chr(AGENT_SIGN_RESPONSE):
+-            return ConchError('unexpected data: %i' % ord(data[0]))
++        if ord(data[0]) != AGENT_SIGN_RESPONSE:
++            raise ConchError('unexpected data: %i' % ord(data[0]))
+         signature = getNS(data[1:])[0]
+         return signature
+ 
+@@ -99,9 +97,12 @@
+             reqType = ord(packet[0])
+             reqName = messages.get(reqType, None)
+             if not reqName:
+-                print 'bad request', reqType
+-            f = getattr(self, 'agentc_%s' % reqName)
+-            f(packet[1:])
++                self.sendResponse(AGENT_FAILURE, '')
++            else:
++                f = getattr(self, 'agentc_%s' % reqName)
++                if not hasattr(self.factory, 'keys'):
++                    self.factory.keys = {}
++                f(packet[1:])
+ 
+     def sendResponse(self, reqType, data):
+         pack = struct.pack('!LB', len(data)+1, reqType) + data
+@@ -109,27 +110,58 @@
+ 
+     def agentc_REQUEST_IDENTITIES(self, data):
+         assert data == ''
+-        numKeys = len(self.keys)
++        numKeys = len(self.factory.keys)
+         s = struct.pack('!L', numKeys)
+-        for k in self.keys:
+-            s += struct.pack('!L', len(k)) + k
+-            s += struct.pack('!L', len(self.keys[k][1])) + self.keys[k][1]
++        for key, comment in self.factory.keys.itervalues():
++            s += NS(key.blob()) # yes, wrapped in an NS
++            s += NS(comment)
+         self.sendResponse(AGENT_IDENTITIES_ANSWER, s)
+ 
+     def agentc_SIGN_REQUEST(self, data):
+-        blob, data = common.getNS(data)
+-        if blob not in self.keys:
++        blob, data = getNS(data)
++        if blob not in self.factory.keys:
+             return self.sendResponse(AGENT_FAILURE, '')
+-        signData, data = common.getNS(data)
++        signData, data = getNS(data)
+         assert data == '\000\000\000\000'
+-        self.sendResponse(AGENT_SIGN_RESPONSE, common.NS(keys.signData(self.keys[blob][0], signData)))
++        self.sendResponse(AGENT_SIGN_RESPONSE, NS(self.factory.keys[blob][0].sign(signData)))
+ 
+-    def agentc_ADD_IDENTITY(self, data): pass
+-    def agentc_REMOVE_IDENTITY(self, data): pass
+-    def agentc_REMOVE_ALL_IDENTITIES(self, data): pass
++    def agentc_ADD_IDENTITY(self, data): 
++        k = keys.Key.fromString(data, type='private_blob') # not wrapped in NS here
++        self.factory.keys[k.blob()] = (k, k.comment)
++        self.sendResponse(AGENT_SUCCESS, '')
+ 
++    def agentc_REMOVE_IDENTITY(self, data): 
++        blob, _ = getNS(data)
++        k = keys.Key.fromString(blob, type='blob')
++        del self.factory.keys[k.blob()]
++        self.sendResponse(AGENT_SUCCESS, '')
++
++    def agentc_REMOVE_ALL_IDENTITIES(self, data): 
++        assert data == ''
++        self.factory.keys = {}
++        self.sendResponse(AGENT_SUCCESS, '')
++
++    # v1 messages that we ignore because we don't keep v1 keys
++    # open-ssh sends both v1 and v2 commands, so we have to
++    # do no-ops for v1 commands or we'll get "bad request" errors
++
++    def agentc_REQUEST_RSA_IDENTITIES(self, data):
++        self.sendResponse(AGENT_RSA_IDENTITIES_ANSWER, struct.pack('!L', 0))
++
++    def agentc_REMOVE_RSA_IDENTITY(self, data):
++        self.sendResponse(AGENT_SUCCESS, '')
++
++    def agentc_REMOVE_ALL_RSA_IDENTITIES(self, data):
++        self.sendResponse(AGENT_SUCCESS, '')
++
++AGENTC_REQUEST_RSA_IDENTITIES   = 1
++AGENT_RSA_IDENTITIES_ANSWER     = 2
+ AGENT_FAILURE                   = 5
+ AGENT_SUCCESS                   = 6
++
++AGENTC_REMOVE_RSA_IDENTITY         = 8
++AGENTC_REMOVE_ALL_RSA_IDENTITIES   = 9
++
+ AGENTC_REQUEST_IDENTITIES       = 11
+ AGENT_IDENTITIES_ANSWER         = 12
+ AGENTC_SIGN_REQUEST             = 13
+Index: twisted/conch/ssh/keys.py
+===================================================================
+--- twisted/conch/ssh/keys.py	(revision 24258)
++++ twisted/conch/ssh/keys.py	(working copy)
+@@ -118,6 +118,50 @@
+             raise BadKeyError('unknown blob type: %s' % keyType)
+     _fromString_BLOB = classmethod(_fromString_BLOB)
+ 
++    def _fromString_PRIVATE_BLOB(Class, blob):
++        """
++        Return a private key object corresponding to this private key blob.
++        The blob formats are as follows:
++
++        RSA keys::
++            string 'ssh-rsa'
++            integer n
++            integer e
++            integer d
++            integer u
++            integer p
++            integer q
++
++        DSA keys::
++            string 'ssh-dss'
++            integer p
++            integer q
++            integer g
++            integer y
++            integer x
++
++        @type blob: C{str}
++        @return: a C{Crypto.PublicKey.pubkey.pubkey} object
++        @raises BadKeyError: if the key type (the first string) is unknown.
++        """
++        keyType, rest = common.getNS(blob)
++
++        if keyType == 'ssh-rsa':
++            n, e, d, u, p, q, rest = common.getMP(rest, 6)
++            comment, rest = common.getNS(rest)
++            rsakey = Class(RSA.construct((n, e, d, p, q, u)))
++            rsakey.comment = comment
++            return rsakey
++        elif keyType == 'ssh-dss':
++            p, q, g, y, x, rest = common.getMP(rest, 5)
++            comment, rest = common.getNS(rest)
++            dsakey =  Class(DSA.construct((y, g, p, q, x)))
++            dsakey.comment = comment
++            return dsakey
++        else:
++            raise BadKeyError('unknown blob type: %s' % keyType)
++    _fromString_PRIVATE_BLOB = classmethod(_fromString_PRIVATE_BLOB)
++
+     def _fromString_PUBLIC_OPENSSH(Class, data):
+         """
+         Return a public key object corresponding to this OpenSSH public key
+@@ -449,6 +493,40 @@
+                     common.MP(data['q']) + common.MP(data['g']) +
+                     common.MP(data['y']))
+ 
++    def privateBlob(self):
++        """
++        Return the private key blob for this key.  The blob is the
++        over-the-wire format for private keys:
++
++        RSA keys::
++            string 'ssh-rsa'
++            integer n
++            integer e
++            integer d
++            integer u
++            integer p
++            integer q
++
++        DSA keys::
++            string 'ssh-dss'
++            integer p
++            integer q
++            integer g
++            integer y
++            integer x
++        """
++        type = self.type()
++        data = self.data()
++        if type == 'RSA':
++            return (common.NS('ssh-rsa') + common.MP(data['n']) +
++                    common.MP(data['e']) + common.MP(data['d']) +
++                    common.MP(data['u']) + common.MP(data['p']) +
++                    common.MP(data['q']))
++        elif type == 'DSA':
++            return (common.NS('ssh-dss') + common.MP(data['p']) +
++                    common.MP(data['q']) + common.MP(data['g']) +
++                    common.MP(data['y']) + common.MP(data['x']))
++
+     def toString(self, type, extra=None):
+         """
+         Create a string representation of this key.  If the key is a

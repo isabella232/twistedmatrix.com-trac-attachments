@@ -1,0 +1,150 @@
+Index: twisted/internet/endpoints.py
+===================================================================
+--- twisted/internet/endpoints.py	(revision 0)
++++ twisted/internet/endpoints.py	(revision 0)
+@@ -0,0 +1,116 @@
++# -*- test-case-name: twisted.test.test_endpoints -*-
++
++from zope.interface import Interface, implements
++
++from twisted.internet import address, interfaces
++from twisted.internet import reactor, defer, protocol
++from twisted.python import components, failure
++from twisted.protocols import policies
++
++class _WrappingProtocol(policies.ProtocolWrapper):
++    # FIXME: we probably don't need to use policies.ProtocolWrapper
++    # with a little work we can just set up the wrappedProtocols
++    # transport correctly, instead of pretending to be it.
++    def connectionMade(self):
++        policies.ProtocolWrapper.connectionMade(self)
++        self.factory.deferred.callback(self.wrappedProtocol)
++
++class _CallableFactory(protocol.ClientFactory):
++    protocol = _WrappingProtocol
++
++    def __init__(self, callable):
++        self.callable = callable
++        self.deferred = defer.Deferred()
++
++    def buildProtocol(self, addr):
++        try:
++            proto = self.callable(addr)
++        except:
++            self.deferred.errback()
++        else:
++            return self.protocol(self, proto)
++
++    def registerProtocol(self, proto):
++        pass
++
++    def unregisterProtocol(self, proto):
++        pass
++
++    def clientConnectionFailed(self, connector, reason):
++        self.deferred.errback(reason)
++
++
++class TCPEndpoint(object):
++    implements(interfaces.IClientEndpoint, interfaces.IServerEndpoint)
++
++    def __init__(self, host='', port=0, timeout=30,
++                 backlog=50, bindAddress=None):
++
++        self.host = host
++        self.port = port
++        self.timeout = timeout
++        self.backlog = backlog
++        self.bindAddress = bindAddress
++
++    def connect(self, protoCreator):
++        wf = _CallableFactory(protoCreator)
++        d = defer.execute(reactor.connectTCP, self.host, self.port, wf,
++                          timeout=self.timeout,
++                          bindAddress=self.bindAddress)
++
++        d.addCallback(lambda _: wf.deferred)
++
++        return d
++
++    def listen(self, protoCreator):
++         wf = _CallableFactory(protoCreator)
++         return defer.execute(reactor.listenTCP, self.port, wf,
++                              backlog=self.backlog,
++                              interface=self.host)
++
++
++class UNIXEndpoint(object):
++    implements(interfaces.IClientEndpoint, interfaces.IServerEndpoint)
++
++    def __init__(self, address, timeout=30, checkPID=0,
++                 backlog=50, mode=0666, wantPID=0):
++        self.address = address
++        self.timeout = timeout
++        self.checkPID= checkPID
++        self.backlog = backlog
++        self.mode = mode
++        self.wantPID= wantPID
++
++    def connect(self, protoCreator):
++        wf = _CallableFactory(protoCreator)
++        d = defer.execute(reactor.connectUNIX, self.address, wf,
++                          timeout=self.timeout,
++                          checkPID=self.checkPID)
++
++        d.addCallback(lambda _: wf.deferred)
++
++        return d
++
++    def listen(self, protoCreator):
++        wf = _CallableFactory(protoCreator)
++        return defer.execute(reactor.listenUNIX, self.address, wf,
++                                                backlog=self.backlog,
++                                                mode=self.mode,
++                                                wantPID=self.wantPID)
++
++
++def addressToEndpoint(addr):
++    if isinstance(addr, address.UNIXAddress):
++        endpoint = UNIXEndpoint(addr.name)
++    elif isinstance(addr, address.IPv4Address):
++        if addr.type == 'TCP':
++            endpoint = TCPEndpoint(addr.host,
++                                   addr.port)
++
++        elif addr.type == 'UDP':
++            raise TypeError('Could not adapt: UDP Endpoints not supported')
++
++    return endpoint
++
++components.registerAdapter(addressToEndpoint, interfaces.IAddress,
++                           interfaces.IClientEndpoint, interfaces.IServerEndpoint)
+Index: twisted/internet/interfaces.py
+===================================================================
+--- twisted/internet/interfaces.py	(revision 18049)
++++ twisted/internet/interfaces.py	(working copy)
+@@ -1294,3 +1294,24 @@
+ 
+     def leaveGroup(addr, interface=""):
+         """Leave multicast group, return Deferred of success."""
++
++class IClientEndpoint(Interface):
++    """Object that represents a remote endpoint that we wish to connect to.
++    """
++    def connect(callable):
++        """
++        @param callable: A callable that returns a
++                         L{IProtocol} instance.
++        @return: A L{Deferred} that results in an L{IProtocol} upon successful
++        connection otherwise a L{ConnectError}
++        """
++
++class IServerEndpoint(Interface):
++    """Object representing an endpoint where we will listen for connections.
++    """
++
++    def listen(callable):
++        """
++        @param callable: A callable that returns an L{IProtocol}
++        @return: A L{Deferred} that results in an L{IListeningPort} or an L{CannotListenError}
++        """
